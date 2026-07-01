@@ -3576,6 +3576,7 @@ namespace gamescope
 			bNeedsFullComposite |= g_bColorSliderInUse;
 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
 			bNeedsFullComposite |= !g_reshade_effect.empty();
+			bNeedsFullComposite |= vulkan_framegen_is_enabled();
 
 			if ( g_bOutputHDREnabled )
 			{
@@ -3608,6 +3609,45 @@ namespace gamescope
 					( !k_bUseCursorPlane && bDrewCursor ) ? "yes" : "no",
 					!g_reshade_effect.empty() ? "yes" : "no" );
 			}
+
+			if ( gamescope::Rc<CVulkanTexture> pGeneratedFrame = vulkan_framegen_consume_generated_frame() )
+			{
+				if ( g_bFramegenDebug )
+					drm_log.infof( "framegen: DRM presenting generated frame" );
+
+				FrameInfo_t generatedFrameInfo = {};
+				generatedFrameInfo.allowVRR = false;
+				generatedFrameInfo.outputEncodingEOTF = pFrameInfo->outputEncodingEOTF;
+				generatedFrameInfo.applyOutputColorMgmt = false;
+				generatedFrameInfo.layerCount = 1;
+
+				FrameInfo_t::Layer_t *baseLayer = &generatedFrameInfo.layers[ 0 ];
+				baseLayer->scale.x = 1.0;
+				baseLayer->scale.y = 1.0;
+				baseLayer->opacity = 1.0;
+				baseLayer->zpos = g_zposBase;
+				baseLayer->tex = pGeneratedFrame;
+				baseLayer->applyColorMgmt = false;
+				baseLayer->filter = GamescopeUpscaleFilter::NEAREST;
+				baseLayer->ctm = nullptr;
+				baseLayer->colorspace = pFrameInfo->outputEncodingEOTF == EOTF_PQ ? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+
+				GetVBlankTimer().UpdateWasCompositing( true );
+				m_bWasPartialCompositing = false;
+				m_bWasCompositing = true;
+
+				int ret = drm_prepare( &g_DRM, bAsync, &generatedFrameInfo );
+				if ( ret == -EACCES )
+					return 0;
+				if ( ret != 0 )
+				{
+					drm_log.errorf( "Failed to prepare generated frame flip: %s", strerror( -ret ) );
+					return ret;
+				}
+
+				return Commit( &generatedFrameInfo );
+			}
+
 			if ( !bNeedsFullComposite && !bWantsPartialComposite )
 			{
 				// Save the pending mode so it can be restored after drm_rollback() and carried

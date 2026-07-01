@@ -45,6 +45,7 @@
 #include "cs_composite_rcas.h"
 #include "cs_easu.h"
 #include "cs_easu_fp16.h"
+#include "cs_framegen_blend.h"
 #include "cs_gaussian_blur_horizontal.h"
 #include "cs_nis.h"
 #include "cs_nis_fp16.h"
@@ -1064,6 +1065,7 @@ bool CVulkanDevice::createShaders()
 		SHADER(NIS, cs_nis);
 	}
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
+	SHADER(FRAMEGEN_BLEND, cs_framegen_blend);
 #undef SHADER
 
 	for (uint32_t i = 0; i < shaderInfos.size(); i++)
@@ -1294,6 +1296,7 @@ void CVulkanDevice::compileAllPipelines()
 	SHADER(EASU, 1, 1, 1);
 	SHADER(NIS, 1, 1, 1);
 	SHADER(RGB_TO_NV12, 1, 1, 1);
+	SHADER(FRAMEGEN_BLEND, 1, 1, 1);
 #undef SHADER
 
 	for (auto& info : pipelineInfos) {
@@ -1952,8 +1955,6 @@ void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
 	// no need to reimport if the image didn't change
 	if (!result.second)
 		return;
-	// using the swapchain image as a source without writing to it doesn't make any sense
-	assert(image->outputImage() == false);
 	result.first->second.needsImport = image->externalImage();
 	result.first->second.needsExport = image->externalImage();
 }
@@ -3408,6 +3409,7 @@ bool vulkan_remake_swapchain( void )
 	VulkanOutput_t *pOutput = &g_output;
 	g_device.waitIdle();
 	g_device.vk.QueueWaitIdle( g_device.queue() );
+	vulkan_framegen_reset( "swapchain_remake" );
 
 	pOutput->outputImages.clear();
 
@@ -3508,6 +3510,7 @@ bool vulkan_remake_output_images()
 {
 	VulkanOutput_t *pOutput = &g_output;
 	g_device.waitIdle();
+	vulkan_framegen_reset( "output_images_remade" );
 
 	pOutput->nOutImage = 0;
 
@@ -4156,6 +4159,260 @@ extern uint32_t g_reshade_technique_idx;
 
 ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
 
+static const char *framegen_mode_name()
+{
+	switch ( g_eFramegenMode )
+	{
+		case GamescopeFramegenMode::Blend:
+			return "blend";
+		default:
+			return "unknown";
+	}
+}
+
+struct FramegenHistory_t
+{
+	gamescope::Rc<CVulkanTexture> previousReal;
+	gamescope::Rc<CVulkanTexture> currentReal;
+	gamescope::Rc<CVulkanTexture> pendingGenerated;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	uint32_t drmFormat = DRM_FORMAT_INVALID;
+	uint64_t previousFrameId = 0;
+	uint64_t currentFrameId = 0;
+	uint64_t generatedFrameId = 0;
+	uint64_t previousPresentTimeNs = 0;
+	uint64_t currentPresentTimeNs = 0;
+	bool valid = false;
+};
+
+static FramegenHistory_t g_framegenHistory;
+static bool g_bLoggedFramegenConfig = false;
+static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = 250'000'000ull;
+
+bool vulkan_framegen_is_enabled()
+{
+	return g_bExperimentalFramegen && g_nFramegenMultiplier == 2 && g_eFramegenMode == GamescopeFramegenMode::Blend;
+}
+
+static bool framegen_texture_matches( const gamescope::Rc<CVulkanTexture> &pTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
+{
+	return pTexture != nullptr
+		&& pTexture->width() == width
+		&& pTexture->height() == height
+		&& pTexture->drmFormat() == drmFormat;
+}
+
+static bool framegen_output_matches( const gamescope::OwningRc<CVulkanTexture> &pTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
+{
+	return pTexture != nullptr
+		&& pTexture->width() == width
+		&& pTexture->height() == height
+		&& pTexture->drmFormat() == drmFormat;
+}
+
+static void framegen_invalidate_history( const char *reason )
+{
+	if ( g_bFramegenDebug )
+	{
+		vk_log.infof( "framegen: history valid=false reason=%s", reason ? reason : "unknown" );
+	}
+
+	g_framegenHistory.valid = false;
+	g_framegenHistory.pendingGenerated = nullptr;
+}
+
+void vulkan_framegen_reset( const char *reason )
+{
+	if ( g_bFramegenDebug )
+	{
+		vk_log.infof( "framegen: reset history reason=%s", reason ? reason : "unknown" );
+	}
+
+	g_framegenHistory = {};
+	for ( auto &pImage : g_output.framegenOutputImages )
+		pImage = nullptr;
+}
+
+bool vulkan_framegen_has_pending_generated_frame()
+{
+	return vulkan_framegen_is_enabled() && g_framegenHistory.pendingGenerated != nullptr;
+}
+
+gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame()
+{
+	if ( !vulkan_framegen_has_pending_generated_frame() )
+		return nullptr;
+
+	gamescope::Rc<CVulkanTexture> pGenerated = g_framegenHistory.pendingGenerated;
+	g_framegenHistory.pendingGenerated = nullptr;
+
+	if ( g_bFramegenDebug )
+	{
+		vk_log.infof( "framegen: presented generated frame id=%" PRIu64 ".5", g_framegenHistory.generatedFrameId );
+	}
+
+	return pGenerated;
+}
+
+static bool framegen_create_texture( gamescope::Rc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
+{
+	CVulkanTexture::createFlags createFlags;
+	createFlags.bSampled = true;
+	createFlags.bTransferSrc = true;
+	createFlags.bTransferDst = true;
+
+	gamescope::OwningRc<CVulkanTexture> pTexture = new CVulkanTexture();
+	if ( !pTexture->BInit( width, height, 1u, drmFormat, createFlags ) )
+		return false;
+
+	*ppTexture = pTexture;
+	return true;
+}
+
+static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
+{
+	CVulkanTexture::createFlags createFlags;
+	createFlags.bFlippable = true;
+	createFlags.bStorage = true;
+	createFlags.bOutputImage = true;
+
+	*ppTexture = new CVulkanTexture();
+	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
+}
+
+static bool framegen_ensure_resources( uint32_t width, uint32_t height, uint32_t drmFormat )
+{
+	if ( g_framegenHistory.width != width || g_framegenHistory.height != height || g_framegenHistory.drmFormat != drmFormat )
+	{
+		vulkan_framegen_reset( "resize_or_format_change" );
+		g_framegenHistory.width = width;
+		g_framegenHistory.height = height;
+		g_framegenHistory.drmFormat = drmFormat;
+	}
+
+	if ( !framegen_texture_matches( g_framegenHistory.previousReal, width, height, drmFormat ) )
+	{
+		if ( !framegen_create_texture( &g_framegenHistory.previousReal, width, height, drmFormat ) )
+		{
+			vulkan_framegen_reset( "previous_real_allocation_failed" );
+			return false;
+		}
+	}
+
+	if ( !framegen_texture_matches( g_framegenHistory.currentReal, width, height, drmFormat ) )
+	{
+		if ( !framegen_create_texture( &g_framegenHistory.currentReal, width, height, drmFormat ) )
+		{
+			vulkan_framegen_reset( "current_real_allocation_failed" );
+			return false;
+		}
+	}
+
+	for ( auto &pImage : g_output.framegenOutputImages )
+	{
+		if ( framegen_output_matches( pImage, width, height, drmFormat ) )
+			continue;
+
+		if ( !framegen_create_output_texture( &pImage, width, height, drmFormat ) )
+		{
+			vulkan_framegen_reset( "generated_allocation_failed" );
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static void framegen_record_real_frame( CVulkanCmdBuffer *pCmdBuffer, gamescope::Rc<CVulkanTexture> pRealFrame )
+{
+	if ( !vulkan_framegen_is_enabled() || !pCmdBuffer || !pRealFrame )
+		return;
+
+	if ( !g_bLoggedFramegenConfig )
+	{
+		vk_log.infof( "framegen: enabled mode=%s multiplier=%d", framegen_mode_name(), g_nFramegenMultiplier );
+		vk_log.infof( "framegen: forcing composite path" );
+		g_bLoggedFramegenConfig = true;
+	}
+
+	if ( !framegen_ensure_resources( pRealFrame->width(), pRealFrame->height(), pRealFrame->drmFormat() ) )
+		return;
+
+	uint64_t now = get_time_in_nanos();
+	if ( g_framegenHistory.valid && now - g_framegenHistory.previousPresentTimeNs > k_ulFramegenMaxRealFrameGapNs )
+		framegen_invalidate_history( "frame_gap" );
+
+	g_framegenHistory.currentFrameId++;
+	g_framegenHistory.currentPresentTimeNs = now;
+
+	if ( g_bFramegenDebug )
+	{
+		vk_log.infof( "framegen: real frame id=%" PRIu64 " time=%" PRIu64 " size=%ux%u format=0x%" PRIX32,
+			g_framegenHistory.currentFrameId,
+			now,
+			pRealFrame->width(),
+			pRealFrame->height(),
+			pRealFrame->drmFormat() );
+	}
+
+	pCmdBuffer->copyImage( pRealFrame, g_framegenHistory.currentReal );
+
+	if ( !g_framegenHistory.valid )
+	{
+		if ( g_bFramegenDebug )
+			vk_log.infof( "framegen: history valid=false reason=first_frame" );
+
+		std::swap( g_framegenHistory.previousReal, g_framegenHistory.currentReal );
+		g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId;
+		g_framegenHistory.previousPresentTimeNs = now;
+		g_framegenHistory.valid = true;
+		return;
+	}
+
+	uint32_t uGeneratedIndex = g_output.nOutImage % g_output.framegenOutputImages.size();
+	gamescope::Rc<CVulkanTexture> pGenerated = g_output.framegenOutputImages[ uGeneratedIndex ];
+	if ( !pGenerated )
+		return;
+
+	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_BLEND ) );
+	pCmdBuffer->bindTarget( pGenerated );
+	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
+	pCmdBuffer->setTextureSrgb( 0, true );
+	pCmdBuffer->setSamplerUnnormalized( 0, false );
+	pCmdBuffer->setSamplerNearest( 0, false );
+	pCmdBuffer->bindTexture( 1, g_framegenHistory.currentReal );
+	pCmdBuffer->setTextureSrgb( 1, true );
+	pCmdBuffer->setSamplerUnnormalized( 1, false );
+	pCmdBuffer->setSamplerNearest( 1, false );
+
+	const int pixelsPerGroup = 8;
+	pCmdBuffer->dispatch( div_roundup( pGenerated->width(), pixelsPerGroup ), div_roundup( pGenerated->height(), pixelsPerGroup ) );
+
+	if ( g_framegenHistory.pendingGenerated && g_bFramegenDebug )
+		vk_log.infof( "framegen: replacing unpresented generated frame" );
+
+	g_framegenHistory.generatedFrameId = g_framegenHistory.currentFrameId;
+	g_framegenHistory.pendingGenerated = pGenerated;
+
+	if ( g_bFramegenDebug )
+	{
+		vk_log.infof( "framegen: generated frame id=%" PRIu64 ".5 previous=%" PRIu64 " current=%" PRIu64 " output=%ux%u queue family %u",
+			g_framegenHistory.generatedFrameId,
+			g_framegenHistory.previousFrameId,
+			g_framegenHistory.currentFrameId,
+			pGenerated->width(),
+			pGenerated->height(),
+			g_device.queueFamily() );
+	}
+
+	std::swap( g_framegenHistory.previousReal, g_framegenHistory.currentReal );
+	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId;
+	g_framegenHistory.previousPresentTimeNs = now;
+
+	force_repaint();
+}
+
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer )
 {
 	EOTF outputTF = frameInfo->outputEncodingEOTF;
@@ -4389,6 +4646,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 	}
+
+	if ( !GetBackend()->UsesVulkanSwapchain() && !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
+		framegen_record_real_frame( cmdBuffer.get(), compositeImage );
 
 	if ( pPipewireTexture != nullptr )
 	{

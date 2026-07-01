@@ -9116,6 +9116,9 @@ steamcompmgr_main(int argc, char **argv)
 				bShouldPaint = false;
 			}
 
+			if ( vblank && vulkan_framegen_has_pending_generated_frame() )
+				bShouldPaint = true;
+
 			if ( bShouldPaint )
 			{
 				paint_all( pPaintFocus, eFlipType == FlipType::Async );

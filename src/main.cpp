@@ -136,6 +136,10 @@ const struct option *gamescope_options = (struct option[]){
 	{ "force-composition", no_argument, nullptr, 'c' },
 	{ "force-composite", no_argument, nullptr, 0 },
 	{ "debug-dual-gpu-route", no_argument, nullptr, 0 },
+	{ "experimental-framegen", no_argument, nullptr, 0 },
+	{ "framegen-multiplier", required_argument, nullptr, 0 },
+	{ "framegen-mode", required_argument, nullptr, 0 },
+	{ "framegen-debug", no_argument, nullptr, 0 },
 	{ "composite-debug", no_argument, nullptr, 0 },
 	{ "disable-xres", no_argument, nullptr, 'x' },
 	{ "fade-out-duration", required_argument, nullptr, 0 },
@@ -264,6 +268,10 @@ const char usage[] =
 	"  --force-composition, --force-composite\n"
 	"                                 disable direct scan-out\n"
 	"  --debug-dual-gpu-route         log compositor GPU, buffer import, frame path, and FSR/NIS routing diagnostics\n"
+	"  --experimental-framegen        enable experimental x2 compositor-side frame generation\n"
+	"  --framegen-multiplier 2        generated-frame multiplier; only 2 is supported for now\n"
+	"  --framegen-mode blend          generated-frame algorithm; only blend is supported for now\n"
+	"  --framegen-debug               log framegen history, dispatch, and present cadence\n"
 	"  --composite-debug              draw frame markers on alternating corners of the screen when compositing\n"
 	"  --disable-color-management     disable color management\n"
 	"  --disable-xres                 disable XRes for PID lookup\n"
@@ -332,6 +340,10 @@ float g_flMaxWindowScale = FLT_MAX;
 uint32_t g_preferVendorID = 0;
 uint32_t g_preferDeviceID = 0;
 bool g_bDebugDualGpuRoute = false;
+bool g_bExperimentalFramegen = false;
+bool g_bFramegenDebug = false;
+int g_nFramegenMultiplier = 2;
+GamescopeFramegenMode g_eFramegenMode = GamescopeFramegenMode::Blend;
 
 pthread_t g_mainThread;
 
@@ -796,6 +808,28 @@ int main(int argc, char **argv)
 					g_bDebugDualGpuRoute = true;
 				} else if (strcmp(opt_name, "force-composite") == 0) {
 					cv_composite_force = true;
+				} else if (strcmp(opt_name, "experimental-framegen") == 0) {
+					g_bExperimentalFramegen = true;
+					cv_composite_force = true;
+				} else if (strcmp(opt_name, "framegen-debug") == 0) {
+					g_bFramegenDebug = true;
+				} else if (strcmp(opt_name, "framegen-multiplier") == 0) {
+					g_nFramegenMultiplier = parse_integer( optarg, opt_name );
+					if ( g_nFramegenMultiplier != 2 )
+					{
+						fprintf( stderr, "gamescope: --framegen-multiplier currently only supports 2\n" );
+						return 1;
+					}
+				} else if (strcmp(opt_name, "framegen-mode") == 0) {
+					if ( strcmp( optarg, "blend" ) == 0 )
+					{
+						g_eFramegenMode = GamescopeFramegenMode::Blend;
+					}
+					else
+					{
+						fprintf( stderr, "gamescope: --framegen-mode currently only supports blend\n" );
+						return 1;
+					}
 				} else if (strcmp(opt_name, "disable-color-management") == 0) {
 					g_bForceDisableColorMgmt = true;
 				} else if (strcmp(opt_name, "xwayland-count") == 0) {

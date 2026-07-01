@@ -1,0 +1,24 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "descriptor_set.h"
+
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+void main() {
+    uvec2 coord = uvec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y);
+    uvec2 outSize = imageSize(dst);
+
+    if (coord.x >= outSize.x || coord.y >= outSize.y)
+        return;
+
+    vec2 uv = (vec2(coord) + vec2(0.5f)) / vec2(outSize);
+    vec4 previousFrame = texture(s_samplers[0], uv);
+    vec4 currentFrame = texture(s_samplers[1], uv);
+
+    imageStore(dst, ivec2(coord), mix(previousFrame, currentFrame, 0.5f));
+}

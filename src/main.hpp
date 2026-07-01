@@ -74,3 +74,13 @@ extern bool g_bNoTouchPointerEmulation;
 extern uint32_t g_preferVendorID;
 extern uint32_t g_preferDeviceID;
 extern bool g_bDebugDualGpuRoute;
+
+enum class GamescopeFramegenMode : uint32_t
+{
+    Blend,
+};
+
+extern bool g_bExperimentalFramegen;
+extern bool g_bFramegenDebug;
+extern int g_nFramegenMultiplier;
+extern GamescopeFramegenMode g_eFramegenMode;

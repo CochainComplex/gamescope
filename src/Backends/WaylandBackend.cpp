@@ -1073,6 +1073,7 @@ namespace gamescope
             bNeedsFullComposite |= g_bColorSliderInUse;
             bNeedsFullComposite |= pFrameInfo->bFadingOut;
             bNeedsFullComposite |= !g_reshade_effect.empty();
+            bNeedsFullComposite |= vulkan_framegen_is_enabled();
 
             if ( g_bOutputHDREnabled )
                 bNeedsFullComposite |= g_bHDRItmEnable;
@@ -1096,7 +1097,30 @@ namespace gamescope
                     m_bVisible ? "yes" : "no" );
             }
 
-            if ( !bNeedsFullComposite )
+            if ( gamescope::Rc<CVulkanTexture> pGeneratedFrame = vulkan_framegen_consume_generated_frame() )
+            {
+                if ( g_bFramegenDebug )
+                    xdg_log.infof( "framegen: Wayland presenting generated frame" );
+
+                FrameInfo_t::Layer_t compositeLayer{};
+                compositeLayer.scale.x = 1.0;
+                compositeLayer.scale.y = 1.0;
+                compositeLayer.opacity = 1.0;
+                compositeLayer.zpos = g_zposBase;
+
+                compositeLayer.tex = pGeneratedFrame;
+                compositeLayer.applyColorMgmt = false;
+
+                compositeLayer.filter = GamescopeUpscaleFilter::NEAREST;
+                compositeLayer.ctm = nullptr;
+                compositeLayer.colorspace = pFrameInfo->outputEncodingEOTF == EOTF_PQ ? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+
+                m_Planes[0].Present( &compositeLayer );
+
+                for ( int i = 1; i < 8; i++ )
+                    m_Planes[i].Present( nullptr );
+            }
+            else if ( !bNeedsFullComposite )
             {
                 if ( g_bDebugDualGpuRoute )
                     xdg_log.infof( "dual-gpu-route: Wayland frame path direct plane submission" );
