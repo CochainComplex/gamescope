@@ -11,6 +11,7 @@
 #include "waitable.h"
 #include "Utils/TempFiles.h"
 
+#include <cinttypes>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -45,6 +46,7 @@ extern int g_nPreferredOutputWidth;
 extern int g_nPreferredOutputHeight;
 extern bool g_bForceHDR10OutputDebug;
 extern bool g_bBorderlessOutputWindow;
+extern bool g_bDebugDualGpuRoute;
 extern gamescope::ConVar<bool> cv_adaptive_sync;
 
 extern gamescope::ConVar<bool> cv_composite_force;
@@ -1080,8 +1082,24 @@ namespace gamescope
 
             bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
 
+            if ( g_bDebugDualGpuRoute )
+            {
+                xdg_log.infof( "dual-gpu-route: Wayland present decision layers %d needs-full-composite %s force %s fsr %s nis %s blur %s filter-composite %s reshade %s visible %s",
+                    pFrameInfo->layerCount,
+                    bNeedsFullComposite ? "yes" : "no",
+                    cv_composite_force ? "yes" : "no",
+                    pFrameInfo->useFSRLayer0 ? "yes" : "no",
+                    pFrameInfo->useNISLayer0 ? "yes" : "no",
+                    pFrameInfo->blurLayer0 ? "yes" : "no",
+                    bNeedsCompositeFromFilter ? "yes" : "no",
+                    !g_reshade_effect.empty() ? "yes" : "no",
+                    m_bVisible ? "yes" : "no" );
+            }
+
             if ( !bNeedsFullComposite )
             {
+                if ( g_bDebugDualGpuRoute )
+                    xdg_log.infof( "dual-gpu-route: Wayland frame path direct plane submission" );
                 bool bNeedsBacking = true;
                 if ( pFrameInfo->layerCount >= 1 )
                 {
@@ -1114,6 +1132,8 @@ namespace gamescope
             }
             else
             {
+                if ( g_bDebugDualGpuRoute )
+                    xdg_log.infof( "dual-gpu-route: Wayland frame path full Vulkan composition" );
                 std::optional oCompositeResult = vulkan_composite( (FrameInfo_t *)pFrameInfo, nullptr, false );
 
                 if ( !oCompositeResult )
@@ -2210,6 +2230,16 @@ namespace gamescope
 
     OwningRc<IBackendFb> CWaylandBackend::ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf )
     {
+        if ( g_bDebugDualGpuRoute )
+        {
+            xdg_log.infof( "dual-gpu-route: Wayland backend dma-buf import request %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d",
+                pDmaBuf->width,
+                pDmaBuf->height,
+                pDmaBuf->format,
+                pDmaBuf->modifier,
+                pDmaBuf->n_planes );
+        }
+
         zwp_linux_buffer_params_v1 *pBufferParams = zwp_linux_dmabuf_v1_create_params( m_pLinuxDmabuf );
         if ( !pBufferParams )
         {
@@ -2239,10 +2269,23 @@ namespace gamescope
         if ( !pImportedBuffer )
         {
             xdg_log.errorf( "Failed to import dmabuf" );
+            if ( g_bDebugDualGpuRoute )
+            {
+                xdg_log.errorf( "dual-gpu-route: Wayland backend dma-buf import failed %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64,
+                    pDmaBuf->width,
+                    pDmaBuf->height,
+                    pDmaBuf->format,
+                    pDmaBuf->modifier );
+            }
             return nullptr;
         }
 
         zwp_linux_buffer_params_v1_destroy( pBufferParams );
+
+        if ( g_bDebugDualGpuRoute )
+        {
+            xdg_log.infof( "dual-gpu-route: Wayland backend dma-buf import success" );
+        }
 
         return new CWaylandFb{ this, pImportedBuffer };
     }

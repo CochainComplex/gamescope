@@ -47,6 +47,7 @@ using namespace std::literals;
 EStreamColorspace g_ForcedNV12ColorSpace = k_EStreamColorspace_Unknown;
 extern gamescope::ConVar<bool> cv_adaptive_sync;
 extern gamescope::ConVar<bool> cv_shutdown_on_primary_child_death;
+extern gamescope::ConVar<bool> cv_composite_force;
 
 const char *gamescope_optstring = nullptr;
 const char *g_pOriginalDisplay = nullptr;
@@ -133,6 +134,8 @@ const struct option *gamescope_options = (struct option[]){
 	{ "debug-events", no_argument, nullptr, 0 },
 	{ "steam", no_argument, nullptr, 'e' },
 	{ "force-composition", no_argument, nullptr, 'c' },
+	{ "force-composite", no_argument, nullptr, 0 },
+	{ "debug-dual-gpu-route", no_argument, nullptr, 0 },
 	{ "composite-debug", no_argument, nullptr, 0 },
 	{ "disable-xres", no_argument, nullptr, 'x' },
 	{ "fade-out-duration", required_argument, nullptr, 0 },
@@ -258,7 +261,9 @@ const char usage[] =
 	"  --synchronous-x11              force X11 connection synchronization\n"
 	"  --debug-hud                    paint HUD with debug info\n"
 	"  --debug-events                 debug X11 events\n"
-	"  --force-composition            disable direct scan-out\n"
+	"  --force-composition, --force-composite\n"
+	"                                 disable direct scan-out\n"
+	"  --debug-dual-gpu-route         log compositor GPU, buffer import, frame path, and FSR/NIS routing diagnostics\n"
 	"  --composite-debug              draw frame markers on alternating corners of the screen when compositing\n"
 	"  --disable-color-management     disable color management\n"
 	"  --disable-xres                 disable XRes for PID lookup\n"
@@ -326,6 +331,7 @@ float g_flMaxWindowScale = FLT_MAX;
 
 uint32_t g_preferVendorID = 0;
 uint32_t g_preferDeviceID = 0;
+bool g_bDebugDualGpuRoute = false;
 
 pthread_t g_mainThread;
 
@@ -773,6 +779,9 @@ int main(int argc, char **argv)
 				if ( gamescope::cv_backend_virtual_connector_strategy == gamescope::VirtualConnectorStrategies::SingleApplication )
 					gamescope::cv_backend_virtual_connector_strategy = gamescope::VirtualConnectorStrategies::SteamControlled;
 				break;
+			case 'c':
+				cv_composite_force = true;
+				break;
 			case 0: // long options without a short option
 				opt_name = gamescope_options[opt_index].name;
 				if (strcmp(opt_name, "help") == 0) {
@@ -783,6 +792,10 @@ int main(int argc, char **argv)
 					return 0;
 				} else if (strcmp(opt_name, "debug-layers") == 0) {
 					g_bDebugLayers = true;
+				} else if (strcmp(opt_name, "debug-dual-gpu-route") == 0) {
+					g_bDebugDualGpuRoute = true;
+				} else if (strcmp(opt_name, "force-composite") == 0) {
+					cv_composite_force = true;
 				} else if (strcmp(opt_name, "disable-color-management") == 0) {
 					g_bForceDisableColorMgmt = true;
 				} else if (strcmp(opt_name, "xwayland-count") == 0) {

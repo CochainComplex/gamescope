@@ -1422,7 +1422,20 @@ import_commit (
 	gamescope::OwningRc<gamescope::IBackendFb> pBackendFb;
 	if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
 	{
+		if ( g_bDebugDualGpuRoute )
+		{
+			xwm_log.infof( "dual-gpu-route: client buffer source dma-buf %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d",
+				dmabuf.width,
+				dmabuf.height,
+				dmabuf.format,
+				dmabuf.modifier,
+				dmabuf.n_planes );
+		}
 		pBackendFb = GetBackend()->ImportDmabufToBackend( &dmabuf );
+	}
+	else if ( g_bDebugDualGpuRoute )
+	{
+		xwm_log.infof( "dual-gpu-route: client buffer source non-dma-buf %dx%d", buf->width, buf->height );
 	}
 
 	gamescope::OwningRc<CVulkanTexture> pOwnedTexture = vulkan_create_texture_from_wlr_buffer( buf, std::move( pBackendFb ) );

@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <algorithm>
 #include <array>
@@ -149,6 +150,65 @@ static void vk_errorf(VkResult result, const char *fmt, ...) {
 
 	vk_log.errorf("%s (VkResult: %d)", buf, result);
 }
+
+static const char *vk_device_type_name( VkPhysicalDeviceType eType )
+{
+	switch ( eType )
+	{
+		case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "integrated";
+		case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:  return "discrete";
+		case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:   return "virtual";
+		case VK_PHYSICAL_DEVICE_TYPE_CPU:           return "cpu";
+		default:                                    return "other";
+	}
+}
+
+static const char *vk_image_tiling_name( VkImageTiling eTiling )
+{
+	switch ( eTiling )
+	{
+		case VK_IMAGE_TILING_OPTIMAL:                 return "optimal";
+		case VK_IMAGE_TILING_LINEAR:                  return "linear";
+		case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: return "drm_format_modifier";
+		default:                                      return "unknown";
+	}
+}
+
+#if HAVE_DRM
+static void debug_log_drm_device( const char *pszPrefix, drmDevice *pDrmDevice )
+{
+	if ( !g_bDebugDualGpuRoute || !pDrmDevice )
+		return;
+
+	const char *pszPrimaryNode = ( pDrmDevice->available_nodes & ( 1 << DRM_NODE_PRIMARY ) )
+		? pDrmDevice->nodes[ DRM_NODE_PRIMARY ]
+		: "(none)";
+	const char *pszRenderNode = ( pDrmDevice->available_nodes & ( 1 << DRM_NODE_RENDER ) )
+		? pDrmDevice->nodes[ DRM_NODE_RENDER ]
+		: "(none)";
+
+	if ( pDrmDevice->bustype == DRM_BUS_PCI && pDrmDevice->businfo.pci )
+	{
+		drmPciBusInfoPtr pPci = pDrmDevice->businfo.pci;
+		vk_log.infof( "dual-gpu-route: %s DRM device pci %04x:%02x:%02x.%u primary %s render %s",
+			pszPrefix,
+			unsigned( pPci->domain ),
+			unsigned( pPci->bus ),
+			unsigned( pPci->dev ),
+			unsigned( pPci->func ),
+			pszPrimaryNode,
+			pszRenderNode );
+	}
+	else
+	{
+		vk_log.infof( "dual-gpu-route: %s DRM device bus type %d primary %s render %s",
+			pszPrefix,
+			pDrmDevice->bustype,
+			pszPrimaryNode,
+			pszRenderNode );
+	}
+}
+#endif
 
 // For when device is up and it would be totally fatal to fail
 #define vk_check( x ) \
@@ -368,6 +428,21 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 				computeOnlyIndex = std::min(computeOnlyIndex, i);
 		}
 
+		if ( g_bDebugDualGpuRoute )
+		{
+			vk_log.infof( "dual-gpu-route: Vulkan candidate '%s' vendor:device %04x:%04x type %s api %u.%u.%u general queue %d compute-only queue %d%s",
+				deviceProperties.deviceName,
+				deviceProperties.vendorID,
+				deviceProperties.deviceID,
+				vk_device_type_name( deviceProperties.deviceType ),
+				VK_API_VERSION_MAJOR( deviceProperties.apiVersion ),
+				VK_API_VERSION_MINOR( deviceProperties.apiVersion ),
+				VK_API_VERSION_PATCH( deviceProperties.apiVersion ),
+				generalIndex == ~0u ? -1 : int( generalIndex ),
+				computeOnlyIndex == ~0u ? -1 : int( computeOnlyIndex ),
+				(g_preferVendorID == deviceProperties.vendorID && g_preferDeviceID == deviceProperties.deviceID) ? " preferred" : "" );
+		}
+
 		if (generalIndex != ~0u || computeOnlyIndex != ~0u)
 		{
 			// Select the device if it's the first one or the preferred one
@@ -425,6 +500,16 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 	VkPhysicalDeviceProperties props;
 	vk.GetPhysicalDeviceProperties( m_physDev, &props );
 	vk_log.infof( "selecting physical device '%s': queue family %x (general queue family %x)", props.deviceName, m_queueFamily, m_generalQueueFamily );
+	if ( g_bDebugDualGpuRoute )
+	{
+		vk_log.infof( "dual-gpu-route: compositor Vulkan device '%s' vendor:device %04x:%04x type %s queue family %u general queue family %u",
+			props.deviceName,
+			props.vendorID,
+			props.deviceID,
+			vk_device_type_name( props.deviceType ),
+			m_queueFamily,
+			m_generalQueueFamily );
+	}
 
 	return true;
 }
@@ -475,6 +560,17 @@ bool CVulkanDevice::createDevice()
 		};
 		vk.GetPhysicalDeviceProperties2( physDev(), &props2 );
 
+		if ( g_bDebugDualGpuRoute )
+		{
+			vk_log.infof( "dual-gpu-route: compositor Vulkan DRM props primary %s %" PRId64 ":%" PRId64 " render %s %" PRId64 ":%" PRId64,
+				drmProps.hasPrimary ? "yes" : "no",
+				drmProps.primaryMajor,
+				drmProps.primaryMinor,
+				drmProps.hasRender ? "yes" : "no",
+				drmProps.renderMajor,
+				drmProps.renderMinor );
+		}
+
 		if ( !GetBackend()->UsesVulkanSwapchain() && !drmProps.hasPrimary ) {
 			vk_log.errorf( "physical device has no primary node" );
 			return false;
@@ -492,6 +588,7 @@ bool CVulkanDevice::createDevice()
 		}
 		assert(drmDev->available_nodes & (1 << DRM_NODE_RENDER));
 		const char *drmRenderName = drmDev->nodes[DRM_NODE_RENDER];
+		debug_log_drm_device( "compositor Vulkan", drmDev );
 
 		m_drmRendererFd = open( drmRenderName, O_RDWR | O_CLOEXEC );
 		drmFreeDevice(&drmDev);
@@ -2106,6 +2203,29 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	assert( imageInfo.format != VK_FORMAT_UNDEFINED );
 
+	if ( g_bDebugDualGpuRoute && pDMA )
+	{
+		vk_log.infof( "dual-gpu-route: client dma-buf Vulkan import request %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d usage 0x%x sampled %s storage %s transfer-dst %s",
+			pDMA->width,
+			pDMA->height,
+			pDMA->format,
+			pDMA->modifier,
+			pDMA->n_planes,
+			usage,
+			flags.bSampled ? "yes" : "no",
+			flags.bStorage ? "yes" : "no",
+			flags.bTransferDst ? "yes" : "no" );
+
+		for ( int i = 0; i < pDMA->n_planes; i++ )
+		{
+			vk_log.infof( "dual-gpu-route:   plane %d fd %d offset %u stride %u",
+				i,
+				pDMA->fd[i],
+				pDMA->offset[i],
+				pDMA->stride[i] );
+		}
+	}
+
 	std::array<VkFormat, 2> formats = {
 		DRMFormatToVulkan(drmFormat, false),
 		DRMFormatToVulkan(drmFormat, true),
@@ -2140,6 +2260,17 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			return false;
 		}
 
+		if ( g_bDebugDualGpuRoute )
+		{
+			vk_log.infof( "dual-gpu-route: client dma-buf modifier capability result %d external features 0x%x importable %s",
+				res,
+				externalImageProperties.externalMemoryProperties.externalMemoryFeatures,
+				( res == VK_SUCCESS &&
+				  ( externalImageProperties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT ) )
+					? "yes"
+					: "no" );
+		}
+
 		if ( res == VK_SUCCESS &&
 		     ( externalImageProperties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT ) )
 		{
@@ -2159,6 +2290,12 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 			imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
 		}
+	}
+	else if ( g_bDebugDualGpuRoute && pDMA && pDMA->modifier != DRM_FORMAT_MOD_INVALID )
+	{
+		vk_log.infof( "dual-gpu-route: client dma-buf has modifier 0x%" PRIX64 " but compositor Vulkan modifier support is %s",
+			pDMA->modifier,
+			g_device.supportsModifiers() ? "enabled" : "disabled" );
 	}
 
 	std::vector<uint64_t> modifiers = {};
@@ -2586,6 +2723,14 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	}
 	
 	m_bInitialized = true;
+
+	if ( g_bDebugDualGpuRoute && pDMA )
+	{
+		vk_log.infof( "dual-gpu-route: client dma-buf Vulkan import success tiling %s allocation %" PRIu64 " bytes backend fb %s",
+			vk_image_tiling_name( tiling ),
+			uint64_t( m_size ),
+			m_pBackendFb ? "yes" : "no" );
+	}
 	
 	return true;
 }
@@ -3581,7 +3726,29 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 	//	pDMA->width, pDMA->height, pDMA->format, pDMA->modifier, pDMA->n_planes);
 	
 	if ( pTex->BInit( pDMA->width, pDMA->height, 1u, pDMA->format, texCreateFlags, pDMA, 0, 0, nullptr, pBackendFb ) == false )
+	{
+		if ( g_bDebugDualGpuRoute )
+		{
+			vk_log.errorf( "dual-gpu-route: client dma-buf Vulkan import failed %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d backend fb %s",
+				pDMA->width,
+				pDMA->height,
+				pDMA->format,
+				pDMA->modifier,
+				pDMA->n_planes,
+				pBackendFb ? "yes" : "no" );
+		}
 		return nullptr;
+	}
+
+	if ( g_bDebugDualGpuRoute )
+	{
+		vk_log.infof( "dual-gpu-route: client dma-buf Vulkan import completed %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " backend fb %s",
+			pDMA->width,
+			pDMA->height,
+			pDMA->format,
+			pDMA->modifier,
+			pBackendFb ? "yes" : "no" );
+	}
 	
 	return pTex;
 }
@@ -3995,6 +4162,40 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	if (!frameInfo->applyOutputColorMgmt)
 		outputTF = EOTF_Count; //Disable blending stuff.
 
+	if ( g_bDebugDualGpuRoute )
+	{
+		const char *pszPath = "normal composite";
+		if ( frameInfo->useFSRLayer0 )
+			pszPath = "FSR composite";
+		else if ( frameInfo->useNISLayer0 )
+			pszPath = "NIS composite";
+		else if ( frameInfo->blurLayer0 )
+			pszPath = "blur composite";
+		else if ( !g_reshade_effect.empty() )
+			pszPath = "ReShade/effect composite";
+
+		CVulkanTexture *pLayer0 = frameInfo->layerCount > 0 ? frameInfo->layers[0].tex.get() : nullptr;
+		vk_log.infof( "dual-gpu-route: frame path %s layers %d partial %s output %ux%u pipewire %s override %s queue family %u",
+			pszPath,
+			frameInfo->layerCount,
+			partial ? "yes" : "no",
+			currentOutputWidth,
+			currentOutputHeight,
+			pPipewireTexture ? "yes" : "no",
+			pOutputOverride ? "yes" : "no",
+			g_device.queueFamily() );
+		if ( pLayer0 )
+		{
+			vk_log.infof( "dual-gpu-route:   layer0 texture %ux%u drm format 0x%" PRIX32 " scale %.4f %.4f colorspace %d",
+				pLayer0->width(),
+				pLayer0->height(),
+				pLayer0->drmFormat(),
+				frameInfo->layers[0].scale.x,
+				frameInfo->layers[0].scale.y,
+				frameInfo->layers[0].colorspace );
+		}
+	}
+
 	g_pLastReshadeEffect = nullptr;
 	if (!g_reshade_effect.empty())
 	{
@@ -4044,6 +4245,18 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		uint32_t tempX = frameInfo->layers[0].integerWidth();
 		uint32_t tempY = frameInfo->layers[0].integerHeight();
 
+		if ( g_bDebugDualGpuRoute )
+		{
+			vk_log.infof( "dual-gpu-route: FSR dispatch input %ux%u temp %ux%u output %ux%u queue family %u",
+				inputX,
+				inputY,
+				tempX,
+				tempY,
+				currentOutputWidth,
+				currentOutputHeight,
+				g_device.queueFamily() );
+		}
+
 		update_tmp_images(tempX, tempY);
 
 		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_EASU));
@@ -4076,6 +4289,18 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 		uint32_t tempX = frameInfo->layers[0].integerWidth();
 		uint32_t tempY = frameInfo->layers[0].integerHeight();
+
+		if ( g_bDebugDualGpuRoute )
+		{
+			vk_log.infof( "dual-gpu-route: NIS dispatch input %ux%u temp %ux%u output %ux%u queue family %u",
+				inputX,
+				inputY,
+				tempX,
+				tempY,
+				currentOutputWidth,
+				currentOutputHeight,
+				g_device.queueFamily() );
+		}
 
 		update_tmp_images(tempX, tempY);
 
@@ -4352,11 +4577,21 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
 	size_t stride;
 	if ( !wlr_buffer_begin_data_ptr_access( buf, WLR_BUFFER_DATA_PTR_ACCESS_READ, &src, &drmFormat, &stride ) )
 	{
+		if ( g_bDebugDualGpuRoute )
+			vk_log.errorf( "dual-gpu-route: client wlr_buffer is neither dma-buf nor CPU-readable data pointer" );
 		return nullptr;
 	}
 
 	uint32_t width = buf->width;
 	uint32_t height = buf->height;
+	if ( g_bDebugDualGpuRoute )
+	{
+		vk_log.infof( "dual-gpu-route: client buffer fallback CPU copy %ux%u format 0x%" PRIX32 " stride %zu",
+			width,
+			height,
+			drmFormat,
+			stride );
+	}
 
 	VkBufferCreateInfo bufferCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -4422,7 +4657,11 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
 	texCreateFlags.bTransferDst = true;
 	texCreateFlags.bFlippable = true;
 	if ( pTex->BInit( width, height, 1u, drmFormat, texCreateFlags, nullptr, 0, 0, nullptr, pBackendFb ) == false )
+	{
+		if ( g_bDebugDualGpuRoute )
+			vk_log.errorf( "dual-gpu-route: client buffer fallback CPU-copy texture creation failed" );
 		return nullptr;
+	}
 
 	auto cmdBuffer = g_device.commandBuffer();
 
@@ -4435,6 +4674,11 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
 
 	g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
 	g_device.vk.FreeMemory(g_device.device(), bufferMemory, nullptr);
+
+	if ( g_bDebugDualGpuRoute )
+	{
+		vk_log.infof( "dual-gpu-route: client buffer fallback CPU copy completed" );
+	}
 
 	return pTex;
 }

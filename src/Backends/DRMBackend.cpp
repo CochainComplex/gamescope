@@ -1627,6 +1627,17 @@ gamescope::OwningRc<gamescope::IBackendFb> drm_fbid_from_dmabuf( struct drm_t *d
 	gamescope::OwningRc<gamescope::IBackendFb> pBackendFb;
 	uint32_t fb_id = 0;
 
+	if ( g_bDebugDualGpuRoute )
+	{
+		drm_log.infof( "dual-gpu-route: DRM FB import request %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d allow modifiers %s",
+			dma_buf->width,
+			dma_buf->height,
+			dma_buf->format,
+			dma_buf->modifier,
+			dma_buf->n_planes,
+			drm->allow_modifiers ? "yes" : "no" );
+	}
+
 	if ( !wlr_drm_format_set_has( &drm->formats, dma_buf->format, dma_buf->modifier ) )
 	{
 		drm_log.errorf( "Cannot import FB to DRM: format 0x%" PRIX32 " and modifier 0x%" PRIX64 " not supported for scan-out", dma_buf->format, dma_buf->modifier );
@@ -1670,6 +1681,10 @@ gamescope::OwningRc<gamescope::IBackendFb> drm_fbid_from_dmabuf( struct drm_t *d
 	}
 
 	drm_log.debugf("make fbid %u", fb_id);
+	if ( g_bDebugDualGpuRoute )
+	{
+		drm_log.infof( "dual-gpu-route: DRM FB import success fb_id %u", fb_id );
+	}
 
 	pBackendFb = new gamescope::CDRMFb( fb_id );
 
@@ -1693,6 +1708,15 @@ out:
 		if ( drmIoctl( drm->fd, DRM_IOCTL_GEM_CLOSE, &args ) != 0 ) {
 			drm_log.errorf_errno( "drmIoctl(GEM_CLOSE) failed" );
 		}
+	}
+
+	if ( g_bDebugDualGpuRoute && !pBackendFb )
+	{
+		drm_log.errorf( "dual-gpu-route: DRM FB import failed %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64,
+			dma_buf->width,
+			dma_buf->height,
+			dma_buf->format,
+			dma_buf->modifier );
 	}
 
 	return pBackendFb;
@@ -3568,12 +3592,30 @@ namespace gamescope
 			bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
 
 			bool bDoComposite = true;
+			if ( g_bDebugDualGpuRoute )
+			{
+				drm_log.infof( "dual-gpu-route: DRM present decision connector %s layers %d wants-partial %s needs-full-composite %s force %s first-frame %s fsr %s nis %s blur %s filter-composite %s cursor-composite %s reshade %s",
+					g_DRM.pConnector ? g_DRM.pConnector->GetName() : "(none)",
+					pFrameInfo->layerCount,
+					bWantsPartialComposite ? "yes" : "no",
+					bNeedsFullComposite ? "yes" : "no",
+					cv_composite_force ? "yes" : "no",
+					bWasFirstFrame ? "yes" : "no",
+					pFrameInfo->useFSRLayer0 ? "yes" : "no",
+					pFrameInfo->useNISLayer0 ? "yes" : "no",
+					pFrameInfo->blurLayer0 ? "yes" : "no",
+					bNeedsCompositeFromFilter ? "yes" : "no",
+					( !k_bUseCursorPlane && bDrewCursor ) ? "yes" : "no",
+					!g_reshade_effect.empty() ? "yes" : "no" );
+			}
 			if ( !bNeedsFullComposite && !bWantsPartialComposite )
 			{
 				// Save the pending mode so it can be restored after drm_rollback() and carried
 				// over to the composite path
 				std::shared_ptr<gamescope::BackendBlob> pPendingModeId = g_DRM.pending.mode_id;
 				int ret = drm_prepare( &g_DRM, bAsync, pFrameInfo );
+				if ( g_bDebugDualGpuRoute )
+					drm_log.infof( "dual-gpu-route: DRM direct scanout prepare returned %d", ret );
 				if ( ret == 0 )
 					bDoComposite = false;
 				else if ( ret == -EACCES )
@@ -3588,6 +3630,8 @@ namespace gamescope
 			if ( !bDoComposite )
 			{
 				// Scanout + Planes Path
+				if ( g_bDebugDualGpuRoute )
+					drm_log.infof( "dual-gpu-route: DRM frame path direct scanout/planes" );
 				m_bWasPartialCompositing = false;
 				m_bWasCompositing = false;
 				if ( pFrameInfo->layerCount == 2 )
@@ -3599,6 +3643,8 @@ namespace gamescope
 			// Composition Path
 			if ( kDisablePartialComposition )
 				bNeedsFullComposite = true;
+			if ( g_bDebugDualGpuRoute )
+				drm_log.infof( "dual-gpu-route: DRM frame path %s composition", bNeedsFullComposite ? "full" : "partial" );
 
 			FrameInfo_t compositeFrameInfo = *pFrameInfo;
 
@@ -4102,4 +4148,3 @@ int HackyDRMPresent( const FrameInfo_t *pFrameInfo, bool bAsync )
 {
 	return static_cast<gamescope::CDRMBackend *>( GetBackend() )->Present( pFrameInfo, bAsync );
 }
-
