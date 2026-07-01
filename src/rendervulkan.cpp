@@ -46,6 +46,7 @@
 #include "cs_easu.h"
 #include "cs_easu_fp16.h"
 #include "cs_framegen_blend.h"
+#include "cs_framegen_extrapolate.h"
 #include "cs_gaussian_blur_horizontal.h"
 #include "cs_nis.h"
 #include "cs_nis_fp16.h"
@@ -1066,6 +1067,7 @@ bool CVulkanDevice::createShaders()
 	}
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
 	SHADER(FRAMEGEN_BLEND, cs_framegen_blend);
+	SHADER(FRAMEGEN_EXTRAPOLATE, cs_framegen_extrapolate);
 #undef SHADER
 
 	for (uint32_t i = 0; i < shaderInfos.size(); i++)
@@ -1297,6 +1299,7 @@ void CVulkanDevice::compileAllPipelines()
 	SHADER(NIS, 1, 1, 1);
 	SHADER(RGB_TO_NV12, 1, 1, 1);
 	SHADER(FRAMEGEN_BLEND, 1, 1, 1);
+	SHADER(FRAMEGEN_EXTRAPOLATE, 1, 1, 1);
 #undef SHADER
 
 	for (auto& info : pipelineInfos) {
@@ -4163,12 +4166,36 @@ static const char *framegen_mode_name()
 {
 	switch ( g_eFramegenMode )
 	{
+		case GamescopeFramegenMode::Extrapolate:
+			return "extrapolate";
 		case GamescopeFramegenMode::Blend:
 			return "blend";
 		default:
 			return "unknown";
 	}
 }
+
+struct FramegenPushData_t
+{
+	float strength;
+	float suppressLo;
+	float suppressHi;
+	float pad;
+
+	explicit FramegenPushData_t( float flStrength, float flLo, float flHi )
+		: strength( flStrength )
+		, suppressLo( flLo )
+		, suppressHi( flHi )
+		, pad( 0.0f )
+	{
+	}
+};
+
+// Inter-frame change (gamma-encoded [0,1]) over which forward extrapolation is
+// faded out. Below k_flFramegenSuppressLo we trust the full predicted step;
+// above k_flFramegenSuppressHi we fall back to the current frame to avoid ghosting.
+static constexpr float k_flFramegenSuppressLo = 0.06f;
+static constexpr float k_flFramegenSuppressHi = 0.30f;
 
 struct FramegenHistory_t
 {
@@ -4192,7 +4219,8 @@ static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = 250'000'000ull;
 
 bool vulkan_framegen_is_enabled()
 {
-	return g_bExperimentalFramegen && g_nFramegenMultiplier == 2 && g_eFramegenMode == GamescopeFramegenMode::Blend;
+	return g_bExperimentalFramegen && g_nFramegenMultiplier == 2
+		&& ( g_eFramegenMode == GamescopeFramegenMode::Extrapolate || g_eFramegenMode == GamescopeFramegenMode::Blend );
 }
 
 static bool framegen_texture_matches( const gamescope::Rc<CVulkanTexture> &pTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
@@ -4375,7 +4403,14 @@ static void framegen_record_real_frame( CVulkanCmdBuffer *pCmdBuffer, gamescope:
 	if ( !pGenerated )
 		return;
 
-	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_BLEND ) );
+	ShaderType eFramegenShader = ( g_eFramegenMode == GamescopeFramegenMode::Blend )
+		? SHADER_TYPE_FRAMEGEN_BLEND
+		: SHADER_TYPE_FRAMEGEN_EXTRAPOLATE;
+
+	if ( eFramegenShader == SHADER_TYPE_FRAMEGEN_EXTRAPOLATE )
+		pCmdBuffer->uploadConstants<FramegenPushData_t>( g_flFramegenStrength, k_flFramegenSuppressLo, k_flFramegenSuppressHi );
+
+	pCmdBuffer->bindPipeline( g_device.pipeline( eFramegenShader ) );
 	pCmdBuffer->bindTarget( pGenerated );
 	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
 	pCmdBuffer->setTextureSrgb( 0, true );

@@ -77,6 +77,11 @@ extern bool g_bDebugDualGpuRoute;
 
 enum class GamescopeFramegenMode : uint32_t
 {
+    // Forward extrapolation of the previous two real frames. Low latency and
+    // temporally monotonic (the generated frame advances motion). Default.
+    Extrapolate,
+    // 50/50 average of the previous two real frames. Softer, but the generated
+    // frame lands temporally between older frames, which can read as judder.
     Blend,
 };
 
@@ -84,3 +89,4 @@ extern bool g_bExperimentalFramegen;
 extern bool g_bFramegenDebug;
 extern int g_nFramegenMultiplier;
 extern GamescopeFramegenMode g_eFramegenMode;
+extern float g_flFramegenStrength;

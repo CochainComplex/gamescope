@@ -56,6 +56,60 @@ gamescope -r 30 -- %command%
 gamescope -w 1920 -h 1080 -W 3440 -H 1440 -b -- %command%
 ```
 
+## Experimental frame generation
+
+`--experimental-framegen` enables compositor-side x2 frame generation: for every
+real frame gamescope composites, it generates one additional frame and presents
+it on the next vblank, doubling the perceived frame rate.
+
+This is a prototype. Keep the following in mind:
+
+* **It only helps when the game runs at or below half your display's refresh
+  rate.** Frame generation fills the gaps between real frames; if the game is
+  already producing a new frame every vblank there is no gap to fill and you
+  will instead drop real frames. Cap the game with `-r` to half the refresh rate
+  (e.g. `-r 72` on a 144 Hz display).
+* **It forces the composite path** (implies `--force-composite`), so direct
+  scan-out is disabled while it is active. This costs a little latency and power
+  versus a plain direct-scan-out frame.
+* **Timing / latency.** The real frame is always presented immediately — frame
+  generation adds no extra latency to the frames the game actually rendered. The
+  default `extrapolate` mode predicts motion forward, so displayed motion stays
+  monotonic and smooth (real N → generated N+½ → real N+1 → …). The alternative
+  `blend` mode averages the last two real frames; it looks softer but places the
+  generated frame temporally *between* older frames, which can read as judder.
+* **Ghosting.** Without motion vectors, `extrapolate` can ghost/halo around
+  fast-moving edges. It already fades the prediction out where the frame-to-frame
+  change is large; if you still see ghosting, lower `--framegen-strength` (e.g.
+  `0.35` or `0.25`). `0.0` disables the forward step entirely (the generated
+  frame becomes a copy of the last real frame); `0.5` (default) gives the
+  smoothest motion.
+
+```sh
+# Dual-GPU: composite on the AMD iGPU (1002:150e), render vkcube on the NVIDIA
+# dGPU (10de:2db9), upscale 1440p -> 2160p with FSR, x2 frame generation.
+gamescope \
+    --prefer-vk-device 1002:150e \
+    --experimental-framegen \
+    -w 2560 -h 1440 -W 3840 -H 2160 \
+    -F fsr -f -- \
+    env MESA_VK_DEVICE_SELECT='10de:2db9!' vkcube
+
+# Same, with the low-latency default made explicit and diagnostics enabled.
+# --debug-dual-gpu-route logs GPU/buffer/frame-path routing; --framegen-debug
+# logs framegen history, dispatch, and present cadence.
+gamescope \
+    --debug-dual-gpu-route \
+    --prefer-vk-device 1002:150e \
+    --experimental-framegen --framegen-mode extrapolate --framegen-debug \
+    -w 2560 -h 1440 -W 3840 -H 2160 \
+    -F fsr -f -- \
+    env MESA_VK_DEVICE_SELECT='10de:2db9!' vkcube
+```
+
+`--experimental-framegen` already implies `--force-composite`, so you don't need
+to pass `--force-composite` separately.
+
 ## Options
 
 See `gamescope --help` for a full list of options.
@@ -70,6 +124,11 @@ See `gamescope --help` for a full list of options.
 * `-S stretch`: use stretch scaling, the game will fill the window. (e.g. 4:3 to 16:9)
 * `-b`: create a border-less window.
 * `-f`: create a full-screen window.
+* `--experimental-framegen`: enable experimental x2 compositor-side frame generation. Implies `--force-composite`. See [Experimental frame generation](#experimental-frame-generation).
+* `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency) or `blend`.
+* `--framegen-strength`: forward-extrapolation step for `extrapolate` mode, `0.0`–`1.0` (default `0.5`). Lower values reduce ghosting.
+* `--framegen-multiplier`: generated-frame multiplier. Only `2` is supported for now.
+* `--framegen-debug`: log framegen history, dispatch, and present cadence.
 
 ## Reshade support
 

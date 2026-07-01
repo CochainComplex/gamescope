@@ -139,6 +139,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "experimental-framegen", no_argument, nullptr, 0 },
 	{ "framegen-multiplier", required_argument, nullptr, 0 },
 	{ "framegen-mode", required_argument, nullptr, 0 },
+	{ "framegen-strength", required_argument, nullptr, 0 },
 	{ "framegen-debug", no_argument, nullptr, 0 },
 	{ "composite-debug", no_argument, nullptr, 0 },
 	{ "disable-xres", no_argument, nullptr, 'x' },
@@ -268,9 +269,10 @@ const char usage[] =
 	"  --force-composition, --force-composite\n"
 	"                                 disable direct scan-out\n"
 	"  --debug-dual-gpu-route         log compositor GPU, buffer import, frame path, and FSR/NIS routing diagnostics\n"
-	"  --experimental-framegen        enable experimental x2 compositor-side frame generation\n"
+	"  --experimental-framegen        enable experimental x2 compositor-side frame generation (forces the composite path)\n"
 	"  --framegen-multiplier 2        generated-frame multiplier; only 2 is supported for now\n"
-	"  --framegen-mode blend          generated-frame algorithm; only blend is supported for now\n"
+	"  --framegen-mode MODE           generated-frame algorithm: 'extrapolate' (default, low latency) or 'blend'\n"
+	"  --framegen-strength 0.5        extrapolation step for 'extrapolate' mode (0.0-1.0); lower reduces ghosting\n"
 	"  --framegen-debug               log framegen history, dispatch, and present cadence\n"
 	"  --composite-debug              draw frame markers on alternating corners of the screen when compositing\n"
 	"  --disable-color-management     disable color management\n"
@@ -343,7 +345,8 @@ bool g_bDebugDualGpuRoute = false;
 bool g_bExperimentalFramegen = false;
 bool g_bFramegenDebug = false;
 int g_nFramegenMultiplier = 2;
-GamescopeFramegenMode g_eFramegenMode = GamescopeFramegenMode::Blend;
+GamescopeFramegenMode g_eFramegenMode = GamescopeFramegenMode::Extrapolate;
+float g_flFramegenStrength = 0.5f;
 
 pthread_t g_mainThread;
 
@@ -821,13 +824,24 @@ int main(int argc, char **argv)
 						return 1;
 					}
 				} else if (strcmp(opt_name, "framegen-mode") == 0) {
-					if ( strcmp( optarg, "blend" ) == 0 )
+					if ( strcmp( optarg, "extrapolate" ) == 0 )
+					{
+						g_eFramegenMode = GamescopeFramegenMode::Extrapolate;
+					}
+					else if ( strcmp( optarg, "blend" ) == 0 )
 					{
 						g_eFramegenMode = GamescopeFramegenMode::Blend;
 					}
 					else
 					{
-						fprintf( stderr, "gamescope: --framegen-mode currently only supports blend\n" );
+						fprintf( stderr, "gamescope: --framegen-mode must be 'extrapolate' or 'blend'\n" );
+						return 1;
+					}
+				} else if (strcmp(opt_name, "framegen-strength") == 0) {
+					g_flFramegenStrength = atof( optarg );
+					if ( g_flFramegenStrength < 0.0f || g_flFramegenStrength > 1.0f )
+					{
+						fprintf( stderr, "gamescope: --framegen-strength must be between 0.0 and 1.0\n" );
 						return 1;
 					}
 				} else if (strcmp(opt_name, "disable-color-management") == 0) {

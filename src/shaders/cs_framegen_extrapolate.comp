@@ -1,0 +1,55 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set.h"
+
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(binding = 0, scalar)
+uniform framegen_params_t {
+    // Forward-extrapolation step. 0.5 places the generated frame at the
+    // half-way point between the current real frame and the next one (matching
+    // the x2 cadence). Lower values reduce ghosting at the cost of smoothness.
+    float u_strength;
+    // Per-pixel inter-frame change (in the range [u_suppressLo, u_suppressHi])
+    // over which extrapolation is faded out. Large changes are edges and
+    // disocclusions where pixel-space prediction ghosts the worst, so we fall
+    // back toward the current frame there.
+    float u_suppressLo;
+    float u_suppressHi;
+    float u_pad;
+};
+
+void main() {
+    uvec2 coord = uvec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y);
+    uvec2 outSize = imageSize(dst);
+
+    if (coord.x >= outSize.x || coord.y >= outSize.y)
+        return;
+
+    vec2 uv = (vec2(coord) + vec2(0.5f)) / vec2(outSize);
+    vec4 previousFrame = texture(s_samplers[0], uv);
+    vec4 currentFrame = texture(s_samplers[1], uv);
+
+    // Low-latency forward extrapolation.
+    //
+    // (currentFrame - previousFrame) is the per-pixel delta across one real
+    // frame interval. Advancing motion forward by u_strength keeps displayed
+    // motion monotonic (real N, N+strength, real N+1, ...) and adds no latency:
+    // the real frame is still presented immediately.
+    //
+    // Without motion vectors, pixel-space prediction ghosts at moving edges, so
+    // we adaptively suppress the step where the inter-frame change is large.
+    vec4 delta = currentFrame - previousFrame;
+    float motion = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
+    float strength = u_strength * (1.0f - smoothstep(u_suppressLo, u_suppressHi, motion));
+
+    vec4 predicted = currentFrame + delta * strength;
+
+    imageStore(dst, ivec2(coord), clamp(predicted, vec4(0.0f), vec4(1.0f)));
+}
