@@ -65,25 +65,32 @@ it on the next vblank, doubling the perceived frame rate.
 This is a prototype. Keep the following in mind:
 
 * **It only helps when the game runs at or below half your display's refresh
-  rate.** Frame generation fills the gaps between real frames; if the game is
-  already producing a new frame every vblank there is no gap to fill and you
-  will instead drop real frames. Cap the game with `-r` to half the refresh rate
-  (e.g. `-r 72` on a 144 Hz display).
+  rate.** Frame generation fills vblanks the game left empty. Real frames always
+  take priority: a generated frame is dropped, never presented, if a new real
+  frame is ready for the same vblank, and generation is skipped automatically
+  while the game outpaces ~⅔ of the refresh rate. Still, cap the game with `-r`
+  to half the refresh rate (e.g. `-r 72` on a 144 Hz display) so the cadence is
+  stable instead of oscillating.
 * **It forces the composite path** (implies `--force-composite`), so direct
   scan-out is disabled while it is active. This costs a little latency and power
   versus a plain direct-scan-out frame.
 * **Timing / latency.** The real frame is always presented immediately — frame
-  generation adds no extra latency to the frames the game actually rendered. The
-  default `extrapolate` mode predicts motion forward, so displayed motion stays
-  monotonic and smooth (real N → generated N+½ → real N+1 → …). The alternative
-  `blend` mode averages the last two real frames; it looks softer but places the
-  generated frame temporally *between* older frames, which can read as judder.
+  generation adds no extra latency to the frames the game actually rendered. All
+  framegen GPU work (history copy + generation) is submitted in a separate
+  command buffer *after* the real frame's composite, so the real frame's page
+  flip never waits on it. The default `extrapolate` mode predicts motion
+  forward, so displayed motion stays monotonic and smooth (real N → generated
+  N+½ → real N+1 → …). The alternative `blend` mode averages the last two real
+  frames; it looks softer but places the generated frame temporally *between*
+  older frames, which can read as judder.
 * **Ghosting.** Without motion vectors, `extrapolate` can ghost/halo around
-  fast-moving edges. It already fades the prediction out where the frame-to-frame
-  change is large; if you still see ghosting, lower `--framegen-strength` (e.g.
-  `0.35` or `0.25`). `0.0` disables the forward step entirely (the generated
-  frame becomes a copy of the last real frame); `0.5` (default) gives the
-  smoothest motion.
+  fast-moving edges. Two safeguards bound this: the prediction is faded out
+  where the frame-to-frame change is large, and it is clamped to the local
+  neighborhood of the current frame (TAA-style rectification), so it can never
+  invent colors that aren't already visible around a pixel. If you still see
+  ghosting, lower `--framegen-strength` (e.g. `0.35` or `0.25`). `0.0` disables
+  the forward step entirely (the generated frame becomes a copy of the last real
+  frame); `0.5` (default) gives the smoothest motion.
 
 ```sh
 # Dual-GPU: composite on the AMD iGPU (1002:150e), render vkcube on the NVIDIA

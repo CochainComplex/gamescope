@@ -9116,8 +9116,19 @@ steamcompmgr_main(int argc, char **argv)
 				bShouldPaint = false;
 			}
 
-			if ( vblank && vulkan_framegen_has_pending_generated_frame() )
-				bShouldPaint = true;
+			if ( vulkan_framegen_has_pending_generated_frame() )
+			{
+				// Real frames always take priority over generated ones: the
+				// backends present a pending generated frame ahead of anything
+				// else, so if a new real frame has been latched, drop the stale
+				// prediction rather than letting it displace real content and
+				// add a vblank of latency. Generated frames only fill vblanks
+				// the game left empty.
+				if ( hasRepaint )
+					vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
+				else if ( vblank )
+					bShouldPaint = true;
+			}
 
 			if ( bShouldPaint )
 			{

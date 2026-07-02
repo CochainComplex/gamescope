@@ -51,5 +51,19 @@ void main() {
 
     vec4 predicted = currentFrame + delta * strength;
 
+    // Rectify the prediction against the local neighborhood of the current
+    // frame (TAA-style). Ghosting/haloing is the prediction overshooting into
+    // values that are not present around the pixel; clamping to the min/max of
+    // the 4-neighbor cross keeps edge motion but cannot invent colors, which
+    // in particular kills the dark/bright trail behind fast-moving edges.
+    vec2 texel = vec2(1.0f) / vec2(outSize);
+    vec3 n0 = texture(s_samplers[1], uv + vec2(texel.x, 0.0f)).rgb;
+    vec3 n1 = texture(s_samplers[1], uv - vec2(texel.x, 0.0f)).rgb;
+    vec3 n2 = texture(s_samplers[1], uv + vec2(0.0f, texel.y)).rgb;
+    vec3 n3 = texture(s_samplers[1], uv - vec2(0.0f, texel.y)).rgb;
+    vec3 neighborMin = min(currentFrame.rgb, min(min(n0, n1), min(n2, n3)));
+    vec3 neighborMax = max(currentFrame.rgb, max(max(n0, n1), max(n2, n3)));
+    predicted.rgb = clamp(predicted.rgb, neighborMin, neighborMax);
+
     imageStore(dst, ivec2(coord), clamp(predicted, vec4(0.0f), vec4(1.0f)));
 }

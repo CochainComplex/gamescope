@@ -4194,8 +4194,11 @@ struct FramegenPushData_t
 // Inter-frame change (gamma-encoded [0,1]) over which forward extrapolation is
 // faded out. Below k_flFramegenSuppressLo we trust the full predicted step;
 // above k_flFramegenSuppressHi we fall back to the current frame to avoid ghosting.
-static constexpr float k_flFramegenSuppressLo = 0.06f;
-static constexpr float k_flFramegenSuppressHi = 0.30f;
+// The shader also rectifies the prediction against the local neighborhood of the
+// current frame, which bounds any remaining overshoot, so this window can be a
+// little wider than pure fade-out would allow.
+static constexpr float k_flFramegenSuppressLo = 0.08f;
+static constexpr float k_flFramegenSuppressHi = 0.40f;
 
 struct FramegenHistory_t
 {
@@ -4210,6 +4213,7 @@ struct FramegenHistory_t
 	uint64_t generatedFrameId = 0;
 	uint64_t previousPresentTimeNs = 0;
 	uint64_t currentPresentTimeNs = 0;
+	uint64_t generatedSeqNo = 0;
 	bool valid = false;
 };
 
@@ -4275,12 +4279,32 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame()
 	gamescope::Rc<CVulkanTexture> pGenerated = g_framegenHistory.pendingGenerated;
 	g_framegenHistory.pendingGenerated = nullptr;
 
+	// The generation work was submitted in its own command buffer so the real
+	// frame's present never waited on it. By consume time (the following
+	// vblank) it has long since executed; this wait is a cheap completion
+	// guarantee before scanout reads the image.
+	vulkan_wait( g_framegenHistory.generatedSeqNo, false );
+
 	if ( g_bFramegenDebug )
 	{
 		vk_log.infof( "framegen: presented generated frame id=%" PRIu64 ".5", g_framegenHistory.generatedFrameId );
 	}
 
 	return pGenerated;
+}
+
+void vulkan_framegen_discard_generated_frame( const char *reason )
+{
+	if ( g_framegenHistory.pendingGenerated == nullptr )
+		return;
+
+	if ( g_bFramegenDebug )
+	{
+		vk_log.infof( "framegen: discarded generated frame id=%" PRIu64 ".5 reason=%s",
+			g_framegenHistory.generatedFrameId, reason ? reason : "unknown" );
+	}
+
+	g_framegenHistory.pendingGenerated = nullptr;
 }
 
 static bool framegen_create_texture( gamescope::Rc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
@@ -4352,9 +4376,9 @@ static bool framegen_ensure_resources( uint32_t width, uint32_t height, uint32_t
 	return true;
 }
 
-static void framegen_record_real_frame( CVulkanCmdBuffer *pCmdBuffer, gamescope::Rc<CVulkanTexture> pRealFrame )
+static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame )
 {
-	if ( !vulkan_framegen_is_enabled() || !pCmdBuffer || !pRealFrame )
+	if ( !vulkan_framegen_is_enabled() || !pRealFrame )
 		return;
 
 	if ( !g_bLoggedFramegenConfig )
@@ -4368,8 +4392,7 @@ static void framegen_record_real_frame( CVulkanCmdBuffer *pCmdBuffer, gamescope:
 		return;
 
 	uint64_t now = get_time_in_nanos();
-	if ( g_framegenHistory.valid && now - g_framegenHistory.previousPresentTimeNs > k_ulFramegenMaxRealFrameGapNs )
-		framegen_invalidate_history( "frame_gap" );
+	const uint64_t ulPrevRealFrameTimeNs = g_framegenHistory.currentPresentTimeNs;
 
 	g_framegenHistory.currentFrameId++;
 	g_framegenHistory.currentPresentTimeNs = now;
@@ -4384,6 +4407,29 @@ static void framegen_record_real_frame( CVulkanCmdBuffer *pCmdBuffer, gamescope:
 			pRealFrame->drmFormat() );
 	}
 
+	// Generated frames only help when the game leaves empty vblanks to fill.
+	// If real frames arrive faster than ~2/3 of the output refresh rate there
+	// is no gap for a generated frame: it would either be discarded, or worse,
+	// displace real content. Go fully dormant (no history copy, no submission)
+	// so the framegen path costs nothing until the game leaves gaps again;
+	// resuming just needs one frame to re-prime history.
+	const uint64_t ulVblankIntervalNs = g_nOutputRefresh > 0 ? 1'000'000'000'000ull / (uint64_t)g_nOutputRefresh : 8'333'333ull;
+	if ( ulPrevRealFrameTimeNs != 0 && now - ulPrevRealFrameTimeNs < ( ulVblankIntervalNs * 3 ) / 2 )
+	{
+		if ( g_framegenHistory.valid || g_framegenHistory.pendingGenerated )
+			framegen_invalidate_history( "game_faster_than_half_refresh" );
+		return;
+	}
+
+	if ( g_framegenHistory.valid && now - g_framegenHistory.previousPresentTimeNs > k_ulFramegenMaxRealFrameGapNs )
+		framegen_invalidate_history( "frame_gap" );
+
+	// All framegen GPU work lives in its own command buffer, submitted after
+	// the composite. The real frame's present waits only on the composite
+	// command buffer, so history upkeep and frame generation add no latency
+	// to the frames the game actually rendered.
+	std::unique_ptr<CVulkanCmdBuffer> pCmdBuffer = g_device.commandBuffer();
+
 	pCmdBuffer->copyImage( pRealFrame, g_framegenHistory.currentReal );
 
 	if ( !g_framegenHistory.valid )
@@ -4395,13 +4441,17 @@ static void framegen_record_real_frame( CVulkanCmdBuffer *pCmdBuffer, gamescope:
 		g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId;
 		g_framegenHistory.previousPresentTimeNs = now;
 		g_framegenHistory.valid = true;
+		g_device.submit( std::move( pCmdBuffer ) );
 		return;
 	}
 
 	uint32_t uGeneratedIndex = g_output.nOutImage % g_output.framegenOutputImages.size();
 	gamescope::Rc<CVulkanTexture> pGenerated = g_output.framegenOutputImages[ uGeneratedIndex ];
 	if ( !pGenerated )
+	{
+		g_device.submit( std::move( pCmdBuffer ) );
 		return;
+	}
 
 	ShaderType eFramegenShader = ( g_eFramegenMode == GamescopeFramegenMode::Blend )
 		? SHADER_TYPE_FRAMEGEN_BLEND
@@ -4427,6 +4477,7 @@ static void framegen_record_real_frame( CVulkanCmdBuffer *pCmdBuffer, gamescope:
 	if ( g_framegenHistory.pendingGenerated && g_bFramegenDebug )
 		vk_log.infof( "framegen: replacing unpresented generated frame" );
 
+	g_framegenHistory.generatedSeqNo = g_device.submit( std::move( pCmdBuffer ) );
 	g_framegenHistory.generatedFrameId = g_framegenHistory.currentFrameId;
 	g_framegenHistory.pendingGenerated = pGenerated;
 
@@ -4682,9 +4733,6 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 	}
 
-	if ( !GetBackend()->UsesVulkanSwapchain() && !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
-		framegen_record_real_frame( cmdBuffer.get(), compositeImage );
-
 	if ( pPipewireTexture != nullptr )
 	{
 
@@ -4733,6 +4781,11 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 
 	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+
+	// Submitted separately, after the composite: the real frame's present
+	// waits on `sequence` only and is never delayed by framegen work.
+	if ( !GetBackend()->UsesVulkanSwapchain() && !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
+		framegen_record_real_frame( compositeImage );
 
 	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
 	{
