@@ -10,65 +10,87 @@ layout(
   local_size_y = 8,
   local_size_z = 1) in;
 
-layout(binding = 0, scalar)
+layout(push_constant, scalar)
 uniform framegen_params_t {
-    // Forward-extrapolation step. 0.5 places the generated frame at the
-    // half-way point between the current real frame and the next one (matching
-    // the x2 cadence). Lower values reduce ghosting at the cost of smoothness.
+    // Effective forward-extrapolation coefficient for THIS generated slot. The
+    // CPU folds the temporal placement (where this slot lands between the two
+    // real frames) and the user --framegen-strength scale into a single value,
+    // so the shader stays slot-agnostic: 0.5 places motion half-way (the x2
+    // default), a x3 pair uses ~0.33 and ~0.66, etc. Lower reduces ghosting.
     float u_strength;
-    // Per-pixel inter-frame change (in the range [u_suppressLo, u_suppressHi])
-    // over which extrapolation is faded out. Large changes are edges and
-    // disocclusions where pixel-space prediction ghosts the worst, so we fall
-    // back toward the current frame there.
+    // Per-pixel inter-frame change over which extrapolation is faded out. Large
+    // changes are edges/disocclusions where pixel-space prediction ghosts the
+    // worst, so we fall back toward the current frame there.
     float u_suppressLo;
     float u_suppressHi;
     float u_pad;
 };
 
-void main() {
-    uvec2 coord = uvec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y);
-    uvec2 outSize = imageSize(dst);
+// History and output are the same resolution, so every fetch is 1:1 — texelFetch
+// skips the sampler's normalized-coordinate math and bilinear hardware entirely.
+//
+// The rectification below reads the current frame's 4-neighbor cross, so an 8x8
+// workgroup touches a 10x10 apron of the current frame. Load that apron into LDS
+// once, cooperatively, and every neighbor read after that is a shared-memory hit
+// instead of a texture fetch: ~6 fetches/pixel collapses to ~1.6 (current tile) +
+// 1 (previous, center only). The previous frame is only needed at the center for
+// the delta, so it never needs an apron.
+const int TILE = 8;
+const int APRON = 1;
+const int TILE_W = TILE + 2 * APRON; // 10
+shared vec4 s_cur[TILE_W * TILE_W];
 
-    if (coord.x >= outSize.x || coord.y >= outSize.y)
+vec4 loadCurClamped(ivec2 p, ivec2 sz) {
+    p = clamp(p, ivec2(0), sz - ivec2(1));
+    return texelFetch(s_samplers[1], p, 0);
+}
+
+void main() {
+    ivec2 sz = imageSize(dst);
+    ivec2 tileBase = ivec2(gl_WorkGroupID.xy) * TILE - ivec2(APRON);
+
+    // 64 threads cooperatively fill the 100-texel apron tile (indices 0..99).
+    for (uint i = gl_LocalInvocationIndex; i < uint(TILE_W * TILE_W); i += uint(TILE * TILE)) {
+        ivec2 t = ivec2(int(i) % TILE_W, int(i) / TILE_W);
+        s_cur[i] = loadCurClamped(tileBase + t, sz);
+    }
+    barrier();
+
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= sz.x || coord.y >= sz.y)
         return;
 
-    vec2 uv = (vec2(coord) + vec2(0.5f)) / vec2(outSize);
-    vec4 previousFrame = texture(s_samplers[0], uv);
-    vec4 currentFrame = texture(s_samplers[1], uv);
+    // Index of this thread's own texel within the apron tile.
+    ivec2 lc = ivec2(gl_LocalInvocationID.xy) + ivec2(APRON);
+    vec4 curSample = s_cur[lc.y * TILE_W + lc.x];
+    vec3 currentFrame = curSample.rgb;
+    vec3 previousFrame = texelFetch(s_samplers[0], coord, 0).rgb;
 
-    // Low-latency forward extrapolation.
-    //
-    // (currentFrame - previousFrame) is the per-pixel delta across one real
-    // frame interval. Advancing motion forward by u_strength keeps displayed
-    // motion monotonic (real N, N+strength, real N+1, ...) and adds no latency:
-    // the real frame is still presented immediately.
-    //
-    // Without motion vectors, pixel-space prediction ghosts at moving edges, so
-    // we adaptively suppress the step where the inter-frame change is large.
-    vec4 delta = currentFrame - previousFrame;
+    // Low-latency forward extrapolation. (current - previous) is the per-pixel
+    // delta across one real-frame interval; advancing motion forward by u_strength
+    // keeps displayed motion monotonic and adds no latency (the real frame is
+    // still presented immediately). Suppress the step where inter-frame change is
+    // large, since pixel-space prediction ghosts at moving edges.
+    vec3 delta = currentFrame - previousFrame;
     float motion = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
     float strength = u_strength * (1.0f - smoothstep(u_suppressLo, u_suppressHi, motion));
 
-    vec4 predicted = currentFrame + delta * strength;
+    vec3 predicted = currentFrame + delta * strength;
 
-    // Rectify the prediction against the local neighborhood of the current
-    // frame (TAA-style). Ghosting/haloing is the prediction overshooting into
-    // values that are not present around the pixel; clamping to the min/max of
-    // the 4-neighbor cross keeps edge motion but cannot invent colors, which
-    // in particular kills the dark/bright trail behind fast-moving edges.
-    vec2 texel = vec2(1.0f) / vec2(outSize);
-    vec3 n0 = texture(s_samplers[1], uv + vec2(texel.x, 0.0f)).rgb;
-    vec3 n1 = texture(s_samplers[1], uv - vec2(texel.x, 0.0f)).rgb;
-    vec3 n2 = texture(s_samplers[1], uv + vec2(0.0f, texel.y)).rgb;
-    vec3 n3 = texture(s_samplers[1], uv - vec2(0.0f, texel.y)).rgb;
-    vec3 neighborMin = min(currentFrame.rgb, min(min(n0, n1), min(n2, n3)));
-    vec3 neighborMax = max(currentFrame.rgb, max(max(n0, n1), max(n2, n3)));
-    predicted.rgb = clamp(predicted.rgb, neighborMin, neighborMax);
+    // Rectify against the local neighborhood of the current frame (TAA-style),
+    // read straight from LDS. Ghosting is the prediction overshooting into values
+    // not present around the pixel; clamping to the 4-neighbor cross keeps edge
+    // motion but cannot invent colors.
+    vec3 n0 = s_cur[lc.y * TILE_W + (lc.x + 1)].rgb;
+    vec3 n1 = s_cur[lc.y * TILE_W + (lc.x - 1)].rgb;
+    vec3 n2 = s_cur[(lc.y + 1) * TILE_W + lc.x].rgb;
+    vec3 n3 = s_cur[(lc.y - 1) * TILE_W + lc.x].rgb;
+    vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
+    vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
+    predicted = clamp(predicted, neighborMin, neighborMax);
 
-    // The neighborhood clamp above is the only range bound we want: for UNORM
-    // targets the inputs are already in [0,1] so the result is too, and for
-    // float scRGB targets values above 1.0 (HDR highlights) and negative
-    // components (wide gamut) are meaningful and must survive. Alpha is not
-    // rectified, so pin it to the current frame instead of extrapolating it.
-    imageStore(dst, ivec2(coord), vec4(predicted.rgb, currentFrame.a));
+    // The neighborhood clamp is the only range bound we want: UNORM targets stay
+    // in [0,1]; float scRGB targets keep HDR highlights above 1.0 and wide-gamut
+    // negatives. Alpha is not rectified, so pin it to the current frame.
+    imageStore(dst, coord, vec4(predicted, curSample.a));
 }

@@ -58,9 +58,17 @@ gamescope -w 1920 -h 1080 -W 3440 -H 1440 -b -- %command%
 
 ## Experimental frame generation
 
-`--experimental-framegen` enables compositor-side x2 frame generation: for every
-real frame gamescope composites, it generates one additional frame and presents
-it on the next vblank, doubling the perceived frame rate.
+`--experimental-framegen` enables compositor-side frame generation: for every
+real frame gamescope composites, it generates one or more additional frames and
+presents them on the empty vblanks the game left behind, multiplying the
+perceived frame rate. `--framegen-multiplier` selects x2 (default), x3 or x4;
+the number of frames actually inserted adapts to the measured frame gap.
+
+Frame generation is designed for a dual-GPU split where a second GPU (e.g. an
+AMD iGPU) composites and generates while the game renders on the primary GPU,
+but it also works on a single GPU. Generated frames are the compositor's own —
+they create no client commits, so they are invisible to the game, Wine/DXVK,
+Reflex and anti-lag, and never produce fake presentation feedback.
 
 This is a prototype. Keep the following in mind:
 
@@ -84,13 +92,25 @@ This is a prototype. Keep the following in mind:
   generation adds no extra latency to the frames the game actually rendered. All
   framegen GPU work (history copy + generation) is submitted in a separate
   command buffer *after* the real frame's composite, so the real frame's page
-  flip never waits on it. A generated frame whose GPU work has not finished by
-  its vblank is skipped (the display repeats the last real frame) rather than
-  waited on, and if the compositing GPU can't keep up at all, framegen goes
-  dormant instead of queueing work in front of real frames. The default
-  `extrapolate` mode predicts motion forward, so displayed motion stays
-  monotonic and smooth (real N → generated N+½ → real N+1 → …). The `blend`
-  mode averages the last two real frames and is kept as a debug aid only.
+  flip never waits on it. When the compositor's GPU exposes a second compute
+  queue (most AMD/RADV hardware does), all generation runs on a **dedicated
+  queue** with its own timeline, so a slow generation can never sit in front of
+  the next composite on the realtime queue — the composite is protected in
+  hardware, not just by scheduling. (Set `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE=1` to
+  force the single-queue path.) A generated frame whose GPU work has not
+  finished by its vblank is skipped (the display repeats the last frame) rather
+  than waited on, and if the compositing GPU can't keep up at all, framegen goes
+  dormant instead of queueing work in front of real frames. History is kept
+  **zero-copy** by retaining references to the composited output images instead
+  of copying them, and the generated-frame shader runs fp16 on capable hardware,
+  so per-frame overhead stays low. The generated-frame algorithm is selected
+  with `--framegen-mode`: `extrapolate` (default) predicts motion forward from
+  the last two real frames so displayed motion stays monotonic and smooth (real
+  N → generated N+⅓ → N+⅔ → real N+1 for x3); `motion` additionally estimates
+  per-block motion (a low-res luma block matcher) and reprojects along it,
+  falling back to extrapolation where the match is unconfident — higher quality
+  on panning/scrolling at a higher compute cost; `blend` averages the last two
+  real frames and is kept as a debug aid only.
 * **Scene changes.** Prediction history is dropped automatically on focus
   change, overlay/notification appearance or disappearance, SDR↔HDR/EOTF
   changes, resolution or format changes, and long frame gaps, so stale content
@@ -152,10 +172,10 @@ See `gamescope --help` for a full list of options.
 * `-S stretch`: use stretch scaling, the game will fill the window. (e.g. 4:3 to 16:9)
 * `-b`: create a border-less window.
 * `-f`: create a full-screen window.
-* `--experimental-framegen`: enable experimental x2 compositor-side frame generation. Implies `--force-composite`; disables adaptive sync and tearing while active. See [Experimental frame generation](#experimental-frame-generation).
-* `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency) or `blend` (debug).
-* `--framegen-strength`: forward-extrapolation step for `extrapolate` mode, `0.0`–`1.0` (default `0.5`). Lower values reduce ghosting.
-* `--framegen-multiplier`: generated-frame multiplier. Only `2` is supported for now.
+* `--experimental-framegen`: enable experimental compositor-side frame generation (x2–x4). Implies `--force-composite`; disables adaptive sync and tearing while active. See [Experimental frame generation](#experimental-frame-generation).
+* `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency), `motion` (motion-compensated, higher quality/cost) or `blend` (debug).
+* `--framegen-strength`: forward-extrapolation step for `extrapolate`/`motion` modes, `0.0`–`1.0` (default `0.5`). Lower values reduce ghosting.
+* `--framegen-multiplier`: generated-frame multiplier, `2` (default), `3` or `4`. The number of frames actually inserted adapts to the measured frame gap.
 * `--framegen-debug`: log framegen history, dispatch, and present cadence.
 
 ## Reshade support

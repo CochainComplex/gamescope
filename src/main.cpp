@@ -271,9 +271,10 @@ const char usage[] =
 	"  --debug-dual-gpu-route         log compositor GPU, buffer import, frame path, and FSR/NIS routing diagnostics\n"
 	"  --experimental-framegen        enable experimental x2 compositor-side frame generation (forces the composite path,\n"
 	"                                 disables adaptive sync and tearing while active)\n"
-	"  --framegen-multiplier 2        generated-frame multiplier; only 2 is supported for now\n"
-	"  --framegen-mode MODE           generated-frame algorithm: 'extrapolate' (default, low latency) or 'blend' (debug)\n"
-	"  --framegen-strength 0.5        extrapolation step for 'extrapolate' mode (0.0-1.0); lower reduces ghosting\n"
+	"  --framegen-multiplier 2        generated-frame multiplier (2, 3 or 4); actual count adapts to the frame gap\n"
+	"  --framegen-mode MODE           generated-frame algorithm: 'extrapolate' (default, low latency),\n"
+	"                                 'motion' (motion-compensated, higher quality/cost) or 'blend' (debug)\n"
+	"  --framegen-strength 0.5        extrapolation step for 'extrapolate'/'motion' modes (0.0-1.0); lower reduces ghosting\n"
 	"  --framegen-debug               log framegen history, dispatch, and present cadence\n"
 	"  --composite-debug              draw frame markers on alternating corners of the screen when compositing\n"
 	"  --disable-color-management     disable color management\n"
@@ -819,9 +820,9 @@ int main(int argc, char **argv)
 					g_bFramegenDebug = true;
 				} else if (strcmp(opt_name, "framegen-multiplier") == 0) {
 					g_nFramegenMultiplier = parse_integer( optarg, opt_name );
-					if ( g_nFramegenMultiplier != 2 )
+					if ( g_nFramegenMultiplier < 2 || g_nFramegenMultiplier > 4 )
 					{
-						fprintf( stderr, "gamescope: --framegen-multiplier currently only supports 2\n" );
+						fprintf( stderr, "gamescope: --framegen-multiplier must be 2, 3 or 4\n" );
 						return 1;
 					}
 				} else if (strcmp(opt_name, "framegen-mode") == 0) {
@@ -833,9 +834,13 @@ int main(int argc, char **argv)
 					{
 						g_eFramegenMode = GamescopeFramegenMode::Blend;
 					}
+					else if ( strcmp( optarg, "motion" ) == 0 )
+					{
+						g_eFramegenMode = GamescopeFramegenMode::Motion;
+					}
 					else
 					{
-						fprintf( stderr, "gamescope: --framegen-mode must be 'extrapolate' or 'blend'\n" );
+						fprintf( stderr, "gamescope: --framegen-mode must be 'extrapolate', 'motion' or 'blend'\n" );
 						return 1;
 					}
 				} else if (strcmp(opt_name, "framegen-strength") == 0) {

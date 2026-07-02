@@ -47,6 +47,10 @@
 #include "cs_easu_fp16.h"
 #include "cs_framegen_blend.h"
 #include "cs_framegen_extrapolate.h"
+#include "cs_framegen_extrapolate_fp16.h"
+#include "cs_framegen_motion_luma.h"
+#include "cs_framegen_motion_match.h"
+#include "cs_framegen_motion_warp.h"
 #include "cs_gaussian_blur_horizontal.h"
 #include "cs_nis.h"
 #include "cs_nis_fp16.h"
@@ -123,6 +127,11 @@ static VkResult vulkan_load_module()
 }
 
 VulkanOutput_t g_output;
+
+// Size of the compute push-constant range reserved for frame generation. Large
+// enough for the extrapolate params and the motion-pass params, well under the
+// Vulkan-guaranteed 128-byte minimum maxPushConstantsSize.
+static constexpr uint32_t k_uFramegenPushConstantSize = 64;
 
 uint32_t g_uCompositeDebug = 0u;
 gamescope::ConVar<uint32_t> cv_composite_debug{ "composite_debug", 0, "Debug composition flags" };
@@ -502,14 +511,28 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 	VkPhysicalDeviceProperties props;
 	vk.GetPhysicalDeviceProperties( m_physDev, &props );
 	vk_log.infof( "selecting physical device '%s': queue family %x (general queue family %x)", props.deviceName, m_queueFamily, m_generalQueueFamily );
+
+	// Record how many queues the chosen compositor family exposes, so
+	// createDevice can request a second (frame-generation) queue when the
+	// hardware allows it. RADV's async-compute family typically exposes several.
+	{
+		uint32_t nQueueFamilies = 0;
+		vk.GetPhysicalDeviceQueueFamilyProperties( m_physDev, &nQueueFamilies, nullptr );
+		std::vector<VkQueueFamilyProperties> queueFamilyProperties( nQueueFamilies );
+		vk.GetPhysicalDeviceQueueFamilyProperties( m_physDev, &nQueueFamilies, queueFamilyProperties.data() );
+		if ( m_queueFamily < nQueueFamilies )
+			m_queueCount = queueFamilyProperties[ m_queueFamily ].queueCount;
+	}
+
 	if ( g_bDebugDualGpuRoute )
 	{
-		vk_log.infof( "dual-gpu-route: compositor Vulkan device '%s' vendor:device %04x:%04x type %s queue family %u general queue family %u",
+		vk_log.infof( "dual-gpu-route: compositor Vulkan device '%s' vendor:device %04x:%04x type %s queue family %u (queues %u) general queue family %u",
 			props.deviceName,
 			props.vendorID,
 			props.deviceID,
 			vk_device_type_name( props.deviceType ),
 			m_queueFamily,
+			m_queueCount,
 			m_generalQueueFamily );
 	}
 
@@ -627,7 +650,7 @@ bool CVulkanDevice::createDevice()
 		m_bSupportsFp16 = vulkan12Features.shaderFloat16 && features2.features.shaderInt16;
 	}
 
-	float queuePriorities = 1.0f;
+	float queuePriorities[2] = { 1.0f, 1.0f };
 
 	VkDeviceQueueGlobalPriorityCreateInfoEXT queueCreateInfoEXT = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT,
@@ -635,21 +658,31 @@ bool CVulkanDevice::createDevice()
 		.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT
 	};
 
-	VkDeviceQueueCreateInfo queueCreateInfos[2] = 
+	// Request a second queue in the compositor's (compute) family for frame
+	// generation, when framegen is enabled, the family exposes one, and it isn't
+	// disabled. Vulkan has no per-queue global priority within a family, so both
+	// queues inherit this create-info's REALTIME priority; the win is decoupling
+	// — a slow generation on queue 1 can never block the next composite on queue
+	// 0 of the in-order realtime queue. Gated on framegen so a session that never
+	// uses it requests exactly the single REALTIME queue it did before.
+	const bool bWantFramegenQueue = g_bExperimentalFramegen && m_queueCount >= 2 && !env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_SINGLE_QUEUE" ) );
+	const uint32_t nComputeQueues = bWantFramegenQueue ? 2u : 1u;
+
+	VkDeviceQueueCreateInfo queueCreateInfos[2] =
 	{
 		{
 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
 			.pNext = gamescope::Process::HasCapSysNice() ? &queueCreateInfoEXT : nullptr,
 			.queueFamilyIndex = m_queueFamily,
-			.queueCount = 1,
-			.pQueuePriorities = &queuePriorities
+			.queueCount = nComputeQueues,
+			.pQueuePriorities = queuePriorities
 		},
 		{
 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
 			.pNext = gamescope::Process::HasCapSysNice() ? &queueCreateInfoEXT : nullptr,
 			.queueFamilyIndex = m_generalQueueFamily,
 			.queueCount = 1,
-			.pQueuePriorities = &queuePriorities
+			.pQueuePriorities = queuePriorities
 		},
 	};
 
@@ -803,6 +836,14 @@ bool CVulkanDevice::createDevice()
 	else
 		vk.GetDeviceQueue(device(), m_generalQueueFamily, 0, &m_generalQueue);
 
+	if ( bWantFramegenQueue )
+	{
+		vk.GetDeviceQueue( device(), m_queueFamily, 1, &m_framegenQueue );
+		m_bHasFramegenQueue = m_framegenQueue != VK_NULL_HANDLE;
+		if ( m_bHasFramegenQueue )
+			vk_log.infof( "frame generation: using dedicated compute queue (family %u, index 1)", m_queueFamily );
+	}
+
 	return true;
 }
 
@@ -945,12 +986,26 @@ bool CVulkanDevice::createLayouts()
 		return false;
 	}
 
+	// A small compute push-constant range used by the frame-generation shaders
+	// for their per-slot parameters. Push constants are recorded directly into
+	// the command buffer, so framegen needs no slice of the shared upload arena
+	// — which is what lets its work migrate to a dedicated queue without racing
+	// the composite path's bump allocator. Shaders that don't declare a
+	// push_constant block simply ignore the range.
+	VkPushConstantRange framegenPushConstantRange = {
+		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+		.offset = 0,
+		.size = k_uFramegenPushConstantSize,
+	};
+
 	VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.setLayoutCount = 1,
 		.pSetLayouts = &m_descriptorSetLayout,
+		.pushConstantRangeCount = 1,
+		.pPushConstantRanges = &framegenPushConstantRange,
 	};
-	
+
 	res = vk.CreatePipelineLayout(device(), &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout);
 	if ( res != VK_SUCCESS )
 	{
@@ -1008,24 +1063,30 @@ bool CVulkanDevice::createPools()
 
 	res = vk.GetPhysicalDeviceImageFormatProperties2( physDev(), &imageFormatInfo, &imageFormatProps );
 
+	// Reserve extra sets for the separate framegen descriptor ring when framegen
+	// is enabled, so the pool covers both rings. Non-framegen sessions allocate
+	// exactly what they did before.
+	const uint32_t nTotalSets = uint32_t(m_descriptorSets.size())
+		+ ( g_bExperimentalFramegen ? k_uFramegenDescriptorSets : 0u );
+
 	VkDescriptorPoolSize poolSizes[3] {
 		{
 			VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			uint32_t(m_descriptorSets.size()),
+			nTotalSets,
 		},
 		{
 			VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-			uint32_t(m_descriptorSets.size()) * 2,
+			nTotalSets * 2,
 		},
 		{
 			VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			uint32_t(m_descriptorSets.size()) * (((ycbcrProps.combinedImageSamplerDescriptorCount + 1) * VKR_SAMPLER_SLOTS) + (2 * VKR_LUT3D_COUNT)),
+			nTotalSets * (((ycbcrProps.combinedImageSamplerDescriptorCount + 1) * VKR_SAMPLER_SLOTS) + (2 * VKR_LUT3D_COUNT)),
 		},
 	};
-	
+
 	VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = uint32_t(m_descriptorSets.size()),
+		.maxSets = nTotalSets,
 		.poolSizeCount = sizeof(poolSizes) / sizeof(poolSizes[0]),
 		.pPoolSizes = poolSizes,
 	};
@@ -1068,6 +1129,13 @@ bool CVulkanDevice::createShaders()
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
 	SHADER(FRAMEGEN_BLEND, cs_framegen_blend);
 	SHADER(FRAMEGEN_EXTRAPOLATE, cs_framegen_extrapolate);
+	if (m_bSupportsFp16)
+		SHADER(FRAMEGEN_EXTRAPOLATE_FP16, cs_framegen_extrapolate_fp16);
+	else
+		SHADER(FRAMEGEN_EXTRAPOLATE_FP16, cs_framegen_extrapolate);
+	SHADER(FRAMEGEN_MOTION_LUMA, cs_framegen_motion_luma);
+	SHADER(FRAMEGEN_MOTION_MATCH, cs_framegen_motion_match);
+	SHADER(FRAMEGEN_MOTION_WARP, cs_framegen_motion_warp);
 #undef SHADER
 
 	for (uint32_t i = 0; i < shaderInfos.size(); i++)
@@ -1105,6 +1173,25 @@ bool CVulkanDevice::createScratchResources()
 	{
 		vk_log.errorf( "vkAllocateDescriptorSets failed" );
 		return false;
+	}
+
+	// Separate framegen descriptor ring (see CVulkanDevice::descriptorSet).
+	if ( g_bExperimentalFramegen )
+	{
+		m_framegenDescriptorSets.resize( k_uFramegenDescriptorSets );
+		std::vector<VkDescriptorSetLayout> framegenLayouts( k_uFramegenDescriptorSets, m_descriptorSetLayout );
+		VkDescriptorSetAllocateInfo framegenAllocInfo = {
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+			.descriptorPool = m_descriptorPool,
+			.descriptorSetCount = (uint32_t)framegenLayouts.size(),
+			.pSetLayouts = framegenLayouts.data(),
+		};
+		res = vk.AllocateDescriptorSets( device(), &framegenAllocInfo, m_framegenDescriptorSets.data() );
+		if ( res != VK_SUCCESS )
+		{
+			vk_log.errorf( "vkAllocateDescriptorSets (framegen) failed" );
+			return false;
+		}
 	}
 
 	// Make and map upload buffer
@@ -1164,6 +1251,19 @@ bool CVulkanDevice::createScratchResources()
 	{
 		vk_errorf( res, "vkCreateSemaphore failed" );
 		return false;
+	}
+
+	// Dedicated timeline for the frame-generation queue: framegen signals its
+	// own monotonic counter here instead of the shared scratch timeline (whose
+	// single counter cannot tolerate a second queue signalling out of order).
+	if ( m_bHasFramegenQueue )
+	{
+		m_framegenTimeline = CreateTimelineSemaphore( 0, false );
+		if ( m_framegenTimeline == nullptr )
+		{
+			vk_log.errorf( "failed to create frame generation timeline semaphore; disabling dedicated framegen queue" );
+			m_bHasFramegenQueue = false;
+		}
 	}
 
 	return true;
@@ -1627,6 +1727,107 @@ bool CVulkanDevice::hasCompleted(uint64_t sequence)
 	return currentSeqNo >= sequence;
 }
 
+// Submit frame-generation work. With a dedicated framegen queue, this runs on
+// the second queue: it waits on the composite's scratch-timeline value (so it
+// never reads a half-written output image) and signals its own framegen
+// timeline, meaning a slow generation can never sit in front of the next
+// composite on the realtime queue. Without a second queue it forwards to the
+// normal shared-queue submit, where in-order execution provides the same
+// ordering (at the cost of the head-of-line blocking this feature removes).
+uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer, uint64_t ulWaitCompositeSeqNo )
+{
+	if ( !m_bHasFramegenQueue )
+		return submit( std::move( cmdBuffer ) );
+
+	CVulkanCmdBuffer *pRaw = cmdBuffer.get();
+	pRaw->end();
+
+	const uint64_t nextSeqNo = ++m_framegenSeqNo;
+
+	VkSemaphore waitSemaphores[1] = { m_scratchTimelineSemaphore };
+	uint64_t waitValues[1] = { ulWaitCompositeSeqNo };
+	VkPipelineStageFlags waitStages[1] = { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT };
+
+	VkSemaphore signalSemaphores[1] = { m_framegenTimeline->pVkSemaphore };
+	uint64_t signalValues[1] = { nextSeqNo };
+
+	const bool bWait = ulWaitCompositeSeqNo != 0;
+
+	VkTimelineSemaphoreSubmitInfo timelineInfo = {
+		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+		.waitSemaphoreValueCount = bWait ? 1u : 0u,
+		.pWaitSemaphoreValues = bWait ? waitValues : nullptr,
+		.signalSemaphoreValueCount = 1,
+		.pSignalSemaphoreValues = signalValues,
+	};
+
+	VkCommandBuffer rawCmdBuffer = pRaw->rawBuffer();
+	VkSubmitInfo submitInfo = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.pNext = &timelineInfo,
+		.waitSemaphoreCount = bWait ? 1u : 0u,
+		.pWaitSemaphores = bWait ? waitSemaphores : nullptr,
+		.pWaitDstStageMask = bWait ? waitStages : nullptr,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &rawCmdBuffer,
+		.signalSemaphoreCount = 1,
+		.pSignalSemaphores = signalSemaphores,
+	};
+
+	vk_check( vk.QueueSubmit( m_framegenQueue, 1, &submitInfo, VK_NULL_HANDLE ) );
+
+	m_pendingFramegenCmdBufs.emplace( nextSeqNo, std::move( cmdBuffer ) );
+	return nextSeqNo;
+}
+
+bool CVulkanDevice::hasCompletedFramegen( uint64_t sequence )
+{
+	if ( !m_bHasFramegenQueue )
+		return hasCompleted( sequence );
+
+	uint64_t currentSeqNo = 0;
+	vk_check( vk.GetSemaphoreCounterValue( device(), m_framegenTimeline->pVkSemaphore, &currentSeqNo ) );
+	return currentSeqNo >= sequence;
+}
+
+void CVulkanDevice::waitFramegen( uint64_t sequence )
+{
+	if ( !m_bHasFramegenQueue )
+	{
+		wait( sequence, false );
+		return;
+	}
+
+	VkSemaphoreWaitInfo waitInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+		.semaphoreCount = 1,
+		.pSemaphores = &m_framegenTimeline->pVkSemaphore,
+		.pValues = &sequence,
+	};
+	vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
+}
+
+// Recycle framegen command buffers whose framegen-timeline seqNo has completed.
+// Framegen keeps its own pending map because it signals a separate timeline; the
+// buffers return to the shared unused pool (same command family).
+void CVulkanDevice::framegenGarbageCollect()
+{
+	if ( !m_bHasFramegenQueue || m_pendingFramegenCmdBufs.empty() )
+		return;
+
+	uint64_t currentSeqNo = 0;
+	vk_check( vk.GetSemaphoreCounterValue( device(), m_framegenTimeline->pVkSemaphore, &currentSeqNo ) );
+
+	for ( auto it = m_pendingFramegenCmdBufs.begin(); it != m_pendingFramegenCmdBufs.end(); )
+	{
+		if ( it->first > currentSeqNo )
+			break; // ordered by seqNo: nothing later has completed either
+		it->second->reset();
+		m_unusedCmdBufs.push_back( std::move( it->second ) );
+		it = m_pendingFramegenCmdBufs.erase( it );
+	}
+}
+
 void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
 {
 	auto last = m_pendingCmdBufs.find(sequence);
@@ -1662,6 +1863,8 @@ void CVulkanCmdBuffer::reset()
 
 	m_ExternalDependencies.clear();
 	m_ExternalSignals.clear();
+
+	m_bFramegen = false;
 }
 
 void CVulkanCmdBuffer::begin()
@@ -1744,6 +1947,16 @@ void CVulkanCmdBuffer::uploadConstants(Args&&... args)
 	memcpy(ptr, &data, sizeof(data));
 }
 
+template<class PushData, class... Args>
+void CVulkanCmdBuffer::pushConstants(Args&&... args)
+{
+	PushData data(std::forward<Args>(args)...);
+	static_assert( sizeof(PushData) <= k_uFramegenPushConstantSize, "framegen push constants exceed reserved range" );
+	// Recorded straight into the command buffer, so this needs no upload arena
+	// slice and cannot race the composite path's bump allocator across queues.
+	m_device->vk.CmdPushConstants( m_cmdBuffer, m_device->pipelineLayout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data );
+}
+
 void CVulkanCmdBuffer::bindPipeline(VkPipeline pipeline)
 {
 	m_device->vk.CmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
@@ -1760,7 +1973,7 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	prepareDestImage(m_target);
 	insertBarrier();
 
-	VkDescriptorSet descriptorSet = m_device->descriptorSet();
+	VkDescriptorSet descriptorSet = m_device->descriptorSet( m_bFramegen );
 
 	std::array<VkWriteDescriptorSet, 7> writeDescriptorSets;
 	std::array<VkDescriptorImageInfo, VKR_SAMPLER_SLOTS> imageDescriptors = {};
@@ -3436,6 +3649,16 @@ bool vulkan_remake_swapchain( void )
 	return bRet;
 }
 
+// The classic output ring is 3 (ping/pong plus one for partial composition).
+// Frame generation retains the last two composited output images as its
+// prediction history (zero-copy), so it needs a deeper ring: history(2) +
+// the frame being scanned out + the next composite target, without ever
+// recompositing a slot still referenced as history. Generated frames never
+// use this ring (they have their own g_output.framegenOutputImages pool), so
+// 5 is sufficient for any x2..x4 multiplier.
+static constexpr uint32_t k_uOutputRingSizeDefault = 3;
+static constexpr uint32_t k_uOutputRingSizeFramegen = 5;
+
 static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 {
 	CVulkanTexture::createFlags outputImageflags;
@@ -3445,71 +3668,49 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	outputImageflags.bSampled = true; // for pipewire blits
 	outputImageflags.bOutputImage = true;
 
-	pOutput->outputImages.resize(3); // extra image for partial composition.
-	pOutput->outputImagesPartialOverlay.resize(3);
+	const uint32_t nRing = vulkan_framegen_is_enabled() ? k_uOutputRingSizeFramegen : k_uOutputRingSizeDefault;
 
-	pOutput->outputImages[0] = nullptr;
-	pOutput->outputImages[1] = nullptr;
-	pOutput->outputImages[2] = nullptr;
-	pOutput->outputImagesPartialOverlay[0] = nullptr;
-	pOutput->outputImagesPartialOverlay[1] = nullptr;
-	pOutput->outputImagesPartialOverlay[2] = nullptr;
+	pOutput->outputImages.resize(nRing);
+	pOutput->outputImagesPartialOverlay.resize(nRing);
+	for ( uint32_t i = 0; i < nRing; i++ )
+	{
+		pOutput->outputImages[i] = nullptr;
+		pOutput->outputImagesPartialOverlay[i] = nullptr;
+	}
 
 	uint32_t uDRMFormat = pOutput->uOutputFormat;
 
-	pOutput->outputImages[0] = new CVulkanTexture();
-	bool bSuccess = pOutput->outputImages[0]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags );
-	if ( bSuccess != true )
+	for ( uint32_t i = 0; i < nRing; i++ )
 	{
-		vk_log.errorf( "failed to allocate buffer for KMS" );
-		return false;
-	}
-
-	pOutput->outputImages[1] = new CVulkanTexture();
-	bSuccess = pOutput->outputImages[1]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags );
-	if ( bSuccess != true )
-	{
-		vk_log.errorf( "failed to allocate buffer for KMS" );
-		return false;
-	}
-
-	pOutput->outputImages[2] = new CVulkanTexture();
-	bSuccess = pOutput->outputImages[2]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags );
-	if ( bSuccess != true )
-	{
-		vk_log.errorf( "failed to allocate buffer for KMS" );
-		return false;
+		pOutput->outputImages[i] = new CVulkanTexture();
+		if ( !pOutput->outputImages[i]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags ) )
+		{
+			vk_log.errorf( "failed to allocate buffer for KMS" );
+			return false;
+		}
 	}
 
 	// Oh no.
 	pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
 
-	if ( pOutput->uOutputFormatOverlay != VK_FORMAT_UNDEFINED && !kDisablePartialComposition )
+	// Partial composition aliases outputImagesPartialOverlay[i] onto
+	// outputImages[i]'s VkDeviceMemory. Frame generation retains outputImages
+	// slots as history, so a partial composite writing the aliased overlay
+	// image would silently corrupt that history. Framegen forces full
+	// composite anyway, so simply do not allocate the aliases while it is
+	// active — this removes the aliasing hazard structurally.
+	if ( pOutput->uOutputFormatOverlay != VK_FORMAT_UNDEFINED && !kDisablePartialComposition && !vulkan_framegen_is_enabled() )
 	{
 		uint32_t uPartialDRMFormat = pOutput->uOutputFormatOverlay;
 
-		pOutput->outputImagesPartialOverlay[0] = new CVulkanTexture();
-		bool bSuccess = pOutput->outputImagesPartialOverlay[0]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[0].get() );
-		if ( bSuccess != true )
+		for ( uint32_t i = 0; i < nRing; i++ )
 		{
-			vk_log.errorf( "failed to allocate buffer for KMS" );
-			return false;
-		}
-
-		pOutput->outputImagesPartialOverlay[1] = new CVulkanTexture();
-		bSuccess = pOutput->outputImagesPartialOverlay[1]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[1].get() );
-		if ( bSuccess != true )
-		{
-			vk_log.errorf( "failed to allocate buffer for KMS" );
-			return false;
-		}
-
-		pOutput->outputImagesPartialOverlay[2] = new CVulkanTexture();
-		bSuccess = pOutput->outputImagesPartialOverlay[2]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[2].get() );
-		if ( bSuccess != true )
-		{
-			vk_log.errorf( "failed to allocate buffer for KMS" );
-			return false;
+			pOutput->outputImagesPartialOverlay[i] = new CVulkanTexture();
+			if ( !pOutput->outputImagesPartialOverlay[i]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[i].get() ) )
+			{
+				vk_log.errorf( "failed to allocate buffer for KMS" );
+				return false;
+			}
 		}
 	}
 
@@ -3796,6 +3997,7 @@ static uint32_t s_frameId = 0;
 void vulkan_garbage_collect( void )
 {
 	g_device.garbageCollect();
+	g_device.framegenGarbageCollect();
 }
 
 static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace )
@@ -4182,6 +4384,10 @@ static const char *framegen_mode_name()
 	}
 }
 
+// Push constants for the extrapolate shaders. `strength` is the effective
+// per-slot forward coefficient: the CPU folds this slot's temporal placement
+// (where it lands between the two real frames) and the user --framegen-strength
+// into a single value, so the shader stays slot-agnostic.
 struct FramegenPushData_t
 {
 	float strength;
@@ -4198,6 +4404,44 @@ struct FramegenPushData_t
 	}
 };
 
+// Push constants for the motion-mode block-match and warp passes.
+struct FramegenMotionMatchPush_t
+{
+	int32_t searchRadius;
+	int32_t pad0, pad1, pad2;
+
+	explicit FramegenMotionMatchPush_t( int32_t nSearchRadius )
+		: searchRadius( nSearchRadius ), pad0( 0 ), pad1( 0 ), pad2( 0 )
+	{
+	}
+};
+
+struct FramegenMotionWarpPush_t
+{
+	float strength;
+	float suppressLo;
+	float suppressHi;
+	float lowResScale;
+
+	explicit FramegenMotionWarpPush_t( float flStrength, float flLo, float flHi, float flScale )
+		: strength( flStrength ), suppressLo( flLo ), suppressHi( flHi ), lowResScale( flScale )
+	{
+	}
+};
+
+// Motion-estimation intermediates (low-resolution luma pyramids and the motion
+// field). Allocated lazily by the motion dispatch, released on framegen reset.
+struct FramegenMotionResources_t
+{
+	gamescope::OwningRc<CVulkanTexture> lumaPrev;
+	gamescope::OwningRc<CVulkanTexture> lumaCur;
+	gamescope::OwningRc<CVulkanTexture> mvField;
+	uint32_t width = 0;
+	uint32_t height = 0;
+};
+static FramegenMotionResources_t g_framegenMotion;
+static constexpr uint32_t k_uFramegenMotionDownscale = 8;
+
 // Inter-frame change (gamma-encoded [0,1]) over which forward extrapolation is
 // faded out. Below k_flFramegenSuppressLo we trust the full predicted step;
 // above k_flFramegenSuppressHi we fall back to the current frame to avoid ghosting.
@@ -4209,18 +4453,52 @@ static constexpr float k_flFramegenSuppressHi = 0.40f;
 
 struct FramegenHistory_t
 {
+	// The last two real frames, held as references straight into the
+	// g_output.outputImages ring. Zero-copy: the composite already wrote these
+	// images, so framegen never copies them — it keeps them alive and samples
+	// them. Safe because the ring (k_uOutputRingSizeFramegen) is deep enough
+	// that neither slot is recomposited before the next generation reads it.
+	// previousReal is the older of the two.
 	gamescope::Rc<CVulkanTexture> previousReal;
 	gamescope::Rc<CVulkanTexture> currentReal;
-	gamescope::Rc<CVulkanTexture> pendingGenerated;
+
+	// The two output-ring slots the most recent generation batch samples, kept
+	// pinned (skipped by the ring advance) until that batch signals genReadSeqNo.
+	// On the dedicated framegen queue a batch keeps reading its inputs after
+	// history is logically invalidated (e.g. gpu_oversubscribed nulls
+	// previousReal/currentReal); without this, a later composite on the realtime
+	// queue could overwrite a slot the framegen queue is still reading — a
+	// cross-queue write-after-read. We never make the composite wait (that would
+	// delay a real frame); we just avoid reusing the slot until the read is done.
+	gamescope::Rc<CVulkanTexture> genReadA;
+	gamescope::Rc<CVulkanTexture> genReadB;
+	uint64_t genReadSeqNo = 0;
+
+	// Generated frames waiting for their empty vblanks, presented front-first,
+	// one per vblank. Depth is multiplier-1 (x2 -> 1, x4 -> 3). Drained
+	// wholesale the moment a real frame supersedes them.
+	struct PendingGenerated_t
+	{
+		gamescope::Rc<CVulkanTexture> tex;
+		uint64_t seqNo = 0;
+		uint64_t frameId = 0;
+		float phase = 0.0f; // fraction of the real-frame interval, for logs
+	};
+	std::vector<PendingGenerated_t> pending;
+
 	uint32_t width = 0;
 	uint32_t height = 0;
 	uint32_t drmFormat = DRM_FORMAT_INVALID;
 	uint64_t previousFrameId = 0;
 	uint64_t currentFrameId = 0;
-	uint64_t generatedFrameId = 0;
-	uint64_t previousPresentTimeNs = 0;
 	uint64_t currentPresentTimeNs = 0;
-	uint64_t generatedSeqNo = 0;
+	// Seq no (on the framegen timeline) of the most recent generation batch, for
+	// the oversubscription guard: skip new generation while the previous batch
+	// is still running rather than queue work in front of real frames.
+	uint64_t lastGeneratedSeqNo = 0;
+	// Rolling index into g_output.framegenOutputImages for the next generated
+	// frame, advanced per generated frame independent of the real-frame nOutImage.
+	uint32_t nNextOutputIndex = 0;
 	// Identity of the base layer's texture at the last recorded frame. Only a
 	// new base-layer commit counts as a real frame; overlay-only repaints
 	// re-composite the same game content and must not disturb pacing.
@@ -4245,16 +4523,17 @@ static constexpr uint32_t k_uFramegenStableFramesRequired = 8;
 
 bool vulkan_framegen_is_enabled()
 {
-	return g_bExperimentalFramegen && g_nFramegenMultiplier == 2
-		&& ( g_eFramegenMode == GamescopeFramegenMode::Extrapolate || g_eFramegenMode == GamescopeFramegenMode::Blend );
+	return g_bExperimentalFramegen
+		&& g_nFramegenMultiplier >= 2 && g_nFramegenMultiplier <= 4
+		&& ( g_eFramegenMode == GamescopeFramegenMode::Extrapolate
+			|| g_eFramegenMode == GamescopeFramegenMode::Blend
+			|| g_eFramegenMode == GamescopeFramegenMode::Motion );
 }
 
-static bool framegen_texture_matches( const gamescope::Rc<CVulkanTexture> &pTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
+// Number of generated frames to insert between two real frames (multiplier-1).
+static uint32_t framegen_slot_count()
 {
-	return pTexture != nullptr
-		&& pTexture->width() == width
-		&& pTexture->height() == height
-		&& pTexture->drmFormat() == drmFormat;
+	return (uint32_t)std::max( 1, g_nFramegenMultiplier - 1 );
 }
 
 static bool framegen_output_matches( const gamescope::OwningRc<CVulkanTexture> &pTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
@@ -4267,33 +4546,35 @@ static bool framegen_output_matches( const gamescope::OwningRc<CVulkanTexture> &
 
 void vulkan_framegen_invalidate_history( const char *reason )
 {
-	if ( !g_framegenHistory.valid && g_framegenHistory.pendingGenerated == nullptr )
+	if ( !g_framegenHistory.valid && g_framegenHistory.pending.empty()
+		&& g_framegenHistory.previousReal == nullptr && g_framegenHistory.currentReal == nullptr )
 		return;
 
 	if ( g_bFramegenDebug )
-	{
 		vk_log.infof( "framegen: history valid=false reason=%s", reason ? reason : "unknown" );
-	}
 
 	g_framegenHistory.valid = false;
-	g_framegenHistory.pendingGenerated = nullptr;
+	g_framegenHistory.pending.clear();
+	// Release the retained output-ring slots so a ring rebuild is never blocked
+	// by history holding a reference to an old image, and so the next real frame
+	// re-primes cleanly.
+	g_framegenHistory.previousReal = nullptr;
+	g_framegenHistory.currentReal = nullptr;
 }
 
 void vulkan_framegen_reset( const char *reason )
 {
 	if ( g_bFramegenDebug )
-	{
 		vk_log.infof( "framegen: reset history reason=%s", reason ? reason : "unknown" );
-	}
 
 	g_framegenHistory = {};
-	for ( auto &pImage : g_output.framegenOutputImages )
-		pImage = nullptr;
+	g_output.framegenOutputImages.clear();
+	g_framegenMotion = {};
 }
 
 bool vulkan_framegen_has_pending_generated_frame()
 {
-	return vulkan_framegen_is_enabled() && g_framegenHistory.pendingGenerated != nullptr;
+	return vulkan_framegen_is_enabled() && !g_framegenHistory.pending.empty();
 }
 
 gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame()
@@ -4301,62 +4582,50 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame()
 	if ( !vulkan_framegen_has_pending_generated_frame() )
 		return nullptr;
 
-	// Generation was submitted in its own command buffer so the real frame's
-	// present never waited on it. It normally completes long before the vblank
-	// it fills; if the GPU is running behind, presenting now would stall
-	// scanout on compute work, so skip the frame instead — the display simply
-	// repeats the last real frame. Never stall the present path for a
-	// generated frame.
-	if ( !g_device.hasCompleted( g_framegenHistory.generatedSeqNo ) )
+	FramegenHistory_t::PendingGenerated_t front = g_framegenHistory.pending.front();
+
+	// Generation was submitted in its own command buffer (and, when a dedicated
+	// framegen queue exists, on its own queue) so the real frame's present never
+	// waited on it. It normally completes well before the vblank it fills; if the
+	// GPU is behind, presenting now would stall scanout on compute work, so drop
+	// this frame instead — the display simply repeats the last scanned-out frame.
+	// Never stall the present path for a generated frame.
+	if ( !g_device.hasCompletedFramegen( front.seqNo ) )
 	{
-		vulkan_framegen_discard_generated_frame( "generation_too_slow" );
+		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
+		if ( g_bFramegenDebug )
+			vk_log.infof( "framegen: discarded generated frame id=%" PRIu64 ".%02u reason=generation_too_slow",
+				front.frameId, (unsigned)( front.phase * 100.0f ) );
 		return nullptr;
 	}
 
-	gamescope::Rc<CVulkanTexture> pGenerated = g_framegenHistory.pendingGenerated;
-	g_framegenHistory.pendingGenerated = nullptr;
+	g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
 
-	// Instant (completion was checked above), but it routes through the
-	// device's wait bookkeeping: waiting on the latest submission is what
-	// resets the constant-upload bump allocator while framegen submissions
-	// trail every composite.
-	vulkan_wait( g_framegenHistory.generatedSeqNo, false );
+	// Instant (completion checked above). On the shared-queue fallback this also
+	// lets the device recycle the upload arena at a known-idle point; on the
+	// dedicated queue framegen uses push constants and its own timeline, so this
+	// is a cheap already-signalled wait.
+	g_device.waitFramegen( front.seqNo );
 
 	if ( g_bFramegenDebug )
-	{
-		vk_log.infof( "framegen: presented generated frame id=%" PRIu64 ".5", g_framegenHistory.generatedFrameId );
-	}
+		vk_log.infof( "framegen: presented generated frame id=%" PRIu64 ".%02u", front.frameId, (unsigned)( front.phase * 100.0f ) );
 
-	return pGenerated;
+	return front.tex;
 }
 
 void vulkan_framegen_discard_generated_frame( const char *reason )
 {
-	if ( g_framegenHistory.pendingGenerated == nullptr )
+	if ( g_framegenHistory.pending.empty() )
 		return;
 
 	if ( g_bFramegenDebug )
-	{
-		vk_log.infof( "framegen: discarded generated frame id=%" PRIu64 ".5 reason=%s",
-			g_framegenHistory.generatedFrameId, reason ? reason : "unknown" );
-	}
+		vk_log.infof( "framegen: discarded %zu generated frame(s) reason=%s",
+			g_framegenHistory.pending.size(), reason ? reason : "unknown" );
 
-	g_framegenHistory.pendingGenerated = nullptr;
-}
-
-static bool framegen_create_texture( gamescope::Rc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
-{
-	CVulkanTexture::createFlags createFlags;
-	createFlags.bSampled = true;
-	createFlags.bTransferSrc = true;
-	createFlags.bTransferDst = true;
-
-	gamescope::OwningRc<CVulkanTexture> pTexture = new CVulkanTexture();
-	if ( !pTexture->BInit( width, height, 1u, drmFormat, createFlags ) )
-		return false;
-
-	*ppTexture = pTexture;
-	return true;
+	// A real frame supersedes the whole batch: every queued generated frame
+	// belongs to the previous inter-real interval and would inject a vblank of
+	// latency if shown after the real frame. Drop them all.
+	g_framegenHistory.pending.clear();
 }
 
 static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
@@ -4380,23 +4649,13 @@ static bool framegen_ensure_resources( uint32_t width, uint32_t height, uint32_t
 		g_framegenHistory.drmFormat = drmFormat;
 	}
 
-	if ( !framegen_texture_matches( g_framegenHistory.previousReal, width, height, drmFormat ) )
-	{
-		if ( !framegen_create_texture( &g_framegenHistory.previousReal, width, height, drmFormat ) )
-		{
-			vulkan_framegen_reset( "previous_real_allocation_failed" );
-			return false;
-		}
-	}
-
-	if ( !framegen_texture_matches( g_framegenHistory.currentReal, width, height, drmFormat ) )
-	{
-		if ( !framegen_create_texture( &g_framegenHistory.currentReal, width, height, drmFormat ) )
-		{
-			vulkan_framegen_reset( "current_real_allocation_failed" );
-			return false;
-		}
-	}
+	// Generated-frame scanout pool: 2*multiplier distinct images so the
+	// (multiplier-1) frames in flight plus any still being scanned out never
+	// alias. History (previousReal/currentReal) is NOT allocated here — it is
+	// retained by reference from the output ring in framegen_record_real_frame.
+	const size_t nPool = (size_t)2 * (size_t)g_nFramegenMultiplier;
+	if ( g_output.framegenOutputImages.size() != nPool )
+		g_output.framegenOutputImages.resize( nPool );
 
 	for ( auto &pImage : g_output.framegenOutputImages )
 	{
@@ -4413,14 +4672,164 @@ static bool framegen_ensure_resources( uint32_t width, uint32_t height, uint32_t
 	return true;
 }
 
-static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo )
+static bool framegen_is_float_drm_format( uint32_t drmFormat )
+{
+	// Float (scRGB) targets carry HDR highlights above 1.0 and wide-gamut
+	// negatives; fp16 arithmetic can band those, so the extrapolate shader stays
+	// fp32 for them (see the fp16 shader's precision note).
+	switch ( drmFormat )
+	{
+		case DRM_FORMAT_ABGR16161616F:
+		case DRM_FORMAT_XBGR16161616F:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static void framegen_bind_extrapolate( CVulkanCmdBuffer *pCmdBuffer, ShaderType shader, const gamescope::Rc<CVulkanTexture> &pTarget, float flStrength )
+{
+	// Blend mode takes no parameters; the extrapolate variants read the effective
+	// per-slot coefficient from push constants (no upload arena, so this is safe
+	// on the dedicated framegen queue).
+	if ( shader != SHADER_TYPE_FRAMEGEN_BLEND )
+		pCmdBuffer->pushConstants<FramegenPushData_t>( flStrength, k_flFramegenSuppressLo, k_flFramegenSuppressHi );
+
+	pCmdBuffer->bindPipeline( g_device.pipeline( shader ) );
+	pCmdBuffer->bindTarget( pTarget );
+	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
+	pCmdBuffer->setTextureSrgb( 0, true );
+	pCmdBuffer->setSamplerUnnormalized( 0, false );
+	pCmdBuffer->setSamplerNearest( 0, false );
+	pCmdBuffer->bindTexture( 1, g_framegenHistory.currentReal );
+	pCmdBuffer->setTextureSrgb( 1, true );
+	pCmdBuffer->setSamplerUnnormalized( 1, false );
+	pCmdBuffer->setSamplerNearest( 1, false );
+
+	const int pixelsPerGroup = 8;
+	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pixelsPerGroup ), div_roundup( pTarget->height(), pixelsPerGroup ) );
+}
+
+static bool framegen_create_intermediate( gamescope::OwningRc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
+{
+	CVulkanTexture::createFlags createFlags;
+	createFlags.bStorage = true;
+	createFlags.bSampled = true;
+
+	*ppTexture = new CVulkanTexture();
+	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
+}
+
+// Pick the extrapolate/blend shader for the current mode and target format.
+static ShaderType framegen_extrapolate_shader()
+{
+	if ( g_eFramegenMode == GamescopeFramegenMode::Blend )
+		return SHADER_TYPE_FRAMEGEN_BLEND;
+	if ( g_device.supportsFp16() && !framegen_is_float_drm_format( g_framegenHistory.drmFormat ) )
+		return SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16;
+	return SHADER_TYPE_FRAMEGEN_EXTRAPOLATE;
+}
+
+// Motion-compensated generation, part 1 (once per batch): build low-res luma for
+// both real frames and block-match them into a motion field. This depends only
+// on the two real frames — constant across every generated slot in the interval
+// — so it is computed a single time and the field reused by each warp. Recorded
+// into the batch command buffer; the dispatch path inserts the read-after-write
+// barriers between passes. Returns false (fall back to extrapolation for the
+// whole batch) if the intermediates can't be allocated.
+static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t width, uint32_t height )
+{
+	const uint32_t lowW = std::max( 1u, div_roundup( width, k_uFramegenMotionDownscale ) );
+	const uint32_t lowH = std::max( 1u, div_roundup( height, k_uFramegenMotionDownscale ) );
+	const uint32_t uMotionFormat = DRM_FORMAT_ABGR16161616F;
+
+	if ( g_framegenMotion.width != lowW || g_framegenMotion.height != lowH
+		|| g_framegenMotion.lumaPrev == nullptr || g_framegenMotion.lumaCur == nullptr || g_framegenMotion.mvField == nullptr )
+	{
+		if ( !framegen_create_intermediate( &g_framegenMotion.lumaPrev, lowW, lowH, uMotionFormat )
+			|| !framegen_create_intermediate( &g_framegenMotion.lumaCur, lowW, lowH, uMotionFormat )
+			|| !framegen_create_intermediate( &g_framegenMotion.mvField, lowW, lowH, uMotionFormat ) )
+		{
+			if ( g_bFramegenDebug )
+				vk_log.infof( "framegen: motion intermediate allocation failed, falling back to extrapolation" );
+			g_framegenMotion = {};
+			return false;
+		}
+		g_framegenMotion.width = lowW;
+		g_framegenMotion.height = lowH;
+	}
+
+	const uint32_t pg = 8;
+
+	// Pass 1: downscale both real frames to low-res luma.
+	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_LUMA ) );
+	pCmdBuffer->bindTarget( g_framegenMotion.lumaPrev );
+	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
+	pCmdBuffer->setTextureSrgb( 0, true );
+	pCmdBuffer->setSamplerUnnormalized( 0, false );
+	pCmdBuffer->setSamplerNearest( 0, false );
+	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
+
+	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_LUMA ) );
+	pCmdBuffer->bindTarget( g_framegenMotion.lumaCur );
+	pCmdBuffer->bindTexture( 0, g_framegenHistory.currentReal );
+	pCmdBuffer->setTextureSrgb( 0, true );
+	pCmdBuffer->setSamplerUnnormalized( 0, false );
+	pCmdBuffer->setSamplerNearest( 0, false );
+	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
+
+	// Pass 2: block match -> motion field (.rg = mv, .b = confidence).
+	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH ) );
+	pCmdBuffer->bindTarget( g_framegenMotion.mvField );
+	pCmdBuffer->bindTexture( 0, g_framegenMotion.lumaPrev );
+	pCmdBuffer->setTextureSrgb( 0, false );
+	pCmdBuffer->setSamplerUnnormalized( 0, false );
+	pCmdBuffer->setSamplerNearest( 0, true );
+	pCmdBuffer->bindTexture( 1, g_framegenMotion.lumaCur );
+	pCmdBuffer->setTextureSrgb( 1, false );
+	pCmdBuffer->setSamplerUnnormalized( 1, false );
+	pCmdBuffer->setSamplerNearest( 1, true );
+	pCmdBuffer->pushConstants<FramegenMotionMatchPush_t>( 4 );
+	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
+
+	return true;
+}
+
+// Motion-compensated generation, part 2 (per slot): warp the current frame
+// forward along the shared motion field, blending back to extrapolation where
+// the match is unconfident. Each slot writes a distinct target, so warps in the
+// same batch don't hazard against each other.
+static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::Rc<CVulkanTexture> &pTarget, float flStrength )
+{
+	const uint32_t pg = 8;
+
+	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_WARP ) );
+	pCmdBuffer->bindTarget( pTarget );
+	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
+	pCmdBuffer->setTextureSrgb( 0, true );
+	pCmdBuffer->setSamplerUnnormalized( 0, false );
+	pCmdBuffer->setSamplerNearest( 0, false );
+	pCmdBuffer->bindTexture( 1, g_framegenHistory.currentReal );
+	pCmdBuffer->setTextureSrgb( 1, true );
+	pCmdBuffer->setSamplerUnnormalized( 1, false );
+	pCmdBuffer->setSamplerNearest( 1, false );
+	pCmdBuffer->bindTexture( 2, g_framegenMotion.mvField );
+	pCmdBuffer->setTextureSrgb( 2, false );
+	pCmdBuffer->setSamplerUnnormalized( 2, false );
+	pCmdBuffer->setSamplerNearest( 2, false );
+	pCmdBuffer->pushConstants<FramegenMotionWarpPush_t>( flStrength, k_flFramegenSuppressLo, k_flFramegenSuppressHi, (float)k_uFramegenMotionDownscale );
+	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pg ), div_roundup( pTarget->height(), pg ) );
+}
+
+static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo )
 {
 	if ( !vulkan_framegen_is_enabled() || !pRealFrame || !pFrameInfo )
 		return;
 
 	if ( !g_bLoggedFramegenConfig )
 	{
-		vk_log.infof( "framegen: enabled mode=%s multiplier=%d", framegen_mode_name(), g_nFramegenMultiplier );
+		vk_log.infof( "framegen: enabled mode=%s multiplier=%d%s", framegen_mode_name(), g_nFramegenMultiplier,
+			g_device.hasFramegenQueue() ? " (dedicated queue)" : "" );
 		vk_log.infof( "framegen: forcing composite path" );
 		vk_log.infof( "framegen: adaptive sync (VRR) and tearing flips are suppressed while framegen is active" );
 		g_bLoggedFramegenConfig = true;
@@ -4471,10 +4880,12 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	}
 
 	// Generated frames only help when the game leaves empty vblanks to fill.
-	// If real frames arrive faster than ~2/3 of the output refresh rate there
-	// is no gap for a generated frame: it would either be discarded, or worse,
-	// displace real content. Go fully dormant (no history copy, no submission)
-	// so the framegen path costs nothing until the game leaves gaps again.
+	// Require the real-frame gap to exceed ~1.5 vblank intervals (at least one
+	// empty vblank). Below that there is no room for a generated frame; it would
+	// be discarded or, worse, displace real content. Go fully dormant — the
+	// framegen path costs nothing until the game leaves gaps again. The
+	// multiplier is a cap; how many frames we actually insert adapts to the
+	// measured gap below.
 	const uint64_t ulVblankIntervalNs = g_nOutputRefresh > 0 ? 1'000'000'000'000ull / (uint64_t)g_nOutputRefresh : 8'333'333ull;
 	if ( ulPrevRealFrameTimeNs != 0 && now - ulPrevRealFrameTimeNs < ( ulVblankIntervalNs * 3 ) / 2 )
 	{
@@ -4483,24 +4894,42 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		return;
 	}
 
-	if ( g_framegenHistory.valid && now - g_framegenHistory.previousPresentTimeNs > k_ulFramegenMaxRealFrameGapNs )
+	if ( g_framegenHistory.valid && ulPrevRealFrameTimeNs != 0 && now - ulPrevRealFrameTimeNs > k_ulFramegenMaxRealFrameGapNs )
 		vulkan_framegen_invalidate_history( "frame_gap" );
 
-	// If the previous generation still hasn't executed by the time the next
-	// real frame arrives, the compositing GPU has no headroom for framegen.
-	// Submitting more work would make the *next* composite queue behind it on
-	// the same queue — the one way this design could delay a real frame — so
-	// skip everything and re-enter through the stabilization window.
-	if ( !g_device.hasCompleted( g_framegenHistory.generatedSeqNo ) )
+	// If the previous generation batch still hasn't executed by the time the
+	// next real frame arrives, the compositing GPU has no headroom. Without a
+	// dedicated framegen queue, piling on more work would make the next composite
+	// queue behind it — the one way this design could delay a real frame — so
+	// skip everything and re-enter through the stabilization window. (With a
+	// dedicated queue the composite is protected regardless, but generating work
+	// the GPU can't consume is still wasteful.)
+	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
 	{
 		g_framegenHistory.nStableFrames = 0;
 		vulkan_framegen_invalidate_history( "gpu_oversubscribed" );
 		return;
 	}
 
+	// Zero-copy history shift: the previous "current" becomes "previous", and the
+	// just-composited output image becomes "current". We only hold references
+	// into the output ring — the composite already wrote these images.
+	g_framegenHistory.previousReal = g_framegenHistory.currentReal;
+	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId - 1;
+	g_framegenHistory.currentReal = pRealFrame;
+
+	// Prime: the first frame after a reset/invalidation only establishes history.
+	if ( !g_framegenHistory.valid )
+	{
+		if ( g_bFramegenDebug )
+			vk_log.infof( "framegen: priming history with real frame id=%" PRIu64, g_framegenHistory.currentFrameId );
+		g_framegenHistory.valid = true;
+		return;
+	}
+
 	// Hysteresis: dropping out (above) is instant, resuming takes a run of
-	// consecutive slow frames. Until the pace has proven stable, stay fully
-	// dormant — no history copy, no submission.
+	// consecutive slow frames. Until the pace has proven stable, keep shifting
+	// history but generate nothing.
 	if ( g_framegenHistory.nStableFrames < k_uFramegenStableFramesRequired )
 	{
 		g_framegenHistory.nStableFrames++;
@@ -4509,77 +4938,109 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		return;
 	}
 
-	// All framegen GPU work lives in its own command buffer, submitted after
-	// the composite. The real frame's present waits only on the composite
-	// command buffer, so history upkeep and frame generation add no latency
-	// to the frames the game actually rendered.
+	if ( g_framegenHistory.previousReal == nullptr || g_framegenHistory.currentReal == nullptr )
+		return;
+
+	// Fill as many empty vblanks as the measured gap actually offers, capped by
+	// the multiplier: round the gap to whole vblanks and generate one fewer than
+	// that (the final slot is the next real frame).
+	const uint32_t nGapVblanks = (uint32_t)( ( now - ulPrevRealFrameTimeNs + ulVblankIntervalNs / 2 ) / ulVblankIntervalNs );
+	uint32_t nGenerate = nGapVblanks > 1 ? std::min( nGapVblanks - 1, framegen_slot_count() ) : 0;
+
+	// Without a dedicated framegen queue the batch is submitted to the same
+	// in-order queue as the next composite, so it sits in front of it. Cap the
+	// single-queue path to one generated frame to bound that head-of-line work —
+	// the proven x2-prototype behaviour — rather than amplifying it under x3/x4.
+	if ( !g_device.hasFramegenQueue() )
+		nGenerate = std::min( nGenerate, 1u );
+
+	if ( nGenerate == 0 )
+		return;
+
+	// Any leftover pending frames belong to a superseded interval; drop them
+	// before queuing this interval's batch (normally already done by the
+	// supersede path in the present decision).
+	g_framegenHistory.pending.clear();
+
+	// Reserve this interval's output slots up front so an empty batch never
+	// records/submits a command buffer.
+	struct SlotPlan_t { gamescope::Rc<CVulkanTexture> tex; float phase; float strength; };
+	std::vector<SlotPlan_t> slots;
+	slots.reserve( nGenerate );
+	for ( uint32_t k = 1; k <= nGenerate; k++ )
+	{
+		const uint32_t idx = g_framegenHistory.nNextOutputIndex % g_output.framegenOutputImages.size();
+		g_framegenHistory.nNextOutputIndex++;
+		gamescope::Rc<CVulkanTexture> pGenerated = g_output.framegenOutputImages[ idx ];
+		if ( !pGenerated )
+			continue;
+
+		const float phase = (float)k / (float)nGapVblanks;
+		// Effective forward coefficient: temporal placement scaled by the user
+		// strength (0.5 is neutral, reproducing the classic x2 half-way step).
+		const float flStrength = std::clamp( phase * ( g_flFramegenStrength / 0.5f ), 0.0f, 1.0f );
+		slots.push_back( { std::move( pGenerated ), phase, flStrength } );
+	}
+
+	if ( slots.empty() )
+		return;
+
+	// Record the whole interval's generation into ONE command buffer submitted
+	// once: the shared motion intermediates are serialized by the per-command-
+	// buffer barrier tracking, all slots share a single framegen seqNo, and the
+	// batch draws from the isolated framegen descriptor ring (see markFramegen).
 	std::unique_ptr<CVulkanCmdBuffer> pCmdBuffer = g_device.commandBuffer();
+	pCmdBuffer->markFramegen();
 
-	pCmdBuffer->copyImage( pRealFrame, g_framegenHistory.currentReal );
+	// Motion estimation depends only on the two real frames, so it is computed
+	// once for the batch; falls back to extrapolation for every slot if the
+	// intermediates can't be allocated.
+	const bool bMotion = g_eFramegenMode == GamescopeFramegenMode::Motion
+		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(), g_framegenHistory.currentReal->height() );
+	const ShaderType extrapolateShader = framegen_extrapolate_shader();
 
-	if ( !g_framegenHistory.valid )
+	for ( const SlotPlan_t &slot : slots )
 	{
-		if ( g_bFramegenDebug )
-			vk_log.infof( "framegen: priming history with real frame id=%" PRIu64, g_framegenHistory.currentFrameId );
-
-		std::swap( g_framegenHistory.previousReal, g_framegenHistory.currentReal );
-		g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId;
-		g_framegenHistory.previousPresentTimeNs = now;
-		g_framegenHistory.valid = true;
-		g_device.submit( std::move( pCmdBuffer ) );
-		return;
+		if ( bMotion )
+			framegen_warp_slot( pCmdBuffer.get(), slot.tex, slot.strength );
+		else
+			framegen_bind_extrapolate( pCmdBuffer.get(), extrapolateShader, slot.tex, slot.strength );
 	}
 
-	uint32_t uGeneratedIndex = g_output.nOutImage % g_output.framegenOutputImages.size();
-	gamescope::Rc<CVulkanTexture> pGenerated = g_output.framegenOutputImages[ uGeneratedIndex ];
-	if ( !pGenerated )
+	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo );
+
+	for ( const SlotPlan_t &slot : slots )
 	{
-		g_device.submit( std::move( pCmdBuffer ) );
-		return;
+		FramegenHistory_t::PendingGenerated_t entry;
+		entry.tex = slot.tex;
+		entry.seqNo = ulSeqNo;
+		entry.frameId = g_framegenHistory.currentFrameId;
+		entry.phase = slot.phase;
+		g_framegenHistory.pending.push_back( std::move( entry ) );
 	}
 
-	ShaderType eFramegenShader = ( g_eFramegenMode == GamescopeFramegenMode::Blend )
-		? SHADER_TYPE_FRAMEGEN_BLEND
-		: SHADER_TYPE_FRAMEGEN_EXTRAPOLATE;
+	g_framegenHistory.lastGeneratedSeqNo = ulSeqNo;
 
-	if ( eFramegenShader == SHADER_TYPE_FRAMEGEN_EXTRAPOLATE )
-		pCmdBuffer->uploadConstants<FramegenPushData_t>( g_flFramegenStrength, k_flFramegenSuppressLo, k_flFramegenSuppressHi );
+	// Pin this batch's input slots until it finishes reading them, so a later
+	// composite can't reuse a slot the framegen queue is still sampling even
+	// after history is invalidated. The oversubscription guard admits only one
+	// batch at a time, so these always match the current (previousReal,
+	// currentReal) while incomplete — at most two slots are ever pinned.
+	g_framegenHistory.genReadA = g_framegenHistory.previousReal;
+	g_framegenHistory.genReadB = g_framegenHistory.currentReal;
+	g_framegenHistory.genReadSeqNo = ulSeqNo;
 
-	pCmdBuffer->bindPipeline( g_device.pipeline( eFramegenShader ) );
-	pCmdBuffer->bindTarget( pGenerated );
-	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
-	pCmdBuffer->setTextureSrgb( 0, true );
-	pCmdBuffer->setSamplerUnnormalized( 0, false );
-	pCmdBuffer->setSamplerNearest( 0, false );
-	pCmdBuffer->bindTexture( 1, g_framegenHistory.currentReal );
-	pCmdBuffer->setTextureSrgb( 1, true );
-	pCmdBuffer->setSamplerUnnormalized( 1, false );
-	pCmdBuffer->setSamplerNearest( 1, false );
-
-	const int pixelsPerGroup = 8;
-	pCmdBuffer->dispatch( div_roundup( pGenerated->width(), pixelsPerGroup ), div_roundup( pGenerated->height(), pixelsPerGroup ) );
-
-	if ( g_framegenHistory.pendingGenerated && g_bFramegenDebug )
-		vk_log.infof( "framegen: replacing unpresented generated frame" );
-
-	g_framegenHistory.generatedSeqNo = g_device.submit( std::move( pCmdBuffer ) );
-	g_framegenHistory.generatedFrameId = g_framegenHistory.currentFrameId;
-	g_framegenHistory.pendingGenerated = pGenerated;
+	const uint32_t nGeneratedCount = (uint32_t)slots.size();
 
 	if ( g_bFramegenDebug )
 	{
-		vk_log.infof( "framegen: generated frame id=%" PRIu64 ".5 previous=%" PRIu64 " current=%" PRIu64 " output=%ux%u queue family %u",
-			g_framegenHistory.generatedFrameId,
-			g_framegenHistory.previousFrameId,
+		vk_log.infof( "framegen: generated %u frame(s) for real id=%" PRIu64 " gapVblanks=%u mode=%s queue family %u",
+			nGeneratedCount,
 			g_framegenHistory.currentFrameId,
-			pGenerated->width(),
-			pGenerated->height(),
+			nGapVblanks,
+			framegen_mode_name(),
 			g_device.queueFamily() );
 	}
-
-	std::swap( g_framegenHistory.previousReal, g_framegenHistory.currentReal );
-	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId;
-	g_framegenHistory.previousPresentTimeNs = now;
 
 	force_repaint();
 }
@@ -4873,11 +5334,43 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// composites (streaming captures run their own vulkan_screenshot pass),
 	// which use screenshot color management and must not enter history.
 	if ( !GetBackend()->UsesVulkanSwapchain() && !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
-		framegen_record_real_frame( compositeImage, frameInfo );
+		framegen_record_real_frame( compositeImage, frameInfo, sequence );
 
 	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
 	{
-		g_output.nOutImage = ( g_output.nOutImage + 1 ) % 3;
+		// Remember the slot we just composited into before advancing off it; the
+		// skip below means it is not always nOutImage-1.
+		g_output.nLastOutImage = g_output.nOutImage;
+
+		const uint32_t nRing = g_output.outputImages.size();
+		uint32_t nNext = ( g_output.nOutImage + 1 ) % nRing;
+
+		// While framegen holds output-ring slots as zero-copy history, never
+		// advance onto them: an overlay-only repaint (which still composites and
+		// increments) would otherwise recomposite a slot still referenced as
+		// previousReal/currentReal — overwriting history, or on the dedicated
+		// framegen queue write-after-read racing a generation still reading it.
+		// A slot an in-flight batch is still sampling (genReadA/genReadB) is
+		// pinned the same way until that batch signals genReadSeqNo, covering the
+		// window where history has been invalidated but the read is still running.
+		// At most two slots are pinned in a >=5 ring, so a free slot always
+		// exists; the bound guards against spinning if that ever changed. When
+		// framegen is off every pointer is null and this is the old advance.
+		const CVulkanTexture *pCur = g_framegenHistory.currentReal.get();
+		const CVulkanTexture *pPrev = g_framegenHistory.previousReal.get();
+		const bool bGenReadInFlight = g_framegenHistory.genReadSeqNo != 0
+			&& !g_device.hasCompletedFramegen( g_framegenHistory.genReadSeqNo );
+		const CVulkanTexture *pReadA = bGenReadInFlight ? g_framegenHistory.genReadA.get() : nullptr;
+		const CVulkanTexture *pReadB = bGenReadInFlight ? g_framegenHistory.genReadB.get() : nullptr;
+		for ( uint32_t i = 0; ( pCur || pPrev || pReadA || pReadB ) && i < nRing; i++ )
+		{
+			const CVulkanTexture *pSlot = g_output.outputImages[ nNext ].get();
+			if ( pSlot != pCur && pSlot != pPrev && pSlot != pReadA && pSlot != pReadB )
+				break;
+			nNext = ( nNext + 1 ) % nRing;
+		}
+
+		g_output.nOutImage = nNext;
 	}
 
 	return sequence;
@@ -4900,19 +5393,25 @@ bool vulkan_has_drm_props()
 
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer )
 {
-	// Get previous image ( +2 )
-	// 1 2 3
-	//   |
-	// |
-	uint32_t nRegularImage = ( g_output.nOutImage + 2 ) % 3;
+	const uint32_t nRing = g_output.outputImages.size();
 
-	// Get previous previous image ( +1 )
-	// 1 2 3
-	//   |
-	//     |
-	uint32_t nDeferredImage = ( g_output.nOutImage + 1 ) % 3;
+	// The just-composited image (one step back from the next write slot).
+	// For the classic 3-image ring this is (nOutImage + 2) % 3.
+	uint32_t nRegularImage = ( g_output.nOutImage + nRing - 1 ) % nRing;
+
+	// The image before that (two steps back), used for deferred/partial reads.
+	// For the classic 3-image ring this is (nOutImage + 1) % 3.
+	uint32_t nDeferredImage = ( g_output.nOutImage + nRing - 2 ) % nRing;
 
 	uint32_t nOutImage = defer ? nDeferredImage : nRegularImage;
+
+	// Under framegen the ring advance skips slots pinned as history, so the last
+	// composited slot is not reliably nOutImage-1; use the explicitly tracked
+	// index for the non-deferred base-layer read. Partial overlays (the only
+	// deferred consumer) are disabled while framegen is active, so that path is
+	// untouched.
+	if ( !defer && vulkan_framegen_is_enabled() )
+		nOutImage = g_output.nLastOutImage;
 
 	if ( partial )
 	{

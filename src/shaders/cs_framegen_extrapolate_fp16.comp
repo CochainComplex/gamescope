@@ -1,0 +1,74 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set.h"
+
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform framegen_params_t {
+    // See cs_framegen_extrapolate.comp for the full description. Uploaded as
+    // fp32; the arithmetic below runs in fp16 (packed math on RDNA: double ALU
+    // rate, half the register pressure). The generated frame is a transient
+    // in-between, so fp16 precision is ample for both PQ (10-bit stored) and
+    // scRGB (16F stored) targets; scRGB HDR magnitudes stay well within fp16 range.
+    float u_strength;
+    float u_suppressLo;
+    float u_suppressHi;
+    float u_pad;
+};
+
+// LDS apron tile kept in fp32 storage (16-bit workgroup storage needs a separate
+// capability we don't require); only the math is fp16. See the fp32 variant for
+// the tiling rationale.
+const int TILE = 8;
+const int APRON = 1;
+const int TILE_W = TILE + 2 * APRON; // 10
+shared vec4 s_cur[TILE_W * TILE_W];
+
+vec4 loadCurClamped(ivec2 p, ivec2 sz) {
+    p = clamp(p, ivec2(0), sz - ivec2(1));
+    return texelFetch(s_samplers[1], p, 0);
+}
+
+void main() {
+    ivec2 sz = imageSize(dst);
+    ivec2 tileBase = ivec2(gl_WorkGroupID.xy) * TILE - ivec2(APRON);
+
+    for (uint i = gl_LocalInvocationIndex; i < uint(TILE_W * TILE_W); i += uint(TILE * TILE)) {
+        ivec2 t = ivec2(int(i) % TILE_W, int(i) / TILE_W);
+        s_cur[i] = loadCurClamped(tileBase + t, sz);
+    }
+    barrier();
+
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= sz.x || coord.y >= sz.y)
+        return;
+
+    ivec2 lc = ivec2(gl_LocalInvocationID.xy) + ivec2(APRON);
+    vec4 curSample = s_cur[lc.y * TILE_W + lc.x];
+    f16vec3 currentFrame = f16vec3(curSample.rgb);
+    f16vec3 previousFrame = f16vec3(texelFetch(s_samplers[0], coord, 0).rgb);
+
+    f16vec3 delta = currentFrame - previousFrame;
+    float16_t motion = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
+    float16_t strength = float16_t(u_strength) * (float16_t(1.0) - smoothstep(float16_t(u_suppressLo), float16_t(u_suppressHi), motion));
+
+    f16vec3 predicted = currentFrame + delta * strength;
+
+    f16vec3 n0 = f16vec3(s_cur[lc.y * TILE_W + (lc.x + 1)].rgb);
+    f16vec3 n1 = f16vec3(s_cur[lc.y * TILE_W + (lc.x - 1)].rgb);
+    f16vec3 n2 = f16vec3(s_cur[(lc.y + 1) * TILE_W + lc.x].rgb);
+    f16vec3 n3 = f16vec3(s_cur[(lc.y - 1) * TILE_W + lc.x].rgb);
+    f16vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
+    f16vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
+    predicted = clamp(predicted, neighborMin, neighborMax);
+
+    imageStore(dst, coord, vec4(vec3(predicted), curSample.a));
+}

@@ -1,0 +1,41 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set_constants.h"
+
+// Downscale a real frame to a low-resolution luma image for block matching.
+// This writes an RGBA16F target (luma in .r), so it declares binding 1 with its
+// own rgba16f qualifier instead of the shared rgba8 dst in descriptor_set.h.
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(binding = 1, rgba16f) writeonly uniform image2D dst;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.2126f, 0.7152f, 0.0722f));
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(dst);
+    if (coord.x >= dstSize.x || coord.y >= dstSize.y)
+        return;
+
+    // Each low-res texel covers a downscale x downscale source region. Average
+    // four bilinear taps spread across that footprint to approximate a box
+    // downsample cheaply (each tap already averages a source 2x2).
+    vec2 uv = (vec2(coord) + vec2(0.5f)) / vec2(dstSize);
+    vec2 off = vec2(0.25f) / vec2(dstSize);
+    vec3 c = texture(s_samplers[0], uv + vec2(-off.x, -off.y)).rgb
+           + texture(s_samplers[0], uv + vec2( off.x, -off.y)).rgb
+           + texture(s_samplers[0], uv + vec2(-off.x,  off.y)).rgb
+           + texture(s_samplers[0], uv + vec2( off.x,  off.y)).rgb;
+    c *= 0.25f;
+
+    imageStore(dst, coord, vec4(luma(c), 0.0f, 0.0f, 0.0f));
+}

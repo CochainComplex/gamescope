@@ -1,0 +1,75 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set.h"
+
+// Motion-compensated warp. Reprojects the current frame forward along the
+// estimated motion field, blends toward the plain forward-extrapolation result
+// wherever the match is unconfident (so it can never be much worse than the
+// extrapolate mode), and applies the same TAA-style neighborhood rectification.
+// Writes the output image, so it reuses descriptor_set.h's rgba8 dst.
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform motion_warp_t {
+    // Effective forward coefficient for this slot (phase * user strength scale).
+    float u_strength;
+    float u_suppressLo;
+    float u_suppressHi;
+    // Full-res / low-res ratio, to turn low-res-texel motion into a UV shift.
+    float u_lowResScale;
+};
+
+// s_samplers[0] = previousReal, [1] = currentReal, [2] = motion field
+// (.rg = mv in low-res texels, .b = confidence), sampled bilinearly.
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outSize = imageSize(dst);
+    if (coord.x >= outSize.x || coord.y >= outSize.y)
+        return;
+
+    vec2 uv = (vec2(coord) + vec2(0.5f)) / vec2(outSize);
+
+    vec3 previousFrame = texture(s_samplers[0], uv).rgb;
+    vec4 currentSample = texture(s_samplers[1], uv);
+    vec3 currentFrame = currentSample.rgb;
+
+    vec4 mvSample = texture(s_samplers[2], uv);
+    vec2 mvLow = mvSample.rg;                       // prev->cur flow, low-res texels
+    float conf = clamp(mvSample.b, 0.0f, 1.0f);
+
+    // Low-res-texel motion -> full-res UV shift.
+    vec2 mvUv = mvLow * u_lowResScale / vec2(outSize);
+
+    // Motion-compensated prediction: content now at `uv` continues along mv, so
+    // the pixel a fraction u_strength into the future is filled by gathering from
+    // where its content is now (uv - u_strength * mv).
+    vec3 predictedMotion = texture(s_samplers[1], uv - mvUv * u_strength).rgb;
+
+    // Plain forward extrapolation, used as the low-confidence fallback.
+    vec3 delta = currentFrame - previousFrame;
+    float motion = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
+    float strength = u_strength * (1.0f - smoothstep(u_suppressLo, u_suppressHi, motion));
+    vec3 predictedExtra = currentFrame + delta * strength;
+
+    vec3 predicted = mix(predictedExtra, predictedMotion, conf);
+
+    // TAA-style rectification against the current frame's 4-neighbor cross: keeps
+    // edge motion but cannot invent colors, killing warp/ghost overshoot.
+    vec2 texel = vec2(1.0f) / vec2(outSize);
+    vec3 n0 = texture(s_samplers[1], uv + vec2(texel.x, 0.0f)).rgb;
+    vec3 n1 = texture(s_samplers[1], uv - vec2(texel.x, 0.0f)).rgb;
+    vec3 n2 = texture(s_samplers[1], uv + vec2(0.0f, texel.y)).rgb;
+    vec3 n3 = texture(s_samplers[1], uv - vec2(0.0f, texel.y)).rgb;
+    vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
+    vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
+    predicted = clamp(predicted, neighborMin, neighborMax);
+
+    imageStore(dst, coord, vec4(predicted, currentSample.a));
+}

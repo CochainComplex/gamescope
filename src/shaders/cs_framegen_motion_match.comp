@@ -1,0 +1,73 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set_constants.h"
+
+// Low-resolution block matching between the two real frames' luma pyramids.
+// For each low-res texel it searches for the motion vector that best explains
+// the current frame from the previous one, and writes { mv.x, mv.y, confidence }
+// into an RGBA16F field (own rgba16f binding-1 qualifier).
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform motion_match_t {
+    int u_searchRadius; // in low-res texels
+    int u_pad0;
+    int u_pad1;
+    int u_pad2;
+};
+
+layout(binding = 1, rgba16f) writeonly uniform image2D dst;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+// s_samplers[0] = previous-frame luma, s_samplers[1] = current-frame luma.
+
+float lumaPrev(ivec2 p, ivec2 sz) { return texelFetch(s_samplers[0], clamp(p, ivec2(0), sz - 1), 0).r; }
+float lumaCur (ivec2 p, ivec2 sz) { return texelFetch(s_samplers[1], clamp(p, ivec2(0), sz - 1), 0).r; }
+
+void main() {
+    ivec2 sz = imageSize(dst);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= sz.x || p.y >= sz.y)
+        return;
+
+    // SAD of a 3x3 block: current at p versus previous at p - mv. The best mv is
+    // the prev->cur flow (content at cur(p) came from prev(p - mv)).
+    float zeroSad = 0.0f;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            zeroSad += abs(lumaCur(p + ivec2(dx, dy), sz) - lumaPrev(p + ivec2(dx, dy), sz));
+
+    float bestSad = zeroSad;
+    ivec2 bestMv = ivec2(0);
+
+    int R = u_searchRadius;
+    for (int my = -R; my <= R; my++) {
+        for (int mx = -R; mx <= R; mx++) {
+            if (mx == 0 && my == 0)
+                continue;
+            float sad = 0.0f;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++)
+                    sad += abs(lumaCur(p + ivec2(dx, dy), sz) - lumaPrev(p + ivec2(dx, dy) - ivec2(mx, my), sz));
+            // Regularize toward small motion to suppress spurious far matches.
+            sad += 0.02f * float(abs(mx) + abs(my));
+            if (sad < bestSad) {
+                bestSad = sad;
+                bestMv = ivec2(mx, my);
+            }
+        }
+    }
+
+    // Confidence: high when the residual is small (per-sample, block of 9) and
+    // when the winning match beats the zero-motion baseline meaningfully.
+    float residual = bestSad / 9.0f;
+    float conf = clamp(1.0f - residual * 6.0f, 0.0f, 1.0f);
+    conf *= clamp((zeroSad - bestSad) * 4.0f, 0.0f, 1.0f);
+
+    imageStore(dst, p, vec4(float(bestMv.x), float(bestMv.y), conf, 0.0f));
+}

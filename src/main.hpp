@@ -83,6 +83,11 @@ enum class GamescopeFramegenMode : uint32_t
     // 50/50 average of the previous two real frames. Softer, but the generated
     // frame lands temporally between older frames, which can read as judder.
     Blend,
+    // Motion-compensated: estimate per-block motion between the last two real
+    // frames (luma pyramid + block matching) and reproject along it, falling
+    // back to extrapolation where matching is unconfident. Higher quality on
+    // panning/scrolling motion at a higher compute cost.
+    Motion,
 };
 
 extern bool g_bExperimentalFramegen;
