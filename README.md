@@ -65,24 +65,45 @@ it on the next vblank, doubling the perceived frame rate.
 This is a prototype. Keep the following in mind:
 
 * **It only helps when the game runs at or below half your display's refresh
-  rate.** Frame generation fills vblanks the game left empty. Real frames always
-  take priority: a generated frame is dropped, never presented, if a new real
-  frame is ready for the same vblank, and generation is skipped automatically
-  while the game outpaces ~⅔ of the refresh rate. Still, cap the game with `-r`
-  to half the refresh rate (e.g. `-r 72` on a 144 Hz display) so the cadence is
-  stable instead of oscillating.
+  rate.** Frame generation fills vblanks the game left empty. Real content
+  always takes priority: a generated frame is dropped, never presented, if a
+  new game frame *or* an overlay/notification update is ready for the same
+  vblank, and generation goes fully dormant while the game outpaces ~⅔ of the
+  refresh rate. Resuming after a fast spell requires a short run of stable
+  slow frames (hysteresis), so a game hovering around the threshold doesn't
+  flap between generating and dormant. Still, cap the game with `-r` to half
+  the refresh rate (e.g. `-r 72` on a 144 Hz display) so the cadence is stable.
 * **It forces the composite path** (implies `--force-composite`), so direct
   scan-out is disabled while it is active. This costs a little latency and power
-  versus a plain direct-scan-out frame.
+  versus a plain direct-scan-out frame. **Adaptive sync (VRR) and tearing flips
+  are suppressed while framegen is active** — framegen fills fixed vblank
+  slots, which is fundamentally at odds with both. If you prefer VRR at your
+  game's native frame rate (lower latency, no artifacts) over doubled motion
+  clarity, run without `--experimental-framegen`.
 * **Timing / latency.** The real frame is always presented immediately — frame
   generation adds no extra latency to the frames the game actually rendered. All
   framegen GPU work (history copy + generation) is submitted in a separate
   command buffer *after* the real frame's composite, so the real frame's page
-  flip never waits on it. The default `extrapolate` mode predicts motion
-  forward, so displayed motion stays monotonic and smooth (real N → generated
-  N+½ → real N+1 → …). The alternative `blend` mode averages the last two real
-  frames; it looks softer but places the generated frame temporally *between*
-  older frames, which can read as judder.
+  flip never waits on it. A generated frame whose GPU work has not finished by
+  its vblank is skipped (the display repeats the last real frame) rather than
+  waited on, and if the compositing GPU can't keep up at all, framegen goes
+  dormant instead of queueing work in front of real frames. The default
+  `extrapolate` mode predicts motion forward, so displayed motion stays
+  monotonic and smooth (real N → generated N+½ → real N+1 → …). The `blend`
+  mode averages the last two real frames and is kept as a debug aid only.
+* **Scene changes.** Prediction history is dropped automatically on focus
+  change, overlay/notification appearance or disappearance, SDR↔HDR/EOTF
+  changes, resolution or format changes, and long frame gaps, so stale content
+  is never smeared across a scene transition. Generation resumes one frame
+  later. Overlay-only repaints (e.g. a MangoHud update) never count as game
+  frames and always win over a pending generated frame. Screenshots and
+  pipewire streaming captures run separate passes and don't interact with
+  frame generation.
+* **HDR** is supported: with an HDR10 (PQ) output the prediction runs on
+  PQ-encoded values (perceptually well-behaved), and with scRGB float output
+  highlights above 1.0 and wide-gamut values survive generation. Generated
+  frames bypass output color management because the history already stores
+  color-managed output.
 * **Ghosting.** Without motion vectors, `extrapolate` can ghost/halo around
   fast-moving edges. Two safeguards bound this: the prediction is faded out
   where the frame-to-frame change is large, and it is clamped to the local
@@ -131,8 +152,8 @@ See `gamescope --help` for a full list of options.
 * `-S stretch`: use stretch scaling, the game will fill the window. (e.g. 4:3 to 16:9)
 * `-b`: create a border-less window.
 * `-f`: create a full-screen window.
-* `--experimental-framegen`: enable experimental x2 compositor-side frame generation. Implies `--force-composite`. See [Experimental frame generation](#experimental-frame-generation).
-* `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency) or `blend`.
+* `--experimental-framegen`: enable experimental x2 compositor-side frame generation. Implies `--force-composite`; disables adaptive sync and tearing while active. See [Experimental frame generation](#experimental-frame-generation).
+* `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency) or `blend` (debug).
 * `--framegen-strength`: forward-extrapolation step for `extrapolate` mode, `0.0`–`1.0` (default `0.5`). Lower values reduce ghosting.
 * `--framegen-multiplier`: generated-frame multiplier. Only `2` is supported for now.
 * `--framegen-debug`: log framegen history, dispatch, and present cadence.

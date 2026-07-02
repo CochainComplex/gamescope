@@ -415,6 +415,7 @@ bool vulkan_framegen_is_enabled();
 bool vulkan_framegen_has_pending_generated_frame();
 gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame();
 void vulkan_framegen_discard_generated_frame( const char *reason );
+void vulkan_framegen_invalidate_history( const char *reason );
 void vulkan_framegen_reset( const char *reason );
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
@@ -787,6 +788,7 @@ public:
 	uint64_t submitInternal( CVulkanCmdBuffer* cmdBuf );
 	void wait(uint64_t sequence, bool reset = true);
 	void waitIdle(bool reset = true);
+	bool hasCompleted(uint64_t sequence);
 	void garbageCollect();
 	inline VkDescriptorSet descriptorSet()
 	{

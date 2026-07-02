@@ -65,5 +65,10 @@ void main() {
     vec3 neighborMax = max(currentFrame.rgb, max(max(n0, n1), max(n2, n3)));
     predicted.rgb = clamp(predicted.rgb, neighborMin, neighborMax);
 
-    imageStore(dst, ivec2(coord), clamp(predicted, vec4(0.0f), vec4(1.0f)));
+    // The neighborhood clamp above is the only range bound we want: for UNORM
+    // targets the inputs are already in [0,1] so the result is too, and for
+    // float scRGB targets values above 1.0 (HDR highlights) and negative
+    // components (wide gamut) are meaningful and must survive. Alpha is not
+    // rectified, so pin it to the current frame instead of extrapolating it.
+    imageStore(dst, ivec2(coord), vec4(predicted.rgb, currentFrame.a));
 }

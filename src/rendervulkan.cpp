@@ -1620,6 +1620,13 @@ void CVulkanDevice::waitIdle(bool reset)
 	wait(m_submissionSeqNo, reset);
 }
 
+bool CVulkanDevice::hasCompleted(uint64_t sequence)
+{
+	uint64_t currentSeqNo = 0;
+	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
+	return currentSeqNo >= sequence;
+}
+
 void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
 {
 	auto last = m_pendingCmdBufs.find(sequence);
@@ -4214,12 +4221,27 @@ struct FramegenHistory_t
 	uint64_t previousPresentTimeNs = 0;
 	uint64_t currentPresentTimeNs = 0;
 	uint64_t generatedSeqNo = 0;
+	// Identity of the base layer's texture at the last recorded frame. Only a
+	// new base-layer commit counts as a real frame; overlay-only repaints
+	// re-composite the same game content and must not disturb pacing.
+	const CVulkanTexture *pLastBaseTexture = nullptr;
+	// Scene fingerprint: prediction across a layer-count or output-encoding
+	// change would smear the previous scene over the new one.
+	int nLastLayerCount = -1;
+	EOTF eLastEOTF = EOTF_Count;
+	// Consecutive real frames slow enough to leave an empty vblank to fill.
+	uint32_t nStableFrames = 0;
 	bool valid = false;
 };
 
 static FramegenHistory_t g_framegenHistory;
 static bool g_bLoggedFramegenConfig = false;
 static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = 250'000'000ull;
+// Hysteresis for the pacing gate: one fast frame drops framegen instantly
+// (real frames are protected first), but resuming requires this many
+// consecutive slow frames. Without it, a game hovering around the threshold
+// flaps between generating and dormant, which reads as periodic microstutter.
+static constexpr uint32_t k_uFramegenStableFramesRequired = 8;
 
 bool vulkan_framegen_is_enabled()
 {
@@ -4243,8 +4265,11 @@ static bool framegen_output_matches( const gamescope::OwningRc<CVulkanTexture> &
 		&& pTexture->drmFormat() == drmFormat;
 }
 
-static void framegen_invalidate_history( const char *reason )
+void vulkan_framegen_invalidate_history( const char *reason )
 {
+	if ( !g_framegenHistory.valid && g_framegenHistory.pendingGenerated == nullptr )
+		return;
+
 	if ( g_bFramegenDebug )
 	{
 		vk_log.infof( "framegen: history valid=false reason=%s", reason ? reason : "unknown" );
@@ -4276,13 +4301,25 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame()
 	if ( !vulkan_framegen_has_pending_generated_frame() )
 		return nullptr;
 
+	// Generation was submitted in its own command buffer so the real frame's
+	// present never waited on it. It normally completes long before the vblank
+	// it fills; if the GPU is running behind, presenting now would stall
+	// scanout on compute work, so skip the frame instead — the display simply
+	// repeats the last real frame. Never stall the present path for a
+	// generated frame.
+	if ( !g_device.hasCompleted( g_framegenHistory.generatedSeqNo ) )
+	{
+		vulkan_framegen_discard_generated_frame( "generation_too_slow" );
+		return nullptr;
+	}
+
 	gamescope::Rc<CVulkanTexture> pGenerated = g_framegenHistory.pendingGenerated;
 	g_framegenHistory.pendingGenerated = nullptr;
 
-	// The generation work was submitted in its own command buffer so the real
-	// frame's present never waited on it. By consume time (the following
-	// vblank) it has long since executed; this wait is a cheap completion
-	// guarantee before scanout reads the image.
+	// Instant (completion was checked above), but it routes through the
+	// device's wait bookkeeping: waiting on the latest submission is what
+	// resets the constant-upload bump allocator while framegen submissions
+	// trail every composite.
 	vulkan_wait( g_framegenHistory.generatedSeqNo, false );
 
 	if ( g_bFramegenDebug )
@@ -4376,20 +4413,46 @@ static bool framegen_ensure_resources( uint32_t width, uint32_t height, uint32_t
 	return true;
 }
 
-static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame )
+static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo )
 {
-	if ( !vulkan_framegen_is_enabled() || !pRealFrame )
+	if ( !vulkan_framegen_is_enabled() || !pRealFrame || !pFrameInfo )
 		return;
 
 	if ( !g_bLoggedFramegenConfig )
 	{
 		vk_log.infof( "framegen: enabled mode=%s multiplier=%d", framegen_mode_name(), g_nFramegenMultiplier );
 		vk_log.infof( "framegen: forcing composite path" );
+		vk_log.infof( "framegen: adaptive sync (VRR) and tearing flips are suppressed while framegen is active" );
 		g_bLoggedFramegenConfig = true;
 	}
 
+	// Only a new base-layer commit counts as a real frame. Overlay-only
+	// repaints (a MangoHud tick, a notification fading) re-composite the same
+	// game content: recording them would poison the pacing measurement and
+	// pay for a duplicate history copy. Pointer identity is sufficient here —
+	// a recycled allocation would at worst skip one record and self-heals.
+	const CVulkanTexture *pBaseTexture = pFrameInfo->layerCount > 0 ? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
+	if ( pBaseTexture && pBaseTexture == g_framegenHistory.pLastBaseTexture )
+	{
+		if ( g_bFramegenDebug )
+			vk_log.infof( "framegen: ignoring overlay-only repaint (base content unchanged)" );
+		return;
+	}
+	g_framegenHistory.pLastBaseTexture = pBaseTexture;
+
 	if ( !framegen_ensure_resources( pRealFrame->width(), pRealFrame->height(), pRealFrame->drmFormat() ) )
 		return;
+
+	// A layer-count change (overlay appearing/vanishing) or an output-encoding
+	// change (SDR<->HDR can flip the EOTF without changing the image format)
+	// abruptly replaces scene content; drop the history rather than smear the
+	// old scene over the new one for a frame.
+	if ( g_framegenHistory.nLastLayerCount != pFrameInfo->layerCount || g_framegenHistory.eLastEOTF != pFrameInfo->outputEncodingEOTF )
+	{
+		vulkan_framegen_invalidate_history( g_framegenHistory.eLastEOTF != pFrameInfo->outputEncodingEOTF ? "output_eotf_change" : "layer_count_change" );
+		g_framegenHistory.nLastLayerCount = pFrameInfo->layerCount;
+		g_framegenHistory.eLastEOTF = pFrameInfo->outputEncodingEOTF;
+	}
 
 	uint64_t now = get_time_in_nanos();
 	const uint64_t ulPrevRealFrameTimeNs = g_framegenHistory.currentPresentTimeNs;
@@ -4411,18 +4474,40 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// If real frames arrive faster than ~2/3 of the output refresh rate there
 	// is no gap for a generated frame: it would either be discarded, or worse,
 	// displace real content. Go fully dormant (no history copy, no submission)
-	// so the framegen path costs nothing until the game leaves gaps again;
-	// resuming just needs one frame to re-prime history.
+	// so the framegen path costs nothing until the game leaves gaps again.
 	const uint64_t ulVblankIntervalNs = g_nOutputRefresh > 0 ? 1'000'000'000'000ull / (uint64_t)g_nOutputRefresh : 8'333'333ull;
 	if ( ulPrevRealFrameTimeNs != 0 && now - ulPrevRealFrameTimeNs < ( ulVblankIntervalNs * 3 ) / 2 )
 	{
-		if ( g_framegenHistory.valid || g_framegenHistory.pendingGenerated )
-			framegen_invalidate_history( "game_faster_than_half_refresh" );
+		g_framegenHistory.nStableFrames = 0;
+		vulkan_framegen_invalidate_history( "game_faster_than_half_refresh" );
 		return;
 	}
 
 	if ( g_framegenHistory.valid && now - g_framegenHistory.previousPresentTimeNs > k_ulFramegenMaxRealFrameGapNs )
-		framegen_invalidate_history( "frame_gap" );
+		vulkan_framegen_invalidate_history( "frame_gap" );
+
+	// If the previous generation still hasn't executed by the time the next
+	// real frame arrives, the compositing GPU has no headroom for framegen.
+	// Submitting more work would make the *next* composite queue behind it on
+	// the same queue — the one way this design could delay a real frame — so
+	// skip everything and re-enter through the stabilization window.
+	if ( !g_device.hasCompleted( g_framegenHistory.generatedSeqNo ) )
+	{
+		g_framegenHistory.nStableFrames = 0;
+		vulkan_framegen_invalidate_history( "gpu_oversubscribed" );
+		return;
+	}
+
+	// Hysteresis: dropping out (above) is instant, resuming takes a run of
+	// consecutive slow frames. Until the pace has proven stable, stay fully
+	// dormant — no history copy, no submission.
+	if ( g_framegenHistory.nStableFrames < k_uFramegenStableFramesRequired )
+	{
+		g_framegenHistory.nStableFrames++;
+		if ( g_bFramegenDebug )
+			vk_log.infof( "framegen: stabilizing %u/%u", g_framegenHistory.nStableFrames, k_uFramegenStableFramesRequired );
+		return;
+	}
 
 	// All framegen GPU work lives in its own command buffer, submitted after
 	// the composite. The real frame's present waits only on the composite
@@ -4435,7 +4520,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	if ( !g_framegenHistory.valid )
 	{
 		if ( g_bFramegenDebug )
-			vk_log.infof( "framegen: history valid=false reason=first_frame" );
+			vk_log.infof( "framegen: priming history with real frame id=%" PRIu64, g_framegenHistory.currentFrameId );
 
 		std::swap( g_framegenHistory.previousReal, g_framegenHistory.currentReal );
 		g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId;
@@ -4784,8 +4869,11 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 	// Submitted separately, after the composite: the real frame's present
 	// waits on `sequence` only and is never delayed by framegen work.
+	// The pPipewireTexture slot is only used by screenshot-style side
+	// composites (streaming captures run their own vulkan_screenshot pass),
+	// which use screenshot color management and must not enter history.
 	if ( !GetBackend()->UsesVulkanSwapchain() && !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
-		framegen_record_real_frame( compositeImage );
+		framegen_record_real_frame( compositeImage, frameInfo );
 
 	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
 	{

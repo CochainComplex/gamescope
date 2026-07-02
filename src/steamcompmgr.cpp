@@ -2563,7 +2563,11 @@ paint_all( global_focus_t *pFocus, bool async )
 	struct FrameInfo_t frameInfo = {};
 	frameInfo.applyOutputColorMgmt = g_ColorMgmt.pending.enabled;
 	frameInfo.outputEncodingEOTF = g_ColorMgmt.pending.outputEncodingEOTF;
-	frameInfo.allowVRR = cv_adaptive_sync;
+	// Framegen fills fixed vblank slots; with adaptive sync the display would
+	// instead track real flips, and the generated-frame flip (allowVRR=false)
+	// would toggle VRR_ENABLED off and back on every alternate present. The
+	// two are mutually exclusive: framegen wins while it is enabled.
+	frameInfo.allowVRR = cv_adaptive_sync && !vulkan_framegen_is_enabled();
 	frameInfo.bFadingOut = fadingOut;
 
 	// If the window we'd paint as the base layer is the streaming client,
@@ -4490,6 +4494,11 @@ determine_and_apply_focus( global_focus_t *pFocus )
 
 		XFlush( root_ctx->dpy );
 	}
+
+	// A focus change abruptly replaces what the composite shows; extrapolating
+	// across it would smear the previous window onto the new one for a frame.
+	if ( previousLocalFocus.focusWindow != pFocus->focusWindow )
+		vulkan_framegen_invalidate_history( "focus_change" );
 
 	// Sort out fading.
 	if (pFocus->focusWindow && previousLocalFocus.focusWindow != pFocus->focusWindow)
@@ -9025,7 +9034,10 @@ steamcompmgr_main(int argc, char **argv)
 			// for composition to finish before submitting.
 			// If we want to do async + composite, we should set up syncfile stuff and have DRM wait on it.
 			const bool bSurfaceWantsAsync = (g_HeldCommits[HELD_COMMIT_BASE] != nullptr && g_HeldCommits[HELD_COMMIT_BASE]->async);
-			const bool bTearing = cv_tearing_enabled && GetBackend()->SupportsTearing() && bSurfaceWantsAsync;
+			// Generated frames must land on vblanks; tearing real frames around
+			// them would misplace both. Framegen and tearing are exclusive.
+			const bool bTearing = cv_tearing_enabled && GetBackend()->SupportsTearing() && bSurfaceWantsAsync
+				&& !vulkan_framegen_is_enabled();
 
 			enum class FlipType
 			{
@@ -9120,14 +9132,26 @@ steamcompmgr_main(int argc, char **argv)
 			{
 				// Real frames always take priority over generated ones: the
 				// backends present a pending generated frame ahead of anything
-				// else, so if a new real frame has been latched, drop the stale
-				// prediction rather than letting it displace real content and
-				// add a vblank of latency. Generated frames only fill vblanks
-				// the game left empty.
-				if ( hasRepaint )
+				// else, so if new real content has been latched — a game frame
+				// or an overlay/notification update — drop the stale prediction
+				// rather than letting it displace that content and add a vblank
+				// of latency. Generated frames only fill vblanks the game left
+				// empty.
+				if ( hasRepaint || hasRepaintNonBasePlane )
 					vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
 				else if ( vblank )
 					bShouldPaint = true;
+			}
+
+			if ( vblank && g_bFramegenDebug && vulkan_framegen_is_enabled() )
+			{
+				// Classify what this vblank slot will show: a real frame, a
+				// generated frame, or (nothing presented) a hardware repeat of
+				// the previous scanout buffer.
+				const char *pszSlotType = !bShouldPaint
+					? "repeat"
+					: ( vulkan_framegen_has_pending_generated_frame() ? "generated" : "real" );
+				xwm_log.infof( "framegen: vblank slot=%s", pszSlotType );
 			}
 
 			if ( bShouldPaint )
