@@ -133,6 +133,22 @@ This is a prototype. Keep the following in mind:
   the forward step entirely (the generated frame becomes a copy of the last real
   frame); `0.5` (default) gives the smoothest motion.
 
+The GPU selector notation used below is `vendor:device`, written as lowercase
+hexadecimal PCI IDs. You can find the IDs with:
+
+```sh
+lspci -nn | grep -Ei 'vga|3d|display'
+vulkaninfo --summary
+```
+
+For example, an `lspci` line ending in `[1002:150e]` is written as
+`1002:150e`, and a line ending in `[10de:2db9]` is written as `10de:2db9`.
+Pass the compositor GPU to gamescope with `--prefer-vk-device vendor:device`.
+For the game process after the `--` separator, use
+`MESA_VK_DEVICE_SELECT='vendor:device!'` to request only that Vulkan device.
+On NVIDIA Optimus systems, the child process may also need
+`__NV_PRIME_RENDER_OFFLOAD=1 __VK_LAYER_NV_optimus=NVIDIA_only`.
+
 ```sh
 # Dual-GPU: composite on the AMD iGPU (1002:150e), render vkcube on the NVIDIA
 # dGPU (10de:2db9), upscale 1440p -> 2160p with FSR, x2 frame generation.
