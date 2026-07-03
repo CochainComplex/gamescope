@@ -4,7 +4,14 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
 
-#include "descriptor_set.h"
+#include "descriptor_set_constants.h"
+
+// fp16 variant of cs_framegen_extrapolate_pair.comp; see that file for the
+// pairing rationale and cs_framegen_extrapolate_fp16.comp for the precision
+// note (uploaded fp32, arithmetic fp16).
+layout(binding = 1, rgba8) writeonly uniform image2D dst0;
+layout(binding = 2, rgba8) writeonly uniform image2D dst1;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 
 layout(
   local_size_x = 8,
@@ -12,20 +19,13 @@ layout(
   local_size_z = 1) in;
 
 layout(push_constant, scalar)
-uniform framegen_params_t {
-    // See cs_framegen_extrapolate.comp for the full description. Uploaded as
-    // fp32; the arithmetic below runs in fp16 when Vulkan reports support.
-    // The generated frame is a transient in-between, so fp16 precision is ample
-    // for non-float targets. Float scRGB targets stay on the fp32 shader.
-    float u_strength;
+uniform framegen_pair_params_t {
+    float u_strength0;
+    float u_strength1;
     float u_suppressLo;
     float u_suppressHi;
-    float u_pad;
 };
 
-// LDS apron tile kept in fp32 storage (16-bit workgroup storage needs a separate
-// capability we don't require); only the math is fp16. See the fp32 variant for
-// the tiling rationale.
 const int TILE = 8;
 const int APRON = 1;
 const int TILE_W = TILE + 2 * APRON; // 10
@@ -37,7 +37,7 @@ vec4 loadCurClamped(ivec2 p, ivec2 sz) {
 }
 
 void main() {
-    ivec2 sz = imageSize(dst);
+    ivec2 sz = imageSize(dst0);
     ivec2 tileBase = ivec2(gl_WorkGroupID.xy) * TILE - ivec2(APRON);
 
     for (uint i = gl_LocalInvocationIndex; i < uint(TILE_W * TILE_W); i += uint(TILE * TILE)) {
@@ -57,9 +57,7 @@ void main() {
 
     f16vec3 delta = currentFrame - previousFrame;
     float16_t motion = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
-    float16_t strength = float16_t(u_strength) * (float16_t(1.0) - smoothstep(float16_t(u_suppressLo), float16_t(u_suppressHi), motion));
-
-    f16vec3 predicted = currentFrame + delta * strength;
+    float16_t suppress = float16_t(1.0) - smoothstep(float16_t(u_suppressLo), float16_t(u_suppressHi), motion);
 
     f16vec3 n0 = f16vec3(s_cur[lc.y * TILE_W + (lc.x + 1)].rgb);
     f16vec3 n1 = f16vec3(s_cur[lc.y * TILE_W + (lc.x - 1)].rgb);
@@ -67,7 +65,10 @@ void main() {
     f16vec3 n3 = f16vec3(s_cur[(lc.y - 1) * TILE_W + lc.x].rgb);
     f16vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
     f16vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
-    predicted = clamp(predicted, neighborMin, neighborMax);
 
-    imageStore(dst, coord, vec4(vec3(predicted), curSample.a));
+    f16vec3 predicted0 = clamp(currentFrame + delta * (float16_t(u_strength0) * suppress), neighborMin, neighborMax);
+    f16vec3 predicted1 = clamp(currentFrame + delta * (float16_t(u_strength1) * suppress), neighborMin, neighborMax);
+
+    imageStore(dst0, coord, vec4(vec3(predicted0), curSample.a));
+    imageStore(dst1, coord, vec4(vec3(predicted1), curSample.a));
 }

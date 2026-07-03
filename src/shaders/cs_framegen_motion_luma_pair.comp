@@ -1,0 +1,32 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "descriptor_set_constants.h"
+
+// Pair downscale for motion mode. Previous and current real frames share the
+// same low-res grid, so one dispatch writes both luma targets and saves a
+// descriptor update, barrier, and dispatch versus two independent passes.
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(binding = 1, r16f) writeonly uniform image2D dstPrev;
+layout(binding = 2, r16f) writeonly uniform image2D dstCur;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    uvec2 coord = uvec2(gl_GlobalInvocationID.xy);
+    ivec2 outSize = imageSize(dstPrev);
+    if (coord.x >= uint(outSize.x) || coord.y >= uint(outSize.y))
+        return;
+
+    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(outSize);
+    imageStore(dstPrev, ivec2(coord), vec4(luma(texture(s_samplers[0], uv).rgb), 0.0, 0.0, 1.0));
+    imageStore(dstCur, ivec2(coord), vec4(luma(texture(s_samplers[1], uv).rgb), 0.0, 0.0, 1.0));
+}

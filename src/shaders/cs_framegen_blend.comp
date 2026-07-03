@@ -9,6 +9,18 @@ layout(
   local_size_y = 8,
   local_size_z = 1) in;
 
+layout(push_constant)
+uniform framegen_params_t {
+    // Temporal placement of this slot within the real-frame interval, used as
+    // the mix weight toward the newer frame: 0.5 reproduces the classic x2
+    // half-way blend, a x3 pair uses ~0.33/0.66 so the slots are distinct
+    // frames instead of identical duplicates.
+    float u_phase;
+    float u_pad0;
+    float u_pad1;
+    float u_pad2;
+};
+
 void main() {
     uvec2 coord = uvec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y);
     uvec2 outSize = imageSize(dst);
@@ -20,5 +32,5 @@ void main() {
     vec4 previousFrame = texture(s_samplers[0], uv);
     vec4 currentFrame = texture(s_samplers[1], uv);
 
-    imageStore(dst, ivec2(coord), mix(previousFrame, currentFrame, 0.5f));
+    imageStore(dst, ivec2(coord), mix(previousFrame, currentFrame, u_phase));
 }

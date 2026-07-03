@@ -8982,8 +8982,20 @@ steamcompmgr_main(int argc, char **argv)
 
 		static int nIgnoredOverlayRepaints = 0;
 
+		// Framegen overlay deferral: how many consecutive vblanks a pure
+		// overlay-only update has been held back so a ready generated frame
+		// could fill the empty slot instead. Bounded by k_nFramegenMaxDeferredOverlay
+		// (a full x4 interval's empty vblanks plus margin) so a steadily updating
+		// overlay is never starved; reset once the overlay actually composites.
+		static constexpr int k_nFramegenMaxDeferredOverlay = 4;
+		static int nFramegenDeferredOverlay = 0;
+		bool bFramegenDeferOverlay = false;
+
 		if ( !hasRepaintNonBasePlane )
+		{
 			nIgnoredOverlayRepaints = 0;
+			nFramegenDeferredOverlay = 0;
+		}
 
 		if ( cv_adaptive_sync_ignore_overlay )
 			nIgnoredOverlayRepaints = 0;
@@ -9137,10 +9149,50 @@ steamcompmgr_main(int argc, char **argv)
 				// rather than letting it displace that content and add a vblank
 				// of latency. Generated frames only fill vblanks the game left
 				// empty.
-				if ( hasRepaint || hasRepaintNonBasePlane )
+				if ( hasRepaint )
+				{
+					// Real BASE/game content always wins the vblank: a new game
+					// frame supersedes the stale predictions, so drop them.
 					vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
+				}
 				else if ( vblank )
-					bShouldPaint = true;
+				{
+					// No new base content. Present the generated frame only if
+					// its GPU work has actually finished — otherwise leave the
+					// vblank as a hardware repeat instead of paying a full
+					// recomposite of unchanged content (the backends present a
+					// pending generated frame ahead of the composite, and a
+					// too-slow one drops to a full composite there).
+					const bool bReady = vulkan_framegen_generated_frame_ready();
+
+					// A pure overlay/notification update (no base change) used to
+					// discard the generated frame and force a full recomposite
+					// every interval — with an FPS overlay updating each frame
+					// that starved framegen to ~zero presented frames. Instead
+					// defer the overlay one vblank so the generated frame fills
+					// the empty slot; the overlay rides the next real composite,
+					// which redraws every layer anyway. Bounded so a steadily
+					// updating overlay can't be starved the other way.
+					const bool bOverlayOnly = hasRepaintNonBasePlane;
+					if ( bReady && ( !bOverlayOnly || nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay ) )
+					{
+						bShouldPaint = true;
+						if ( bOverlayOnly )
+						{
+							bFramegenDeferOverlay = true;
+							nFramegenDeferredOverlay++;
+						}
+					}
+					else
+					{
+						// Not ready, or the overlay deferral budget is spent.
+						// Drop the stale slot; if only an overlay changed, fall
+						// through and composite it now, otherwise repeat.
+						vulkan_framegen_discard_generated_frame( bReady ? "overlay_defer_budget" : "generation_too_slow" );
+						if ( !bOverlayOnly )
+							bShouldPaint = false;
+					}
+				}
 			}
 
 			if ( vblank && g_bFramegenDebug && vulkan_framegen_is_enabled() )
@@ -9176,7 +9228,11 @@ steamcompmgr_main(int argc, char **argv)
 			GetBackend()->OnEndFrame();
 
 			hasRepaint = false;
-			hasRepaintNonBasePlane = false;
+			// When this paint presented a generated frame in place of a pure
+			// overlay update, keep the overlay flag set so the overlay composites
+			// on the next real vblank instead of being dropped here.
+			if ( !bFramegenDeferOverlay )
+				hasRepaintNonBasePlane = false;
 			nIgnoredOverlayRepaints = 0;
 
 			{

@@ -1,0 +1,82 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set_constants.h"
+
+// Two-slot forward extrapolation: the same prediction as
+// cs_framegen_extrapolate.comp, but one dispatch writes TWO generated frames.
+// Every slot of an interval reads the same two real frames, so fusing a pair
+// halves the dominant cost — the two full-resolution history reads — for the
+// x3/x4 multipliers. Declares its own rgba8 targets: binding 1 is the shared
+// dst slot, binding 2 the second storage-image slot (dst_chroma's slot, unused
+// by non-YCbCr targets).
+layout(binding = 1, rgba8) writeonly uniform image2D dst0;
+layout(binding = 2, rgba8) writeonly uniform image2D dst1;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform framegen_pair_params_t {
+    // Effective forward-extrapolation coefficients for the two slots (see
+    // cs_framegen_extrapolate.comp for the derivation of a slot coefficient).
+    float u_strength0;
+    float u_strength1;
+    float u_suppressLo;
+    float u_suppressHi;
+};
+
+// Same LDS apron tiling as cs_framegen_extrapolate.comp.
+const int TILE = 8;
+const int APRON = 1;
+const int TILE_W = TILE + 2 * APRON; // 10
+shared vec4 s_cur[TILE_W * TILE_W];
+
+vec4 loadCurClamped(ivec2 p, ivec2 sz) {
+    p = clamp(p, ivec2(0), sz - ivec2(1));
+    return texelFetch(s_samplers[1], p, 0);
+}
+
+void main() {
+    ivec2 sz = imageSize(dst0);
+    ivec2 tileBase = ivec2(gl_WorkGroupID.xy) * TILE - ivec2(APRON);
+
+    for (uint i = gl_LocalInvocationIndex; i < uint(TILE_W * TILE_W); i += uint(TILE * TILE)) {
+        ivec2 t = ivec2(int(i) % TILE_W, int(i) / TILE_W);
+        s_cur[i] = loadCurClamped(tileBase + t, sz);
+    }
+    barrier();
+
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= sz.x || coord.y >= sz.y)
+        return;
+
+    ivec2 lc = ivec2(gl_LocalInvocationID.xy) + ivec2(APRON);
+    vec4 curSample = s_cur[lc.y * TILE_W + lc.x];
+    vec3 currentFrame = curSample.rgb;
+    vec3 previousFrame = texelFetch(s_samplers[0], coord, 0).rgb;
+
+    vec3 delta = currentFrame - previousFrame;
+    float motion = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
+    float suppress = 1.0f - smoothstep(u_suppressLo, u_suppressHi, motion);
+
+    // The rectification bound depends only on the current frame, so it is
+    // computed once and shared by both slots.
+    vec3 n0 = s_cur[lc.y * TILE_W + (lc.x + 1)].rgb;
+    vec3 n1 = s_cur[lc.y * TILE_W + (lc.x - 1)].rgb;
+    vec3 n2 = s_cur[(lc.y + 1) * TILE_W + lc.x].rgb;
+    vec3 n3 = s_cur[(lc.y - 1) * TILE_W + lc.x].rgb;
+    vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
+    vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
+
+    vec3 predicted0 = clamp(currentFrame + delta * (u_strength0 * suppress), neighborMin, neighborMax);
+    vec3 predicted1 = clamp(currentFrame + delta * (u_strength1 * suppress), neighborMin, neighborMax);
+
+    imageStore(dst0, coord, vec4(predicted0, curSample.a));
+    imageStore(dst1, coord, vec4(predicted1, curSample.a));
+}

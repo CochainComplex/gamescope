@@ -6,14 +6,17 @@
 #include "descriptor_set_constants.h"
 
 // Downscale a real frame to a low-resolution luma image for block matching.
-// This writes an RGBA16F target (luma in .r), so it declares binding 1 with its
-// own rgba16f qualifier instead of the shared rgba8 dst in descriptor_set.h.
+// The target is single-channel R16F — SAD block matching only needs luma, so
+// one channel replaces the old RGBA16F (4x less matcher-staging bandwidth), and
+// R16F has no sRGB view variant so the matcher's texelFetch never applies an
+// unintended decode. Declared here with its own qualifier instead of the shared
+// rgba8 dst in descriptor_set.h.
 layout(
   local_size_x = 8,
   local_size_y = 8,
   local_size_z = 1) in;
 
-layout(binding = 1, rgba16f) writeonly uniform image2D dst;
+layout(binding = 1, r16f) writeonly uniform image2D dst;
 layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 
 float luma(vec3 c) {

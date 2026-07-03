@@ -362,6 +362,13 @@ namespace gamescope
         virtual bool SupportsPlaneHardwareCursor() const = 0;
         virtual bool SupportsTearing() const = 0;
 
+        // Whether this backend actually presents compositor-generated frames.
+        // Only backends that consume generated frames on their present path
+        // (DRM, nested Wayland) should return true; others must not, so frame
+        // generation never runs — and never imposes its forced-composite /
+        // no-VRR tax — where the generated frames would just be discarded.
+        virtual bool SupportsFramegen() const { return false; }
+
         virtual bool UsesVulkanSwapchain() const = 0;
         virtual bool IsSessionBased() const = 0;
 

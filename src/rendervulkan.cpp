@@ -48,7 +48,12 @@
 #include "cs_framegen_blend.h"
 #include "cs_framegen_extrapolate.h"
 #include "cs_framegen_extrapolate_fp16.h"
+#include "cs_framegen_extrapolate_pair.h"
+#include "cs_framegen_extrapolate_pair_fp16.h"
 #include "cs_framegen_motion_luma.h"
+#include "cs_framegen_motion_luma_rgba.h"
+#include "cs_framegen_motion_luma_pair.h"
+#include "cs_framegen_motion_luma_pair_rgba.h"
 #include "cs_framegen_motion_match.h"
 #include "cs_framegen_motion_warp.h"
 #include "cs_gaussian_blur_horizontal.h"
@@ -64,6 +69,11 @@
 
 extern bool g_bWasPartialComposite;
 extern bool g_bAllowDeferredBackend;
+
+static bool framegen_backend_supported()
+{
+	return GetBackend() != nullptr && GetBackend()->SupportsFramegen();
+}
 
 static constexpr mat3x4 g_rgb2yuv_srgb_to_bt601_limited = {{
   { 0.257f, 0.504f, 0.098f, 0.0625f },
@@ -398,6 +408,30 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 
 extern bool env_to_bool(const char *env);
 
+static const char *vulkan_queue_family_quirk_force_general( const VkPhysicalDeviceProperties &props )
+{
+	struct VendorQueueQuirk_t
+	{
+		uint32_t vendorID;
+		const char *reason;
+	};
+
+	static constexpr VendorQueueQuirk_t s_Quirks[] = {
+		{
+			0x8086,
+			"Intel compute-only queue interop performance quirk (drm/xe#4452)",
+		},
+	};
+
+	for ( const VendorQueueQuirk_t &quirk : s_Quirks )
+	{
+		if ( props.vendorID == quirk.vendorID )
+			return quirk.reason;
+	}
+
+	return nullptr;
+}
+
 bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 {
 	uint32_t deviceCount = 0;
@@ -484,16 +518,9 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 				m_generalQueueFamily = generalIndex;
 				m_physDev = cphysDev;
 
-				/* When Intel uses compute-only queue for Gamescope composition, some games
-				 * experience performance loss. Using the general queue alleviates the issue
-				 * for now.
-				 * See: https://gitlab.freedesktop.org/drm/xe/kernel/-/issues/4452
-				 *
-				 * TODO: Remove vendorID check for Intel once issue is resolved.
-				 */
-				if (deviceProperties.vendorID == 0x8086) /* Intel */
+				if ( const char *pszReason = vulkan_queue_family_quirk_force_general( deviceProperties ) )
 				{
-					vk_log.infof("Intel device detected, forcing general queue family instead of compute-only queue");
+					vk_log.infof( "%s; forcing general queue family instead of compute-only queue", pszReason );
 					m_queueFamily = generalIndex;
 				}
 				else if ( env_to_bool( getenv( "GAMESCOPE_FORCE_GENERAL_QUEUE" ) ) )
@@ -514,7 +541,7 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 
 	// Record how many queues the chosen compositor family exposes, so
 	// createDevice can request a second (frame-generation) queue when the
-	// hardware allows it. RADV's async-compute family typically exposes several.
+	// hardware/driver exposes it.
 	{
 		uint32_t nQueueFamilies = 0;
 		vk.GetPhysicalDeviceQueueFamilyProperties( m_physDev, &nQueueFamilies, nullptr );
@@ -647,7 +674,20 @@ bool CVulkanDevice::createDevice()
 		};
 		vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
 
-		m_bSupportsFp16 = vulkan12Features.shaderFloat16 && features2.features.shaderInt16;
+		if ( !vulkan12Features.scalarBlockLayout )
+		{
+			vk_log.errorf( "physical device does not support scalarBlockLayout, required by gamescope shaders" );
+			return false;
+		}
+
+		if ( !vulkan12Features.timelineSemaphore )
+		{
+			vk_log.errorf( "physical device does not support timelineSemaphore, required by gamescope synchronization" );
+			return false;
+		}
+
+		m_bSupportsShaderFloat16 = vulkan12Features.shaderFloat16;
+		m_bSupportsFp16 = m_bSupportsShaderFloat16 && features2.features.shaderInt16;
 	}
 
 	float queuePriorities[2] = { 1.0f, 1.0f };
@@ -665,7 +705,8 @@ bool CVulkanDevice::createDevice()
 	// — a slow generation on queue 1 can never block the next composite on queue
 	// 0 of the in-order realtime queue. Gated on framegen so a session that never
 	// uses it requests exactly the single REALTIME queue it did before.
-	const bool bWantFramegenQueue = g_bExperimentalFramegen && m_queueCount >= 2 && !env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_SINGLE_QUEUE" ) );
+	const bool bWantFramegenQueue = g_bExperimentalFramegen && framegen_backend_supported()
+		&& m_queueCount >= 2 && !env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_SINGLE_QUEUE" ) );
 	const uint32_t nComputeQueues = bWantFramegenQueue ? 2u : 1u;
 
 	VkDeviceQueueCreateInfo queueCreateInfos[2] =
@@ -787,7 +828,7 @@ bool CVulkanDevice::createDevice()
 	VkPhysicalDeviceVulkan12Features vulkan12Features = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
 		.pNext = std::exchange(features2.pNext, &vulkan12Features),
-		.shaderFloat16 = m_bSupportsFp16,
+		.shaderFloat16 = m_bSupportsShaderFloat16,
 		.scalarBlockLayout = VK_TRUE,
 		.timelineSemaphore = VK_TRUE,
 	};
@@ -1067,7 +1108,7 @@ bool CVulkanDevice::createPools()
 	// is enabled, so the pool covers both rings. Non-framegen sessions allocate
 	// exactly what they did before.
 	const uint32_t nTotalSets = uint32_t(m_descriptorSets.size())
-		+ ( g_bExperimentalFramegen ? k_uFramegenDescriptorSets : 0u );
+		+ ( g_bExperimentalFramegen && framegen_backend_supported() ? k_uFramegenDescriptorSets : 0u );
 
 	VkDescriptorPoolSize poolSizes[3] {
 		{
@@ -1129,11 +1170,19 @@ bool CVulkanDevice::createShaders()
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
 	SHADER(FRAMEGEN_BLEND, cs_framegen_blend);
 	SHADER(FRAMEGEN_EXTRAPOLATE, cs_framegen_extrapolate);
-	if (m_bSupportsFp16)
+	if (m_bSupportsShaderFloat16)
 		SHADER(FRAMEGEN_EXTRAPOLATE_FP16, cs_framegen_extrapolate_fp16);
 	else
 		SHADER(FRAMEGEN_EXTRAPOLATE_FP16, cs_framegen_extrapolate);
+	SHADER(FRAMEGEN_EXTRAPOLATE_PAIR, cs_framegen_extrapolate_pair);
+	if (m_bSupportsShaderFloat16)
+		SHADER(FRAMEGEN_EXTRAPOLATE_PAIR_FP16, cs_framegen_extrapolate_pair_fp16);
+	else
+		SHADER(FRAMEGEN_EXTRAPOLATE_PAIR_FP16, cs_framegen_extrapolate_pair);
 	SHADER(FRAMEGEN_MOTION_LUMA, cs_framegen_motion_luma);
+	SHADER(FRAMEGEN_MOTION_LUMA_RGBA, cs_framegen_motion_luma_rgba);
+	SHADER(FRAMEGEN_MOTION_LUMA_PAIR, cs_framegen_motion_luma_pair);
+	SHADER(FRAMEGEN_MOTION_LUMA_PAIR_RGBA, cs_framegen_motion_luma_pair_rgba);
 	SHADER(FRAMEGEN_MOTION_MATCH, cs_framegen_motion_match);
 	SHADER(FRAMEGEN_MOTION_WARP, cs_framegen_motion_warp);
 #undef SHADER
@@ -1176,7 +1225,7 @@ bool CVulkanDevice::createScratchResources()
 	}
 
 	// Separate framegen descriptor ring (see CVulkanDevice::descriptorSet).
-	if ( g_bExperimentalFramegen )
+	if ( g_bExperimentalFramegen && framegen_backend_supported() )
 	{
 		m_framegenDescriptorSets.resize( k_uFramegenDescriptorSets );
 		std::vector<VkDescriptorSetLayout> framegenLayouts( k_uFramegenDescriptorSets, m_descriptorSetLayout );
@@ -1388,19 +1437,33 @@ void CVulkanDevice::compileAllPipelines()
 {
 	pthread_setname_np( pthread_self(), "gamescope-shdr" );
 
-	std::array<PipelineInfo_t, SHADER_TYPE_COUNT> pipelineInfos;
-#define SHADER(type, layer_count, max_ycbcr, blur_layers) pipelineInfos[SHADER_TYPE_##type] = {SHADER_TYPE_##type, layer_count, max_ycbcr, blur_layers}
-	SHADER(BLIT, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
-	SHADER(BLUR, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
-	SHADER(BLUR_COND, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
-	SHADER(BLUR_FIRST_PASS, 1, 2, 1);
-	SHADER(RCAS, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
-	SHADER(EASU, 1, 1, 1);
-	SHADER(NIS, 1, 1, 1);
-	SHADER(RGB_TO_NV12, 1, 1, 1);
-	SHADER(FRAMEGEN_BLEND, 1, 1, 1);
-	SHADER(FRAMEGEN_EXTRAPOLATE, 1, 1, 1);
-#undef SHADER
+	std::vector<PipelineInfo_t> pipelineInfos = {
+		PipelineInfo_t{ SHADER_TYPE_BLIT, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1 },
+		PipelineInfo_t{ SHADER_TYPE_BLUR, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers },
+		PipelineInfo_t{ SHADER_TYPE_BLUR_COND, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers },
+		PipelineInfo_t{ SHADER_TYPE_BLUR_FIRST_PASS, 1, 2, 1 },
+		PipelineInfo_t{ SHADER_TYPE_RCAS, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1 },
+		PipelineInfo_t{ SHADER_TYPE_EASU, 1, 1, 1 },
+		PipelineInfo_t{ SHADER_TYPE_NIS, 1, 1, 1 },
+		PipelineInfo_t{ SHADER_TYPE_RGB_TO_NV12, 1, 1, 1 },
+	};
+
+	if ( vulkan_framegen_is_enabled() )
+	{
+		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_BLEND, 1, 1, 1 } );
+		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE, 1, 1, 1 } );
+		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR, 1, 1, 1 } );
+		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR, 1, 1, 1 } );
+		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA, 1, 1, 1 } );
+		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_MATCH, 1, 1, 1 } );
+		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_WARP, 1, 1, 1 } );
+
+		if ( m_bSupportsShaderFloat16 )
+		{
+			pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16, 1, 1, 1 } );
+			pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR_FP16, 1, 1, 1 } );
+		}
+	}
 
 	for (auto& info : pipelineInfos) {
 		for (uint32_t layerCount = 1; layerCount <= info.layerCount; layerCount++) {
@@ -1718,6 +1781,17 @@ void CVulkanDevice::wait(uint64_t sequence, bool reset)
 void CVulkanDevice::waitIdle(bool reset)
 {
 	wait(m_submissionSeqNo, reset);
+
+	// The dedicated framegen queue signals its own timeline, so a composite-queue
+	// wait does not cover it. Drain it too and recycle its command buffers, so
+	// teardown/remake paths (which call waitIdle before freeing the output ring
+	// and framegen pools those buffers still reference) never free GPU-in-flight
+	// resources. Not on any per-frame path.
+	if ( m_bHasFramegenQueue )
+	{
+		waitFramegen( m_framegenSeqNo );
+		framegenGarbageCollect();
+	}
 }
 
 bool CVulkanDevice::hasCompleted(uint64_t sequence)
@@ -1921,6 +1995,14 @@ void CVulkanCmdBuffer::setSamplerUnnormalized(uint32_t slot, bool unnormalized)
 void CVulkanCmdBuffer::bindTarget(gamescope::Rc<CVulkanTexture> target)
 {
 	m_target = target.get();
+	m_target2 = nullptr;
+	if (target)
+		m_textureRefs.emplace_back(std::move(target));
+}
+
+void CVulkanCmdBuffer::bindTarget2(gamescope::Rc<CVulkanTexture> target)
+{
+	m_target2 = target.get();
 	if (target)
 		m_textureRefs.emplace_back(std::move(target));
 }
@@ -1934,6 +2016,7 @@ void CVulkanCmdBuffer::clearState()
 		sampler = {};
 
 	m_target = nullptr;
+	m_target2 = nullptr;
 	m_useSrgb.reset();
 }
 
@@ -1971,6 +2054,8 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	}
 	assert(m_target != nullptr);
 	prepareDestImage(m_target);
+	if (m_target2)
+		prepareDestImage(m_target2);
 	insertBarrier();
 
 	VkDescriptorSet descriptorSet = m_device->descriptorSet( m_bFramegen );
@@ -2097,6 +2182,14 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	{
 		targetDescriptors[0].imageView = m_target->srgbView();
 		targetDescriptors[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+		// Optional second RGBA target (framegen paired shader). Reuses the chroma
+		// descriptor slot, which is otherwise unused for non-YCbCr compute.
+		if (m_target2)
+		{
+			targetDescriptors[1].imageView = m_target2->srgbView();
+			targetDescriptors[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+		}
 	}
 	else
 	{
@@ -2114,6 +2207,8 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	m_device->vk.CmdDispatch(m_cmdBuffer, x, y, z);
 
 	markDirty(m_target);
+	if (m_target2)
+		markDirty(m_target2);
 }
 
 void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst)
@@ -4379,6 +4474,8 @@ static const char *framegen_mode_name()
 			return "extrapolate";
 		case GamescopeFramegenMode::Blend:
 			return "blend";
+		case GamescopeFramegenMode::Motion:
+			return "motion";
 		default:
 			return "unknown";
 	}
@@ -4400,6 +4497,37 @@ struct FramegenPushData_t
 		, suppressLo( flLo )
 		, suppressHi( flHi )
 		, pad( 0.0f )
+	{
+	}
+};
+
+// Paired extrapolation: two slot coefficients in one dispatch, so the two 4K
+// history reads are shared instead of repeated per generated frame.
+struct FramegenPairPushData_t
+{
+	float strength0;
+	float strength1;
+	float suppressLo;
+	float suppressHi;
+
+	FramegenPairPushData_t( float flStrength0, float flStrength1, float flLo, float flHi )
+		: strength0( flStrength0 )
+		, strength1( flStrength1 )
+		, suppressLo( flLo )
+		, suppressHi( flHi )
+	{
+	}
+};
+
+// Blend mode: per-slot temporal placement as the crossfade weight, so x3/x4
+// produces distinct intermediate frames instead of identical 0.5 duplicates.
+struct FramegenBlendPushData_t
+{
+	float phase;
+	float pad0, pad1, pad2;
+
+	explicit FramegenBlendPushData_t( float flPhase )
+		: phase( flPhase ), pad0( 0.0f ), pad1( 0.0f ), pad2( 0.0f )
 	{
 	}
 };
@@ -4438,9 +4566,27 @@ struct FramegenMotionResources_t
 	gamescope::OwningRc<CVulkanTexture> mvField;
 	uint32_t width = 0;
 	uint32_t height = 0;
+	uint32_t lumaFormat = DRM_FORMAT_INVALID;
 };
 static FramegenMotionResources_t g_framegenMotion;
 static constexpr uint32_t k_uFramegenMotionDownscale = 8;
+
+// Framegen shader dispatch is capability-based, not vendor-based. Vulkan gives
+// us the two decisions that matter here: whether float16 arithmetic is legal,
+// and whether R16F can be used as a sampled+storage image. Vendor IDs are useful
+// for diagnostics, but they are deliberately not part of this selection table.
+struct FramegenDispatch_t
+{
+	uint32_t drmFormat = DRM_FORMAT_INVALID;
+	ShaderType extrapolate = SHADER_TYPE_FRAMEGEN_EXTRAPOLATE;
+	ShaderType extrapolatePair = SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR;
+	ShaderType motionLumaPair = SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA;
+	uint32_t motionLumaFormat = DRM_FORMAT_ABGR16161616F;
+	bool useFp16 = false;
+	bool useR16FLuma = false;
+	bool motionSupported = false;
+};
+static FramegenDispatch_t g_framegenDispatch;
 
 // Inter-frame change (gamma-encoded [0,1]) over which forward extrapolation is
 // faded out. Below k_flFramegenSuppressLo we trust the full predicted step;
@@ -4520,9 +4666,20 @@ static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = 250'000'000ull;
 // consecutive slow frames. Without it, a game hovering around the threshold
 // flaps between generating and dormant, which reads as periodic microstutter.
 static constexpr uint32_t k_uFramegenStableFramesRequired = 8;
+// Leaky-bucket drain per non-generatable frame. A single jittered/quantized
+// frame costs only this much of the stability counter (recovered in one good
+// frame each), while a sustained fast/overloaded run still drains to dormant in
+// a few frames. Must be >=1 and small relative to the required count above.
+static constexpr uint32_t k_uFramegenStableFramesLeak = 2;
 
 bool vulkan_framegen_is_enabled()
 {
+	// Only enable on backends that actually present generated frames. Otherwise
+	// generation would run and be discarded, and the forced-composite / no-VRR /
+	// no-tearing tax would be paid for no benefit (Headless, OpenVR, SDL).
+	if ( !framegen_backend_supported() )
+		return false;
+
 	return g_bExperimentalFramegen
 		&& g_nFramegenMultiplier >= 2 && g_nFramegenMultiplier <= 4
 		&& ( g_eFramegenMode == GamescopeFramegenMode::Extrapolate
@@ -4555,6 +4712,8 @@ void vulkan_framegen_invalidate_history( const char *reason )
 
 	g_framegenHistory.valid = false;
 	g_framegenHistory.pending.clear();
+	g_framegenHistory.nStableFrames = 0;
+	g_framegenHistory.pLastBaseTexture = nullptr;
 	// Release the retained output-ring slots so a ring rebuild is never blocked
 	// by history holding a reference to an old image, and so the next real frame
 	// re-primes cleanly.
@@ -4575,6 +4734,16 @@ void vulkan_framegen_reset( const char *reason )
 bool vulkan_framegen_has_pending_generated_frame()
 {
 	return vulkan_framegen_is_enabled() && !g_framegenHistory.pending.empty();
+}
+
+bool vulkan_framegen_generated_frame_ready()
+{
+	if ( !vulkan_framegen_has_pending_generated_frame() )
+		return false;
+	// Peek the front slot's completion without consuming it, so the present
+	// decision can choose a hardware repeat over a wasted full recomposite when
+	// generation hasn't finished by its vblank.
+	return g_device.hasCompletedFramegen( g_framegenHistory.pending.front().seqNo );
 }
 
 gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame()
@@ -4687,16 +4856,11 @@ static bool framegen_is_float_drm_format( uint32_t drmFormat )
 	}
 }
 
-static void framegen_bind_extrapolate( CVulkanCmdBuffer *pCmdBuffer, ShaderType shader, const gamescope::Rc<CVulkanTexture> &pTarget, float flStrength )
+// Bind the two real-frame history textures into sampler slots 0 (previous) and
+// 1 (current) with bilinear, normalized, sRGB-alias sampling — the common setup
+// for every generation shader.
+static void framegen_bind_history( CVulkanCmdBuffer *pCmdBuffer )
 {
-	// Blend mode takes no parameters; the extrapolate variants read the effective
-	// per-slot coefficient from push constants (no upload arena, so this is safe
-	// on the dedicated framegen queue).
-	if ( shader != SHADER_TYPE_FRAMEGEN_BLEND )
-		pCmdBuffer->pushConstants<FramegenPushData_t>( flStrength, k_flFramegenSuppressLo, k_flFramegenSuppressHi );
-
-	pCmdBuffer->bindPipeline( g_device.pipeline( shader ) );
-	pCmdBuffer->bindTarget( pTarget );
 	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
 	pCmdBuffer->setTextureSrgb( 0, true );
 	pCmdBuffer->setSamplerUnnormalized( 0, false );
@@ -4705,6 +4869,48 @@ static void framegen_bind_extrapolate( CVulkanCmdBuffer *pCmdBuffer, ShaderType 
 	pCmdBuffer->setTextureSrgb( 1, true );
 	pCmdBuffer->setSamplerUnnormalized( 1, false );
 	pCmdBuffer->setSamplerNearest( 1, false );
+}
+
+static void framegen_bind_extrapolate( CVulkanCmdBuffer *pCmdBuffer, ShaderType shader, const gamescope::Rc<CVulkanTexture> &pTarget, float flStrength )
+{
+	// The extrapolate variants read the effective per-slot coefficient from push
+	// constants (no upload arena, so this is safe on the dedicated framegen queue).
+	pCmdBuffer->pushConstants<FramegenPushData_t>( flStrength, k_flFramegenSuppressLo, k_flFramegenSuppressHi );
+
+	pCmdBuffer->bindPipeline( g_device.pipeline( shader ) );
+	pCmdBuffer->bindTarget( pTarget );
+	framegen_bind_history( pCmdBuffer );
+
+	const int pixelsPerGroup = 8;
+	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pixelsPerGroup ), div_roundup( pTarget->height(), pixelsPerGroup ) );
+}
+
+// Paired extrapolation: one dispatch writes two generated frames, sharing the
+// two full-resolution history reads instead of repeating them per slot.
+static void framegen_bind_extrapolate_pair( CVulkanCmdBuffer *pCmdBuffer, ShaderType shader,
+	const gamescope::Rc<CVulkanTexture> &pTarget0, const gamescope::Rc<CVulkanTexture> &pTarget1,
+	float flStrength0, float flStrength1 )
+{
+	pCmdBuffer->pushConstants<FramegenPairPushData_t>( flStrength0, flStrength1, k_flFramegenSuppressLo, k_flFramegenSuppressHi );
+
+	pCmdBuffer->bindPipeline( g_device.pipeline( shader ) );
+	pCmdBuffer->bindTarget( pTarget0 );
+	pCmdBuffer->bindTarget2( pTarget1 );
+	framegen_bind_history( pCmdBuffer );
+
+	const int pixelsPerGroup = 8;
+	pCmdBuffer->dispatch( div_roundup( pTarget0->width(), pixelsPerGroup ), div_roundup( pTarget0->height(), pixelsPerGroup ) );
+}
+
+// Blend mode (debug): crossfade the two real frames by this slot's temporal
+// placement, so x3/x4 emits graded frames rather than identical 0.5 duplicates.
+static void framegen_bind_blend( CVulkanCmdBuffer *pCmdBuffer, const gamescope::Rc<CVulkanTexture> &pTarget, float flPhase )
+{
+	pCmdBuffer->pushConstants<FramegenBlendPushData_t>( flPhase );
+
+	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_BLEND ) );
+	pCmdBuffer->bindTarget( pTarget );
+	framegen_bind_history( pCmdBuffer );
 
 	const int pixelsPerGroup = 8;
 	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pixelsPerGroup ), div_roundup( pTarget->height(), pixelsPerGroup ) );
@@ -4720,14 +4926,48 @@ static bool framegen_create_intermediate( gamescope::OwningRc<CVulkanTexture> *p
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
 }
 
-// Pick the extrapolate/blend shader for the current mode and target format.
-static ShaderType framegen_extrapolate_shader()
+static bool framegen_format_supports_sampled_storage( uint32_t drmFormat )
 {
-	if ( g_eFramegenMode == GamescopeFramegenMode::Blend )
-		return SHADER_TYPE_FRAMEGEN_BLEND;
-	if ( g_device.supportsFp16() && !framegen_is_float_drm_format( g_framegenHistory.drmFormat ) )
-		return SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16;
-	return SHADER_TYPE_FRAMEGEN_EXTRAPOLATE;
+	VkFormat format = DRMFormatToVulkan( drmFormat, false );
+	if ( format == VK_FORMAT_UNDEFINED )
+		return false;
+
+	VkFormatProperties props = {};
+	g_device.vk.GetPhysicalDeviceFormatProperties( g_device.physDev(), format, &props );
+	const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+	return ( props.optimalTilingFeatures & needed ) == needed;
+}
+
+static const FramegenDispatch_t &framegen_dispatch_for_format( uint32_t drmFormat )
+{
+	if ( g_framegenDispatch.drmFormat == drmFormat )
+		return g_framegenDispatch;
+
+	FramegenDispatch_t dispatch;
+	dispatch.drmFormat = drmFormat;
+
+	// fp16 is used on capable hardware except for float (scRGB) targets; see
+	// framegen_is_float_drm_format.
+	dispatch.useFp16 = g_device.supportsShaderFloat16() && !framegen_is_float_drm_format( drmFormat );
+	dispatch.extrapolate = dispatch.useFp16 ? SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16 : SHADER_TYPE_FRAMEGEN_EXTRAPOLATE;
+	dispatch.extrapolatePair = dispatch.useFp16 ? SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR_FP16 : SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR;
+
+	dispatch.useR16FLuma = framegen_format_supports_sampled_storage( DRM_FORMAT_R16F );
+	dispatch.motionLumaFormat = dispatch.useR16FLuma ? DRM_FORMAT_R16F : DRM_FORMAT_ABGR16161616F;
+	dispatch.motionLumaPair = dispatch.useR16FLuma ? SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR : SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA;
+	dispatch.motionSupported = framegen_format_supports_sampled_storage( DRM_FORMAT_ABGR16161616F );
+
+	g_framegenDispatch = dispatch;
+	if ( g_bFramegenDebug )
+	{
+		vk_log.infof( "framegen: dispatch profile target=0x%" PRIX32 " extrapolate=%s motion=%s luma=0x%" PRIX32,
+			drmFormat,
+			dispatch.useFp16 ? "fp16" : "fp32",
+			dispatch.motionSupported ? "yes" : "no",
+			dispatch.motionLumaFormat );
+	}
+
+	return g_framegenDispatch;
 }
 
 // Motion-compensated generation, part 1 (once per batch): build low-res luma for
@@ -4737,18 +4977,19 @@ static ShaderType framegen_extrapolate_shader()
 // into the batch command buffer; the dispatch path inserts the read-after-write
 // barriers between passes. Returns false (fall back to extrapolation for the
 // whole batch) if the intermediates can't be allocated.
-static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t width, uint32_t height )
+static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t width, uint32_t height, const FramegenDispatch_t &dispatch )
 {
 	const uint32_t lowW = std::max( 1u, div_roundup( width, k_uFramegenMotionDownscale ) );
 	const uint32_t lowH = std::max( 1u, div_roundup( height, k_uFramegenMotionDownscale ) );
-	const uint32_t uMotionFormat = DRM_FORMAT_ABGR16161616F;
+	const uint32_t uFieldFormat = DRM_FORMAT_ABGR16161616F;
 
 	if ( g_framegenMotion.width != lowW || g_framegenMotion.height != lowH
+		|| g_framegenMotion.lumaFormat != dispatch.motionLumaFormat
 		|| g_framegenMotion.lumaPrev == nullptr || g_framegenMotion.lumaCur == nullptr || g_framegenMotion.mvField == nullptr )
 	{
-		if ( !framegen_create_intermediate( &g_framegenMotion.lumaPrev, lowW, lowH, uMotionFormat )
-			|| !framegen_create_intermediate( &g_framegenMotion.lumaCur, lowW, lowH, uMotionFormat )
-			|| !framegen_create_intermediate( &g_framegenMotion.mvField, lowW, lowH, uMotionFormat ) )
+		if ( !framegen_create_intermediate( &g_framegenMotion.lumaPrev, lowW, lowH, dispatch.motionLumaFormat )
+			|| !framegen_create_intermediate( &g_framegenMotion.lumaCur, lowW, lowH, dispatch.motionLumaFormat )
+			|| !framegen_create_intermediate( &g_framegenMotion.mvField, lowW, lowH, uFieldFormat ) )
 		{
 			if ( g_bFramegenDebug )
 				vk_log.infof( "framegen: motion intermediate allocation failed, falling back to extrapolation" );
@@ -4757,25 +4998,23 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		}
 		g_framegenMotion.width = lowW;
 		g_framegenMotion.height = lowH;
+		g_framegenMotion.lumaFormat = dispatch.motionLumaFormat;
 	}
 
 	const uint32_t pg = 8;
 
 	// Pass 1: downscale both real frames to low-res luma.
-	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_LUMA ) );
+	pCmdBuffer->bindPipeline( g_device.pipeline( dispatch.motionLumaPair ) );
 	pCmdBuffer->bindTarget( g_framegenMotion.lumaPrev );
+	pCmdBuffer->bindTarget2( g_framegenMotion.lumaCur );
 	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
 	pCmdBuffer->setTextureSrgb( 0, true );
 	pCmdBuffer->setSamplerUnnormalized( 0, false );
 	pCmdBuffer->setSamplerNearest( 0, false );
-	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
-
-	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_LUMA ) );
-	pCmdBuffer->bindTarget( g_framegenMotion.lumaCur );
-	pCmdBuffer->bindTexture( 0, g_framegenHistory.currentReal );
-	pCmdBuffer->setTextureSrgb( 0, true );
-	pCmdBuffer->setSamplerUnnormalized( 0, false );
-	pCmdBuffer->setSamplerNearest( 0, false );
+	pCmdBuffer->bindTexture( 1, g_framegenHistory.currentReal );
+	pCmdBuffer->setTextureSrgb( 1, true );
+	pCmdBuffer->setSamplerUnnormalized( 1, false );
+	pCmdBuffer->setSamplerNearest( 1, false );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 
 	// Pass 2: block match -> motion field (.rg = mv, .b = confidence).
@@ -4879,41 +5118,33 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			pRealFrame->drmFormat() );
 	}
 
-	// Generated frames only help when the game leaves empty vblanks to fill.
-	// Require the real-frame gap to exceed ~1.5 vblank intervals (at least one
-	// empty vblank). Below that there is no room for a generated frame; it would
-	// be discarded or, worse, displace real content. Go fully dormant — the
-	// framegen path costs nothing until the game leaves gaps again. The
-	// multiplier is a cap; how many frames we actually insert adapts to the
-	// measured gap below.
+	// A very long gap is a scene discontinuity (stall, load screen); drop history
+	// so the previous scene is never smeared across the resume.
 	const uint64_t ulVblankIntervalNs = g_nOutputRefresh > 0 ? 1'000'000'000'000ull / (uint64_t)g_nOutputRefresh : 8'333'333ull;
-	if ( ulPrevRealFrameTimeNs != 0 && now - ulPrevRealFrameTimeNs < ( ulVblankIntervalNs * 3 ) / 2 )
-	{
-		g_framegenHistory.nStableFrames = 0;
-		vulkan_framegen_invalidate_history( "game_faster_than_half_refresh" );
-		return;
-	}
-
 	if ( g_framegenHistory.valid && ulPrevRealFrameTimeNs != 0 && now - ulPrevRealFrameTimeNs > k_ulFramegenMaxRealFrameGapNs )
 		vulkan_framegen_invalidate_history( "frame_gap" );
 
-	// If the previous generation batch still hasn't executed by the time the
-	// next real frame arrives, the compositing GPU has no headroom. Without a
-	// dedicated framegen queue, piling on more work would make the next composite
-	// queue behind it — the one way this design could delay a real frame — so
-	// skip everything and re-enter through the stabilization window. (With a
-	// dedicated queue the composite is protected regardless, but generating work
-	// the GPU can't consume is still wasteful.)
-	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
-	{
-		g_framegenHistory.nStableFrames = 0;
-		vulkan_framegen_invalidate_history( "gpu_oversubscribed" );
-		return;
-	}
+	// Two conditions decide whether THIS interval can carry a generated frame,
+	// both without dropping history:
+	//  - the game must leave an empty vblank (gap > ~1.5 intervals); a faster
+	//    interval has no slot to fill, so generating would displace real content.
+	//  - the previous batch must have finished; generating past an unfinished one
+	//    piles work the compositing GPU can't consume.
+	// Neither is a scene change, so instead of hard-resetting the stability
+	// counter (which made one jittered/quantized frame cost a ~9-frame dormancy
+	// and flap around non-integer cadences), we drive a leaky bucket: good frames
+	// raise it, non-generatable frames lower it. A single blip barely dents it; a
+	// sustained fast/overloaded run still winds it down to dormant.
+	const bool bLeavesEmptyVblank = ulPrevRealFrameTimeNs != 0
+		&& now - ulPrevRealFrameTimeNs >= ( ulVblankIntervalNs * 3 ) / 2;
+	const bool bGpuHasHeadroom = g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo );
+	const bool bGeneratable = bLeavesEmptyVblank && bGpuHasHeadroom;
 
 	// Zero-copy history shift: the previous "current" becomes "previous", and the
 	// just-composited output image becomes "current". We only hold references
-	// into the output ring — the composite already wrote these images.
+	// into the output ring — the composite already wrote these images. We shift on
+	// every kept real frame (even non-generatable ones) so the two most recent
+	// reals stay fresh and a slowdown resumes generation without a re-prime.
 	g_framegenHistory.previousReal = g_framegenHistory.currentReal;
 	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId - 1;
 	g_framegenHistory.currentReal = pRealFrame;
@@ -4927,14 +5158,24 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		return;
 	}
 
-	// Hysteresis: dropping out (above) is instant, resuming takes a run of
-	// consecutive slow frames. Until the pace has proven stable, keep shifting
-	// history but generate nothing.
-	if ( g_framegenHistory.nStableFrames < k_uFramegenStableFramesRequired )
+	// Leaky-bucket hysteresis (see above). Only score once we have a real gap to
+	// judge (ulPrevRealFrameTimeNs != 0); the priming frame above never reaches here.
+	if ( bGeneratable )
 	{
-		g_framegenHistory.nStableFrames++;
+		if ( g_framegenHistory.nStableFrames < k_uFramegenStableFramesRequired )
+			g_framegenHistory.nStableFrames++;
+	}
+	else
+	{
+		g_framegenHistory.nStableFrames = g_framegenHistory.nStableFrames > k_uFramegenStableFramesLeak
+			? g_framegenHistory.nStableFrames - k_uFramegenStableFramesLeak : 0;
+	}
+
+	if ( !bGeneratable || g_framegenHistory.nStableFrames < k_uFramegenStableFramesRequired )
+	{
 		if ( g_bFramegenDebug )
-			vk_log.infof( "framegen: stabilizing %u/%u", g_framegenHistory.nStableFrames, k_uFramegenStableFramesRequired );
+			vk_log.infof( "framegen: %s %u/%u", bGeneratable ? "stabilizing" : "dormant",
+				g_framegenHistory.nStableFrames, k_uFramegenStableFramesRequired );
 		return;
 	}
 
@@ -4991,20 +5232,39 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// batch draws from the isolated framegen descriptor ring (see markFramegen).
 	std::unique_ptr<CVulkanCmdBuffer> pCmdBuffer = g_device.commandBuffer();
 	pCmdBuffer->markFramegen();
+	const FramegenDispatch_t &dispatch = framegen_dispatch_for_format( g_framegenHistory.drmFormat );
 
 	// Motion estimation depends only on the two real frames, so it is computed
 	// once for the batch; falls back to extrapolation for every slot if the
 	// intermediates can't be allocated.
 	const bool bMotion = g_eFramegenMode == GamescopeFramegenMode::Motion
-		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(), g_framegenHistory.currentReal->height() );
-	const ShaderType extrapolateShader = framegen_extrapolate_shader();
+		&& dispatch.motionSupported
+		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(), g_framegenHistory.currentReal->height(), dispatch );
 
-	for ( const SlotPlan_t &slot : slots )
+	if ( bMotion )
 	{
-		if ( bMotion )
+		// Each warp reads the shared motion field and history; keep per-slot.
+		for ( const SlotPlan_t &slot : slots )
 			framegen_warp_slot( pCmdBuffer.get(), slot.tex, slot.strength );
-		else
-			framegen_bind_extrapolate( pCmdBuffer.get(), extrapolateShader, slot.tex, slot.strength );
+	}
+	else if ( g_eFramegenMode == GamescopeFramegenMode::Blend )
+	{
+		for ( const SlotPlan_t &slot : slots )
+			framegen_bind_blend( pCmdBuffer.get(), slot.tex, slot.phase );
+	}
+	else
+	{
+		// Extrapolate: fuse slots in pairs so the two full-resolution history
+		// images are read once per pair instead of once per slot (the dominant
+		// cost at x3/x4). An odd final slot falls back to the single-slot shader.
+		size_t i = 0;
+		for ( ; i + 1 < slots.size(); i += 2 )
+		{
+			framegen_bind_extrapolate_pair( pCmdBuffer.get(), dispatch.extrapolatePair,
+				slots[ i ].tex, slots[ i + 1 ].tex, slots[ i ].strength, slots[ i + 1 ].strength );
+		}
+		if ( i < slots.size() )
+			framegen_bind_extrapolate( pCmdBuffer.get(), dispatch.extrapolate, slots[ i ].tex, slots[ i ].strength );
 	}
 
 	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo );

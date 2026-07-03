@@ -413,6 +413,9 @@ void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 bool vulkan_framegen_is_enabled();
 bool vulkan_framegen_has_pending_generated_frame();
+// True when a generated frame is pending AND its GPU work has completed, so it
+// can be presented this vblank without stalling scanout. Non-consuming.
+bool vulkan_framegen_generated_frame_ready();
 gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame();
 void vulkan_framegen_discard_generated_frame( const char *reason );
 void vulkan_framegen_invalidate_history( const char *reason );
@@ -575,7 +578,12 @@ enum ShaderType {
 	SHADER_TYPE_FRAMEGEN_BLEND,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16,
+	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR,
+	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR_FP16,
 	SHADER_TYPE_FRAMEGEN_MOTION_LUMA,
+	SHADER_TYPE_FRAMEGEN_MOTION_LUMA_RGBA,
+	SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR,
+	SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA,
 	SHADER_TYPE_FRAMEGEN_MOTION_MATCH,
 	SHADER_TYPE_FRAMEGEN_MOTION_WARP,
 
@@ -850,6 +858,7 @@ public:
 	inline bool hasDrmPrimaryDevId() {return m_bHasDrmPrimaryDevId;}
 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
 	inline bool supportsFp16() {return m_bSupportsFp16;}
+	inline bool supportsShaderFloat16() {return m_bSupportsShaderFloat16;}
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
 	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size)
@@ -912,6 +921,7 @@ protected:
 	dev_t m_drmPrimaryDevId = 0;
 
 	bool m_bSupportsFp16 = false;
+	bool m_bSupportsShaderFloat16 = false;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
 	bool m_bInitialized = false;
@@ -1003,6 +1013,10 @@ public:
 	void setSamplerNearest(uint32_t slot, bool nearest);
 	void setSamplerUnnormalized(uint32_t slot, bool unnormalized);
 	void bindTarget(gamescope::Rc<CVulkanTexture> target);
+	// Second storage-image target (descriptor binding 2, the chroma slot, unused
+	// by non-YCbCr compute). Used by the paired framegen shader to write two
+	// generated frames from one dispatch. Cleared by bindTarget()/state reset.
+	void bindTarget2(gamescope::Rc<CVulkanTexture> target);
 	void clearState();
 	template<class PushData, class... Args>
 	void uploadConstants(Args&&... args);
@@ -1047,6 +1061,7 @@ private:
 	std::bitset<VKR_SAMPLER_SLOTS> m_useSrgb;
 	std::array<SamplerState, VKR_SAMPLER_SLOTS> m_samplerState;
 	CVulkanTexture *m_target;
+	CVulkanTexture *m_target2 = nullptr;
 
 	std::array<CVulkanTexture *, VKR_LUT3D_COUNT> m_shaperLut;
 	std::array<CVulkanTexture *, VKR_LUT3D_COUNT> m_lut3D;

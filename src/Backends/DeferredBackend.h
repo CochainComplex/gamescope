@@ -221,6 +221,11 @@ namespace gamescope
 			return false;
 		}
 
+		virtual bool SupportsFramegen() const override
+		{
+			return m_pChild->SupportsFramegen();
+		}
+
 		virtual bool UsesVulkanSwapchain() const override
 		{
             // Doesn't need to be 'initted' for this check.
