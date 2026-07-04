@@ -420,6 +420,13 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame();
 void vulkan_framegen_discard_generated_frame( const char *reason );
 void vulkan_framegen_invalidate_history( const char *reason );
 void vulkan_framegen_reset( const char *reason );
+
+// Standalone GPU microbenchmark of the frame-generation dispatches (extrapolate,
+// motion, blend). Times the real production shaders with timestamp queries and
+// prints a table. Used by the gamescope_framegen_microbench executable; needs a
+// headless device (vulkan_init) but no compositor.
+void vulkan_framegen_benchmark();
+
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 
@@ -577,6 +584,7 @@ enum ShaderType {
 	SHADER_TYPE_RGB_TO_NV12,
 	SHADER_TYPE_FRAMEGEN_BLEND,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE,
+	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR_FP16,
@@ -716,6 +724,11 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdEndRendering) \
 	VK_FUNC(CmdPipelineBarrier) \
 	VK_FUNC(CmdPushConstants) \
+	VK_FUNC(CmdResetQueryPool) \
+	VK_FUNC(CmdWriteTimestamp) \
+	VK_FUNC(CreateQueryPool) \
+	VK_FUNC(DestroyQueryPool) \
+	VK_FUNC(GetQueryPoolResults) \
 	VK_FUNC(CreateBuffer) \
 	VK_FUNC(CreateCommandPool) \
 	VK_FUNC(CreateComputePipelines) \

@@ -9195,7 +9195,8 @@ steamcompmgr_main(int argc, char **argv)
 				}
 			}
 
-			if ( vblank && g_bFramegenDebug && vulkan_framegen_is_enabled() )
+			static uint64_t s_uFramegenVblankDebugLogCounter = 0;
+			if ( vblank && vulkan_framegen_is_enabled() && FramegenDebugShouldLog( s_uFramegenVblankDebugLogCounter ) )
 			{
 				// Classify what this vblank slot will show: a real frame, a
 				// generated frame, or (nothing presented) a hardware repeat of

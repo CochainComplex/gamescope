@@ -346,6 +346,7 @@ uint32_t g_preferDeviceID = 0;
 bool g_bDebugDualGpuRoute = false;
 bool g_bExperimentalFramegen = false;
 bool g_bFramegenDebug = false;
+uint32_t g_uFramegenDebugEvery = 60;
 int g_nFramegenMultiplier = 2;
 GamescopeFramegenMode g_eFramegenMode = GamescopeFramegenMode::Extrapolate;
 float g_flFramegenStrength = 0.5f;
@@ -480,6 +481,31 @@ static int parse_integer(const char *str, const char *optionName)
 		fprintf( stderr, "gamescope: invalid value for --%s, \"%s\" is either not an integer or is far too large\n", optionName, str );
 		exit(1);
 	}
+}
+
+static uint32_t parse_framegen_debug_every()
+{
+	const char *pszEvery = getenv( "GAMESCOPE_FRAMEGEN_DEBUG_EVERY" );
+	if ( !pszEvery || !*pszEvery )
+		return 60;
+
+	auto result = gamescope::Parse<uint32_t>( pszEvery );
+	if ( !result.has_value() || result.value() == 0 )
+	{
+		fprintf( stderr, "gamescope: GAMESCOPE_FRAMEGEN_DEBUG_EVERY must be a positive integer; using 60\n" );
+		return 60;
+	}
+
+	return result.value();
+}
+
+bool FramegenDebugShouldLog( uint64_t &counter )
+{
+	if ( !g_bFramegenDebug )
+		return false;
+
+	counter++;
+	return g_uFramegenDebugEvery <= 1 || counter == 1 || counter % g_uFramegenDebugEvery == 0;
 }
 
 static float parse_float(const char *str, const char *optionName)
@@ -818,6 +844,7 @@ int main(int argc, char **argv)
 					cv_composite_force = true;
 				} else if (strcmp(opt_name, "framegen-debug") == 0) {
 					g_bFramegenDebug = true;
+					g_uFramegenDebugEvery = parse_framegen_debug_every();
 				} else if (strcmp(opt_name, "framegen-multiplier") == 0) {
 					g_nFramegenMultiplier = parse_integer( optarg, opt_name );
 					if ( g_nFramegenMultiplier < 2 || g_nFramegenMultiplier > 4 )
@@ -1062,6 +1089,16 @@ int main(int argc, char **argv)
 	{
 		fprintf( stderr, "vulkan_init_formats failed\n" );
 		return 1;
+	}
+
+	// Frame-generation GPU microbenchmark: with a Vulkan device and the framegen
+	// pipelines available, time the generation dispatches in isolation and exit
+	// before the compositor spins up. Run with e.g.:
+	//   GAMESCOPE_FRAMEGEN_BENCHMARK=1 gamescope --backend headless -- true
+	if ( getenv( "GAMESCOPE_FRAMEGEN_BENCHMARK" ) )
+	{
+		vulkan_framegen_benchmark();
+		return 0;
 	}
 
 	if ( !vulkan_make_output() )

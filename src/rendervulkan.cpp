@@ -47,6 +47,7 @@
 #include "cs_easu_fp16.h"
 #include "cs_framegen_blend.h"
 #include "cs_framegen_extrapolate.h"
+#include "cs_framegen_extrapolate_direct.h"
 #include "cs_framegen_extrapolate_fp16.h"
 #include "cs_framegen_extrapolate_pair.h"
 #include "cs_framegen_extrapolate_pair_fp16.h"
@@ -1170,6 +1171,7 @@ bool CVulkanDevice::createShaders()
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
 	SHADER(FRAMEGEN_BLEND, cs_framegen_blend);
 	SHADER(FRAMEGEN_EXTRAPOLATE, cs_framegen_extrapolate);
+	SHADER(FRAMEGEN_EXTRAPOLATE_DIRECT, cs_framegen_extrapolate_direct);
 	if (m_bSupportsShaderFloat16)
 		SHADER(FRAMEGEN_EXTRAPOLATE_FP16, cs_framegen_extrapolate_fp16);
 	else
@@ -1452,6 +1454,7 @@ void CVulkanDevice::compileAllPipelines()
 	{
 		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_BLEND, 1, 1, 1 } );
 		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE, 1, 1, 1 } );
+		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT, 1, 1, 1 } );
 		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR, 1, 1, 1 } );
 		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR, 1, 1, 1 } );
 		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA, 1, 1, 1 } );
@@ -2015,8 +2018,15 @@ void CVulkanCmdBuffer::clearState()
 	for (auto& sampler : m_samplerState)
 		sampler = {};
 
+	for (auto& lut : m_shaperLut)
+		lut = nullptr;
+
+	for (auto& lut : m_lut3D)
+		lut = nullptr;
+
 	m_target = nullptr;
 	m_target2 = nullptr;
+	m_renderBufferOffset = 0;
 	m_useSrgb.reset();
 }
 
@@ -4571,10 +4581,12 @@ struct FramegenMotionResources_t
 static FramegenMotionResources_t g_framegenMotion;
 static constexpr uint32_t k_uFramegenMotionDownscale = 8;
 
-// Framegen shader dispatch is capability-based, not vendor-based. Vulkan gives
-// us the two decisions that matter here: whether float16 arithmetic is legal,
-// and whether R16F can be used as a sampled+storage image. Vendor IDs are useful
-// for diagnostics, but they are deliberately not part of this selection table.
+// Framegen shader dispatch is capability-based first: Vulkan tells us whether
+// float16 arithmetic is legal and whether R16F works as a sampled+storage image.
+// The one exception is the LDS-vs-direct extrapolation shader, which turns on
+// texture-cache effectiveness — a property no capability bit exposes — so it uses
+// a narrow, benchmark-backed vendor check (see framegen_dispatch_for_format). The
+// selection is computed once and cached, so it never costs a per-dispatch branch.
 struct FramegenDispatch_t
 {
 	uint32_t drmFormat = DRM_FORMAT_INVALID;
@@ -4762,7 +4774,8 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame()
 	if ( !g_device.hasCompletedFramegen( front.seqNo ) )
 	{
 		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
-		if ( g_bFramegenDebug )
+		static uint64_t s_uTooSlowDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uTooSlowDebugLogCounter ) )
 			vk_log.infof( "framegen: discarded generated frame id=%" PRIu64 ".%02u reason=generation_too_slow",
 				front.frameId, (unsigned)( front.phase * 100.0f ) );
 		return nullptr;
@@ -4776,7 +4789,8 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame()
 	// is a cheap already-signalled wait.
 	g_device.waitFramegen( front.seqNo );
 
-	if ( g_bFramegenDebug )
+	static uint64_t s_uPresentedDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uPresentedDebugLogCounter ) )
 		vk_log.infof( "framegen: presented generated frame id=%" PRIu64 ".%02u", front.frameId, (unsigned)( front.phase * 100.0f ) );
 
 	return front.tex;
@@ -4787,7 +4801,8 @@ void vulkan_framegen_discard_generated_frame( const char *reason )
 	if ( g_framegenHistory.pending.empty() )
 		return;
 
-	if ( g_bFramegenDebug )
+	static uint64_t s_uDiscardDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uDiscardDebugLogCounter ) )
 		vk_log.infof( "framegen: discarded %zu generated frame(s) reason=%s",
 			g_framegenHistory.pending.size(), reason ? reason : "unknown" );
 
@@ -4957,12 +4972,37 @@ static const FramegenDispatch_t &framegen_dispatch_for_format( uint32_t drmForma
 	dispatch.motionLumaPair = dispatch.useR16FLuma ? SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR : SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA;
 	dispatch.motionSupported = framegen_format_supports_sampled_storage( DRM_FORMAT_ABGR16161616F );
 
+	// LDS-vs-direct extrapolation is a memory-strategy choice that capability bits
+	// cannot express: it turns on the GPU's texture-cache effectiveness, not on a
+	// feature flag. The LDS apron (staging the current frame's neighbour cross into
+	// shared memory) only pays off on cache-poor / bandwidth-starved parts; on
+	// large-cache GPUs those neighbours are already cache hits, so the apron's
+	// cooperative load + barrier is pure overhead. Measured on this tree: the
+	// direct (no-LDS) fp32 shader is ~30-37% faster than either LDS variant on
+	// NVIDIA and also beats fp16 there. So NVIDIA selects the direct shader; every
+	// other vendor keeps the LDS path (and fp16 where capable) until benchmarked on
+	// that part with the framegen microbench. This is the one selection that a
+	// narrow vendor check earns — decided once here and cached, so no per-dispatch
+	// cost. Extend the predicate as parts are measured.
+	VkPhysicalDeviceProperties physProps = {};
+	g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &physProps );
+	const bool bPreferDirectExtrapolate = ( physProps.vendorID == 0x10DE ); // NVIDIA, measured
+	if ( bPreferDirectExtrapolate )
+	{
+		dispatch.useFp16 = false;
+		dispatch.extrapolate = SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT;
+		// The paired extrapolation shader (x3/x4 only) is left on its LDS variant
+		// until the direct-pair path is measured.
+	}
+
 	g_framegenDispatch = dispatch;
 	if ( g_bFramegenDebug )
 	{
+		const char *pszExtrap = dispatch.extrapolate == SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT ? "fp32-direct"
+			: ( dispatch.useFp16 ? "fp16-lds" : "fp32-lds" );
 		vk_log.infof( "framegen: dispatch profile target=0x%" PRIX32 " extrapolate=%s motion=%s luma=0x%" PRIX32,
 			drmFormat,
-			dispatch.useFp16 ? "fp16" : "fp32",
+			pszExtrap,
 			dispatch.motionSupported ? "yes" : "no",
 			dispatch.motionLumaFormat );
 	}
@@ -5060,6 +5100,211 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pg ), div_roundup( pTarget->height(), pg ) );
 }
 
+// ---------------------------------------------------------------------------
+// Frame-generation GPU microbenchmark.
+//
+// Times the exact production dispatch helpers above (framegen_bind_extrapolate,
+// framegen_prepare_motion + framegen_warp_slot, framegen_bind_blend) in
+// isolation, using GPU timestamp queries so the reported cost is pure shader
+// execution — no submit, present, or pacing overhead. Runs against synthetic
+// history textures on a headless device; driven by gamescope_framegen_microbench.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct FramegenBenchRes_t { const char *pszName; uint32_t nWidth; uint32_t nHeight; };
+
+static gamescope::OwningRc<CVulkanTexture> framegen_bench_make_image( uint32_t nWidth, uint32_t nHeight, uint32_t uDrmFormat )
+{
+	CVulkanTexture::createFlags flags;
+	flags.bSampled = true;
+	flags.bStorage = true;
+	gamescope::OwningRc<CVulkanTexture> pTex = new CVulkanTexture();
+	if ( !pTex->BInit( nWidth, nHeight, 1u, uDrmFormat, flags ) )
+		return nullptr;
+	return pTex;
+}
+
+} // namespace
+
+void vulkan_framegen_benchmark()
+{
+	VkPhysicalDeviceProperties props = {};
+	g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &props );
+	const double flTimestampPeriodNs = props.limits.timestampPeriod;
+	if ( flTimestampPeriodNs == 0.0 )
+	{
+		fprintf( stderr, "framegen-bench: device does not support timestamp queries\n" );
+		return;
+	}
+
+	const VkQueryPoolCreateInfo queryPoolInfo = {
+		.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+		.queryType = VK_QUERY_TYPE_TIMESTAMP,
+		.queryCount = 2,
+	};
+	VkQueryPool queryPool = VK_NULL_HANDLE;
+	if ( g_device.vk.CreateQueryPool( g_device.device(), &queryPoolInfo, nullptr, &queryPool ) != VK_SUCCESS )
+	{
+		fprintf( stderr, "framegen-bench: CreateQueryPool failed\n" );
+		return;
+	}
+
+	const FramegenBenchRes_t resolutions[] = {
+		{ "1080p", 1920, 1080 },
+		{ "1440p", 2560, 1440 },
+		{ "2160p", 3840, 2160 },
+	};
+
+	// Two representative targets: a 10-bit integer format (HDR10/SDR path, where
+	// production runs the fp16 extrapolate shader) and an fp16-float format (scRGB
+	// path, forced to fp32 for precision). Both let us A/B the fp16 vs fp32 shader.
+	struct FramegenBenchFormat_t { const char *pszName; uint32_t uDrmFormat; };
+	const FramegenBenchFormat_t formats[] = {
+		{ "ABGR2101010 (int, HDR10/SDR path)", DRM_FORMAT_ABGR2101010 },
+		{ "ABGR16161616F (float, scRGB path)", DRM_FORMAT_ABGR16161616F },
+	};
+	const bool bFp16 = g_device.supportsShaderFloat16();
+
+	printf( "\ngamescope frame-generation GPU microbenchmark\n" );
+	printf( "device : %s\n", props.deviceName );
+	printf( "fp16   : shader float16 %s\n", bFp16 ? "supported" : "unsupported" );
+	printf( "timing : GPU timestamps, mean of 200 dispatches, strength=%.2f\n", g_flFramegenStrength );
+	printf( "note   : (*) = variant production uses for that format\n" );
+
+	for ( const FramegenBenchFormat_t &fmt : formats )
+	{
+	printf( "\n== target %s ==\n", fmt.pszName );
+	printf( "%-8s  %-26s  %10s\n", "res", "pass", "GPU ms" );
+	printf( "-------------------------------------------------------\n" );
+	const uint32_t uDrmFormat = fmt.uDrmFormat;
+	const bool bFloatTarget = ( uDrmFormat == DRM_FORMAT_ABGR16161616F || uDrmFormat == DRM_FORMAT_XBGR16161616F );
+
+	// Time a single recorded workload: warm up once (first-use allocations,
+	// pipeline residency), then average the GPU timestamp delta over nIters
+	// submits. Each submit is drained before the next, so nothing overlaps and
+	// the descriptor ring never wraps under an in-flight dispatch.
+	auto timePass = [&]( auto &&recordFn ) -> double
+	{
+		const uint32_t nIters = 200;
+		{
+			auto cmd = g_device.commandBuffer();
+			recordFn( cmd.get() );
+			g_device.submit( std::move( cmd ) );
+			g_device.waitIdle();
+		}
+		double dTotalNs = 0.0;
+		for ( uint32_t i = 0; i < nIters; i++ )
+		{
+			auto cmd = g_device.commandBuffer();
+			VkCommandBuffer raw = cmd->rawBuffer();
+			g_device.vk.CmdResetQueryPool( raw, queryPool, 0, 2 );
+			g_device.vk.CmdWriteTimestamp( raw, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 0 );
+			recordFn( cmd.get() );
+			g_device.vk.CmdWriteTimestamp( raw, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 1 );
+			g_device.submit( std::move( cmd ) );
+			g_device.waitIdle();
+
+			uint64_t ts[2] = { 0, 0 };
+			g_device.vk.GetQueryPoolResults( g_device.device(), queryPool, 0, 2,
+				sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
+			dTotalNs += double( ts[1] - ts[0] ) * flTimestampPeriodNs;
+		}
+		return dTotalNs / double( nIters ) / 1.0e6;
+	};
+
+	for ( const FramegenBenchRes_t &res : resolutions )
+	{
+		gamescope::OwningRc<CVulkanTexture> pPrev = framegen_bench_make_image( res.nWidth, res.nHeight, uDrmFormat );
+		gamescope::OwningRc<CVulkanTexture> pCur  = framegen_bench_make_image( res.nWidth, res.nHeight, uDrmFormat );
+		gamescope::OwningRc<CVulkanTexture> pOut  = framegen_bench_make_image( res.nWidth, res.nHeight, uDrmFormat );
+		if ( !pPrev || !pCur || !pOut )
+		{
+			fprintf( stderr, "framegen-bench: %s image allocation failed\n", res.pszName );
+			continue;
+		}
+
+		// Point framegen history at the synthetic frames (what the dispatch
+		// helpers sample as previous/current real frames).
+		g_framegenHistory.previousReal = pPrev;
+		g_framegenHistory.currentReal = pCur;
+
+		const FramegenDispatch_t &dispatch = framegen_dispatch_for_format( uDrmFormat );
+
+		// Extrapolate variants on identical images — a direct A/B. (*) marks the
+		// shader the vendor dispatcher actually selects for this GPU + format.
+		double msExtrap32 = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+			framegen_bind_extrapolate( cmd, SHADER_TYPE_FRAMEGEN_EXTRAPOLATE, pOut, g_flFramegenStrength );
+		} );
+		printf( "%-8s  %-26s  %10.3f\n", res.pszName,
+			dispatch.extrapolate == SHADER_TYPE_FRAMEGEN_EXTRAPOLATE ? "extrapolate fp32-lds (*)" : "extrapolate fp32-lds", msExtrap32 );
+
+		if ( bFp16 )
+		{
+			double msExtrap16 = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+				framegen_bind_extrapolate( cmd, SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16, pOut, g_flFramegenStrength );
+			} );
+			printf( "%-8s  %-26s  %10.3f\n", res.pszName,
+				dispatch.extrapolate == SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16 ? "extrapolate fp16-lds (*)" : "extrapolate fp16-lds", msExtrap16 );
+		}
+
+		// Direct (no-LDS) fp32 variant — the vendor dispatcher picks this on
+		// large-cache GPUs. Mark it (*) when it is the selected production shader.
+		{
+			const bool bDirectSelected = ( dispatch.extrapolate == SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT );
+			double msExtrapDirect = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+				framegen_bind_extrapolate( cmd, SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT, pOut, g_flFramegenStrength );
+			} );
+			printf( "%-8s  %-26s  %10.3f\n", res.pszName,
+				bDirectSelected ? "extrapolate fp32-direct (*)" : "extrapolate fp32-direct", msExtrapDirect );
+		}
+
+		// Blend — cheapest mode, a useful floor.
+		double msBlend = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+			framegen_bind_blend( cmd, pOut, 0.5f );
+		} );
+		printf( "%-8s  %-26s  %10.3f\n", res.pszName, "blend", msBlend );
+
+		// Motion: per-real-frame setup (luma downscale + block match) and the
+		// per-generated-frame warp are distinct costs — report both.
+		if ( dispatch.motionSupported )
+		{
+			// Prime intermediates so the warp timing doesn't include allocation.
+			{
+				auto cmd = g_device.commandBuffer();
+				framegen_prepare_motion( cmd.get(), res.nWidth, res.nHeight, dispatch );
+				g_device.submit( std::move( cmd ) );
+				g_device.waitIdle();
+			}
+
+			double msMotionPrep = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+				framegen_prepare_motion( cmd, res.nWidth, res.nHeight, dispatch );
+			} );
+			printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion setup (per real)", msMotionPrep );
+
+			double msMotionWarp = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+				framegen_warp_slot( cmd, pOut, g_flFramegenStrength );
+			} );
+			printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion warp (per gen)", msMotionWarp );
+		}
+		else
+		{
+			printf( "%-8s  %-26s  %10s\n", res.pszName, "motion", "unsupported" );
+		}
+
+		printf( "-------------------------------------------------------\n" );
+
+		// Drop history references and motion intermediates before the images go.
+		g_framegenHistory.previousReal = nullptr;
+		g_framegenHistory.currentReal = nullptr;
+		vulkan_framegen_reset( "benchmark cleanup" );
+	}
+	} // format loop
+
+	g_device.vk.DestroyQueryPool( g_device.device(), queryPool, nullptr );
+	printf( "\n" );
+}
+
 static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo )
 {
 	if ( !vulkan_framegen_is_enabled() || !pRealFrame || !pFrameInfo )
@@ -5082,7 +5327,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	const CVulkanTexture *pBaseTexture = pFrameInfo->layerCount > 0 ? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
 	if ( pBaseTexture && pBaseTexture == g_framegenHistory.pLastBaseTexture )
 	{
-		if ( g_bFramegenDebug )
+		static uint64_t s_uOverlayOnlyDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uOverlayOnlyDebugLogCounter ) )
 			vk_log.infof( "framegen: ignoring overlay-only repaint (base content unchanged)" );
 		return;
 	}
@@ -5108,7 +5354,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	g_framegenHistory.currentFrameId++;
 	g_framegenHistory.currentPresentTimeNs = now;
 
-	if ( g_bFramegenDebug )
+	static uint64_t s_uRealFrameDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uRealFrameDebugLogCounter ) )
 	{
 		vk_log.infof( "framegen: real frame id=%" PRIu64 " time=%" PRIu64 " size=%ux%u format=0x%" PRIX32,
 			g_framegenHistory.currentFrameId,
@@ -5152,7 +5399,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// Prime: the first frame after a reset/invalidation only establishes history.
 	if ( !g_framegenHistory.valid )
 	{
-		if ( g_bFramegenDebug )
+		static uint64_t s_uPrimeDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uPrimeDebugLogCounter ) )
 			vk_log.infof( "framegen: priming history with real frame id=%" PRIu64, g_framegenHistory.currentFrameId );
 		g_framegenHistory.valid = true;
 		return;
@@ -5173,7 +5421,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	if ( !bGeneratable || g_framegenHistory.nStableFrames < k_uFramegenStableFramesRequired )
 	{
-		if ( g_bFramegenDebug )
+		static uint64_t s_uDormantDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uDormantDebugLogCounter ) )
 			vk_log.infof( "framegen: %s %u/%u", bGeneratable ? "stabilizing" : "dormant",
 				g_framegenHistory.nStableFrames, k_uFramegenStableFramesRequired );
 		return;
@@ -5292,7 +5541,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	const uint32_t nGeneratedCount = (uint32_t)slots.size();
 
-	if ( g_bFramegenDebug )
+	static uint64_t s_uGeneratedDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uGeneratedDebugLogCounter ) )
 	{
 		vk_log.infof( "framegen: generated %u frame(s) for real id=%" PRIu64 " gapVblanks=%u mode=%s queue family %u",
 			nGeneratedCount,

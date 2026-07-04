@@ -3,6 +3,7 @@
 #include <getopt.h>
 
 #include <atomic>
+#include <cstdint>
 
 extern const char *gamescope_optstring;
 extern const struct option *gamescope_options;
@@ -92,6 +93,9 @@ enum class GamescopeFramegenMode : uint32_t
 
 extern bool g_bExperimentalFramegen;
 extern bool g_bFramegenDebug;
+extern uint32_t g_uFramegenDebugEvery;
 extern int g_nFramegenMultiplier;
 extern GamescopeFramegenMode g_eFramegenMode;
 extern float g_flFramegenStrength;
+
+bool FramegenDebugShouldLog( uint64_t &counter );

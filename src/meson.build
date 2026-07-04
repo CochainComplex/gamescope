@@ -68,6 +68,7 @@ shader_src = [
   'shaders/cs_easu_fp16.comp',
   'shaders/cs_framegen_blend.comp',
   'shaders/cs_framegen_extrapolate.comp',
+  'shaders/cs_framegen_extrapolate_direct.comp',
   'shaders/cs_framegen_extrapolate_fp16.comp',
   'shaders/cs_framegen_extrapolate_pair.comp',
   'shaders/cs_framegen_extrapolate_pair_fp16.comp',

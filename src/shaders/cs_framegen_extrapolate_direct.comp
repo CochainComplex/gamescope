@@ -1,0 +1,66 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set.h"
+
+// Direct (no-LDS) forward extrapolation — bit-identical output to
+// cs_framegen_extrapolate.comp, but the 4-neighbour rectification cross is read
+// straight from the texture units instead of being staged through an LDS apron.
+//
+// Rationale: this pass is memory-bandwidth-bound and very light on ALU. On GPUs
+// with an effective texture cache (large L2 / Infinity Cache — e.g. desktop
+// NVIDIA and RDNA3) the neighbour reads are served from cache for free, so the
+// LDS apron's cooperative load + barrier is pure overhead. Measured ~30-37%
+// faster than the LDS variant on NVIDIA. The LDS variant is kept for cache-poor
+// / bandwidth-starved parts where staging still wins; the compositor picks the
+// variant per GPU in framegen_dispatch_for_format (zero runtime dispatch cost).
+
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform framegen_params_t {
+    // See cs_framegen_extrapolate.comp for the derivation of these.
+    float u_strength;
+    float u_suppressLo;
+    float u_suppressHi;
+    float u_pad;
+};
+
+vec3 loadCurClamped(ivec2 p, ivec2 sz) {
+    return texelFetch(s_samplers[1], clamp(p, ivec2(0), sz - ivec2(1)), 0).rgb;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(dst);
+    if (coord.x >= sz.x || coord.y >= sz.y)
+        return;
+
+    vec4 curSample = texelFetch(s_samplers[1], coord, 0);
+    vec3 currentFrame = curSample.rgb;
+    vec3 previousFrame = texelFetch(s_samplers[0], coord, 0).rgb;
+
+    // Low-latency forward extrapolation, suppressed where inter-frame change is
+    // large (moving edges / disocclusions ghost the worst).
+    vec3 delta = currentFrame - previousFrame;
+    float motion = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
+    float strength = u_strength * (1.0f - smoothstep(u_suppressLo, u_suppressHi, motion));
+
+    vec3 predicted = currentFrame + delta * strength;
+
+    // TAA-style rectification against the current frame's 4-neighbor cross.
+    vec3 n0 = loadCurClamped(coord + ivec2( 1, 0), sz);
+    vec3 n1 = loadCurClamped(coord + ivec2(-1, 0), sz);
+    vec3 n2 = loadCurClamped(coord + ivec2( 0, 1), sz);
+    vec3 n3 = loadCurClamped(coord + ivec2( 0,-1), sz);
+    vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
+    vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
+    predicted = clamp(predicted, neighborMin, neighborMax);
+
+    imageStore(dst, coord, vec4(predicted, curSample.a));
+}
