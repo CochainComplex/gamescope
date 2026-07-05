@@ -72,15 +72,19 @@ Reflex and anti-lag, and never produce fake presentation feedback.
 
 This is a prototype. Keep the following in mind:
 
-* **It only helps when the game runs at or below half your display's refresh
-  rate.** Frame generation fills vblanks the game left empty. Real content
-  always takes priority: a generated frame is dropped, never presented, if a
-  new game frame *or* an overlay/notification update is ready for the same
-  vblank, and generation goes fully dormant while the game outpaces ~⅔ of the
-  refresh rate. Resuming after a fast spell requires a short run of stable
-  slow frames (hysteresis), so a game hovering around the threshold doesn't
-  flap between generating and dormant. Still, cap the game with `-r` to half
-  the refresh rate (e.g. `-r 72` on a 144 Hz display) so the cadence is stable.
+* **Generated frames only display on empty vblanks.** Real content always takes
+  priority: a generated frame is dropped, never presented, if a new game frame
+  *or* an overlay/notification update is ready for the same vblank. On a
+  dedicated framegen queue, gamescope also prepares speculative generated
+  candidates after usable real frames so sudden missed vblanks already have
+  work in flight on the second GPU. If a slow game exhausts that first batch,
+  the dedicated queue can refill one prediction at a time while the real-frame
+  history is still recent, bounded by the stall/scene-change timeout. If the
+  game keeps up, those candidates are discarded before they can add latency. On
+  the single/shared-queue path,
+  admission stays conservative and framegen waits for a stable empty-vblank
+  cadence before generating. For the most deterministic cadence, cap the game
+  near an integer fraction of refresh (for example `-r 72` on a 144 Hz display).
 * **It forces the composite path** (implies `--force-composite`), so direct
   scan-out is disabled while it is active. This costs a little latency and power
   versus a plain direct-scan-out frame. **Adaptive sync (VRR) and tearing flips
@@ -191,7 +195,7 @@ See `gamescope --help` for a full list of options.
 * `--experimental-framegen`: enable experimental compositor-side frame generation (x2–x4). Implies `--force-composite`; disables adaptive sync and tearing while active. See [Experimental frame generation](#experimental-frame-generation).
 * `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency), `motion` (motion-compensated, higher quality/cost) or `blend` (debug).
 * `--framegen-strength`: forward-extrapolation step for `extrapolate`/`motion` modes, `0.0`–`1.0` (default `0.5`). Lower values reduce ghosting.
-* `--framegen-multiplier`: generated-frame multiplier, `2` (default), `3` or `4`. The number of frames actually inserted adapts to the measured frame gap.
+* `--framegen-multiplier`: generated-frame multiplier, `2` (default), `3` or `4`. The number of frames actually displayed adapts to empty vblanks; on a dedicated framegen queue gamescope may speculatively prepare candidates that are later dropped if real content arrives first.
 * `--framegen-debug`: log framegen history, dispatch, and present cadence.
 
 ## Reshade support
