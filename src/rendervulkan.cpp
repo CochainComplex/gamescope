@@ -1317,6 +1317,49 @@ bool CVulkanDevice::createScratchResources()
 		}
 	}
 
+	// Best-effort timestamp query-pool ring to measure live framegen GPU time,
+	// feeding the deadline-driven degradation ladder. Only meaningful on the
+	// dedicated queue (where a batch's timestamps aren't serialized behind the
+	// composite); if the queue family can't timestamp, framegen simply runs
+	// without the measurement and the ladder stays at full quality.
+	if ( m_bHasFramegenQueue )
+	{
+		uint32_t nQueueFamilyCount = 0;
+		vk.GetPhysicalDeviceQueueFamilyProperties( physDev(), &nQueueFamilyCount, nullptr );
+		std::vector<VkQueueFamilyProperties> queueFamilyProps( nQueueFamilyCount );
+		vk.GetPhysicalDeviceQueueFamilyProperties( physDev(), &nQueueFamilyCount, queueFamilyProps.data() );
+
+		VkPhysicalDeviceProperties physProps = {};
+		vk.GetPhysicalDeviceProperties( physDev(), &physProps );
+
+		const bool bTimestampsUsable = m_queueFamily < nQueueFamilyCount
+			&& queueFamilyProps[ m_queueFamily ].timestampValidBits > 0
+			&& physProps.limits.timestampPeriod != 0.0f;
+
+		if ( bTimestampsUsable )
+		{
+			// A batch is admitted only when the previous one has finished (the
+			// oversubscription guard), so at most one is ever in flight; a small
+			// ring still gives a late readback slack before a slot is reused.
+			m_uFramegenQueryRingDepth = 4;
+			const VkQueryPoolCreateInfo queryPoolInfo = {
+				.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+				.queryType = VK_QUERY_TYPE_TIMESTAMP,
+				.queryCount = m_uFramegenQueryRingDepth * 2,
+			};
+			if ( vk.CreateQueryPool( device(), &queryPoolInfo, nullptr, &m_framegenQueryPool ) == VK_SUCCESS )
+			{
+				m_flFramegenTimestampPeriodNs = physProps.limits.timestampPeriod;
+				vk_log.infof( "frame generation: measuring GPU time via timestamp queries (period %.2f ns)", m_flFramegenTimestampPeriodNs );
+			}
+			else
+			{
+				m_framegenQueryPool = VK_NULL_HANDLE;
+				m_uFramegenQueryRingDepth = 0;
+			}
+		}
+	}
+
 	return true;
 }
 
@@ -1811,7 +1854,7 @@ bool CVulkanDevice::hasCompleted(uint64_t sequence)
 // composite on the realtime queue. Without a second queue it forwards to the
 // normal shared-queue submit, where in-order execution provides the same
 // ordering (at the cost of the head-of-line blocking this feature removes).
-uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer, uint64_t ulWaitCompositeSeqNo )
+uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer, uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung, uint32_t nGeneratedCount )
 {
 	if ( !m_bHasFramegenQueue )
 		return submit( std::move( cmdBuffer ) );
@@ -1854,6 +1897,11 @@ uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf
 	vk_check( vk.QueueSubmit( m_framegenQueue, 1, &submitInfo, VK_NULL_HANDLE ) );
 
 	m_pendingFramegenCmdBufs.emplace( nextSeqNo, std::move( cmdBuffer ) );
+	// Associate the timestamp ring slot (if any), ladder rung, and generated-count
+	// with its seqNo, so readback can attribute measured cost to the exact batch
+	// shape. A rung's cost is not stable across x2-like and x4-like gaps.
+	if ( nQuerySlot >= 0 )
+		m_framegenQuerySlotBySeqNo.emplace( nextSeqNo, FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount } );
 	return nextSeqNo;
 }
 
@@ -1865,6 +1913,40 @@ bool CVulkanDevice::hasCompletedFramegen( uint64_t sequence )
 	uint64_t currentSeqNo = 0;
 	vk_check( vk.GetSemaphoreCounterValue( device(), m_framegenTimeline->pVkSemaphore, &currentSeqNo ) );
 	return currentSeqNo >= sequence;
+}
+
+// Record the opening timestamp of a framegen batch. Rotates the query-pool ring,
+// resets that slot's two queries, and writes a TOP_OF_PIPE timestamp. Returns the
+// slot for framegenTimestampEnd / submitFramegen, or -1 when measurement is off.
+int CVulkanDevice::framegenTimestampBegin( CVulkanCmdBuffer *pCmdBuffer )
+{
+	if ( m_framegenQueryPool == VK_NULL_HANDLE || m_uFramegenQueryRingDepth == 0 || pCmdBuffer == nullptr )
+		return -1;
+
+	const uint32_t nSlot = m_uFramegenQueryHead;
+	m_uFramegenQueryHead = ( m_uFramegenQueryHead + 1 ) % m_uFramegenQueryRingDepth;
+
+	VkCommandBuffer raw = pCmdBuffer->rawBuffer();
+	vk.CmdResetQueryPool( raw, m_framegenQueryPool, nSlot * 2, 2 );
+	vk.CmdWriteTimestamp( raw, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_framegenQueryPool, nSlot * 2 );
+	return (int)nSlot;
+}
+
+// Record the closing timestamp of a framegen batch (BOTTOM_OF_PIPE). Must be
+// called while the command buffer is still recording, before submitFramegen ends it.
+void CVulkanDevice::framegenTimestampEnd( CVulkanCmdBuffer *pCmdBuffer, int nSlot )
+{
+	if ( nSlot < 0 || m_framegenQueryPool == VK_NULL_HANDLE || pCmdBuffer == nullptr )
+		return;
+
+	vk.CmdWriteTimestamp( pCmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_framegenQueryPool, (uint32_t)nSlot * 2 + 1 );
+}
+
+void CVulkanDevice::framegenResetRungCosts()
+{
+	for ( uint32_t r = 0; r < kFramegenLadderSlots; r++ )
+		for ( uint32_t c = 0; c < kFramegenGeneratedCountSlots; c++ )
+			m_aFramegenRungCostNs[ r ][ c ] = 0;
 }
 
 void CVulkanDevice::waitFramegen( uint64_t sequence )
@@ -1899,6 +1981,32 @@ void CVulkanDevice::framegenGarbageCollect()
 	{
 		if ( it->first > currentSeqNo )
 			break; // ordered by seqNo: nothing later has completed either
+
+		// The seqNo has completed, so any timestamps this batch wrote are ready.
+		// Read them back WITHOUT WAIT_BIT (never stall the compositor thread) and
+		// fold into the rolling GPU-time stat that drives the degradation ladder.
+		auto slotIt = m_framegenQuerySlotBySeqNo.find( it->first );
+		if ( slotIt != m_framegenQuerySlotBySeqNo.end() )
+		{
+			const uint32_t nSlot = slotIt->second.nSlot;
+			const uint32_t nRung = slotIt->second.nRung;
+			const uint32_t nGeneratedCount = slotIt->second.nGeneratedCount;
+			uint64_t ts[2] = { 0, 0 };
+			const VkResult res = vk.GetQueryPoolResults( device(), m_framegenQueryPool, nSlot * 2, 2,
+				sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT );
+			if ( res == VK_SUCCESS && ts[1] > ts[0] && nRung < kFramegenLadderSlots && nGeneratedCount < kFramegenGeneratedCountSlots )
+			{
+				const uint64_t ulGpuNs = (uint64_t)( double( ts[1] - ts[0] ) * m_flFramegenTimestampPeriodNs );
+				m_ulFramegenLastRawGpuTimeNs = ulGpuNs;
+				// Fold into this exact batch shape with a symmetric slow EMA (7/8).
+				// A single anomalous batch must not shed quality for the whole scene,
+				// and x2-like gaps must not inherit x4-like batch timings.
+				uint64_t &ulRungCost = m_aFramegenRungCostNs[ nRung ][ nGeneratedCount ];
+				ulRungCost = ( ulRungCost == 0 ) ? ulGpuNs : ( ulRungCost * 7 + ulGpuNs ) / 8;
+			}
+			m_framegenQuerySlotBySeqNo.erase( slotIt );
+		}
+
 		it->second->reset();
 		m_unusedCmdBufs.push_back( std::move( it->second ) );
 		it = m_pendingFramegenCmdBufs.erase( it );
@@ -4476,9 +4584,9 @@ extern uint32_t g_reshade_technique_idx;
 
 ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
 
-static const char *framegen_mode_name()
+static const char *framegen_mode_name_of( GamescopeFramegenMode eMode )
 {
-	switch ( g_eFramegenMode )
+	switch ( eMode )
 	{
 		case GamescopeFramegenMode::Extrapolate:
 			return "extrapolate";
@@ -4489,6 +4597,11 @@ static const char *framegen_mode_name()
 		default:
 			return "unknown";
 	}
+}
+
+static const char *framegen_mode_name()
+{
+	return framegen_mode_name_of( g_eFramegenMode );
 }
 
 // Push constants for the extrapolate shaders. `strength` is the effective
@@ -4667,6 +4780,14 @@ struct FramegenHistory_t
 	EOTF eLastEOTF = EOTF_Count;
 	// Consecutive real frames slow enough to leave an empty vblank to fill.
 	uint32_t nStableFrames = 0;
+	// Deadline-driven degradation ladder (#04) position: 0 = full startup config,
+	// each step sheds work (motion->extrapolate, then a multiplier notch). Never
+	// reaches "stop generating" — that is left to the reactive pacing gate below.
+	// Monotonic within a scene (only ever increases); reset to 0 on a scene change.
+	// nDegradeHold is a post-step cooldown so the new rung's cost folds into the
+	// measurement before the next step decision.
+	uint32_t nDegradeSteps = 0;
+	uint32_t nDegradeHold = 0;
 	bool valid = false;
 };
 
@@ -4684,6 +4805,16 @@ static constexpr uint32_t k_uFramegenStableFramesRequired = 8;
 // a few frames. Must be >=1 and small relative to the required count above.
 static constexpr uint32_t k_uFramegenStableFramesLeak = 2;
 
+// Deadline for the degradation ladder (#04): when a rung's measured GPU cost
+// exceeds this fraction of the vblank interval, shed a rung. The margin below
+// 100% is proactive headroom against per-batch jitter, so a batch whose mean sits
+// here rarely spikes past the true vblank and drops its generated frame.
+static constexpr uint64_t k_uFramegenDeadlinePercent = 85; // > this % of a vblank interval -> degrade
+// Frames to hold after a ladder step before stepping again, so the new rung's real
+// cost folds into the measurement first (the readback lags by ~1 batch). Without
+// it the loop would step again on the not-yet-updated rung cost and over-degrade.
+static constexpr uint32_t k_uFramegenDegradeHoldFrames = 4;
+
 bool vulkan_framegen_is_enabled()
 {
 	// Only enable on backends that actually present generated frames. Otherwise
@@ -4699,10 +4830,55 @@ bool vulkan_framegen_is_enabled()
 			|| g_eFramegenMode == GamescopeFramegenMode::Motion );
 }
 
-// Number of generated frames to insert between two real frames (multiplier-1).
-static uint32_t framegen_slot_count()
+// Deadline-driven degradation ladder (#04). The startup mode/multiplier are the
+// quality CEILING; under GPU-time pressure the ladder sheds work one rung at a
+// time. It is monotonic within a scene (only ever degrades); quality is re-probed
+// from this ceiling only on a scene change (invalidate_history). It NEVER mutates
+// the base globals (g_eFramegenMode / g_nFramegenMultiplier): those gate the whole
+// feature (vulkan_framegen_is_enabled) and size the output pool, so the ladder only
+// ever degrades within them and reads its result through framegen_effective_config.
+struct FramegenEffective_t
 {
-	return (uint32_t)std::max( 1, g_nFramegenMultiplier - 1 );
+	GamescopeFramegenMode mode;
+	uint32_t multiplier;
+};
+
+// Total number of rungs available from the startup config: one to drop
+// motion->extrapolate (only if configured for motion), plus one per multiplier
+// notch down to x2. Deliberately does NOT include a "stop generating" rung: the
+// ladder always keeps generating (at worst the cheapest config), so its GPU-time
+// input never starves. The genuine "even the cheapest config overruns" case is
+// left to the existing reactive pacing gate (bGpuHasHeadroom + nStableFrames),
+// which is driven by live per-frame signals and so self-heals, unlike a
+// measurement-frozen ladder rung would.
+static uint32_t framegen_max_degrade_steps()
+{
+	const uint32_t nMotionRung = ( g_eFramegenMode == GamescopeFramegenMode::Motion ) ? 1u : 0u;
+	const uint32_t nMultiplierRungs = (uint32_t)std::max( 0, g_nFramegenMultiplier - 2 );
+	return nMotionRung + nMultiplierRungs;
+}
+
+// Apply nDegradeSteps degradations to the startup ceiling. Motion (the priciest
+// pass) is shed first, then the multiplier is stepped down to x2. nDegradeSteps
+// is always clamped to framegen_max_degrade_steps(), so n is fully consumed and
+// the result is always a still-generating config (never dormant).
+static FramegenEffective_t framegen_effective_config( uint32_t nDegradeSteps )
+{
+	FramegenEffective_t eff = { g_eFramegenMode, (uint32_t)std::max( 2, g_nFramegenMultiplier ) };
+	uint32_t n = nDegradeSteps;
+
+	if ( n > 0 && eff.mode == GamescopeFramegenMode::Motion )
+	{
+		eff.mode = GamescopeFramegenMode::Extrapolate;
+		n--;
+	}
+	while ( n > 0 && eff.multiplier > 2 )
+	{
+		eff.multiplier--;
+		n--;
+	}
+
+	return eff;
 }
 
 static bool framegen_output_matches( const gamescope::OwningRc<CVulkanTexture> &pTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
@@ -4725,6 +4901,13 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.valid = false;
 	g_framegenHistory.pending.clear();
 	g_framegenHistory.nStableFrames = 0;
+	// Re-probe quality from the top on a fresh scene: the ladder is monotonic
+	// within a scene, so a scene change is the only place quality is restored.
+	g_framegenHistory.nDegradeSteps = 0;
+	g_framegenHistory.nDegradeHold = 0;
+	// Forget learned per-rung costs so the new scene is measured afresh rather than
+	// inheriting the old scene's "this rung overruns" verdicts.
+	g_device.framegenResetRungCosts();
 	g_framegenHistory.pLastBaseTexture = nullptr;
 	// Release the retained output-ring slots so a ring rebuild is never blocked
 	// by history holding a reference to an old image, and so the next real frame
@@ -4739,6 +4922,11 @@ void vulkan_framegen_reset( const char *reason )
 		vk_log.infof( "framegen: reset history reason=%s", reason ? reason : "unknown" );
 
 	g_framegenHistory = {};
+	// The per-rung costs live on g_device and survive the history reset; forget
+	// them too (as invalidate_history does) so the monotonic ladder re-probes the
+	// new workload from full quality instead of stepping on the old scene's stale
+	// over-deadline measurements.
+	g_device.framegenResetRungCosts();
 	g_output.framegenOutputImages.clear();
 	g_framegenMotion = {};
 }
@@ -5178,7 +5366,6 @@ void vulkan_framegen_benchmark()
 	printf( "%-8s  %-26s  %10s\n", "res", "pass", "GPU ms" );
 	printf( "-------------------------------------------------------\n" );
 	const uint32_t uDrmFormat = fmt.uDrmFormat;
-	const bool bFloatTarget = ( uDrmFormat == DRM_FORMAT_ABGR16161616F || uDrmFormat == DRM_FORMAT_XBGR16161616F );
 
 	// Time a single recorded workload: warm up once (first-use allocations,
 	// pipeline residency), then average the GPU timestamp delta over nIters
@@ -5367,7 +5554,15 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	// A very long gap is a scene discontinuity (stall, load screen); drop history
 	// so the previous scene is never smeared across the resume.
-	const uint64_t ulVblankIntervalNs = g_nOutputRefresh > 0 ? 1'000'000'000'000ull / (uint64_t)g_nOutputRefresh : 8'333'333ull;
+	// Pace against the SAME refresh the vblank scheduler counts in. The vblank
+	// timer uses GetRefresh() == (g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh);
+	// in nested mode g_nOutputRefresh is later overwritten with the PARENT monitor's
+	// refresh while slots are still placed on g_nNestedRefresh's cadence. Deriving the
+	// interval from g_nOutputRefresh there desynchronises nGapVblanks / phase / strength
+	// from where the frame is actually shown — the temporal wobble. On DRM the two are
+	// equal, so this is a no-op there.
+	const int nFramegenRefreshMhz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+	const uint64_t ulVblankIntervalNs = nFramegenRefreshMhz > 0 ? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
 	if ( g_framegenHistory.valid && ulPrevRealFrameTimeNs != 0 && now - ulPrevRealFrameTimeNs > k_ulFramegenMaxRealFrameGapNs )
 		vulkan_framegen_invalidate_history( "frame_gap" );
 
@@ -5419,23 +5614,84 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			? g_framegenHistory.nStableFrames - k_uFramegenStableFramesLeak : 0;
 	}
 
+	// Max degradation rungs for the startup config (0 for extrapolate/blend x2).
+	// Needed here for the dormant log; the ladder itself is evaluated further down,
+	// only on frames we actually generate, so it steps on real generating frames
+	// and never on an idle/dormant frame.
+	const uint32_t nMaxDegradeSteps = framegen_max_degrade_steps();
+
 	if ( !bGeneratable || g_framegenHistory.nStableFrames < k_uFramegenStableFramesRequired )
 	{
 		static uint64_t s_uDormantDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uDormantDebugLogCounter ) )
-			vk_log.infof( "framegen: %s %u/%u", bGeneratable ? "stabilizing" : "dormant",
-				g_framegenHistory.nStableFrames, k_uFramegenStableFramesRequired );
+			vk_log.infof( "framegen: %s %u/%u degrade=%u/%u", bGeneratable ? "stabilizing" : "dormant",
+				g_framegenHistory.nStableFrames, k_uFramegenStableFramesRequired,
+				g_framegenHistory.nDegradeSteps, nMaxDegradeSteps );
 		return;
 	}
 
 	if ( g_framegenHistory.previousReal == nullptr || g_framegenHistory.currentReal == nullptr )
 		return;
 
-	// Fill as many empty vblanks as the measured gap actually offers, capped by
-	// the multiplier: round the gap to whole vblanks and generate one fewer than
-	// that (the final slot is the next real frame).
+	// Whole-vblank gap this real interval leaves to fill. Needed by the ladder's
+	// step-helps test below, and by the generated-frame count further down.
 	const uint32_t nGapVblanks = (uint32_t)( ( now - ulPrevRealFrameTimeNs + ulVblankIntervalNs / 2 ) / ulVblankIntervalNs );
-	uint32_t nGenerate = nGapVblanks > 1 ? std::min( nGapVblanks - 1, framegen_slot_count() ) : 0;
+
+	// Deadline-driven degradation (#04): shed one quality rung whenever the CURRENT
+	// config's measured GPU cost (see framegenGarbageCollect) overruns the vblank
+	// budget, so a too-slow config never causes a missed generated frame. Evaluated
+	// only here, on frames we actually generate, so the rung it settles on is a rung
+	// that was really measured and an idle/dormant stretch never moves it.
+	//
+	// Deliberately MONOTONIC within a scene: it only ever degrades, never restores
+	// quality mid-scene. Restoring means re-probing a richer config that may not fit
+	// and then dropping it again — a visible toggle of the generated-frame look, i.e.
+	// exactly the micro-stutter this feature exists to avoid. Quality is re-probed
+	// from full on the next scene change (framegenResetRungCosts + nDegradeSteps = 0
+	// in vulkan_framegen_invalidate_history), which is the natural "the workload may
+	// have changed" signal (focus change, layer/EOTF change, long stall). When no
+	// measurement is available the current rung's cost is 0 and the ladder stays at
+	// full quality, leaving the existing reactive discard as the only safety net.
+	const uint32_t nGapSlots = nGapVblanks > 1 ? nGapVblanks - 1 : 0;
+	const FramegenEffective_t curEffForLadder = framegen_effective_config( g_framegenHistory.nDegradeSteps );
+	const uint32_t nCurGenForLadder = std::min( nGapSlots, std::max( 1u, curEffForLadder.multiplier - 1u ) );
+	const uint64_t ulCurRungCostNs = g_device.framegenRungCostNs( g_framegenHistory.nDegradeSteps, nCurGenForLadder );
+	if ( nMaxDegradeSteps > 0 && ulCurRungCostNs != 0 && g_framegenHistory.nDegradeSteps < nMaxDegradeSteps )
+	{
+		const uint64_t ulDeadlineNs = ( ulVblankIntervalNs * k_uFramegenDeadlinePercent ) / 100;
+		if ( g_framegenHistory.nDegradeHold > 0 )
+		{
+			// Cooldown after a step: keep generating (so the new rung's cost gets
+			// measured) but hold off on another step until that fresh sample folds
+			// in, otherwise we'd act on a not-yet-updated rung cost and overshoot.
+			g_framegenHistory.nDegradeHold--;
+		}
+		else if ( ulCurRungCostNs > ulDeadlineNs )
+		{
+			// Over budget at the current rung. Only take the step if it actually
+			// reduces work at THIS gap: dropping motion->extrapolate always lowers
+			// per-frame cost, but a pure multiplier notch only helps when the gap
+			// lets it generate fewer frames. Otherwise stepping would cost quality
+			// (a coarser cadence / fewer inserted frames) for zero GPU saving.
+			const FramegenEffective_t nextEff = framegen_effective_config( g_framegenHistory.nDegradeSteps + 1 );
+			const uint32_t nNextGen = std::min( nGapSlots, std::max( 1u, nextEff.multiplier - 1u ) );
+			if ( nextEff.mode != curEffForLadder.mode || nNextGen < nCurGenForLadder )
+			{
+				g_framegenHistory.nDegradeSteps++;
+				g_framegenHistory.nDegradeHold = k_uFramegenDegradeHoldFrames;
+			}
+		}
+	}
+
+	const FramegenEffective_t eff = framegen_effective_config( g_framegenHistory.nDegradeSteps );
+
+	// Fill as many empty vblanks as the measured gap actually offers, capped by
+	// the multiplier: generate one fewer than the whole-vblank gap (the final slot
+	// is the next real frame). The ladder's effective multiplier can lower this
+	// ceiling below the startup one under GPU pressure; it is always
+	// <= g_nFramegenMultiplier, so the pre-sized output pool holds.
+	const uint32_t nSlotCeiling = std::max( 1u, eff.multiplier - 1u );
+	uint32_t nGenerate = nGapVblanks > 1 ? std::min( nGapVblanks - 1, nSlotCeiling ) : 0;
 
 	// Without a dedicated framegen queue the batch is submitted to the same
 	// in-order queue as the next composite, so it sits in front of it. Cap the
@@ -5481,12 +5737,17 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// batch draws from the isolated framegen descriptor ring (see markFramegen).
 	std::unique_ptr<CVulkanCmdBuffer> pCmdBuffer = g_device.commandBuffer();
 	pCmdBuffer->markFramegen();
+	// Bracket the batch's dispatches with GPU timestamps so its cost feeds the
+	// degradation ladder next interval. No-op (returns -1) without timestamp support.
+	const int nQuerySlot = g_device.framegenTimestampBegin( pCmdBuffer.get() );
 	const FramegenDispatch_t &dispatch = framegen_dispatch_for_format( g_framegenHistory.drmFormat );
 
 	// Motion estimation depends only on the two real frames, so it is computed
 	// once for the batch; falls back to extrapolation for every slot if the
-	// intermediates can't be allocated.
-	const bool bMotion = g_eFramegenMode == GamescopeFramegenMode::Motion
+	// intermediates can't be allocated. The ladder's effective mode (not the base
+	// global) selects the pass, so motion can be shed under GPU pressure without
+	// disturbing vulkan_framegen_is_enabled() or the forced-composite tax.
+	const bool bMotion = eff.mode == GamescopeFramegenMode::Motion
 		&& dispatch.motionSupported
 		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(), g_framegenHistory.currentReal->height(), dispatch );
 
@@ -5496,7 +5757,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		for ( const SlotPlan_t &slot : slots )
 			framegen_warp_slot( pCmdBuffer.get(), slot.tex, slot.strength );
 	}
-	else if ( g_eFramegenMode == GamescopeFramegenMode::Blend )
+	else if ( eff.mode == GamescopeFramegenMode::Blend )
 	{
 		for ( const SlotPlan_t &slot : slots )
 			framegen_bind_blend( pCmdBuffer.get(), slot.tex, slot.phase );
@@ -5516,7 +5777,10 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			framegen_bind_extrapolate( pCmdBuffer.get(), dispatch.extrapolate, slots[ i ].tex, slots[ i ].strength );
 	}
 
-	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo );
+	g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
+	// Attribute this batch's measured cost to the rung and generated-count it ran
+	// at; batch cost scales with slot count, especially x3/x4 extrapolate pairs.
+	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, (uint32_t)slots.size() );
 
 	for ( const SlotPlan_t &slot : slots )
 	{
@@ -5544,11 +5808,15 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	static uint64_t s_uGeneratedDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uGeneratedDebugLogCounter ) )
 	{
-		vk_log.infof( "framegen: generated %u frame(s) for real id=%" PRIu64 " gapVblanks=%u mode=%s queue family %u",
+		vk_log.infof( "framegen: generated %u frame(s) for real id=%" PRIu64 " gapVblanks=%u mode=%s(x%u) degrade=%u/%u gpu=%.2fms queue family %u",
 			nGeneratedCount,
 			g_framegenHistory.currentFrameId,
 			nGapVblanks,
-			framegen_mode_name(),
+			framegen_mode_name_of( bMotion ? GamescopeFramegenMode::Motion : eff.mode ),
+			eff.multiplier,
+			g_framegenHistory.nDegradeSteps,
+			nMaxDegradeSteps,
+			g_device.framegenLastGpuTimeNs() / 1.0e6,
 			g_device.queueFamily() );
 	}
 

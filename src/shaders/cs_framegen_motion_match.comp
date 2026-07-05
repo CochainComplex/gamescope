@@ -35,20 +35,34 @@ layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 
 const int TILE = 8;
 const int MAX_RADIUS = 4;
-// SAD taps span [-1,1] and candidate offsets span [-R,R], so the previous
-// frame needs a (TILE + 2*(MAX_RADIUS+1))^2 window around the tile and the
-// current frame a (TILE + 2)^2 one.
-const int PREV_W = TILE + 2 * (MAX_RADIUS + 1); // 18
-const int CUR_W = TILE + 2;                     // 10
+// SAD taps span [-1,1], candidate offsets span [-R,R], and the sub-pixel
+// refinement evaluates the SAD one step past the winner (|mv| up to R+1). So the
+// previous-frame window needs a (TILE + 2*APRON)^2 halo with APRON = MAX_RADIUS+2
+// (R + 1 refine step + 1 SAD tap); the current frame only needs (TILE + 2)^2.
+const int APRON = MAX_RADIUS + 2;
+const int PREV_W = TILE + 2 * APRON; // 20
+const int CUR_W = TILE + 2;          // 10
 shared float s_prev[PREV_W * PREV_W];
 shared float s_cur[CUR_W * CUR_W];
 
 float lumaPrevFetch(ivec2 p, ivec2 sz) { return texelFetch(s_samplers[0], clamp(p, ivec2(0), sz - 1), 0).r; }
 float lumaCurFetch (ivec2 p, ivec2 sz) { return texelFetch(s_samplers[1], clamp(p, ivec2(0), sz - 1), 0).r; }
 
+// Raw 3x3 SAD (no regularization) of the invocation's current block against the
+// previous window at candidate offset (mvx, mvy). Reads the staged LDS windows.
+// Used by the sub-pixel refinement, which localizes the true minimum and must
+// not be biased by the small-motion regularizer.
+float sadRawAt(float cur[9], int mvx, int mvy, ivec2 lp) {
+    float sad = 0.0f;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            sad += abs(cur[(dy + 1) * 3 + (dx + 1)] - s_prev[(lp.y + dy - mvy) * PREV_W + (lp.x + dx - mvx)]);
+    return sad;
+}
+
 void main() {
     ivec2 sz = imageSize(dst);
-    ivec2 prevBase = ivec2(gl_WorkGroupID.xy) * TILE - ivec2(MAX_RADIUS + 1);
+    ivec2 prevBase = ivec2(gl_WorkGroupID.xy) * TILE - ivec2(APRON);
     ivec2 curBase = ivec2(gl_WorkGroupID.xy) * TILE - ivec2(1);
 
     // 64 threads cooperatively stage the two windows (clamped at the borders,
@@ -75,7 +89,7 @@ void main() {
         for (int dx = -1; dx <= 1; dx++)
             cur[(dy + 1) * 3 + (dx + 1)] = s_cur[(lc.y + dy) * CUR_W + (lc.x + dx)];
 
-    ivec2 lp = ivec2(gl_LocalInvocationID.xy) + ivec2(MAX_RADIUS + 1);
+    ivec2 lp = ivec2(gl_LocalInvocationID.xy) + ivec2(APRON);
 
     // SAD of a 3x3 block: current at p versus previous at p - mv. The best mv is
     // the prev->cur flow (content at cur(p) came from prev(p - mv)).
@@ -111,5 +125,23 @@ void main() {
     float conf = clamp(1.0f - residual * 6.0f, 0.0f, 1.0f);
     conf *= clamp((zeroSad - bestSad) * 4.0f, 0.0f, 1.0f);
 
-    imageStore(dst, p, vec4(float(bestMv.x), float(bestMv.y), conf, 0.0f));
+    // Sub-pixel refinement. The integer MV, scaled by the 8x downscale, quantizes
+    // the warp displacement to ~8*strength px steps -> a staircase judder on
+    // smooth motion. Fit a parabola to the raw SAD along each axis around the
+    // integer winner and shift the MV by the fractional minimum. The field is
+    // RGBA16F and the warp samples it bilinearly, so a fractional MV upsamples to
+    // a smooth, continuous displacement. Guarded so a flat/non-convex SAD (no
+    // real minimum) keeps the integer vector rather than dividing by ~zero.
+    vec2 subMv = vec2(bestMv);
+    float sc = sadRawAt(cur, bestMv.x,     bestMv.y,     lp);
+    float sxm = sadRawAt(cur, bestMv.x - 1, bestMv.y,     lp);
+    float sxp = sadRawAt(cur, bestMv.x + 1, bestMv.y,     lp);
+    float sym = sadRawAt(cur, bestMv.x,     bestMv.y - 1, lp);
+    float syp = sadRawAt(cur, bestMv.x,     bestMv.y + 1, lp);
+    float denomX = sxm - 2.0f * sc + sxp;
+    float denomY = sym - 2.0f * sc + syp;
+    if (denomX > 1e-5f) subMv.x += clamp(0.5f * (sxm - sxp) / denomX, -0.5f, 0.5f);
+    if (denomY > 1e-5f) subMv.y += clamp(0.5f * (sym - syp) / denomY, -0.5f, 0.5f);
+
+    imageStore(dst, p, vec4(subMv.x, subMv.y, conf, 0.0f));
 }

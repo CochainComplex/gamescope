@@ -825,10 +825,35 @@ public:
 	// next composite on the in-order realtime queue. When no second queue is
 	// available they transparently forward to the shared composite path.
 	bool hasFramegenQueue() const { return m_bHasFramegenQueue; }
-	uint64_t submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo );
+	uint64_t submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot = -1, uint32_t nLadderRung = 0, uint32_t nGeneratedCount = 0 );
 	bool hasCompletedFramegen( uint64_t sequence );
 	void waitFramegen( uint64_t sequence );
 	void framegenGarbageCollect();
+
+	// Per-ladder-rung / generated-count measured GPU cost (ns), folded in
+	// framegenGarbageCollect and keyed by the exact batch shape that ran. 0 =
+	// that shape has not been measured yet. All framegen query state here is
+	// touched only from the compositor thread (record + garbage-collect), like
+	// m_pendingFramegenCmdBufs, so no locking is needed.
+	static constexpr uint32_t kFramegenLadderSlots = 8; // >= max ladder rungs (motion + multiplier notches)
+	static constexpr uint32_t kFramegenGeneratedCountSlots = 4; // counts 1..3, matching max x4 multiplier
+	uint64_t framegenRungCostNs( uint32_t nRung, uint32_t nGeneratedCount ) const
+	{
+		return nRung < kFramegenLadderSlots && nGeneratedCount < kFramegenGeneratedCountSlots
+			? m_aFramegenRungCostNs[ nRung ][ nGeneratedCount ] : 0;
+	}
+	// Raw GPU time (ns) of the most recent framegen batch, for logging only.
+	uint64_t framegenLastGpuTimeNs() const { return m_ulFramegenLastRawGpuTimeNs; }
+	// Forget all per-rung costs (e.g. on a scene change) so the ladder re-probes
+	// quality optimistically for the new scene.
+	void framegenResetRungCosts();
+	// Bracket a framegen batch's dispatches with GPU timestamps. Begin records a
+	// pool reset + TOP_OF_PIPE write and returns the ring slot (or -1 if timing is
+	// unavailable); End records the BOTTOM_OF_PIPE write. The slot is associated
+	// with the batch seqNo via submitFramegen so the result can be read back once
+	// that seqNo completes. No-ops when timing is unavailable.
+	int framegenTimestampBegin( CVulkanCmdBuffer *pCmdBuffer );
+	void framegenTimestampEnd( CVulkanCmdBuffer *pCmdBuffer, int nSlot );
 
 	void garbageCollect();
 	// bFramegen dispatches draw from a separate descriptor-set ring so a
@@ -982,6 +1007,23 @@ protected:
 	std::shared_ptr<VulkanTimelineSemaphore_t> m_framegenTimeline;
 	std::atomic<uint64_t> m_framegenSeqNo = { 0 };
 	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingFramegenCmdBufs;
+
+	// Timestamp query-pool ring for live framegen GPU-time measurement. Ring depth
+	// covers the worst-case in-flight batches; created only when a dedicated
+	// framegen queue exists and its family supports timestamps. Process-lifetime,
+	// like the framegen timeline (no device destructor). All of these are touched
+	// only from the compositor thread (record + garbage-collect), same as
+	// m_pendingFramegenCmdBufs, so no additional locking is required.
+	VkQueryPool m_framegenQueryPool = VK_NULL_HANDLE;
+	uint32_t m_uFramegenQueryRingDepth = 0;
+	uint32_t m_uFramegenQueryHead = 0;
+	double m_flFramegenTimestampPeriodNs = 0.0;
+	// seqNo -> { query ring slot, ladder rung, generated count } so the readback
+	// can attribute the measured cost to the exact batch shape.
+	struct FramegenQueryAssoc_t { uint32_t nSlot; uint32_t nRung; uint32_t nGeneratedCount; };
+	std::map<uint64_t, FramegenQueryAssoc_t> m_framegenQuerySlotBySeqNo;
+	uint64_t m_aFramegenRungCostNs[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
+	uint64_t m_ulFramegenLastRawGpuTimeNs = 0;
 
 private:
 	std::vector<VkExtensionProperties> m_supportedExts;

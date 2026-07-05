@@ -58,10 +58,14 @@ void main() {
     float strength = u_strength * (1.0f - smoothstep(u_suppressLo, u_suppressHi, motion));
     vec3 predictedExtra = currentFrame + delta * strength;
 
-    vec3 predicted = mix(predictedExtra, predictedMotion, conf);
-
-    // TAA-style rectification against the current frame's 4-neighbor cross: keeps
-    // edge motion but cannot invent colors, killing warp/ghost overshoot.
+    // TAA-style rectification against the current frame's 4-neighbor cross. Apply
+    // it ONLY to the extrapolation fallback: that term invents colors (current +
+    // delta) and must be bounded to kill overshoot/ghosting. The motion term is a
+    // real current-frame color gathered from where the content actually is, so
+    // clamping it to the OUTPUT pixel's local cross would cap displacement at ~1
+    // texel and defeat the warp (a confident edge could never advance more than a
+    // pixel/frame). Confidence is the motion term's safety: a poor match lowers
+    // conf and blends back toward the bounded extrapolation.
     vec2 texel = vec2(1.0f) / vec2(outSize);
     vec3 n0 = texture(s_samplers[1], uv + vec2(texel.x, 0.0f)).rgb;
     vec3 n1 = texture(s_samplers[1], uv - vec2(texel.x, 0.0f)).rgb;
@@ -69,7 +73,9 @@ void main() {
     vec3 n3 = texture(s_samplers[1], uv - vec2(0.0f, texel.y)).rgb;
     vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
     vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
-    predicted = clamp(predicted, neighborMin, neighborMax);
+    predictedExtra = clamp(predictedExtra, neighborMin, neighborMax);
+
+    vec3 predicted = mix(predictedExtra, predictedMotion, conf);
 
     imageStore(dst, coord, vec4(predicted, currentSample.a));
 }

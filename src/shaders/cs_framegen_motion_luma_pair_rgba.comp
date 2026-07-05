@@ -20,13 +20,25 @@ float luma(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
+// Average four bilinear taps spread across the block footprint (each tap is
+// itself a source 2x2 average) to approximate a box downsample cheaply.
+vec3 box4(uint s, vec2 uv, vec2 off) {
+    return 0.25 * ( texture(s_samplers[s], uv + vec2(-off.x, -off.y)).rgb
+                  + texture(s_samplers[s], uv + vec2( off.x, -off.y)).rgb
+                  + texture(s_samplers[s], uv + vec2(-off.x,  off.y)).rgb
+                  + texture(s_samplers[s], uv + vec2( off.x,  off.y)).rgb );
+}
+
 void main() {
     uvec2 coord = uvec2(gl_GlobalInvocationID.xy);
     ivec2 outSize = imageSize(dstPrev);
     if (coord.x >= uint(outSize.x) || coord.y >= uint(outSize.y))
         return;
 
+    // See cs_framegen_motion_luma_pair.comp: box-filter the block instead of a
+    // single centered tap, or the integer MV toggles and the warp wobbles.
     vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(outSize);
-    imageStore(dstPrev, ivec2(coord), vec4(luma(texture(s_samplers[0], uv).rgb), 0.0, 0.0, 1.0));
-    imageStore(dstCur, ivec2(coord), vec4(luma(texture(s_samplers[1], uv).rgb), 0.0, 0.0, 1.0));
+    vec2 off = vec2(0.25) / vec2(outSize);
+    imageStore(dstPrev, ivec2(coord), vec4(luma(box4(0, uv, off)), 0.0, 0.0, 1.0));
+    imageStore(dstCur, ivec2(coord), vec4(luma(box4(1, uv, off)), 0.0, 0.0, 1.0));
 }
