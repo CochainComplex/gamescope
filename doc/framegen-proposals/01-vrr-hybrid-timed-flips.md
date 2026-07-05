@@ -1,8 +1,56 @@
 # Proposal 01 — VRR Hybrid Mode: Timed Mid-Interval Generated Flips
 
-Status: design draft
+Status: prototype implemented (opt-in `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1`, dedicated framegen queue required; not yet validated on a VRR panel)
 Scope: compositor-side x2 frame generation on Variable-Refresh-Rate (VRR / adaptive-sync) panels
 Owner-area files: `src/steamcompmgr.cpp`, `src/vblankmanager.cpp/.hpp`, `src/Backends/DRMBackend.cpp`, `src/waitable.h`, `src/rendervulkan.cpp`
+
+## Implementation notes (divergences from the draft below)
+
+The prototype was built on top of proposal 06's display-clock machinery, which
+resolved several of this document's open questions and changed some details:
+
+- **Interval source (open question 1): resolved.** The mid offset is
+  `0.5 × frametime EMA` using #06's slew-limited estimator
+  (`FramegenHistory_t::ulFrametimeEmaNs`), not a new rolling estimate in
+  `page_flip_handler`. Under VRR the estimator's samples are even cleaner than
+  under fixed refresh, because composite times are no longer vblank-quantized.
+- **Anchor: the real flip's KMS timestamp, not commit time.** The timer arm is
+  deferred until the real frame's flip completes
+  (`CurrentPresentsInFlight()==0`), then armed at
+  `GetVBlankTimer().GetLastVBlank() + offset` — the pageflip handler's
+  `MarkVBlank` makes `GetLastVBlank()` the real frame's scanout timestamp, and
+  timerfd shares CLOCK_MONOTONIC with KMS. Both flips pay the same
+  commit→latch latency, so it cancels out of the spacing.
+- **Single mid flip (open question 3): resolved as the ceiling.** Exactly one
+  generated frame per real frame under active VRR, whatever the configured
+  multiplier; the degradation ladder keys rung costs at count 1.
+- **No stall insurance.** The consume-drain hook deliberately does not
+  forward-extrapolate under hybrid: an insurance flip at phase ~1.0 lands
+  exactly where the next real frame is expected, and the panel's minimum flip
+  spacing could then delay that real frame. Stalls are left to panel LFC.
+- **Keep-up guard replaces `cv_framegen_mid_min_budget_ms`:** generate only
+  when `EMA >= 2.2 × panel min-refresh cycle`
+  (`k_uFramegenHybridKeepUpPercent = 220`) so both halves of the split
+  interval respect the panel's minimum flip spacing with ~10% jitter margin.
+- **`force_repaint()` is suppressed for hybrid submissions** — a detail the
+  draft missed: under VRR every wake "can vblank", so the classic
+  force-repaint after planning would present the prediction immediately after
+  the real frame, collapsing the midpoint to ~zero. The timer is the only
+  present trigger in this mode.
+- **Stale-fire discriminator (not in the risk table):** disarming a timerfd
+  does not retract a fire already delivered to the epoll, so a superseded
+  slot's fire could carry over to a freshly planned one. An absolute timer can
+  never fire early, so any deadline observed before the currently armed target
+  (`g_ulFramegenMidTargetNs`) is provably stale and dropped.
+- **In-flight at deadline: retry, not skip.** If the real flip is still
+  scanning out when the timer fires, the deadline flag persists and the
+  flip-completion nudge re-enters the present path within a scanout; a latched
+  real frame supersedes it as usual.
+- Toggles: env `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` (prototype) instead of the
+  proposed convars; there is no `cv_framegen_mid_fraction` (phase fixed 0.5).
+  Requires the dedicated framegen queue, like #06. When VRR is not actually
+  active the hybrid deactivates live and all pacing falls back to the
+  fixed-refresh paths (classic or #06 JIT).
 
 ---
 

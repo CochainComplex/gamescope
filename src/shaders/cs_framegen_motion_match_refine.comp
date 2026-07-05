@@ -1,0 +1,153 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set_constants.h"
+
+// Seeded pyramid refinement for the motion block matcher. Each texel takes
+// the vector median of its 3x3 coarse-field neighbourhood as the seed,
+// doubles it into this level's texel units, and searches only a +/-1 window
+// around the rounded seed with the same 3x3 SAD block as
+// cs_framegen_motion_match.comp. The coarse level carries the search range
+// AND the spatial context (each of its SAD taps covers 4x the content, which
+// disambiguates self-similar detail); this pass only re-localizes. So the
+// finest (largest) level does 9 candidates per texel instead of a (2R+1)^2
+// sweep — the pyramid adds motion range while removing work.
+//
+// No LDS staging here: the seed differs per invocation, so a workgroup-shared
+// previous-frame window cannot be sized, and each per-level luma image is tiny
+// enough to live in the texture caches — ~100 fetches per invocation are
+// nearly all hits.
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform motion_refine_t {
+    // Non-zero on the finest level: adds the sub-texel parabola refinement and
+    // the confidence estimate consumed by the warp pass.
+    int u_finalLevel;
+    int u_pad0;
+    int u_pad1;
+    int u_pad2;
+};
+
+layout(binding = 1, rgba16f) writeonly uniform image2D dst;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+// s_samplers[0] = this level's previous-frame luma, [1] = current-frame luma,
+// [2] = the coarser level's motion field (half resolution).
+
+float lumaPrev(ivec2 p, ivec2 sz) {
+    return texelFetch(s_samplers[0], clamp(p, ivec2(0), sz - 1), 0).r;
+}
+
+// Raw 3x3 SAD of the register-cached current block against the previous frame
+// at candidate offset mv (content at cur(p) came from prev(p - mv)).
+float sadAt(float cur[9], ivec2 p, ivec2 mv, ivec2 sz) {
+    float sad = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            sad += abs(cur[(dy + 1) * 3 + (dx + 1)] - lumaPrev(p + ivec2(dx, dy) - mv, sz));
+    return sad;
+}
+
+void main() {
+    ivec2 sz = imageSize(dst);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= sz.x || p.y >= sz.y)
+        return;
+
+    // Robust seed: the vector median (minimum L1-distance sum) of the 3x3
+    // coarse neighbourhood, scaled into this level's texel units. A single
+    // wrong coarse match — self-similar content locking onto a lookalike —
+    // would otherwise seed a whole coarse-texel-sized band with a confident
+    // large displacement, and the band's boundary shears in the warp like a
+    // tear line. The median rejects isolated outliers while leaving smooth
+    // fields untouched (the centre of a monotone neighbourhood is its own
+    // median), so legitimate pans, zooms and rotations pass through intact.
+    ivec2 csz = textureSize(s_samplers[2], 0);
+    ivec2 cp = p >> 1;
+    vec2 nb[9];
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            nb[(dy + 1) * 3 + (dx + 1)] =
+                texelFetch(s_samplers[2], clamp(cp + ivec2(dx, dy), ivec2(0), csz - 1), 0).rg;
+    float bestDist = 1e30;
+    vec2 med = nb[4];
+    for (int i = 0; i < 9; i++) {
+        float d = 0.0;
+        for (int j = 0; j < 9; j++)
+            d += abs(nb[i].x - nb[j].x) + abs(nb[i].y - nb[j].y);
+        if (d < bestDist) {
+            bestDist = d;
+            med = nb[i];
+        }
+    }
+    vec2 seedF = med * 2.0;
+    ivec2 seed = ivec2(round(seedF));
+
+    // The invocation's own 3x3 current block, kept in registers across every
+    // SAD (it is loop-invariant).
+    float cur[9];
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            cur[(dy + 1) * 3 + (dx + 1)] =
+                texelFetch(s_samplers[1], clamp(p + ivec2(dx, dy), ivec2(0), sz - 1), 0).r;
+
+    // +/-1 window around the seed, regularized toward the FRACTIONAL seed so
+    // ties on flat content follow the coarse level's better-informed motion
+    // instead of collapsing to an arbitrary corner of the window.
+    float bestSad = 1e30;
+    float bestCost = 1e30;
+    ivec2 bestMv = seed;
+    for (int my = -1; my <= 1; my++) {
+        for (int mx = -1; mx <= 1; mx++) {
+            ivec2 mv = seed + ivec2(mx, my);
+            float sad = sadAt(cur, p, mv, sz);
+            float cost = sad + 0.02 * (abs(float(mv.x) - seedF.x) + abs(float(mv.y) - seedF.y));
+            if (cost < bestCost) {
+                bestCost = cost;
+                bestSad = sad;
+                bestMv = mv;
+            }
+        }
+    }
+
+    // Static anchor: zero motion is always a candidate, paying the same
+    // seed-distance penalty. A hallucinated coarse vector over genuinely
+    // static detail must beat "nothing moved" by a margin that grows with its
+    // length, so static content can always snap back regardless of how far
+    // the seed points. Its SAD also feeds the confidence term below.
+    float zeroSad = sadAt(cur, p, ivec2(0), sz);
+    float zeroCost = zeroSad + 0.02 * (abs(seedF.x) + abs(seedF.y));
+    if (zeroCost < bestCost) {
+        bestSad = zeroSad;
+        bestMv = ivec2(0);
+    }
+
+    vec2 subMv = vec2(bestMv);
+    float conf = 0.0;
+    if (u_finalLevel != 0) {
+        // Same confidence semantics as the single-level matcher: high when the
+        // residual is small and the winner meaningfully beats zero motion.
+        float residual = bestSad / 9.0;
+        conf = clamp(1.0 - residual * 6.0, 0.0, 1.0);
+        conf *= clamp((zeroSad - bestSad) * 4.0, 0.0, 1.0);
+
+        // Sub-texel parabola fit on the raw SAD around the integer winner (see
+        // cs_framegen_motion_match.comp for the staircase-judder rationale).
+        // Guarded so a flat/non-convex SAD surface keeps the integer vector.
+        float sxm = sadAt(cur, p, bestMv + ivec2(-1, 0), sz);
+        float sxp = sadAt(cur, p, bestMv + ivec2( 1, 0), sz);
+        float sym = sadAt(cur, p, bestMv + ivec2( 0, -1), sz);
+        float syp = sadAt(cur, p, bestMv + ivec2( 0, 1), sz);
+        float denomX = sxm - 2.0 * bestSad + sxp;
+        float denomY = sym - 2.0 * bestSad + syp;
+        if (denomX > 1e-5) subMv.x += clamp(0.5 * (sxm - sxp) / denomX, -0.5, 0.5);
+        if (denomY > 1e-5) subMv.y += clamp(0.5 * (sym - syp) / denomY, -0.5, 0.5);
+    }
+
+    imageStore(dst, p, vec4(subMv.x, subMv.y, conf, 0.0));
+}

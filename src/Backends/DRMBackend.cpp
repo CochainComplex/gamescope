@@ -3610,13 +3610,24 @@ namespace gamescope
 					!g_reshade_effect.empty() ? "yes" : "no" );
 			}
 
-			if ( gamescope::Rc<CVulkanTexture> pGeneratedFrame = vulkan_framegen_consume_generated_frame() )
+			// In base-layer mode (#02) the consume runs the late overlay
+			// composite against pFrameInfo — the live layer stack paint_all
+			// just assembled — so generated frames carry the freshest
+			// overlays and cursor; the returned image is scanout-ready in
+			// both modes.
+			if ( gamescope::Rc<CVulkanTexture> pGeneratedFrame = vulkan_framegen_consume_generated_frame( pFrameInfo ) )
 			{
 				if ( g_bFramegenDebug )
 					drm_log.infof( "framegen: DRM presenting generated frame" );
 
 				FrameInfo_t generatedFrameInfo = {};
-				generatedFrameInfo.allowVRR = false;
+				// Inherit the real frame's VRR state rather than hard-coding
+				// false: under the VRR hybrid (#01) both real and generated
+				// flips carry allowVRR=true, so VRR_ENABLED stays stable and no
+				// per-frame modeset is triggered. Outside the hybrid the gate in
+				// steamcompmgr already forces allowVRR=false while framegen is
+				// active, so this is the same false it always was.
+				generatedFrameInfo.allowVRR = pFrameInfo->allowVRR;
 				generatedFrameInfo.outputEncodingEOTF = pFrameInfo->outputEncodingEOTF;
 				generatedFrameInfo.applyOutputColorMgmt = false;
 				generatedFrameInfo.layerCount = 1;
@@ -3777,7 +3788,10 @@ namespace gamescope
 				baseLayer->opacity = 1.0;
 				baseLayer->zpos = g_zposBase;
 
-				baseLayer->tex = vulkan_get_last_output_image( false, false );
+				// Bidir framegen (B3): when this composite queued its real frame
+				// behind interpolation slots, flip the queue front in its place
+				// (the delayed presentation timeline); identity otherwise.
+				baseLayer->tex = vulkan_framegen_bidir_flip_texture( vulkan_get_last_output_image( false, false ) );
 				baseLayer->applyColorMgmt = false;
 
 				baseLayer->filter = GamescopeUpscaleFilter::NEAREST;

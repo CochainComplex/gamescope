@@ -1,0 +1,30 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "descriptor_set_constants.h"
+
+// One 2x downscale step of the motion matcher's luma pyramid, for both real
+// frames in a single dispatch (same pair pattern as the luma shader). At an
+// exact 2x step a single bilinear tap at the destination texel's centre IS the
+// source 2x2 box average, so each output texel costs one fetch per frame.
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(binding = 1, r16f) writeonly uniform image2D dstPrev;
+layout(binding = 2, r16f) writeonly uniform image2D dstCur;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+// s_samplers[0] = previous-frame luma (finer level), [1] = current-frame luma.
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outSize = imageSize(dstPrev);
+    if (coord.x >= outSize.x || coord.y >= outSize.y)
+        return;
+
+    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(outSize);
+    imageStore(dstPrev, coord, vec4(texture(s_samplers[0], uv).r, 0.0, 0.0, 0.0));
+    imageStore(dstCur,  coord, vec4(texture(s_samplers[1], uv).r, 0.0, 0.0, 0.0));
+}

@@ -2566,8 +2566,13 @@ paint_all( global_focus_t *pFocus, bool async )
 	// Framegen fills fixed vblank slots; with adaptive sync the display would
 	// instead track real flips, and the generated-frame flip (allowVRR=false)
 	// would toggle VRR_ENABLED off and back on every alternate present. The
-	// two are mutually exclusive: framegen wins while it is enabled.
-	frameInfo.allowVRR = cv_adaptive_sync && !vulkan_framegen_is_enabled();
+	// two are mutually exclusive: framegen wins while it is enabled — UNLESS
+	// the VRR hybrid (#01) is requested, where real frames keep the full
+	// adaptive-sync latency win and the generated frame flips mid-interval on
+	// a timer, with allowVRR held stable across both flips (no toggle, no
+	// modeset; the DRM backend inherits this flag for the generated flip).
+	frameInfo.allowVRR = cv_adaptive_sync
+		&& ( !vulkan_framegen_is_enabled() || vulkan_framegen_vrr_hybrid_requested() );
 	frameInfo.bFadingOut = fadingOut;
 
 	// If the window we'd paint as the base layer is the streaming client,
@@ -8313,6 +8318,28 @@ static gamescope::CTimerFunction g_FPSLimitVRRTimer{ []
 	g_FPSLimitVRRTimer.DisarmTimer();
 }};
 
+// VRR hybrid (#01): one-shot absolute timer for the mid-interval generated
+// flip. Armed after a real frame's flip completes, for (KMS flip timestamp +
+// phase * frametime EMA) — timerfd and the pageflip events share
+// CLOCK_MONOTONIC, so the spacing is display ground truth end to end. The
+// callback runs on this thread inside PollEvents (no atomics needed); the
+// deadline flag persists until acted on, so a fire that finds a flip still in
+// flight retries on the flip-completion nudge instead of dropping the frame.
+static bool g_bFramegenMidDeadline = false;
+static bool g_bFramegenMidArmPending = false;
+// The absolute time the timer is currently armed for. Disarming a timerfd does
+// not retract a fire already delivered to the epoll, so a superseded slot's
+// fire can slip past its DisarmTimer and re-set the deadline flag on the next
+// poll — right after a NEW slot was planned. An absolute timer can never fire
+// early, so any deadline observed before the currently armed target is
+// provably that stale carry-over and is dropped.
+static uint64_t g_ulFramegenMidTargetNs = 0;
+static gamescope::CTimerFunction g_FramegenMidTimer{ []
+{
+	g_FramegenMidTimer.DisarmTimer();
+	g_bFramegenMidDeadline = true;
+}};
+
 void
 steamcompmgr_main(int argc, char **argv)
 {
@@ -8459,6 +8486,7 @@ steamcompmgr_main(int argc, char **argv)
 
 	g_SteamCompMgrWaiter.AddWaitable( &GetVBlankTimer() );
 	g_SteamCompMgrWaiter.AddWaitable( &g_FPSLimitVRRTimer );
+	g_SteamCompMgrWaiter.AddWaitable( &g_FramegenMidTimer );
 	GetVBlankTimer().ArmNextVBlank( true );
 
 	{
@@ -8546,6 +8574,18 @@ steamcompmgr_main(int argc, char **argv)
 		const bool bVRR = GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive();
 		if ( bVRR )
 			vblank = true;
+
+		// VRR hybrid (#01): with adaptive sync active every wake "can vblank",
+		// so a pending generated frame must NOT present on the vblank signal —
+		// it would flip immediately after the real frame. The mid-interval
+		// timer is the present trigger instead. When VRR drops at runtime the
+		// hybrid deactivates live and any leftover timer state is cleared here.
+		const bool bVrrHybridActive = bVRR && vulkan_framegen_vrr_hybrid_active();
+		if ( !bVrrHybridActive )
+		{
+			g_bFramegenMidDeadline = false;
+			g_bFramegenMidArmPending = false;
+		}
 
 		bool flush_root = false;
 
@@ -9149,14 +9189,42 @@ steamcompmgr_main(int argc, char **argv)
 				// rather than letting it displace that content and add a vblank
 				// of latency. Generated frames only fill vblanks the game left
 				// empty.
+				//
+				// VRR hybrid (#01): a flip still in flight means the real
+				// frame's scanout hasn't completed — presenting now would race
+				// two flips into one scan-out. Keep the deadline pending; the
+				// flip-completion nudge re-enters here within a scanout.
+				const bool bHybridInFlight = bVrrHybridActive
+					&& GetBackend()->GetCurrentConnector()
+					&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0;
+				// Drop a stale carry-over fire (see g_ulFramegenMidTargetNs):
+				// the genuinely armed timer will re-set the flag at its target.
+				if ( bVrrHybridActive && g_bFramegenMidDeadline && get_time_in_nanos() < g_ulFramegenMidTargetNs )
+					g_bFramegenMidDeadline = false;
 				if ( hasRepaint )
 				{
 					// Real BASE/game content always wins the vblank: a new game
 					// frame supersedes the stale predictions, so drop them.
-					vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
+					//
+					// Bidir (B3) inverts this: pending entries PRECEDE the new
+					// real frame on the presentation timeline (they interpolate
+					// up to it, and the real frame itself joins the queue), so
+					// nothing is stale — the composite records the new frame and
+					// the backend's flip substitution presents the queue front.
+					if ( !vulkan_framegen_bidir_active() )
+						vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
+					if ( bVrrHybridActive )
+					{
+						// The mid-interval flip this timer was armed for no
+						// longer exists; the new real frame re-plans and re-arms.
+						g_bFramegenMidDeadline = false;
+						g_FramegenMidTimer.DisarmTimer();
+					}
 				}
-				else if ( vblank )
+				else if ( ( bVrrHybridActive ? g_bFramegenMidDeadline : vblank ) && !bHybridInFlight )
 				{
+					if ( bVrrHybridActive )
+						g_bFramegenMidDeadline = false;
 					// No new base content. Present the generated frame only if
 					// its GPU work has actually finished — otherwise leave the
 					// vblank as a hardware repeat instead of paying a full
@@ -9173,11 +9241,18 @@ steamcompmgr_main(int argc, char **argv)
 					// the empty slot; the overlay rides the next real composite,
 					// which redraws every layer anyway. Bounded so a steadily
 					// updating overlay can't be starved the other way.
+					//
+					// Base-layer mode (#02): no deferral needed at all — the
+					// late composite renders the CURRENT overlay stack onto
+					// every generated frame, so the overlay update is shown by
+					// the generated present itself, fresher than the deferred
+					// real composite would have shown it.
 					const bool bOverlayOnly = hasRepaintNonBasePlane;
-					if ( bReady && ( !bOverlayOnly || nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay ) )
+					const bool bLateOverlayComposite = vulkan_framegen_base_layer_active();
+					if ( bReady && ( !bOverlayOnly || bLateOverlayComposite || nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay ) )
 					{
 						bShouldPaint = true;
-						if ( bOverlayOnly )
+						if ( bOverlayOnly && !bLateOverlayComposite )
 						{
 							bFramegenDeferOverlay = true;
 							nFramegenDeferredOverlay++;
@@ -9194,6 +9269,12 @@ steamcompmgr_main(int argc, char **argv)
 					}
 				}
 			}
+			else
+			{
+				// Nothing pending (discarded or invalidated since the timer was
+				// armed) — a stale mid-interval deadline has nothing to show.
+				g_bFramegenMidDeadline = false;
+			}
 
 			static uint64_t s_uFramegenVblankDebugLogCounter = 0;
 			if ( vblank && vulkan_framegen_is_enabled() && FramegenDebugShouldLog( s_uFramegenVblankDebugLogCounter ) )
@@ -9206,6 +9287,15 @@ steamcompmgr_main(int argc, char **argv)
 					: ( vulkan_framegen_has_pending_generated_frame() ? "generated" : "real" );
 				xwm_log.infof( "framegen: vblank slot=%s", pszSlotType );
 			}
+
+			// JIT display-clock pacing (#06): this vblank is going to a
+			// hardware repeat while framegen is active — no real content and
+			// nothing pending (a stall, a too-slow discard, or a mispredicted
+			// keep-up). Ask the JIT planner to fill from the next vblank, so a
+			// hole never exceeds one vblank. No-op unless GAMESCOPE_FRAMEGEN_JIT
+			// is set and a dedicated framegen queue exists.
+			if ( vblank && !bShouldPaint && vulkan_framegen_is_enabled() )
+				vulkan_framegen_jit_tick();
 
 			if ( bShouldPaint )
 			{
@@ -9239,6 +9329,35 @@ steamcompmgr_main(int argc, char **argv)
 			{
 				gamescope::CScriptScopedLock script;
 				script.Manager().CallHook( "OnPostPaint" );
+			}
+		}
+
+		// VRR hybrid (#01): arm the mid-interval timer for a freshly planned
+		// generated frame — but only once the real frame's flip has completed,
+		// so the anchor is the KMS-reported scanout timestamp (GetLastVBlank is
+		// fed by the pageflip handler) rather than a composite-side guess. Both
+		// flips then pay the same commit->latch latency and it cancels out of
+		// the spacing. The completion nudge wakes this loop, so the deferred
+		// arm happens within a scanout of the paint; the timer is absolute, so
+		// wake latency doesn't shift the deadline.
+		if ( bVrrHybridActive )
+		{
+			if ( bPainted && vulkan_framegen_has_pending_generated_frame() )
+				g_bFramegenMidArmPending = true;
+
+			if ( g_bFramegenMidArmPending
+				&& GetBackend()->GetCurrentConnector()
+				&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() == 0 )
+			{
+				g_bFramegenMidArmPending = false;
+				// Re-check: the prediction may have been superseded while the
+				// real flip was still in flight.
+				const uint64_t ulMidOffsetNs = vulkan_framegen_vrr_hybrid_mid_offset_ns();
+				if ( ulMidOffsetNs != 0 && !g_bFramegenMidDeadline )
+				{
+					g_ulFramegenMidTargetNs = GetVBlankTimer().GetLastVBlank() + ulMidOffsetNs;
+					g_FramegenMidTimer.ArmTimer( g_ulFramegenMidTargetNs );
+				}
 			}
 		}
 

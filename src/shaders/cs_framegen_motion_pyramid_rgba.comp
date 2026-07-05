@@ -1,0 +1,27 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "descriptor_set_constants.h"
+
+// RGBA16F compatibility version of cs_framegen_motion_pyramid.comp, used where
+// R16F sampled+storage is unavailable (the matcher reads only .r either way).
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(binding = 1, rgba16f) writeonly uniform image2D dstPrev;
+layout(binding = 2, rgba16f) writeonly uniform image2D dstCur;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outSize = imageSize(dstPrev);
+    if (coord.x >= outSize.x || coord.y >= outSize.y)
+        return;
+
+    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(outSize);
+    imageStore(dstPrev, coord, vec4(texture(s_samplers[0], uv).r, 0.0, 0.0, 1.0));
+    imageStore(dstCur,  coord, vec4(texture(s_samplers[1], uv).r, 0.0, 0.0, 1.0));
+}

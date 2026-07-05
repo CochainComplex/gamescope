@@ -416,10 +416,58 @@ bool vulkan_framegen_has_pending_generated_frame();
 // True when a generated frame is pending AND its GPU work has completed, so it
 // can be presented this vblank without stalling scanout. Non-consuming.
 bool vulkan_framegen_generated_frame_ready();
-gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame();
+// Consumes the front generated frame. pPresentFrameInfo is the live frame the
+// present path just assembled (paint_all's current layer stack): in base-layer
+// mode (#02) the generated pre-upscale base is substituted into it and pushed
+// through the real composite pipeline — FSR/NIS, LUTs, and every CURRENT
+// overlay layer, cursor at its latest position — and the scanout-ready result
+// is returned. In legacy (output-space) mode it is unused and the generated
+// output image is returned directly, as before.
+gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const struct FrameInfo_t *pPresentFrameInfo );
+// True when pending generated frames came from the base-layer path
+// (GAMESCOPE_FRAMEGEN_BASE=1, #02): the late composite renders the current
+// overlay stack onto every generated frame, so a pure overlay update rides the
+// generated present itself and steamcompmgr must not defer it against the
+// generated-frame budget.
+bool vulkan_framegen_base_layer_active();
+// Bidirectional interpolation (B3, GAMESCOPE_FRAMEGEN_BIDIR=1 + motion mode):
+// generated frames interpolate BETWEEN the two real frames instead of
+// extrapolating past the newest one, and the real frame itself rides the
+// pending queue behind its interpolations — its presentation is delayed by up
+// to one real-frame interval. "Active" gates the present arbitration (a new
+// real frame must NOT discard the pending queue: in this mode those entries
+// precede it on the presentation timeline, they are not stale predictions).
+bool vulkan_framegen_bidir_active();
+// Bidir flip substitution: called by the backends on the full-composite present
+// path with the image they were about to flip. When the composite that just ran
+// queued its real frame behind interpolation slots, this returns the pending
+// front (in steady state the PREVIOUS real frame, already complete) to flip in
+// its place; otherwise returns the argument unchanged. Also snaps the delayed
+// timeline back to live (dropping stale pending entries) when a composite
+// bypasses the queue (framegen dormant, prime frame, scene change).
+gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<CVulkanTexture> pComposite );
 void vulkan_framegen_discard_generated_frame( const char *reason );
 void vulkan_framegen_invalidate_history( const char *reason );
 void vulkan_framegen_reset( const char *reason );
+// JIT display-clock pacing (#06, GAMESCOPE_FRAMEGEN_JIT=1 + dedicated queue):
+// reactive fill hook for the present decision. Call on a vblank that is going
+// to a hardware repeat while framegen is active; plans one generated frame for
+// the next vblank with its phase measured against the display clock. No-op
+// when JIT pacing is disabled.
+void vulkan_framegen_jit_tick();
+// VRR hybrid (#01, GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 + dedicated queue): keep
+// adaptive sync active while framegen runs — real frames flip immediately,
+// the generated frame flips mid-interval on a timer. "Requested" (env + queue)
+// gates steamcompmgr's allowVRR decision, which is what lets VRR become active
+// in the first place; "active" additionally requires the connector to be in
+// VRR right now and gates every pacing decision, falling back to fixed-refresh
+// behavior live when VRR drops.
+bool vulkan_framegen_vrr_hybrid_requested();
+bool vulkan_framegen_vrr_hybrid_active();
+// Nanoseconds after the real frame's KMS flip timestamp at which the pending
+// generated frame should be flipped (phase * frametime EMA); 0 when there is
+// nothing to schedule. steamcompmgr arms the mid-interval timer with this.
+uint64_t vulkan_framegen_vrr_hybrid_mid_offset_ns();
 
 // Standalone GPU microbenchmark of the frame-generation dispatches (extrapolate,
 // motion, blend). Times the real production shaders with timestamp queries and
@@ -569,7 +617,14 @@ struct VulkanOutput_t
 	// this pool (never the outputImages ring). Sized to 2*multiplier so the
 	// (multiplier-1) in-flight generated frames plus any still being scanned
 	// out never collide. Allocated lazily by framegen_ensure_resources.
+	// Base-layer mode (#02): holds base-sized, NON-flippable generated frames
+	// instead — inputs to the late overlay composite, never scanout buffers.
 	std::vector<gamescope::OwningRc<CVulkanTexture>> framegenOutputImages;
+	// Base-layer mode (#02): output-sized flippable targets the late overlay
+	// composite renders into (generated base + current overlays -> scanout).
+	// Only one is ever consumed per present; 3 covers scanout + in-flight +
+	// margin. Allocated lazily by framegen_ensure_present_pool.
+	std::vector<gamescope::OwningRc<CVulkanTexture>> framegenPresentImages;
 };
 
 
@@ -592,8 +647,18 @@ enum ShaderType {
 	SHADER_TYPE_FRAMEGEN_MOTION_LUMA_RGBA,
 	SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR,
 	SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA,
+	SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID,
+	SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID_RGBA,
 	SHADER_TYPE_FRAMEGEN_MOTION_MATCH,
+	SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE,
+	SHADER_TYPE_FRAMEGEN_MOTION_FBCHECK,
 	SHADER_TYPE_FRAMEGEN_MOTION_WARP,
+	SHADER_TYPE_FRAMEGEN_MOTION_BIDIR,
+	SHADER_TYPE_FRAMEGEN_MOTION_STATS,
+	SHADER_TYPE_FRAMEGEN_MOTION_STATS_APPLY,
+	SHADER_TYPE_FRAMEGEN_MOTION_NET,
+	SHADER_TYPE_FRAMEGEN_MOTION_NET_TRAIN,
+	SHADER_TYPE_FRAMEGEN_MOTION_NET_OPT,
 
 	SHADER_TYPE_COUNT
 };
@@ -982,8 +1047,12 @@ protected:
 
 	// Separate ring for framegen dispatches (see descriptorSet()). Allocated only
 	// when framegen is enabled; empty otherwise, so the composite path is
-	// unchanged. Sized well above the worst-case single in-flight batch.
-	static constexpr uint32_t k_uFramegenDescriptorSets = 16;
+	// unchanged. Sized above the worst-case single in-flight batch (24
+	// dispatches: luma pair + 2 pyramid + 2x [match + 2 refines] + 2 FB checks
+	// (forward + bidir reverse) + 4 stats probe (clear + accumulate + 2 trust
+	// applies) + 2 net refinements + 2 net training tiles + up to 2 optimizer
+	// steps (init + step on the first online batch) + 3 warps).
+	static constexpr uint32_t k_uFramegenDescriptorSets = 30;
 	std::vector<VkDescriptorSet> m_framegenDescriptorSets;
 	uint32_t m_currentFramegenDescriptorSet = 0;
 

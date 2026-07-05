@@ -1,3 +1,54 @@
+# gamescope-gameslop
+
+*A compositor-side **frame-generation** fork of [gamescope](https://github.com/ValveSoftware/gamescope). The name is tongue-in-cheek: yes, most of the pixels you see are machine-invented in-between frames — "slop" — but they're honestly labelled (the game never sees them) and produced by a real motion-estimation + interpolation pipeline, not a dumb frame average.*
+
+### What it is
+
+A **poor man's DLSS-Frame-Generation / FSR-3 surrogate** that runs on *any* Vulkan GPU — no RTX, no tensor cores, no vendor optical-flow block, no driver lock-in. It's a stopgap for the ongoing GPU/VRAM price crunch: it wrings smooth high-fps *motion* out of hardware you already own. It doesn't lower latency and it can't show detail the game never rendered — it buys smoothness, nothing else.
+
+### The one principle to understand first: this is a **two-GPU** technique
+
+Generating a frame costs real GPU work. If you do that on the **same** card that's rendering the game, you are stealing performance *from the game* to fake frames on top of it — usually a wash or a net loss (you'd get more by just rendering real frames, or by using the game's own FSR/DLSS). So doing this on one GPU is, in general, **not worth it**.
+
+Gameslop's whole reason to exist is to put the generation on a **second, cheaper / older / otherwise-idle GPU**:
+
+- your **strong** card renders the game (nothing taken away from it);
+- a **weak "present" card — ⚠️ this must be the GPU your display is physically connected to** — generates the in-between frames *and* drives the display;
+- the two are bridged over dma-buf.
+
+The generation is essentially **free** because it runs on silicon that would otherwise sit idle. Normally that present card does almost nothing — it just composites and flips *finished* frames straight to the screen, which barely touches it. Gameslop spends that leftover budget doing **more than passthrough**: instead of forwarding a frame and waiting for the next real one, the present card uses its idle time to estimate motion and **synthesise extra frames** in the gap, while its consistency checks try to keep the artifacts down. That second card can be a laptop iGPU (e.g. an AMD 890M), an old GPU you never threw out (a 5700 XT), or the second card in a desktop — cheap hardware doing the work a new flagship would charge you a fortune for.
+
+**When a single GPU *is* worth it (the exception):** only when you have GPU headroom to spare and no better option — typically an **older game that can't use FSR/DLSS frame generation** and doesn't fully load your (good) card. Then spending that idle headroom on generated frames is a real win. For a modern game that already pegs your GPU, single-GPU framegen just robs Peter to pay Paul — use the game's built-in frame generation instead.
+
+**Where the trick lives:** frame generation happens in the **compositor**, downstream of the game — it never reaches *back* into the game's rendering. The generated frames are gamescope's own; the game, Wine/DXVK, Reflex and anti-lag never see them, and nothing is pulled *off* the render card, so the game's real frame rate and input latency are left completely untouched. The second card only ever **polishes what comes out** — a post-processor, not a middleman in the render path. Plug your monitor into the weak "present" GPU, render the game on the strong one, and let the two bridge over dma-buf.
+
+### It is *not* "just interpolation"
+
+**And it works blind — on purpose.** FSR 3 and DLSS Frame Generation are handed the scene's *true* motion by the game engine — per-pixel **motion vectors**, depth, and (on DLSS) a dedicated **optical-flow hardware** block. Gameslop takes **none** of that, and that is a deliberate design choice, not just a missing feature. It *could* try to pull motion vectors, depth or the framebuffer off the render card — but ferrying that data across to the second GPU every frame would **bottleneck the whole system** and add latency to the very render path this design exists to leave alone. So the rule is **non-intervention**: never touch the game's rendering, its GPU, or its input latency. The second card sits **downstream as a pure post-processor** — it sees only the **finished frames** and works out the motion itself from the pixels alone. That's a harder, more artifact-prone problem, which is exactly why most of the pipeline below is not "generate a frame" but "estimate the motion, then decide how much of it to trust":
+
+Under the hood it's a staged, self-correcting motion pipeline:
+
+- **Motion estimation** — a 3-level coarse-to-fine luma **pyramid block matcher** (full search only at the coarsest level, ≈±128 px reach), **sub-pixel parabolic** refinement, seeded ±1 search down the levels, and vector-median seeding to kill tear-like mislocks.
+- **Artifact control** — a **forward-backward consistency check** (round-trip a vector; if it doesn't close, drop its confidence — kills disocclusion/mislock fizzle), a **per-pixel two-source agreement test** that stops ghosted double-exposures at edges, and TAA-style neighbourhood clamping so the warp can never invent colours.
+- **Extrapolate *or* interpolate** — default **forward extrapolation** (zero added latency), or true **bidirectional interpolation** (warp *both* real frames to the in-between phase, confidence-blend, phase-correct crossfade in the gaps) for the smoothest motion at the cost of ~1 frame of latency.
+- **It learns** — a small (~4.6k-param) **convolutional refiner net** cleans up the motion fields (bounded flow residual + confidence recalibration), trainable offline from captured frames *or* **learning in-situ on the GPU while you play**, with per-game persistence. On top of that a **self-supervised loop** grades every real frame against the prediction that targeted it and auto-tunes its own thresholds.
+- **Pacing & display** — **display-clock (KMS pageflip) JIT pacing** places each generated frame against the real vblank cadence; a **VRR/adaptive-sync-compatible** hybrid; and a **base-layer** path that composites HUD/cursor *after* generation so UI text stays crisp.
+- **Engineering** — generation runs on a **dedicated async-compute queue** so it can never stall the real frame; **zero-copy** history; **fp16** + vendor-aware shader dispatch; and a **deadline-driven degradation ladder** that measures its own GPU time and sheds quality *before* it misses a vblank.
+
+### Reality check
+
+It's **experimental**. Expect shimmer on fine detail, ghost trails on fast motion (use base-layer mode for HUDs), and the odd crash. Bidirectional mode adds ~1 frame of lag (skip it for competitive shooters). VRR mode only does something on an actual FreeSync/G-Sync display. The generated frames only fill vblanks the game left empty — if you're already at refresh, there's nothing to do. And the whole economic pitch — a spare/old card doing the heavy lifting — is also its main requirement.
+
+### Start here
+
+- 🕹️ **[How-To guide](doc/framegen-howto.md)** — plain-language setup: the two-card split, how to wire the display, copy-paste commands per mode, and current limits.
+- 🎛️ **[Flags & toggles reference](doc/framegen-proposals/README.md)** — every option and exactly what it needs.
+- 🔧 **[Architecture](doc/framegen-architecture.md)** — how it works under the hood.
+
+> The build target and binary are still `gamescope` (drop-in compatible with existing scripts, Steam launch options, and packaging); "gamescope-gameslop" is the fork's identity, not a rename of the executable.
+
+---
+
 ## gamescope: the micro-compositor formerly known as steamcompmgr
 
 In an embedded session usecase, gamescope does the same thing as steamcompmgr, but with less extra copies and latency:

@@ -1,0 +1,242 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set_constants.h"
+
+// Learned field refinement (Stage C): a tiny convolutional net, fused into a
+// single dispatch, that refines one checked motion field at field resolution
+// — once per real frame, zero cost per generated frame.
+//
+// The net predicts CORRECTIONS, not pixels: a bounded flow residual
+// (2*tanh(o), at most +-2 field texels) and an additive confidence
+// recalibration, applied on top of the Stage-B field. A zero final layer is
+// therefore exactly the Stage-B output — safe by construction — and the
+// worst a bad checkpoint can do is bounded by construction too. It never
+// touches image content, so the HDR pipeline is unaffected.
+//
+// Inputs per field texel (12 channels, mirrored EXACTLY by the trainer in
+// scripts/framegen-net-train.py — keep them in lockstep): both directions'
+// flow/confidence/round-trip error (the two fields disagree precisely where
+// one of them lies), the destination luma, the source luma warped along the
+// field being refined (the photometric evidence the matcher optimized), the
+// normalized prediction residual (same magnitude normalization as the B4
+// probe), and a task-conditioning flag. Three 3x3 conv layers see a 7x7
+// field-texel context (~56 full-res px): enough to learn flow-boundary
+// smoothing, occlusion inpainting where the round trip fails, and confidence
+// calibration against actual usefulness — the residual error classes the
+// hand-written consistency checks can't express.
+//
+// Direction symmetry: refining the reverse field is the same problem with
+// the lumas swapped, so ONE set of weights serves both dispatches — the
+// C++ side just swaps the sampler bindings (the fbcheck pass' trick).
+//
+// Execution shape: each 8x8 workgroup computes an 8x8 output tile from a
+// 14x14 input tile (3-texel apron = the receptive field of three 3x3
+// layers), with activations staged in LDS — the fusion means intermediate
+// activations never touch memory. Weights are cooperatively preloaded into
+// LDS one layer at a time (they are read once per MAC; per-MAC image loads
+// would bottleneck on texture issue rate, the same lesson as the B4
+// stats-read finding). fp32 throughout: the net is small enough that
+// bandwidth is not the bottleneck, and one variant runs on every vendor —
+// a cooperative-matrix fast path only pays once the net grows past the
+// point where a scalar kernel keeps up (see doc/framegen-architecture.md).
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+// The phases below are cooperative work lists, not thread-per-pixel maps.
+// Shape chosen by measurement, position-major on purpose: one thread owns a
+// position and all 16 output channels, so each activation vec4 is loaded
+// once and reused 16 times. Two measured dead ends on NVIDIA: 128
+// threads/tile (slightly worse — not occupancy-bound) and a
+// (position x channel-group) split (2.3x WORSE: it quadruples activation
+// loads — the kernel lives and dies on LDS load-instruction count).
+const uint THREADS = 64u;
+
+layout(push_constant, scalar)
+uniform motion_net_t {
+    // Task-conditioning input channel the net was trained with (0 =
+    // endpoint/pair supervision; reserved for future objectives).
+    float u_mode;
+    float u_pad0;
+    float u_pad1;
+    float u_pad2;
+};
+
+// The refined field (.rg = flow + bounded residual, .b = recalibrated
+// confidence, .a = round-trip error passed through). A conv reads an apron
+// of RAW neighbors, so refinement can never be in place.
+layout(binding = 1, rgba16f) writeonly uniform image2D u_refined;
+
+// s_samplers[0] = source luma (bilinear; the frame the field warps FROM)
+// s_samplers[1] = destination luma (the frame the field predicts)
+// s_samplers[2] = the field being refined (nearest)
+// s_samplers[3] = the opposite-direction field (nearest)
+// s_samplers[4] = the weight texture (nearest, R32F, flat-indexed)
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+
+// Architecture 12 -> 16 -> 16 -> 4 with k=3, hardcoded so every loop
+// unrolls; the C++ loader validates the blob against the same dims.
+const int C_IN  = 12;
+const int C_MID = 16;
+const int TILE  = 8;   // output tile
+const int FEAT  = 14;  // TILE + 2*3 apron
+const int A1    = 12;  // conv1 output tile
+const int A2    = 10;  // conv2 output tile
+
+// Flat float offsets inside the weight texture: per layer, weights in
+// [c_out][ky][kx][c_in] order (input channels contiguous, so a group of four
+// is one vec4 and every MAC step is a dot() — 4 fused multiplies per LDS
+// instruction pair; the scalar version measured ~4x slower, bound on LDS
+// issue rate, not ALU), then biases.
+const int L1_OFF    = 0;     // 16*9*12 + 16 = 1744 floats = 436 vec4
+const int L1_VEC4S  = 436;
+const int L2_OFF    = 1744;  // 16*9*16 + 16 = 2320 floats = 580 vec4
+const int L2_VEC4S  = 580;
+const int L2_BIAS4  = 576;   // chunk-relative vec4 index of the biases
+const int L3_OFF    = 4064;  // 4*9*16 + 4 = 580 floats = 145 vec4
+const int L3_VEC4S  = 145;
+const int L3_BIAS4  = 144;
+
+shared vec4 s_feat4[FEAT * FEAT * 3]; // input features (3 vec4/texel); reused for conv2's output
+shared vec4 s_act4[A1 * A1 * 4];      // conv1 output (4 vec4/texel)
+shared vec4 s_w4[L2_VEC4S];           // current layer's weights (largest layer)
+
+// The weight texture is 2048 texels wide; flat vec4 index -> 4 texels.
+vec4 wload4(int idx4) {
+    int idx = idx4 * 4;
+    return vec4(
+        texelFetch(s_samplers[4], ivec2(idx & 2047, idx >> 11), 0).r,
+        texelFetch(s_samplers[4], ivec2((idx + 1) & 2047, (idx + 1) >> 11), 0).r,
+        texelFetch(s_samplers[4], ivec2((idx + 2) & 2047, (idx + 2) >> 11), 0).r,
+        texelFetch(s_samplers[4], ivec2((idx + 3) & 2047, (idx + 3) >> 11), 0).r);
+}
+
+void main() {
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * TILE;
+    ivec2 sz = textureSize(s_samplers[2], 0);
+    vec2 invSz = 1.0f / vec2(sz);
+    uint li = gl_LocalInvocationIndex;
+
+    // Phase A: cooperatively stage layer-1 weights and the 14x14 feature
+    // tile. Edge texels replicate (coordinate clamp), matching the trainer's
+    // edge padding.
+    for (uint i = li; i < uint(L1_VEC4S); i += THREADS)
+        s_w4[i] = wload4(L1_OFF / 4 + int(i));
+    for (uint i = li; i < uint(FEAT * FEAT); i += THREADS) {
+        ivec2 p = clamp(tileOrigin - 3 + ivec2(int(i) % FEAT, int(i) / FEAT), ivec2(0), sz - 1);
+        vec4 X = texelFetch(s_samplers[2], p, 0);
+        vec4 Y = texelFetch(s_samplers[3], p, 0);
+        vec2 uv = (vec2(p) + 0.5f) * invSz;
+        float ld = texelFetch(s_samplers[1], p, 0).r;
+        // dst(p) = src(p - X(p)): the photometric bet this texel's vector places.
+        float lw = texture(s_samplers[0], uv - X.xy * invSz).r;
+        // Magnitude-normalized residual — scale-free in SDR and HDR alike
+        // (the exact form the B4 probe grades with).
+        float resid = abs(ld - lw) / max(1.0f, max(abs(ld), abs(lw)));
+        uint b = i * 3u;
+        s_feat4[b + 0u] = vec4(X.x * 0.125f, X.y * 0.125f, X.z, min(X.w * 0.5f, 1.0f));
+        s_feat4[b + 1u] = vec4(Y.x * 0.125f, Y.y * 0.125f, Y.z, min(Y.w * 0.5f, 1.0f));
+        s_feat4[b + 2u] = vec4(ld, lw, resid, u_mode);
+    }
+    barrier();
+
+    // Phase B: conv1 (12 -> 16, ReLU) at 12x12 positions. Each thread owns
+    // whole positions; the three feature vec4s are loaded once and shared
+    // across all 16 output channels, and every thread reads the SAME weight
+    // address per step — an LDS broadcast on both vendors.
+    for (uint i = li; i < uint(A1 * A1); i += THREADS) {
+        int ax = int(i) % A1, ay = int(i) / A1;
+        float acc[C_MID];
+        for (int co = 0; co < C_MID; co++)
+            acc[co] = s_w4[(L1_VEC4S - 4) + (co >> 2)][co & 3];
+        for (int tap = 0; tap < 9; tap++) {
+            int fb = ((ay + tap / 3) * FEAT + (ax + tap % 3)) * 3;
+            vec4 f0 = s_feat4[fb + 0];
+            vec4 f1 = s_feat4[fb + 1];
+            vec4 f2 = s_feat4[fb + 2];
+            for (int co = 0; co < C_MID; co++) {
+                int wb = (co * 9 + tap) * 3;
+                acc[co] += dot(f0, s_w4[wb]) + dot(f1, s_w4[wb + 1]) + dot(f2, s_w4[wb + 2]);
+            }
+        }
+        uint ob = i * 4u;
+        for (int g = 0; g < 4; g++)
+            s_act4[ob + uint(g)] = max(vec4(acc[g * 4], acc[g * 4 + 1], acc[g * 4 + 2], acc[g * 4 + 3]), vec4(0.0f));
+    }
+    barrier();
+
+    // Layer-2 weights replace layer 1's (every read of which is behind the
+    // barrier above).
+    for (uint i = li; i < uint(L2_VEC4S); i += THREADS)
+        s_w4[i] = wload4(L2_OFF / 4 + int(i));
+    barrier();
+
+    // Phase C: conv2 (16 -> 16, ReLU) at 10x10 positions; its output reuses
+    // the feature buffer, whose last reader was phase B.
+    for (uint i = li; i < uint(A2 * A2); i += THREADS) {
+        int bx = int(i) % A2, by = int(i) / A2;
+        float acc[C_MID];
+        for (int co = 0; co < C_MID; co++)
+            acc[co] = s_w4[L2_BIAS4 + (co >> 2)][co & 3];
+        for (int tap = 0; tap < 9; tap++) {
+            int ab = ((by + tap / 3) * A1 + (bx + tap % 3)) * 4;
+            vec4 a0 = s_act4[ab + 0];
+            vec4 a1 = s_act4[ab + 1];
+            vec4 a2 = s_act4[ab + 2];
+            vec4 a3 = s_act4[ab + 3];
+            for (int co = 0; co < C_MID; co++) {
+                int wb = (co * 9 + tap) * 4;
+                acc[co] += dot(a0, s_w4[wb]) + dot(a1, s_w4[wb + 1])
+                    + dot(a2, s_w4[wb + 2]) + dot(a3, s_w4[wb + 3]);
+            }
+        }
+        uint ob = i * 4u;
+        for (int g = 0; g < 4; g++)
+            s_feat4[ob + uint(g)] = max(vec4(acc[g * 4], acc[g * 4 + 1], acc[g * 4 + 2], acc[g * 4 + 3]), vec4(0.0f));
+    }
+    barrier();
+
+    for (uint i = li; i < uint(L3_VEC4S); i += THREADS)
+        s_w4[i] = wload4(L3_OFF / 4 + int(i));
+    barrier();
+
+    // Phase D: conv3 (16 -> 4, linear) — exactly one output texel per
+    // thread. Channel 3 is reserved and never evaluated.
+    int cx = int(li) % TILE, cy = int(li) / TILE;
+    vec4 b3 = s_w4[L3_BIAS4];
+    float o0 = b3.x, o1 = b3.y, o2 = b3.z;
+    for (int tap = 0; tap < 9; tap++) {
+        int ab = ((cy + tap / 3) * A2 + (cx + tap % 3)) * 4;
+        vec4 a0 = s_feat4[ab + 0];
+        vec4 a1 = s_feat4[ab + 1];
+        vec4 a2 = s_feat4[ab + 2];
+        vec4 a3 = s_feat4[ab + 3];
+        int w0 = (0 * 9 + tap) * 4, w1 = (1 * 9 + tap) * 4, w2 = (2 * 9 + tap) * 4;
+        o0 += dot(a0, s_w4[w0]) + dot(a1, s_w4[w0 + 1]) + dot(a2, s_w4[w0 + 2]) + dot(a3, s_w4[w0 + 3]);
+        o1 += dot(a0, s_w4[w1]) + dot(a1, s_w4[w1 + 1]) + dot(a2, s_w4[w1 + 2]) + dot(a3, s_w4[w1 + 3]);
+        o2 += dot(a0, s_w4[w2]) + dot(a1, s_w4[w2 + 1]) + dot(a2, s_w4[w2 + 2]) + dot(a3, s_w4[w2 + 3]);
+    }
+
+    ivec2 op = tileOrigin + ivec2(cx, cy);
+    if (op.x >= sz.x || op.y >= sz.y)
+        return;
+    vec4 X0 = texelFetch(s_samplers[2], op, 0);
+    vec2 dF = 2.0f * tanh(vec2(o0, o1));
+    // Confidence raises are evidence-gated per texel: the net may only
+    // un-kill a vector that demonstrably predicts THIS frame pair (raw-field
+    // warped residual below the same threshold the B4 probe counts as
+    // mispredicting). Without the gate, a transiently miscalibrated head —
+    // especially mid online learning — promotes garbage vectors and the warp
+    // confidently gathers stale content in field-texel-sized squares.
+    // Lowering confidence is always safe and always allowed.
+    float ld = texelFetch(s_samplers[1], op, 0).r;
+    vec2 uv = (vec2(op) + 0.5f) * invSz;
+    float lw = texture(s_samplers[0], uv - X0.xy * invSz).r;
+    float resid = abs(ld - lw) / max(1.0f, max(abs(ld), abs(lw)));
+    float dc = o2 < 0.0f ? o2 : o2 * (1.0f - smoothstep(0.03f, 0.10f, resid));
+    imageStore(u_refined, op, vec4(X0.xy + dF, clamp(X0.z + dc, 0.0f, 1.0f), X0.w));
+}

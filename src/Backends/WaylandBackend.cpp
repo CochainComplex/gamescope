@@ -1098,7 +1098,10 @@ namespace gamescope
                     m_bVisible ? "yes" : "no" );
             }
 
-            if ( gamescope::Rc<CVulkanTexture> pGeneratedFrame = vulkan_framegen_consume_generated_frame() )
+            // In base-layer mode (#02) the consume runs the late overlay
+            // composite against pFrameInfo (the live layer stack), returning
+            // a scanout-ready output-sized image in both modes.
+            if ( gamescope::Rc<CVulkanTexture> pGeneratedFrame = vulkan_framegen_consume_generated_frame( pFrameInfo ) )
             {
                 if ( g_bFramegenDebug )
                     xdg_log.infof( "framegen: Wayland presenting generated frame" );
@@ -1175,7 +1178,10 @@ namespace gamescope
                 compositeLayer.opacity = 1.0;
                 compositeLayer.zpos = g_zposBase;
 
-                compositeLayer.tex = vulkan_get_last_output_image( false, false );
+                // Bidir framegen (B3): when this composite queued its real frame
+                // behind interpolation slots, flip the queue front in its place
+                // (the delayed presentation timeline); identity otherwise.
+                compositeLayer.tex = vulkan_framegen_bidir_flip_texture( vulkan_get_last_output_image( false, false ) );
                 compositeLayer.applyColorMgmt = false;
 
                 compositeLayer.filter = GamescopeUpscaleFilter::NEAREST;

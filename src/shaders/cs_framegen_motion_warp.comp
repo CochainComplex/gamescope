@@ -23,6 +23,10 @@ uniform motion_warp_t {
     float u_suppressHi;
     // Full-res / low-res ratio, to turn low-res-texel motion into a UV shift.
     float u_lowResScale;
+    // Two-source agreement window (normalized color distance): disagreement
+    // below Lo is trusted fully, above Hi kills the motion term per pixel.
+    float u_agreeLo;
+    float u_agreeHi;
 };
 
 // s_samplers[0] = previousReal, [1] = currentReal, [2] = motion field
@@ -51,6 +55,23 @@ void main() {
     // the pixel a fraction u_strength into the future is filled by gathering from
     // where its content is now (uv - u_strength * mv).
     vec3 predictedMotion = texture(s_samplers[1], uv - mvUv * u_strength).rgb;
+
+    // Second opinion: the SAME flow projected from the OTHER real frame — the
+    // previous frame is one interval older, so its gather goes one interval
+    // further along the flow. When the flow is right for this pixel both
+    // projections land on the same content and agree; at motion-boundary
+    // bleed, disocclusions and mislocks they land on DIFFERENT content and
+    // disagree — per pixel, at full resolution, where the 1/8-res confidence
+    // field cannot discriminate. Disagreement sends only those pixels to the
+    // bounded fallback, so an unconfident edge degrades to a clean (if
+    // conservative) current-frame color instead of a two-position double
+    // exposure (ghosted edges, doubled text). Normalizing by the local
+    // magnitude keeps the threshold meaningful for scRGB values above 1.0.
+    vec3 predictedMotionPrev = texture(s_samplers[0], uv - mvUv * (u_strength + 1.0f)).rgb;
+    vec3 dd = abs(predictedMotion - predictedMotionPrev);
+    float disagree = max(max(dd.r, dd.g), dd.b);
+    float nrm = max(1.0f, max(max(abs(predictedMotion.r), abs(predictedMotion.g)), abs(predictedMotion.b)));
+    conf *= 1.0f - smoothstep(u_agreeLo, u_agreeHi, disagree / nrm);
 
     // Plain forward extrapolation, used as the low-confidence fallback.
     vec3 delta = currentFrame - previousFrame;

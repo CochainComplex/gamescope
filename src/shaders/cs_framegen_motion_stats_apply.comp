@@ -1,0 +1,63 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set_constants.h"
+
+// Apply half of the B4 quality feedback: fold the batch-global field trust
+// into the motion field's confidence channel, at field resolution, BEFORE the
+// warps run. Trust = 1 - smoothstep over the fraction of texels that passed
+// every consistency check yet still mispredicted the real frame (measured by
+// cs_framegen_motion_stats.comp earlier in this batch) — regimes where the
+// per-texel checks lie: lighting flashes, particle chaos, stroboscopic
+// content. Baking it into .b here means the full-res warps inherit it through
+// the field fetch they already do — zero added per-pixel cost (a per-thread
+// or even per-workgroup stats read in the warps measured ~10% of the warp on
+// NVIDIA: repeated surface loads of the same texel serialize on the cache).
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform motion_stats_apply_t {
+    // Field-trust window over the mispredicting fraction: full trust below
+    // Lo, full fallback above Hi.
+    float u_trustLo;
+    float u_trustHi;
+    float u_pad0;
+    float u_pad1;
+};
+
+// The motion field, scaled in place (.b *= trust; .rg/.a untouched).
+layout(binding = 1, rgba16f) uniform image2D u_field;
+// The stats counters (see cs_framegen_motion_stats.comp for the layout), on
+// the second target binding.
+layout(binding = 2, r32ui) readonly uniform uimage2D u_stats;
+
+shared float s_trust;
+
+void main() {
+    // One stats read per workgroup, broadcast through LDS; before the
+    // bounds-check return so the barrier stays uniform.
+    if (gl_LocalInvocationIndex == 0u) {
+        uint uTotal  = imageLoad(u_stats, ivec2(0, 0)).r;
+        uint uBad    = imageLoad(u_stats, ivec2(2, 0)).r;
+        uint uKilled = imageLoad(u_stats, ivec2(3, 0)).r;
+        float alive = float(max(int(uTotal) - int(uKilled), 1));
+        s_trust = 1.0f - smoothstep(u_trustLo, u_trustHi, float(uBad) / alive);
+    }
+    barrier();
+
+    ivec2 sz = imageSize(u_field);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= sz.x || p.y >= sz.y)
+        return;
+
+    if (s_trust >= 1.0f)
+        return;
+
+    vec4 field = imageLoad(u_field, p);
+    imageStore(u_field, p, vec4(field.rg, field.b * s_trust, field.a));
+}

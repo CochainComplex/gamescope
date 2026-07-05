@@ -1,0 +1,108 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set_constants.h"
+
+// Forward-backward consistency check on the motion field. The forward field is
+// anchored at the current frame (content at cur(p) came from prev(p - F(p)));
+// a second field, estimated by the same pyramid with the two luma bindings
+// swapped, is anchored at the previous frame (prev(q) came from cur(q - R(q))).
+// A correct match round-trips: follow F back to where the content sat in the
+// previous frame and the reverse motion there must return it,
+// R(p - F(p)) ~= -F(p). The two failure classes that break the round trip are
+// exactly the ones that fizzle in the warp: lookalike mislocks (the two
+// directions lock onto DIFFERENT lookalikes, so the trip lands elsewhere) and
+// disocclusions (content newly visible in the current frame has no true
+// correspondence, so its "match" is noise). Both get their confidence killed
+// here, sending those pixels to the warp's bounded extrapolation fallback
+// instead of a confidently wrong gather.
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform motion_fbcheck_t {
+    // Round-trip error (in low-res texels) fully forgiven below the tolerance;
+    // confidence reaches zero at 2x the (motion-scaled) tolerance.
+    float u_tolBase;
+    // Tolerance growth per texel of motion: long vectors legitimately carry
+    // more sub-texel error (quarter-pel quantization at both ends).
+    float u_tolSlope;
+    float u_pad0;
+    float u_pad1;
+};
+
+layout(binding = 1, rgba16f) writeonly uniform image2D dst;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+// s_samplers[0] = forward motion field, [1] = reverse motion field.
+
+// Per-texel consistency factor. Tests the four reverse-field texels under the
+// landing point individually instead of one bilinear blend: at a motion
+// boundary the blend mixes two different motions into a vector nothing
+// actually moved by, which would spuriously fail exactly the edge pixels this
+// pass most needs to classify correctly. The match is consistent if ANY
+// covering texel round-trips — the content belongs to that texel's motion
+// layer.
+float factorAt(ivec2 p, ivec2 sz, ivec2 rsz, out float err) {
+    vec4 fwd = texelFetch(s_samplers[0], clamp(p, ivec2(0), sz - 1), 0);
+    vec2 F = fwd.rg;
+
+    // Where this content sat in the previous frame, in texel-center coords.
+    vec2 q = vec2(p) + vec2(0.5) - F;
+
+    ivec2 base = ivec2(floor(q - vec2(0.5)));
+    float factor = 0.0;
+    err = 1e30;
+    for (int dy = 0; dy <= 1; dy++) {
+        for (int dx = 0; dx <= 1; dx++) {
+            vec2 R = texelFetch(s_samplers[1], clamp(base + ivec2(dx, dy), ivec2(0), rsz - 1), 0).rg;
+            vec2 rt = F + R; // ~0 when the round trip closes
+            float e = abs(rt.x) + abs(rt.y);
+            float tol = u_tolBase + u_tolSlope * (abs(F.x) + abs(F.y) + abs(R.x) + abs(R.y));
+            factor = max(factor, clamp((2.0 * tol - e) / tol, 0.0, 1.0));
+            err = min(err, e);
+        }
+    }
+    return factor;
+}
+
+void main() {
+    ivec2 sz = imageSize(dst);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= sz.x || p.y >= sz.y)
+        return;
+
+    vec4 fwd = texelFetch(s_samplers[0], p, 0);
+    ivec2 rsz = textureSize(s_samplers[1], 0);
+
+    // Feather the kill mask with a 3x3 tent over the neighbourhood's factors.
+    // A raw per-texel kill is an 8x8-pixel tile that snaps to the static
+    // fallback while its neighbours keep warping — the tile boundary shears
+    // like a tear, and single-texel verdict flips flicker at the real-frame
+    // rate. Feathering spreads every transition across ~3 field texels and
+    // averages the flips away; occlusion masks in production interpolators are
+    // dilated/feathered for the same reason.
+    const float w[3] = float[3](1.0, 2.0, 1.0);
+    float sum = 0.0;
+    float wsum = 0.0;
+    float errC = 0.0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            float e;
+            float f = factorAt(p + ivec2(dx, dy), sz, rsz, e);
+            float wt = w[dx + 1] * w[dy + 1];
+            sum += f * wt;
+            wsum += wt;
+            if (dx == 0 && dy == 0)
+                errC = e;
+        }
+    }
+    float factor = sum / wsum;
+
+    // .a carries the raw round-trip error for diagnostics and future per-tile
+    // quality feedback; the warp only consumes .rg/.b.
+    imageStore(dst, p, vec4(fwd.rg, fwd.b * factor, errC));
+}

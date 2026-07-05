@@ -1,8 +1,84 @@
 # Proposal 2 — Base-layer frame generation with late overlay/cursor composite
 
-Status: design / implementation-oriented
+Status: prototype implemented (opt-in `GAMESCOPE_FRAMEGEN_BASE=1`; validated
+nested on the dual-GPU split with the FSR path, motion x3 — see implementation
+notes for divergences and open validation)
 Scope: `src/rendervulkan.cpp`, `src/rendervulkan.hpp`, `src/steamcompmgr.cpp`, `src/Backends/DRMBackend.cpp`, `src/shaders/cs_framegen_extrapolate.comp`
 Depends on: the existing experimental framegen path (commits `313b9af`, `c33daa3`).
+
+---
+
+## Implementation notes (divergences from the draft below)
+
+The prototype landed after the zero-copy history refactor, the dedicated
+framegen queue, #04's degradation ladder and the #06/#01 pacing work, which
+changed several of the draft's premises:
+
+- **The bandwidth motivation inverted; the quality motivation carried.** The
+  draft's "−56% traffic" table assumed history was *copied* at output
+  resolution. Zero-copy history removed those copies, so base-layer mode now
+  *adds* work relative to the tree it landed on: one base-sized history copy
+  per real frame plus one full composite (EASU/RCAS or blit + overlays) per
+  *presented* generated frame, while shrinking the generation dispatches by the
+  base/output area ratio. The feature is justified by what it removes —
+  overlay/HUD/cursor smear is eliminated **by construction** (two contradictory
+  motion fields at one pixel is an ill-posed estimation input; no estimator
+  fixes it), prediction runs in the game's own encoding, and generated frames
+  get the full shaper/3D-LUT color pipeline exactly like real frames.
+- **No `FramegenComposeSnapshot_t`.** The draft's snapshot machinery was
+  dropped entirely. The backend present intercept already receives the **live**
+  `FrameInfo_t` that `paint_all` just assembled for this very present, so the
+  late composite substitutes the generated base into `layers[0]` of that and
+  reuses `vulkan_composite()` wholesale. Open question 2 resolves as "live
+  everything": overlays and cursor are the *current* state (late cursor for
+  free), and no snapshot means no stale-`Rc` client-buffer lifetime hazards.
+  This also handles the NIS path (open question 3) generically.
+- **History copies on the framegen queue, not the composite.** A client buffer
+  cannot be retained zero-copy (its release back to the game is keyed to commit
+  lifetime, not our texture refs), so it is copied into one of two owned
+  base-sized images the moment the frame records — in a copy-only command
+  buffer on the framegen queue, so the real frame's composite and present never
+  wait on it. The copy uses no descriptors and no timestamp slots and is exempt
+  from the one-batch-in-flight machinery; same-queue `ALL_COMMANDS` barriers
+  order it against the previous batch's reads (WAR) and the next batch's reads
+  against it (RAW) across command buffers.
+- **Scene invalidation got *narrower*, a quality win.** Overlays are no longer
+  part of history, so a layer-count change (HUD toggling, notification popping)
+  no longer invalidates prediction in base mode. The new discontinuity signal
+  is the game buffer's own colorspace flipping on an unchanged DRM format.
+- **The overlay-defer budget is bypassed.** steamcompmgr's deferral machinery
+  (added because a per-frame FPS overlay starved framegen) is unnecessary in
+  base mode: an overlay-only update rides the generated present itself, fresher
+  than the deferred real composite would have shown it.
+- **Dispatcher with live fallback** (not a boot-time either/or): env gate plus
+  a per-recorded-frame predicate — layer 0 must be the base plane (no video
+  underlay), non-YCbCr, no ReShade (it rewrites layer 0 inside
+  `vulkan_composite` and would run twice + host-stall), and the client format
+  must support sampled+storage (probed once per format, cached). Unusable
+  scenes fall back to legacy output-space generation live; the switch is
+  mediated by the dims/mode-keyed history reset so the paths never mix within a
+  scene, and pending frames can never be mislabeled (a base-sized non-flippable
+  image never reaches `drm_prepare` directly).
+- **Pools:** `framegenOutputImages` (2×multiplier) becomes base-sized and
+  non-flippable in base mode; a separate 3-deep output-sized flippable
+  `framegenPresentImages` pool receives late composites (one consumed per
+  present: scanout + in-flight + margin).
+- **Ladder caveat:** the batch's begin-timestamp (`TOP_OF_PIPE`) overlaps the
+  tail of the preceding history copy on the same queue, so base-mode rung costs
+  include the copy — conservative (degrades slightly earlier). On the dual-GPU
+  split that copy pulls the render-GPU-resident client buffer over PCIe, which
+  is also the mode's main added bus cost (a second read of the base buffer per
+  real frame, alongside the composite's own).
+- **Multiplier interaction (open question 4):** works as-is — each *consumed*
+  slot pays one late composite in its own otherwise-empty vblank; x3 validated
+  nested.
+- **Validated nested** (Wayland backend, dual-GPU render-NVIDIA/present-AMD,
+  1080p base → 1440p output through EASU/RCAS, motion x3: base-sized history
+  copies + generation, late composite `fsr=1`, presents at phases .33/.66, live
+  base↔legacy toggles, and a legacy A/B run with the env off showing unchanged
+  behavior). Not yet validated: DRM/native, HDR (shaper/LUT visual
+  correctness), an on-screen overlay-freshness A/B (MangoHud over generated
+  frames), and interaction with #01's VRR hybrid on a VRR panel.
 
 ---
 

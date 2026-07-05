@@ -1,0 +1,111 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set_constants.h"
+
+// In-situ learning, optimizer half (Stage C2): fold the gradient slices the
+// training pass just wrote into the persistent Adam state, and publish an
+// EMA-smoothed copy of the weights for the inference pass to serve.
+//
+// One thread per parameter (4644 of them — this dispatch is measured in
+// microseconds). Three ideas carry the whole safety story:
+//
+//   * decay toward the PRIOR, not toward zero: every step the fast weights
+//     relax a little toward the blob the session started from (a shipped
+//     profile, an offline checkpoint, or the neutral zero-head init). The
+//     model can only stay away from its safe prior by continually re-earning
+//     the distance on fresh frames — "a model that works temporarily for the
+//     current scene", structurally.
+//   * the inference pass reads a slow EMA of the fast weights, so the served
+//     correction function moves calmly even while SGD jitters — the same
+//     calmer-than-the-signal rule as the B4 threshold EMAs.
+//   * gradient slices are summed here, deterministically, instead of
+//     float-atomic-added by the training pass: VK_EXT_shader_atomic_float is
+//     not universal, plain image reads are.
+//
+// State texture rows (binding 1, R32F, one row per array):
+//   row 0 = fast weights   row 1 = Adam m   row 2 = Adam v
+//   row 3 = the EMA itself (kept here so this dispatch never has to read the
+//           published texture it is writing)
+// Served weights (binding 2) use the SAME 2048-wide layout the inference
+// shader indexes, so cs_framegen_motion_net.comp is untouched.
+layout(
+  local_size_x = 64,
+  local_size_y = 1,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform motion_net_opt_t {
+    float u_lr;        // Adam step size
+    float u_emaAlpha;  // served-weights EMA factor (e.g. 1/16)
+    float u_decay;     // per-step relaxation toward the prior
+    uint  u_step;      // 1-based Adam step (bias correction); 0 = INIT:
+                       // fast = prior, m = v = 0, served = prior
+};
+
+// Persistent optimizer state, one row per array (width = parameter count).
+layout(binding = 1, r32f) uniform image2D u_state;
+// Served weights, 2048-wide inference layout.
+layout(binding = 2, r32f) writeonly uniform image2D u_served;
+
+// s_samplers[0] = gradient slices (width = parameter count, one row per
+//                 training tile; row count = textureSize().y)
+// s_samplers[1] = the prior (2048-wide upload/staging layout)
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+
+const int N_PARAMS = 4644;
+
+void main() {
+    int p = int(gl_GlobalInvocationID.x);
+    if (p >= N_PARAMS)
+        return;
+
+    ivec2 servedAt = ivec2(p & 2047, p >> 11);
+    float prior = texelFetch(s_samplers[1], servedAt, 0).r;
+
+    if (u_step == 0u) {
+        imageStore(u_state, ivec2(p, 0), vec4(prior));
+        imageStore(u_state, ivec2(p, 1), vec4(0.0f));
+        imageStore(u_state, ivec2(p, 2), vec4(0.0f));
+        imageStore(u_state, ivec2(p, 3), vec4(prior));
+        imageStore(u_served, servedAt, vec4(prior));
+        return;
+    }
+
+    float g = 0.0f;
+    int nSlices = textureSize(s_samplers[0], 0).y;
+    for (int k = 0; k < nSlices; k++)
+        g += texelFetch(s_samplers[0], ivec2(p, k), 0).r;
+    // Tiles carry per-tile means; averaging the slices makes g the global
+    // mean gradient, so u_lr means the same thing as the offline trainer's.
+    g /= float(nSlices);
+
+    float w = imageLoad(u_state, ivec2(p, 0)).r;
+    float m = imageLoad(u_state, ivec2(p, 1)).r;
+    float v = imageLoad(u_state, ivec2(p, 2)).r;
+
+    m = 0.9f * m + 0.1f * g;
+    v = 0.999f * v + 0.001f * g * g;
+    float t = float(u_step);
+    float mh = m / (1.0f - pow(0.9f, t));
+    float vh = v / (1.0f - pow(0.999f, t));
+    w -= u_lr * mh / (sqrt(vh) + 1e-8f);
+    // Relax toward the prior (see header). Also the divergence backstop: a
+    // burst of bad gradients decays away once the scene stops feeding it.
+    w -= u_decay * (w - prior);
+    // The served heads stay bounded by the inference shader's tanh/clamp no
+    // matter what w does, but keep the raw state finite regardless.
+    w = clamp(w, -64.0f, 64.0f);
+
+    imageStore(u_state, ivec2(p, 0), vec4(w));
+    imageStore(u_state, ivec2(p, 1), vec4(m));
+    imageStore(u_state, ivec2(p, 2), vec4(v));
+
+    // Publish: a slow EMA of the fast weights is what inference serves.
+    float ema = imageLoad(u_state, ivec2(p, 3)).r;
+    ema += u_emaAlpha * (w - ema);
+    imageStore(u_state, ivec2(p, 3), vec4(ema));
+    imageStore(u_served, servedAt, vec4(ema));
+}

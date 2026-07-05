@@ -1,0 +1,99 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set.h"
+
+// Bidirectional interpolation warp. Unlike the forward warp
+// (cs_framegen_motion_warp.comp), the output frame sits BETWEEN the two real
+// frames: both are warped toward the slot's temporal phase and blended by
+// confidence, so occluded/disoccluded content is taken from the frame that
+// actually contains it, and pixels where neither direction is trustworthy
+// degrade to a phase-correct crossfade of the unwarped frames — real content
+// that dissolves smoothly instead of holding and then jumping. No TAA
+// rectification is needed: every term is a genuine fetch from a real frame,
+// so the shader can never invent a color. Writes the output image, so it
+// reuses descriptor_set.h's rgba8 dst.
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform motion_bidir_t {
+    // Temporal phase t in (0,1): 0 = the previous real frame, 1 = the current.
+    float u_phase;
+    // Full-res / low-res ratio, to turn low-res-texel motion into a UV shift.
+    float u_lowResScale;
+    // Two-direction agreement window (normalized color distance): where both
+    // directions carry weight but land on different content, averaging them
+    // would double-expose, so disagreement above Hi sends the pixel to the
+    // crossfade fallback instead.
+    float u_agreeLo;
+    float u_agreeHi;
+};
+
+// s_samplers[0] = previousReal, [1] = currentReal,
+// [2] = checked forward field (cur-anchored prev->cur flow, .b = confidence),
+// [3] = checked reverse field (prev-anchored cur->prev flow, .b = confidence).
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outSize = imageSize(dst);
+    if (coord.x >= outSize.x || coord.y >= outSize.y)
+        return;
+
+    vec2 uv = (vec2(coord) + vec2(0.5f)) / vec2(outSize);
+    float t = u_phase;
+
+    vec4 fwdField = texture(s_samplers[2], uv);
+    vec4 revField = texture(s_samplers[3], uv);
+    vec2 mvUvF = fwdField.rg * u_lowResScale / vec2(outSize);
+    vec2 mvUvR = revField.rg * u_lowResScale / vec2(outSize);
+    float confF = clamp(fwdField.b, 0.0f, 1.0f);
+    float confR = clamp(revField.b, 0.0f, 1.0f);
+
+    // An object at output pixel p at time t is found (1-t) further along the
+    // cur-anchored motion in the current frame, and t along the prev-anchored
+    // reverse motion in the previous frame — the same "field at p approximates
+    // field at the source" anchor step the forward warp takes, applied once per
+    // direction. Note the reverse field ALREADY points cur->prev, so both
+    // offsets are additions.
+    vec4 fromCur  = texture(s_samplers[1], uv + mvUvF * (1.0f - t));
+    vec4 fromPrev = texture(s_samplers[0], uv + mvUvR * t);
+
+    // Confidence x phase proximity: near t=1 the current-frame gather covers
+    // the shorter (more reliable) distance, near t=0 the previous-frame one.
+    // With both directions confident this is the standard temporal blend; with
+    // one direction killed (occlusion: content only exists in one frame) the
+    // average IS a per-pixel choose of the surviving side.
+    float wF = confF * t;
+    float wR = confR * (1.0f - t);
+    float wSum = wF + wR;
+    vec4 warped = (wF * fromCur + wR * fromPrev) / max(wSum, 1e-6f);
+
+    // Agreement between the two gathers, weighted by how mixed the blend
+    // actually is: a one-sided blend (mixedness ~0) is already a choose, so
+    // its disagreement is irrelevant; an even blend of two DIFFERENT contents
+    // (mixedness ~1, both confident, boundary bleed) is exactly the double
+    // exposure to kill. Normalizing by the local magnitude keeps the window
+    // meaningful for scRGB values above 1.0.
+    vec3 dd = abs(fromCur.rgb - fromPrev.rgb);
+    float disagree = max(max(dd.r, dd.g), dd.b);
+    float mx = max(max(max(abs(fromCur.r), abs(fromCur.g)), abs(fromCur.b)),
+                   max(max(abs(fromPrev.r), abs(fromPrev.g)), abs(fromPrev.b)));
+    float mixedness = 4.0f * wF * wR / max(wSum * wSum, 1e-9f);
+
+    // Phase-correct crossfade of the unwarped frames: the fallback for killed
+    // or disagreeing pixels. Correct for translucency (a single-layer flow can
+    // never track two motions per pixel, but both layers fade at the right
+    // time here) and temporally smooth (the region dissolves prev->cur over
+    // the interval instead of holding the old frame and snapping).
+    vec4 crossfade = mix(texture(s_samplers[0], uv), texture(s_samplers[1], uv), t);
+
+    float validity = clamp(wSum, 0.0f, 1.0f)
+        * (1.0f - mixedness * smoothstep(u_agreeLo, u_agreeHi, disagree / max(1.0f, mx)));
+
+    imageStore(dst, coord, mix(crossfade, warped, validity));
+}
