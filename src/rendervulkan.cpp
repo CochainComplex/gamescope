@@ -711,7 +711,12 @@ bool CVulkanDevice::createDevice()
 		m_bSupportsFp16 = m_bSupportsShaderFloat16 && features2.features.shaderInt16;
 	}
 
-	float queuePriorities[2] = { 1.0f, 1.0f };
+	// Queue 0 carries real composites; queue 1 is disposable speculative
+	// frame-generation work. Keep the latter at the lowest relative priority so
+	// a long motion pass cannot compete equally for compute/memory resources and
+	// add jitter to a real frame. The global priority is family-wide, but Vulkan
+	// still applies these relative priorities between queues in that family.
+	float queuePriorities[2] = { 1.0f, 0.0f };
 
 	VkDeviceQueueGlobalPriorityCreateInfoEXT queueCreateInfoEXT = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT,
@@ -722,10 +727,10 @@ bool CVulkanDevice::createDevice()
 	// Request a second queue in the compositor's (compute) family for frame
 	// generation, when framegen is enabled, the family exposes one, and it isn't
 	// disabled. Vulkan has no per-queue global priority within a family, so both
-	// queues inherit this create-info's REALTIME priority; the win is decoupling
-	// — a slow generation on queue 1 can never block the next composite on queue
-	// 0 of the in-order realtime queue. Gated on framegen so a session that never
-	// uses it requests exactly the single REALTIME queue it did before.
+	// queues inherit this create-info's REALTIME priority. Their relative
+	// priorities above still favor real composites; the second queue also removes
+	// FIFO head-of-line blocking. Gated on framegen so a session that never uses
+	// it requests exactly the single REALTIME queue it did before.
 	const bool bWantFramegenQueue = g_bExperimentalFramegen && framegen_backend_supported()
 		&& m_queueCount >= 2 && !env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_SINGLE_QUEUE" ) );
 	const uint32_t nComputeQueues = bWantFramegenQueue ? 2u : 1u;
@@ -5825,7 +5830,7 @@ static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope:
 // busy queue). The client texture is only referenced by this immediately
 // submitted copy — never retained across frames — so its commit-keyed buffer
 // lifetime is respected.
-static bool framegen_base_record_copy( gamescope::Rc<CVulkanTexture> pBaseFrame )
+static bool framegen_base_record_copy( gamescope::Rc<CVulkanTexture> pBaseFrame, uint64_t ulCompositeSeqNo )
 {
 	const uint32_t nTarget = g_framegenHistory.nBaseHistoryNext & 1u;
 	gamescope::Rc<CVulkanTexture> pTarget = g_framegenHistory.baseHistory[ nTarget ];
@@ -5835,7 +5840,11 @@ static bool framegen_base_record_copy( gamescope::Rc<CVulkanTexture> pBaseFrame 
 	auto pCmdBuffer = g_device.commandBuffer();
 	pCmdBuffer->markFramegen();
 	pCmdBuffer->copyImage( std::move( pBaseFrame ), pTarget );
-	g_device.submitFramegen( std::move( pCmdBuffer ), 0, -1, 0, 0 );
+	// The real composite carries the client's acquire dependency. Waiting for
+	// its timeline point makes that readiness chain visible to this queue before
+	// it reads the same client image, and also orders the composite's image-state
+	// transitions ahead of the copy.
+	g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo, -1, 0, 0 );
 
 	g_framegenHistory.nBaseHistoryNext = nTarget ^ 1u;
 	g_framegenHistory.previousReal = g_framegenHistory.currentReal;
@@ -8087,7 +8096,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// output image becomes "current", holding references into the output ring.
 	if ( bBaseLayer )
 	{
-		if ( !framegen_base_record_copy( pHistoryFrame ) )
+		if ( !framegen_base_record_copy( pHistoryFrame, ulCompositeSeqNo ) )
 			return;
 	}
 	else

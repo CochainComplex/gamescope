@@ -54,6 +54,17 @@ layout(
 // threads/tile (slightly worse — not occupancy-bound) and a
 // (position x channel-group) split (2.3x WORSE: it quadruples activation
 // loads — the kernel lives and dies on LDS load-instruction count).
+//
+// On top of position-major, the conv phases register-block TWO positions per
+// thread: the weight vec4s are ~16x the load count of the activations (per
+// conv1 position, 432 weight loads vs 27 feature loads), and a thread that
+// owns two positions dots each weight load into both accumulators — the
+// phase's LDS load count drops almost in half. The per-position arithmetic
+// order is unchanged (results stay bit-identical), every thread still reads
+// the SAME weight address per step (the LDS broadcast both vendors have),
+// and occupancy is already capped by the ~28 KB of LDS, so the extra
+// accumulator registers are free. Vendor-agnostic by construction: it only
+// reduces the count of the instruction class the kernel is bound on.
 const uint THREADS = 64u;
 
 layout(push_constant, scalar)
@@ -104,6 +115,10 @@ const int L3_BIAS4  = 144;
 shared vec4 s_feat4[FEAT * FEAT * 3]; // input features (3 vec4/texel); reused for conv2's output
 shared vec4 s_act4[A1 * A1 * 4];      // conv1 output (4 vec4/texel)
 shared vec4 s_w4[L2_VEC4S];           // current layer's weights (largest layer)
+// s_feat4 is overwritten by conv2 before the output confidence gate runs.
+// Preserve the input residual separately; 14*14 floats keep the workgroup
+// below 32 KiB of shared memory and therefore do not change its occupancy.
+shared float s_resid[FEAT * FEAT];
 
 // The weight texture is 2048 texels wide; flat vec4 index -> 4 texels.
 vec4 wload4(int idx4) {
@@ -137,6 +152,7 @@ void main() {
         // Magnitude-normalized residual — scale-free in SDR and HDR alike
         // (the exact form the B4 probe grades with).
         float resid = abs(ld - lw) / max(1.0f, max(abs(ld), abs(lw)));
+        s_resid[i] = resid;
         uint b = i * 3u;
         s_feat4[b + 0u] = vec4(X.x * 0.125f, X.y * 0.125f, X.z, min(X.w * 0.5f, 1.0f));
         s_feat4[b + 1u] = vec4(Y.x * 0.125f, Y.y * 0.125f, Y.z, min(Y.w * 0.5f, 1.0f));
@@ -144,11 +160,40 @@ void main() {
     }
     barrier();
 
-    // Phase B: conv1 (12 -> 16, ReLU) at 12x12 positions. Each thread owns
-    // whole positions; the three feature vec4s are loaded once and shared
-    // across all 16 output channels, and every thread reads the SAME weight
-    // address per step — an LDS broadcast on both vendors.
-    for (uint i = li; i < uint(A1 * A1); i += THREADS) {
+    // Phase B: conv1 (12 -> 16, ReLU) at 12x12 positions, register-blocked
+    // pairwise: thread li owns positions li and li+64 (both < 144), loads
+    // each weight vec4 ONCE and dots it into both accumulators.
+    {
+        uint iA = li;
+        uint iB = li + THREADS;
+        int axA = int(iA) % A1, ayA = int(iA) / A1;
+        int axB = int(iB) % A1, ayB = int(iB) / A1;
+        float accA[C_MID], accB[C_MID];
+        for (int co = 0; co < C_MID; co++) {
+            float b = s_w4[(L1_VEC4S - 4) + (co >> 2)][co & 3];
+            accA[co] = b;
+            accB[co] = b;
+        }
+        for (int tap = 0; tap < 9; tap++) {
+            int fbA = ((ayA + tap / 3) * FEAT + (axA + tap % 3)) * 3;
+            int fbB = ((ayB + tap / 3) * FEAT + (axB + tap % 3)) * 3;
+            vec4 fA0 = s_feat4[fbA + 0], fA1 = s_feat4[fbA + 1], fA2 = s_feat4[fbA + 2];
+            vec4 fB0 = s_feat4[fbB + 0], fB1 = s_feat4[fbB + 1], fB2 = s_feat4[fbB + 2];
+            for (int co = 0; co < C_MID; co++) {
+                int wb = (co * 9 + tap) * 3;
+                vec4 w0 = s_w4[wb], w1 = s_w4[wb + 1], w2 = s_w4[wb + 2];
+                accA[co] += dot(fA0, w0) + dot(fA1, w1) + dot(fA2, w2);
+                accB[co] += dot(fB0, w0) + dot(fB1, w1) + dot(fB2, w2);
+            }
+        }
+        for (int g = 0; g < 4; g++) {
+            s_act4[iA * 4u + uint(g)] = max(vec4(accA[g * 4], accA[g * 4 + 1], accA[g * 4 + 2], accA[g * 4 + 3]), vec4(0.0f));
+            s_act4[iB * 4u + uint(g)] = max(vec4(accB[g * 4], accB[g * 4 + 1], accB[g * 4 + 2], accB[g * 4 + 3]), vec4(0.0f));
+        }
+    }
+    // The 16 remaining positions (128..143), single-position on threads 0-15.
+    if (li < uint(A1 * A1) - 2u * THREADS) {
+        uint i = 2u * THREADS + li;
         int ax = int(i) % A1, ay = int(i) / A1;
         float acc[C_MID];
         for (int co = 0; co < C_MID; co++)
@@ -176,27 +221,41 @@ void main() {
     barrier();
 
     // Phase C: conv2 (16 -> 16, ReLU) at 10x10 positions; its output reuses
-    // the feature buffer, whose last reader was phase B.
-    for (uint i = li; i < uint(A2 * A2); i += THREADS) {
-        int bx = int(i) % A2, by = int(i) / A2;
-        float acc[C_MID];
-        for (int co = 0; co < C_MID; co++)
-            acc[co] = s_w4[L2_BIAS4 + (co >> 2)][co & 3];
+    // the feature buffer, whose last reader was phase B. Register-blocked
+    // like phase B; 100 positions means the second position only exists for
+    // threads 0-35 — the others load a safe dummy index and skip the store
+    // (weight loads, the shared part, are needed by their FIRST position
+    // regardless, so no work is wasted where it counts).
+    {
+        uint iA = li;
+        uint iB = li + THREADS;
+        bool hasB = iB < uint(A2 * A2);
+        uint iBs = hasB ? iB : iA;
+        int bxA = int(iA) % A2, byA = int(iA) / A2;
+        int bxB = int(iBs) % A2, byB = int(iBs) / A2;
+        float accA[C_MID], accB[C_MID];
+        for (int co = 0; co < C_MID; co++) {
+            float b = s_w4[L2_BIAS4 + (co >> 2)][co & 3];
+            accA[co] = b;
+            accB[co] = b;
+        }
         for (int tap = 0; tap < 9; tap++) {
-            int ab = ((by + tap / 3) * A1 + (bx + tap % 3)) * 4;
-            vec4 a0 = s_act4[ab + 0];
-            vec4 a1 = s_act4[ab + 1];
-            vec4 a2 = s_act4[ab + 2];
-            vec4 a3 = s_act4[ab + 3];
+            int abA = ((byA + tap / 3) * A1 + (bxA + tap % 3)) * 4;
+            int abB = ((byB + tap / 3) * A1 + (bxB + tap % 3)) * 4;
+            vec4 aA0 = s_act4[abA + 0], aA1 = s_act4[abA + 1], aA2 = s_act4[abA + 2], aA3 = s_act4[abA + 3];
+            vec4 aB0 = s_act4[abB + 0], aB1 = s_act4[abB + 1], aB2 = s_act4[abB + 2], aB3 = s_act4[abB + 3];
             for (int co = 0; co < C_MID; co++) {
                 int wb = (co * 9 + tap) * 4;
-                acc[co] += dot(a0, s_w4[wb]) + dot(a1, s_w4[wb + 1])
-                    + dot(a2, s_w4[wb + 2]) + dot(a3, s_w4[wb + 3]);
+                vec4 w0 = s_w4[wb], w1 = s_w4[wb + 1], w2 = s_w4[wb + 2], w3 = s_w4[wb + 3];
+                accA[co] += dot(aA0, w0) + dot(aA1, w1) + dot(aA2, w2) + dot(aA3, w3);
+                accB[co] += dot(aB0, w0) + dot(aB1, w1) + dot(aB2, w2) + dot(aB3, w3);
             }
         }
-        uint ob = i * 4u;
-        for (int g = 0; g < 4; g++)
-            s_feat4[ob + uint(g)] = max(vec4(acc[g * 4], acc[g * 4 + 1], acc[g * 4 + 2], acc[g * 4 + 3]), vec4(0.0f));
+        for (int g = 0; g < 4; g++) {
+            s_feat4[iA * 4u + uint(g)] = max(vec4(accA[g * 4], accA[g * 4 + 1], accA[g * 4 + 2], accA[g * 4 + 3]), vec4(0.0f));
+            if (hasB)
+                s_feat4[iB * 4u + uint(g)] = max(vec4(accB[g * 4], accB[g * 4 + 1], accB[g * 4 + 2], accB[g * 4 + 3]), vec4(0.0f));
+        }
     }
     barrier();
 
@@ -233,10 +292,8 @@ void main() {
     // especially mid online learning — promotes garbage vectors and the warp
     // confidently gathers stale content in field-texel-sized squares.
     // Lowering confidence is always safe and always allowed.
-    float ld = texelFetch(s_samplers[1], op, 0).r;
-    vec2 uv = (vec2(op) + 0.5f) * invSz;
-    float lw = texture(s_samplers[0], uv - X0.xy * invSz).r;
-    float resid = abs(ld - lw) / max(1.0f, max(abs(ld), abs(lw)));
+    uint featIndex = uint((cy + 3) * FEAT + (cx + 3));
+    float resid = s_resid[featIndex];
     float dc = o2 < 0.0f ? o2 : o2 * (1.0f - smoothstep(0.03f, 0.10f, resid));
     imageStore(u_refined, op, vec4(X0.xy + dF, clamp(X0.z + dc, 0.0f, 1.0f), X0.w));
 }

@@ -47,11 +47,16 @@ layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 // covering texel round-trips — the content belongs to that texel's motion
 // layer.
 float factorAt(ivec2 p, ivec2 sz, ivec2 rsz, out float err) {
-    vec4 fwd = texelFetch(s_samplers[0], clamp(p, ivec2(0), sz - 1), 0);
+    // The 3x3 feather calls this for virtual neighbours outside the image.
+    // Replicate the border consistently for both the field fetch and its
+    // coordinate; using unclamped p below shifts only the round-trip lookup
+    // outside the image and creates a direction-dependent confidence seam.
+    ivec2 pc = clamp(p, ivec2(0), sz - 1);
+    vec4 fwd = texelFetch(s_samplers[0], pc, 0);
     vec2 F = fwd.rg;
 
     // Where this content sat in the previous frame, in texel-center coords.
-    vec2 q = vec2(p) + vec2(0.5) - F;
+    vec2 q = vec2(pc) + vec2(0.5) - F;
 
     ivec2 base = ivec2(floor(q - vec2(0.5)));
     float factor = 0.0;

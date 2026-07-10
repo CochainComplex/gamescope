@@ -1,6 +1,6 @@
 # gamescope-gameslop
 
-*A compositor-side **frame-generation** fork of [gamescope](https://github.com/ValveSoftware/gamescope). The name is tongue-in-cheek: yes, most of the pixels you see are machine-invented in-between frames — "slop" — but they're honestly labelled (the game never sees them) and produced by a real motion-estimation + interpolation pipeline, not a dumb frame average.*
+*A compositor-side **frame-generation** fork of [gamescope](https://github.com/ValveSoftware/gamescope). The name is tongue-in-cheek: yes, most of the pixels you see are machine-invented in-between frames — "slop" — but they're honestly labelled (the game never sees them) and produced by a real motion-estimation pipeline that **predicts *or* interpolates**, not a dumb frame average.*
 
 ### What it is
 
@@ -22,7 +22,9 @@ The generation is essentially **free** because it runs on silicon that would oth
 
 **Where the trick lives:** frame generation happens in the **compositor**, downstream of the game — it never reaches *back* into the game's rendering. The generated frames are gamescope's own; the game, Wine/DXVK, Reflex and anti-lag never see them, and nothing is pulled *off* the render card, so the game's real frame rate and input latency are left completely untouched. The second card only ever **polishes what comes out** — a post-processor, not a middleman in the render path. Plug your monitor into the weak "present" GPU, render the game on the strong one, and let the two bridge over dma-buf.
 
-### It is *not* "just interpolation"
+### It's not a *dumb* blend — extrapolate, or truly interpolate
+
+"In-between frames" makes people picture crude frame-averaging. Gameslop can do **genuine interpolation** — its highest-quality **bidirectional** mode warps *both* neighbouring real frames to the in-between phase and blends them by confidence (that *is* real interpolation, and it's what the learned net needs). The catch is latency: interpolating means holding the newer real frame back until the one after it arrives, so this mode always runs **~1 frame behind** — which is exactly why it's an **opt-in choice, not the default**. The **default** mode **extrapolates** instead: it predicts motion *forward* from the last two real frames, adds **zero** latency, and isn't interpolation at all. What it never is, in *either* mode, is a dumb average — a plain frame-blend (`blend`) exists only as a debug aid.
 
 **And it works blind — on purpose.** FSR 3 and DLSS Frame Generation are handed the scene's *true* motion by the game engine — per-pixel **motion vectors**, depth, and (on DLSS) a dedicated **optical-flow hardware** block. Gameslop takes **none** of that, and that is a deliberate design choice, not just a missing feature. It *could* try to pull motion vectors, depth or the framebuffer off the render card — but ferrying that data across to the second GPU every frame would **bottleneck the whole system** and add latency to the very render path this design exists to leave alone. So the rule is **non-intervention**: never touch the game's rendering, its GPU, or its input latency. The second card sits **downstream as a pure post-processor** — it sees only the **finished frames** and works out the motion itself from the pixels alone. That's a harder, more artifact-prone problem, which is exactly why most of the pipeline below is not "generate a frame" but "estimate the motion, then decide how much of it to trust":
 
@@ -225,6 +227,97 @@ gamescope \
     -F fsr -f -- \
     env MESA_VK_DEVICE_SELECT='10de:2db9!' vkcube
 ```
+
+### Local dual-GPU test commands
+
+These are the exact style of commands used for the current NVIDIA-render /
+AMD-framegen test machine. Replace the PCI IDs for other systems.
+
+Common framegen settings used in the tests:
+
+```sh
+--prefer-vk-device 1002:150e          # gamescope/compositor/framegen on AMD
+--experimental-framegen
+--framegen-mode motion                # motion-compensated generation
+--framegen-multiplier 3               # x3 target cadence
+--framegen-strength 0.5
+--framegen-debug
+-W 2560 -H 1440 -r 120
+```
+
+If this checkout was built against locally compiled Wayland/WSI dependencies,
+run through the local environment wrapper:
+
+```sh
+GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh gamescope ...
+```
+
+For Vulkan clients, pin the game/render GPU with Mesa's Vulkan selector after
+the `--` separator:
+
+```sh
+GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
+gamescope \
+    --prefer-vk-device 1002:150e \
+    -W 2560 -H 1440 -r 120 \
+    --expose-wayland \
+    --experimental-framegen \
+    --framegen-mode motion \
+    --framegen-multiplier 3 \
+    --framegen-strength 0.5 \
+    --framegen-debug -- \
+    env MESA_VK_DEVICE_SELECT='10de:2db9!' vkmark --size 2560x1440
+```
+
+SuperTuxKart 1.4 is an OpenGL client here, so `MESA_VK_DEVICE_SELECT` does not
+select its render GPU. Force STK through X11/GLX and use NVIDIA's GL offload
+variables for the child process instead:
+
+```sh
+GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
+gamescope \
+    --prefer-vk-device 1002:150e \
+    -W 2560 -H 1440 -r 120 \
+    --expose-wayland \
+    --experimental-framegen \
+    --framegen-mode motion \
+    --framegen-multiplier 3 \
+    --framegen-strength 0.5 \
+    --framegen-debug -- \
+    env IRR_DEVICE_TYPE=x11 \
+        __NV_PRIME_RENDER_OFFLOAD=1 \
+        __GLX_VENDOR_LIBRARY_NAME=nvidia \
+        supertuxkart \
+            --race-now \
+            --track=xr591 \
+            --numkarts=8 \
+            --laps=3 \
+            --difficulty=2 \
+            --screensize=2560x1440 \
+            --windowed \
+            --render-driver=gl \
+            --unlock-all \
+            --disable-polling \
+            --profile-time=18
+```
+
+Before trusting an OpenGL game, verify the split with a quick probe:
+
+```sh
+GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
+gamescope --prefer-vk-device 1002:150e -W 1280 -H 720 -r 120 \
+    --expose-wayland -- \
+    env IRR_DEVICE_TYPE=x11 \
+        __NV_PRIME_RENDER_OFFLOAD=1 \
+        __GLX_VENDOR_LIBRARY_NAME=nvidia \
+        glxinfo -B
+```
+
+The gamescope log should say it selected the AMD device, while `glxinfo` or
+SuperTuxKart should report the NVIDIA OpenGL renderer. Nested runs like the
+commands above validate routing and shader execution, but native scanout pacing
+still needs a real DRM session from a text VT, for example through
+`./run-framegen-native.sh` with the same framegen mode/multiplier/strength.
 
 `--experimental-framegen` already implies `--force-composite`, so you don't need
 to pass `--force-composite` separately.
