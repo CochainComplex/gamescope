@@ -91,11 +91,27 @@ enum class GamescopeFramegenMode : uint32_t
     Motion,
 };
 
+enum class GamescopeFramegenQuality : uint32_t
+{
+    // Forward hierarchical matching only. No reverse consistency, adaptation,
+    // learned refinement, or temporal acceleration.
+    Low,
+    // Add reverse-field consistency and the full-resolution agreement test.
+    Medium,
+    // Add self-supervised adaptation and permit learned field refinement.
+    // This preserves the behavior that predates explicit quality tiers.
+    High,
+    // Add confidence-gated temporal acceleration from the preceding checked
+    // field. This is the most expensive causal forward-prediction path.
+    Ultra,
+};
+
 extern bool g_bExperimentalFramegen;
 extern bool g_bFramegenDebug;
 extern uint32_t g_uFramegenDebugEvery;
 extern int g_nFramegenMultiplier;
 extern GamescopeFramegenMode g_eFramegenMode;
+extern GamescopeFramegenQuality g_eFramegenQuality;
 extern float g_flFramegenStrength;
 
 bool FramegenDebugShouldLog( uint64_t &counter );

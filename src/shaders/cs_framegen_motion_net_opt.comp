@@ -82,9 +82,27 @@ void main() {
     // mean gradient, so u_lr means the same thing as the offline trainer's.
     g /= float(nSlices);
 
+    // The offline trainer clips global gradient norm to 1, which also bounds
+    // every component to [-1,1]. Enforce that necessary bound here without a
+    // cross-workgroup reduction, and discard a non-finite slice instead of
+    // letting one pathological tile poison Adam's persistent moments.
+    if (isnan(g) || isinf(g))
+        g = 0.0f;
+    else
+        g = clamp(g, -1.0f, 1.0f);
+
     float w = imageLoad(u_state, ivec2(p, 0)).r;
     float m = imageLoad(u_state, ivec2(p, 1)).r;
     float v = imageLoad(u_state, ivec2(p, 2)).r;
+
+    // GPU-local recovery makes the optimizer self-contained; the CPU
+    // readback remains the belt-and-suspenders health check and persistence
+    // gate, but no later dispatch needs to sample a poisoned state.
+    if (isnan(w) || isinf(w) || isnan(m) || isinf(m) || isnan(v) || isinf(v)) {
+        w = prior;
+        m = 0.0f;
+        v = 0.0f;
+    }
 
     m = 0.9f * m + 0.1f * g;
     v = 0.999f * v + 0.001f * g * g;
@@ -98,6 +116,12 @@ void main() {
     // The served heads stay bounded by the inference shader's tanh/clamp no
     // matter what w does, but keep the raw state finite regardless.
     w = clamp(w, -64.0f, 64.0f);
+
+    if (isnan(w) || isinf(w) || isnan(m) || isinf(m) || isnan(v) || isinf(v)) {
+        w = prior;
+        m = 0.0f;
+        v = 0.0f;
+    }
 
     imageStore(u_state, ivec2(p, 0), vec4(w));
     imageStore(u_state, ivec2(p, 1), vec4(m));

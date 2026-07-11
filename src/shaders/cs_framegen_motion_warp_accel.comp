@@ -1,0 +1,105 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set.h"
+
+// Ultra-quality causal motion warp. In addition to the current checked field,
+// it reads the preceding interval's final field and reprojects that field to
+// the current content position. Their difference is a constant-acceleration
+// estimate; no future frame, application motion vector, optical-flow API, or
+// vendor extension is required.
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(push_constant, scalar)
+uniform motion_accel_t {
+    float u_strength;
+    float u_suppressLo;
+    float u_suppressHi;
+    float u_lowResScale;
+    float u_agreeLo;
+    float u_agreeHi;
+    // Component-wise acceleration cap in field texels per real interval^2.
+    float u_accelMax;
+    float u_historyValid;
+};
+
+// s_samplers[0] = previousReal, [1] = currentReal,
+// [2] = current final motion field, [3] = preceding final motion field.
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outSize = imageSize(dst);
+    if (coord.x >= outSize.x || coord.y >= outSize.y)
+        return;
+
+    vec2 invOutSize = 1.0f / vec2(outSize);
+    vec2 uv = (vec2(coord) + vec2(0.5f)) * invOutSize;
+
+    vec3 previousFrame = texelFetch(s_samplers[0], coord, 0).rgb;
+    vec4 currentSample = texelFetch(s_samplers[1], coord, 0);
+    vec3 currentFrame = currentSample.rgb;
+
+    vec4 field = texture(s_samplers[2], uv);
+    vec2 flow = field.rg;
+    float conf = clamp(field.b, 0.0f, 1.0f);
+    vec2 flowUv = flow * u_lowResScale * invOutSize;
+
+    // The old field is anchored one real frame earlier. Following the current
+    // flow backward aligns its sample with the same moving content. Confidence
+    // from both intervals is required: a disocclusion or an uncertain old
+    // match must reduce to the established constant-velocity result.
+    vec4 oldField = texture(s_samplers[3], uv - flowUv);
+    vec2 accel = flow - oldField.rg;
+
+    // Remove the sub-pel noise floor before extrapolating a second derivative.
+    // Then reject acceleration that is implausibly large relative to the two
+    // observed velocities and cap what survives. These bounds are what keep a
+    // field-verdict flip from becoming a multi-pixel frametime-rate wobble.
+    const vec2 deadzone = vec2(0.05f);
+    accel = sign(accel) * max(abs(accel) - deadzone, vec2(0.0f));
+    float speed = max(0.5f, max(length(flow), length(oldField.rg)));
+    float accelRatio = length(accel) / speed;
+    float accelTrust = conf * clamp(oldField.b, 0.0f, 1.0f)
+        * (1.0f - smoothstep(0.35f, 1.0f, accelRatio));
+    accel = clamp(accel, vec2(-u_accelMax), vec2(u_accelMax));
+
+    // Quadratic through the three causal positions. With s intervals beyond
+    // the newest real frame, p(s) = p(0) + s*F + s*(s+1)/2*A. At A=0 this is
+    // exactly the constant-velocity production warp.
+    float accelCoeff = 0.5f * u_strength * (u_strength + 1.0f);
+    vec2 futureFlow = flow * u_strength + accel * (accelCoeff * accelTrust * u_historyValid);
+    vec2 futureUv = futureFlow * u_lowResScale * invOutSize;
+    vec3 predictedMotion = texture(s_samplers[1], uv - futureUv).rgb;
+
+    // The previous-frame source is one observed flow farther back than the
+    // current-frame source. Agreement remains a per-pixel safety verdict even
+    // when both sources use the accelerated target position.
+    vec2 fromPrevUv = (futureFlow + flow) * u_lowResScale * invOutSize;
+    vec3 predictedMotionPrev = texture(s_samplers[0], uv - fromPrevUv).rgb;
+    vec3 dd = abs(predictedMotion - predictedMotionPrev);
+    float disagree = max(max(dd.r, dd.g), dd.b);
+    float nrm = max(1.0f, max(max(abs(predictedMotion.r), abs(predictedMotion.g)), abs(predictedMotion.b)));
+    conf *= 1.0f - smoothstep(u_agreeLo, u_agreeHi, disagree / nrm);
+
+    // Same bounded pixel-space fallback as every lower motion tier.
+    vec3 delta = currentFrame - previousFrame;
+    float motion = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
+    float strength = u_strength * (1.0f - smoothstep(u_suppressLo, u_suppressHi, motion));
+    vec3 predictedExtra = currentFrame + delta * strength;
+
+    ivec2 last = outSize - ivec2(1);
+    vec3 n0 = texelFetch(s_samplers[1], clamp(coord + ivec2(1, 0), ivec2(0), last), 0).rgb;
+    vec3 n1 = texelFetch(s_samplers[1], clamp(coord - ivec2(1, 0), ivec2(0), last), 0).rgb;
+    vec3 n2 = texelFetch(s_samplers[1], clamp(coord + ivec2(0, 1), ivec2(0), last), 0).rgb;
+    vec3 n3 = texelFetch(s_samplers[1], clamp(coord - ivec2(0, 1), ivec2(0), last), 0).rgb;
+    vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
+    vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
+    predictedExtra = clamp(predictedExtra, neighborMin, neighborMax);
+
+    imageStore(dst, coord, vec4(mix(predictedExtra, predictedMotion, conf), currentSample.a));
+}

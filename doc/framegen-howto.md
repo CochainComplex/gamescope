@@ -162,10 +162,22 @@ look a little juddery.
 
 ### b) Motion — the recommended everyday mode
 ```
---experimental-framegen --framegen-mode motion --framegen-multiplier 2
+--experimental-framegen --framegen-mode motion --framegen-quality high --framegen-multiplier 2
 ```
 Tracks how things move for sharper, cleaner extra frames. Extra quality helpers
 (consistency checks + self-tuning) are **on automatically**. Good default.
+
+Choose the cost explicitly for the display/framegen GPU:
+
+| Quality | Work enabled | Best fit |
+|---------|--------------|----------|
+| `low` | forward motion match only | older or bandwidth-limited GPUs |
+| `medium` | + reverse consistency and edge agreement | balanced quality/cost |
+| `high` | + self-tuning; optional AI | recommended default |
+| `ultra` | + bounded acceleration prediction from three causal intervals | fastest present GPUs, maximum forward quality |
+
+Gamescope automatically walks downward through these levels if measured GPU
+time misses the display deadline. It never oscillates upward within a scene.
 
 ### c) Bidirectional — the smoothest motion
 ```
@@ -199,11 +211,12 @@ nothing and falls back to normal.
 
 ### f) AI refiner (most experimental)
 ```bash
-GAMESCOPE_FRAMEGEN_BIDIR=1 GAMESCOPE_FRAMEGEN_NET_ONLINE=1 gamescope --prefer-vk-device "$PRESENT" …
+GAMESCOPE_FRAMEGEN_NET_ONLINE=1 gamescope --prefer-vk-device "$PRESENT" \
+  --experimental-framegen --framegen-mode motion --framegen-quality high …
 ```
 A tiny neural net cleans up the motion and **learns your game as you play**.
-Requires bidirectional mode. Newest and least-tested; turn it off if anything
-looks worse. To remember what it learned between sessions, add
+It works with zero-latency forward prediction; bidirectional mode is optional.
+Newest and least-tested; turn it off if anything looks worse. To remember what it learned between sessions, add
 `GAMESCOPE_FRAMEGEN_NET_PROFILE=$HOME/fg-<gamename>.bin`.
 
 ---
@@ -212,12 +225,14 @@ looks worse. To remember what it learned between sessions, add
 
 | You want… | Use |
 |-----------|-----|
-| Just try it, keep it simple | **Motion, x2** (b) |
+| Just try it, keep it simple | **Motion high, x2** (b) |
+| Weak display/framegen GPU | **Motion low or medium, x2** |
 | The smoothest single-player experience | **Bidirectional** (c) |
 | Competitive / fast shooter (lowest lag) | **Simple** (a), *not* bidirectional |
 | Crisp menus and HUD | add **Base-layer** (d) |
 | You own a FreeSync/G-Sync monitor | add **VRR** (e) |
-| Squeeze out extra quality, don't mind bugs | **Bidirectional + AI** (f) |
+| Maximum quality without added latency | **Motion ultra + AI** (f) |
+| Smoothest output, one-frame latency acceptable | **Bidirectional + AI** |
 
 Start with `--framegen-multiplier 2`. Try `3` or `4` only if the present card
 can keep up (see limits).

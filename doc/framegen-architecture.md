@@ -46,8 +46,9 @@ path; the opt-in **bidir** mode (`GAMESCOPE_FRAMEGEN_BIDIR=1`, §3.3) deliberate
 |---|---|---|
 | `--experimental-framegen` | `g_bExperimentalFramegen` | master enable; forces the full-composite path |
 | `--framegen-mode {extrapolate\|motion\|blend}` | `g_eFramegenMode` | default `extrapolate`; `blend` is debug-only |
+| `--framegen-quality {low\|medium\|high\|ultra}` | `g_eFramegenQuality` | motion cost ceiling; default `high` preserves the pre-tier pipeline |
 | `--framegen-multiplier {2,3,4}` | `g_nFramegenMultiplier` | validated, `exit(1)` on bad value; also *sizes the output pool* |
-| `--framegen-strength <0.0-1.0>` | `g_flFramegenStrength` | forward step; **parsed with `atof`** — garbage silently → 0.0 (no error), unlike the multiplier |
+| `--framegen-strength <0.0-1.0>` | `g_flFramegenStrength` | validated finite float forward step; malformed or out-of-range values fail startup |
 | `--framegen-debug` | `g_bFramegenDebug`, `g_uFramegenDebugEvery` | see §8 observability |
 
 Parse sites `main.cpp:139-160, 842-880`; benchmark early-exit `main.cpp:1094-1100`.
@@ -77,7 +78,7 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - **`IBackend::SupportsFramegen()`** (`backend.h`, new virtual) — default false; DRM + nested-Wayland return true; `CDeferredBackend` delegates to its child (`DeferredBackend.h:224`). Gates the feature to backends that can actually consume generated frames and pay the forced-composite/no-VRR tax.
 
 ### Shader build wiring (`src/meson.build`)
-The 22 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build:69-97`) and registered unconditionally by the `SHADER()` macro table (`rendervulkan.cpp:1172-1205`; the Stage-B `MOTION_PYRAMID{,_RGBA}` / `MOTION_MATCH_REFINE` / `MOTION_FBCHECK`, the B3 `MOTION_BIDIR`, the B4 `MOTION_STATS{,_APPLY}` and the Stage-C/C2 `MOTION_NET{,_TRAIN,_OPT}` slots are the newest). **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays** (`:1175-1183`), so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
+The 23 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) and registered unconditionally by the `SHADER()` macro table; `MOTION_WARP_ACCEL` is the ultra-tier addition. **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays**, so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
 
 ---
 
@@ -152,7 +153,10 @@ hardware linearizes on read).
 | **Extrapolate fp16** (`_extrapolate_fp16.comp`) | same math, `f16vec3` ALU; push uploaded fp32 then cast; alpha never demoted | **LDS apron stays vec4 fp32** — only ALU is fp16, bandwidth unchanged, so upside is capped | `supportsShaderFloat16 && !floatTarget`, non-NVIDIA | fp16 range/precision bands scRGB highlights → **gated off for float targets** |
 | **Extrapolate pair (+ pair_fp16)** (`_extrapolate_pair.comp`) | writes TWO slots from one dispatch; suppress term + neighbor min/max computed **once** and shared | halves the two full-res history reads across the pair | x3/x4 | same quality; halves history bandwidth at high multipliers |
 | **Blend** — DEBUG ONLY (`cs_framegen_blend.comp`) | `mix(prev, cur, phase)` full vec4 **including alpha**; **INTERPOLATION**; no suppression/rectification | normalized-coord **bilinear** `texture()` (the only framegen shader using sampler filtering) | `eff.mode==Blend` only | structurally violates invariant #4 → judder; reference lever |
-| **Motion** (luma → match → warp) | see §3.2 | see §3.2 | `eff.mode==Motion && dispatch.motionSupported`; **priciest rung, shed first** | smooth pans; `conf=0` ≡ bounded extrapolate (never much worse); highest cost |
+| **Motion low** | forward luma pyramid + hierarchical match + constant-velocity warp | no reverse field, stats, or ML dispatches | `eff.quality==Low` | cheapest motion-compensated tier |
+| **Motion medium** | low + reverse match / FB check + full-res agreement | reverse chain once per real | `eff.quality==Medium` | rejects disocclusions and boundary bleed |
+| **Motion high** | medium + B4 adaptation; optional learned refiner/training | default; compatible with the pre-tier path | `eff.quality==High` | self-tuning quality with optional ML |
+| **Motion ultra** | high + retained-field acceleration warp | one field copy per estimated interval + one low-res field sample per output pixel | `eff.quality==Ultra` | most advanced zero-added-latency forward prediction |
 
 **Invariant across all extrapolate variants:** alpha pinned to `current`; the *only* range bound is
 the 9-tap neighbor clamp — no `[0,1]` clamp, so UNORM stays in range while scRGB keeps HDR>1.0 and
@@ -223,6 +227,24 @@ intermediates can't be allocated.
 Because `predicted = mix(predictedExtra, predictedMotion, conf)`, **motion is a strict superset of
 extrapolate** — `conf=0` reproduces the bounded extrapolate output exactly, so it can never be much
 worse even where matching fails.
+
+#### 3.2.1 Ultra causal acceleration
+
+`cs_framegen_motion_warp_accel.comp` uses a third causal interval without requiring application
+motion vectors, a vendor optical-flow block, or a future frame. After an ultra batch's warps finish,
+the final checked/refined/trust-scaled forward field is copied to `mvFieldHistory`. On the next
+consecutive estimated real-frame pair, the shader samples that older field at `uv-currentFlow`, so
+the old and current vectors describe the same moving content, then evaluates
+`A = F_current - F_old`. The future displacement is the quadratic
+`s·F + 0.5·s·(s+1)·A`.
+
+Acceleration has four structural guards: both fields must retain confidence; a 0.05-field-texel
+dead zone removes sub-pel estimator noise; acceleration fades out when large relative to observed
+speed and is capped to ±1 field texel per component; and the existing full-resolution two-source
+agreement still decides whether the motion gather reaches the output. The retained field carries a
+real-frame ID. If shared-queue admission skips even one interval, the ID is non-consecutive and the
+original constant-velocity shader runs instead. Scene invalidation clears the ID. Lower tiers never
+allocate, copy, bind, or dispatch this path.
 
 ### 3.3 Bidirectional interpolation (B3, `GAMESCOPE_FRAMEGEN_BIDIR=1`, opt-in)
 
@@ -364,6 +386,13 @@ live: from a neutral prior on vkmark, the confidence head recovers ~10 points of
 within seconds; warm-started from an offline blob it holds the blob's precision while tracking
 (see `doc/framegen-proposals/README.md` for the measured A/B).
 
+Optimizer robustness is two-layered. The GPU rejects non-finite gradient slices, clamps each
+parameter gradient to the necessary `[-1,1]` bound implied by the offline trainer's global-norm
+clip, and locally resets any poisoned Adam scalar to its finite prior. The CPU readback still
+validates every served weight before persistence; on failure it forces both optimizer state and
+the served weight texture through the prior upload before the next inference, closing the old
+one-batch "detected but still served" window.
+
 ---
 
 ## 4. The decision state machine
@@ -429,13 +458,14 @@ idle/dormant stretch never moves the rung.
   pure multiplier notch that doesn't lower the generated count this gap would cost quality for zero
   GPU saving. On step: `nDegradeSteps++`, `nDegradeHold = k_uFramegenDegradeHoldFrames(4)`.
 
-**Rung ordering** (`framegen_effective_config` `:4880`): applies `n` degradations to the ceiling
-`{g_eFramegenMode, max(2, g_nFramegenMultiplier)}` — sheds **Motion → Extrapolate first** (one rung),
-then steps the multiplier down toward x2. `framegen_max_degrade_steps() = (mode==Motion?1:0) +
-max(0, mult−2)`. There is deliberately **no "stop generating" rung** — the ladder always keeps
+**Rung ordering** (`framegen_effective_config`): applies `n` degradations to the ceiling
+`{g_eFramegenMode, g_eFramegenQuality, max(2, g_nFramegenMultiplier)}`. Motion walks
+**ultra → high → medium → low → extrapolate**, beginning wherever the user set the ceiling, then
+the multiplier steps toward x2. `framegen_max_degrade_steps()` counts the selected quality rank plus
+the final motion-to-extrapolate step and multiplier notches. There is deliberately **no "stop generating" rung** — the ladder always keeps
 generating (so its GPU-time input never starves); the genuine "even x2 overruns" case is left to the
-reactive pacing gate. It **never mutates** `g_eFramegenMode`/`g_nFramegenMultiplier` (those gate the
-feature and size the pool); it only reads an *effective* config. **Monotonic within a scene** — never
+reactive pacing gate. It **never mutates** `g_eFramegenMode`/`g_eFramegenQuality`/`g_nFramegenMultiplier`
+(those are the user's ceiling and size the pool); it only reads an *effective* config. **Monotonic within a scene** — never
 restores mid-scene (restoring means re-probing a richer config that may not fit, then dropping it → a
 visible toggle, the exact micro-stutter this feature exists to avoid). Re-probed from full only on a
 scene change.
@@ -594,7 +624,7 @@ cache hit.
 | **01** | VRR hybrid — present the real frame VRR-style for the full latency win, schedule the generated frame with a timer-armed mid-interval atomic flip | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_VRR_HYBRID=1`, dedicated queue + active VRR only). The VRR-suppression gates are gone: `steamcompmgr.cpp:2574` now keeps `allowVRR` on while framegen runs iff the hybrid is requested, and `DRMBackend.cpp:3625` inherits the real frame's `allowVRR` instead of hard-coding false — so both flips carry the same VRR state and no per-frame modeset fires. Single generated frame at phase 0.5 flipped by the absolute mid-interval timer `g_FramegenMidTimer` (`steamcompmgr.cpp:8337`); planned by `framegen_vrr_hybrid_submit` (`rendervulkan.cpp:5661`). Built on #06's frametime EMA; toggle is env, not the proposed `cv_framegen_vrr_hybrid`. **Not yet validated on a VRR panel** (see the proposal's Status line). |
 | **02** | Base-layer generation + late overlay/cursor composite — generate on the pre-upscale game layer, composite UI on top (~−56% BW, no HUD ghosting) | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_BASE=1`, no dedicated-queue requirement). Generation runs on `layers[0].tex`; the present-time consume late-composites overlays/cursor over the generated base through `vulkan_composite` (`framegen_base_present_composite`, `:5350`), so UI/HUD/cursor smear is eliminated **by construction** and generated frames get the full FSR + shaper/3D-LUT pipeline. **Divergence:** the draft's "−56% BW" inverted post zero-copy-history — base mode now *adds* a base-sized history copy per real frame + one full composite per presented generated frame; the justification is the quality win, not bandwidth. Live per-frame dispatcher (`framegen_base_layer_usable`, `:4939`) falls back to output-space generation for video-underlay/YCbCr/ReShade/no-storage-format scenes. Validated nested on the dual-GPU FSR path (motion x3). |
 | **03** | dGPU optical-flow donor — offload motion estimation to the render GPU's `VK_NV_optical_flow` OFA, ship a small flow field over PCIe | **Aspirational** (longest horizon). Zero OFA symbols; needs a second Vulkan device gamescope has never had; cross-vendor timeline interop rated unreliable. Motion mode is the shipped fallback. |
-| **04** | Timestamp-driven adaptive degradation | **IMPLEMENTED** (`a75bfbe`) but **divergent** from the doc — shipped is *monotonic* (down-only, re-probe on scene change), rungs are mode/multiplier notches (not a pyramid table), 85% deadline (not 0.6 budget), 2D per-(rung,gen-count) 7/8-EMA (not one global EWMA), fixed 4-frame cooldown, zero CLI flags, `VK_EXT_calibrated_timestamps` unused. (The proposals `README.md` now marks this Implemented.) |
+| **04** | Timestamp-driven adaptive degradation | **IMPLEMENTED** (`a75bfbe`) but **divergent** from the proposal — shipped is *monotonic* (down-only, re-probe on scene change), rungs are motion-quality/mode/multiplier notches (not a pyramid table), 85% deadline (not 0.6 budget), 2D per-(rung,gen-count) 7/8-EMA (not one global EWMA), fixed 4-frame cooldown, and no tuning flags. `VK_EXT_calibrated_timestamps` is unused. |
 | **05** | Tile classification + `vkCmdDispatchIndirect` + SDMA static fill — generate only over moving tiles, fill static tiles on the transfer engine | **Aspirational** (deferred). No transfer-only queue discovery / classify shader exists; the doc admits it depends on transfer-queue discovery that isn't there yet. |
 | **06** | JIT phase — plan one slot per vblank against the KMS pageflip clock with a slew-limited frametime EMA, instead of baking phases from a single-interval gap guess; adds the "skip when keeping up" guard | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_JIT=1`, dedicated queue only). `framegen_jit_submit` / `vulkan_framegen_jit_tick` (`rendervulkan.cpp`), EMA `FramegenHistory_t::ulFrametimeEmaNs`, keep-up guard `k_uFramegenJitKeepUpPercent=110`. Tested with GravityMark (~21% fewer generation passes for identical present coverage); phase-accuracy/smoothness benefit still needs native DRM + human A/B. |
 
@@ -625,8 +655,7 @@ cache hit.
 - **Translucency (vkmark "penguins")** — tested: FG *preserves* opacity (0.52 vs 0.50); the earlier
   "goes opaque" claim was disproven. Residual is edge judder/ghosting, not transparency loss; needs a
   human framegen-off A/B to finalize.
-- **Config inconsistencies.** `--framegen-strength` uses `atof` (garbage → 0.0 silently, disabling the
-  forward step with no error) vs the multiplier's validated `exit(1)`;
+- **Config semantics.** Framegen strength and multiplier both use strict parsers plus fatal range validation;
   `GAMESCOPE_FRAMEGEN_BENCHMARK` is presence-only, `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE` / `_JIT` /
   `_VRR_HYBRID` / `_BASE` / `_BIDIR` need a truthy int, and the Stage-B knobs `_FB` / `_AGREE` / `_ADAPT` are default-on
   (`=0` to disable) with `_FB_TOL`/`_NET_LR` floats, `_NET`/`_RECORD`/`_NET_PROFILE` paths and `_RECORD_MAX`/`_NET_EVERY` uints. All eighteen `GAMESCOPE_FRAMEGEN_*` env vars are undocumented in `--help`.

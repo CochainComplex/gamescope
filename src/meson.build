@@ -82,6 +82,7 @@ shader_src = [
   'shaders/cs_framegen_motion_match_refine.comp',
   'shaders/cs_framegen_motion_fbcheck.comp',
   'shaders/cs_framegen_motion_warp.comp',
+  'shaders/cs_framegen_motion_warp_accel.comp',
   'shaders/cs_framegen_motion_bidir.comp',
   'shaders/cs_framegen_motion_stats.comp',
   'shaders/cs_framegen_motion_stats_apply.comp',

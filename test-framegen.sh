@@ -17,6 +17,7 @@
 #   LIMIT=2            game fps = REFRESH / LIMIT (the gap framegen fills; 2 => x2)
 #   DEBUG_EVERY=1      log every Nth framegen event (1 = exact counts, higher = less spam)
 #   DURATION=          seconds to auto-stop a 'run' (empty = until you close the window)
+#   QUALITY=high       motion tier: low | medium | high | ultra
 #
 # Examples:
 #   ./test-framegen.sh bench amd
@@ -86,10 +87,12 @@ cmd_gpus() {
 }
 
 cmd_bench() {
-    local id; id=$(resolve_gpu "${1:-nvidia}")
+    local id quality="${QUALITY:-high}"; id=$(resolve_gpu "${1:-nvidia}")
+    case "$quality" in low|medium|high|ultra) ;; *) echo "error: QUALITY must be low|medium|high|ultra" >&2; exit 1 ;; esac
     echo "# framegen GPU microbenchmark — device $id"
-    echo "# (bandwidth-bound passes; compare extrapolate fp16 vs fp32 and motion warp)"
-    GAMESCOPE_FRAMEGEN_BENCHMARK=1 "$BIN" --backend headless --prefer-vk-device "$id" -- true 2>/dev/null
+    echo "# quality=$quality (compare extrapolate variants and the selected motion pipeline)"
+    GAMESCOPE_FRAMEGEN_BENCHMARK=1 "$BIN" --backend headless --prefer-vk-device "$id" \
+        --framegen-quality "$quality" -- true 2>/dev/null
 }
 
 summarize() {
@@ -137,15 +140,16 @@ cmd_run() {
     app="${4:-vkcube}"
     read -r -a app_cmd <<< "$app"
     read -r w h < <(res_to_dims "$res")
-    local refresh="${REFRESH:-144}" limit="${LIMIT:-2}" every="${DEBUG_EVERY:-1}"
+    local refresh="${REFRESH:-144}" limit="${LIMIT:-2}" every="${DEBUG_EVERY:-1}" quality="${QUALITY:-high}"
 
     case "$mode" in extrapolate|motion|blend) ;; *) echo "error: mode must be extrapolate|motion|blend" >&2; exit 1 ;; esac
+    case "$quality" in low|medium|high|ultra) ;; *) echo "error: QUALITY must be low|medium|high|ultra" >&2; exit 1 ;; esac
     if ! command -v "${app%% *}" >/dev/null 2>&1; then
         echo "error: test app '${app%% *}' not found in PATH" >&2; exit 1
     fi
 
     local log; log="$(mktemp -t framegen-run.XXXXXX.log)"
-    echo "# device=$id  mode=$mode  res=${w}x${h}  refresh=${refresh}  game=~$((refresh/limit))fps  app=$app"
+    echo "# device=$id  mode=$mode/$quality  res=${w}x${h}  refresh=${refresh}  game=~$((refresh/limit))fps  app=$app"
     echo "# log: $log"
     echo "# close the gamescope window (or Ctrl+C) to stop and see the summary."
     [[ -n "${DURATION:-}" ]] && echo "# auto-stop after ${DURATION}s"
@@ -154,7 +158,7 @@ cmd_run() {
     local -a cmd=(
         "$BIN" --backend wayland --prefer-vk-device "$id"
         -W "$w" -H "$h" -r "$refresh" --framerate-limit "$limit"
-        --experimental-framegen --framegen-mode "$mode" --framegen-strength 0.5
+        --experimental-framegen --framegen-mode "$mode" --framegen-quality "$quality" --framegen-strength 0.5
         --framegen-debug -- "${app_cmd[@]}"
     )
 

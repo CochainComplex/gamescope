@@ -3,6 +3,7 @@
 #include <X11/Xlib.h>
 
 #include <cstdio>
+#include <cmath>
 #include <format>
 #include <thread>
 #include <mutex>
@@ -139,6 +140,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "experimental-framegen", no_argument, nullptr, 0 },
 	{ "framegen-multiplier", required_argument, nullptr, 0 },
 	{ "framegen-mode", required_argument, nullptr, 0 },
+	{ "framegen-quality", required_argument, nullptr, 0 },
 	{ "framegen-strength", required_argument, nullptr, 0 },
 	{ "framegen-debug", no_argument, nullptr, 0 },
 	{ "composite-debug", no_argument, nullptr, 0 },
@@ -274,6 +276,7 @@ const char usage[] =
 	"  --framegen-multiplier 2        generated-frame multiplier (2, 3 or 4); actual count adapts to the frame gap\n"
 	"  --framegen-mode MODE           generated-frame algorithm: 'extrapolate' (default, low latency),\n"
 	"                                 'motion' (motion-compensated, higher quality/cost) or 'blend' (debug)\n"
+	"  --framegen-quality LEVEL       motion quality/cost ceiling: 'low', 'medium', 'high' (default), or 'ultra'\n"
 	"  --framegen-strength 0.5        extrapolation step for 'extrapolate'/'motion' modes (0.0-1.0); lower reduces ghosting\n"
 	"  --framegen-debug               log framegen history, dispatch, and present cadence\n"
 	"  --composite-debug              draw frame markers on alternating corners of the screen when compositing\n"
@@ -349,6 +352,7 @@ bool g_bFramegenDebug = false;
 uint32_t g_uFramegenDebugEvery = 60;
 int g_nFramegenMultiplier = 2;
 GamescopeFramegenMode g_eFramegenMode = GamescopeFramegenMode::Extrapolate;
+GamescopeFramegenQuality g_eFramegenQuality = GamescopeFramegenQuality::High;
 float g_flFramegenStrength = 0.5f;
 
 pthread_t g_mainThread;
@@ -870,9 +874,24 @@ int main(int argc, char **argv)
 						fprintf( stderr, "gamescope: --framegen-mode must be 'extrapolate', 'motion' or 'blend'\n" );
 						return 1;
 					}
+				} else if (strcmp(opt_name, "framegen-quality") == 0) {
+					if ( strcmp( optarg, "low" ) == 0 )
+						g_eFramegenQuality = GamescopeFramegenQuality::Low;
+					else if ( strcmp( optarg, "medium" ) == 0 )
+						g_eFramegenQuality = GamescopeFramegenQuality::Medium;
+					else if ( strcmp( optarg, "high" ) == 0 )
+						g_eFramegenQuality = GamescopeFramegenQuality::High;
+					else if ( strcmp( optarg, "ultra" ) == 0 )
+						g_eFramegenQuality = GamescopeFramegenQuality::Ultra;
+					else
+					{
+						fprintf( stderr, "gamescope: --framegen-quality must be 'low', 'medium', 'high' or 'ultra'\n" );
+						return 1;
+					}
 				} else if (strcmp(opt_name, "framegen-strength") == 0) {
-					g_flFramegenStrength = atof( optarg );
-					if ( g_flFramegenStrength < 0.0f || g_flFramegenStrength > 1.0f )
+					g_flFramegenStrength = parse_float( optarg, opt_name );
+					if ( !std::isfinite( g_flFramegenStrength )
+						|| g_flFramegenStrength < 0.0f || g_flFramegenStrength > 1.0f )
 					{
 						fprintf( stderr, "gamescope: --framegen-strength must be between 0.0 and 1.0\n" );
 						return 1;

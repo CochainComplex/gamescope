@@ -25,6 +25,7 @@ on top of it.
 |---|---|---|
 | `--experimental-framegen` | — | **Master switch** — required by every feature below. |
 | `--framegen-mode` | **`extrapolate`** · `motion` · `blend` | Algorithm. `motion` unlocks the whole motion-quality stack (FB / agreement / adaptation / bidir / learned net). `blend` is interpolation for debugging only. |
+| `--framegen-quality` | `low` · `medium` · **`high`** · `ultra` | Motion cost/quality ceiling. Low = forward match; medium = +FB/agreement; high = +adaptation and optional ML; ultra = +causal temporal acceleration. Deadline degradation walks down these tiers. |
 | `--framegen-multiplier` | **`2`** · `3` · `4` | Presented-to-real ratio (inserts up to *N*−1 generated frames per real frame); also sizes the output image pool. |
 | `--framegen-strength` | `0.0`–`1.0` (**`0.5`**) | Forward extrapolation step size. |
 | `--framegen-debug` | — | Per-frame logging (rate set by `GAMESCOPE_FRAMEGEN_DEBUG_EVERY`). |
@@ -43,8 +44,8 @@ on top of it.
 | Variable | Requires | Effect |
 |---|---|---|
 | `GAMESCOPE_FRAMEGEN_BIDIR=1` | `--framegen-mode motion`; **excludes** `GAMESCOPE_FRAMEGEN_JIT`, `GAMESCOPE_FRAMEGEN_VRR_HYBRID`, `GAMESCOPE_FRAMEGEN_BASE` | Bidirectional interpolation — smoothest motion, but real frames present **one interval late**. |
-| `GAMESCOPE_FRAMEGEN_NET=<blob>` | `--framegen-mode motion` | Learned causal forward-field refiner; value is the path to a `GSFR` weights blob (see below). Bidir is optional. Empty / unreadable → disabled, not fatal. |
-| `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | `--framegen-mode motion`; `NET` blob optional | In-situ learning (C2): the forward refiner keeps training on the framegen GPU against every real frame, tracking the current scene. Without a `NET` blob it starts from a neutral prior; without `NET_PROFILE` the model is **ephemeral — nothing is written to disk**. |
+| `GAMESCOPE_FRAMEGEN_NET=<blob>` | `--framegen-mode motion --framegen-quality high|ultra` | Learned causal forward-field refiner; value is the path to a `GSFR` weights blob (see below). Bidir is optional. Empty / unreadable → disabled, not fatal. |
+| `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | motion `high`/`ultra`; `NET` blob optional | In-situ learning (C2): the forward refiner keeps training on the framegen GPU against every real frame, tracking the current scene. Without a `NET` blob it starts from a neutral prior; without `NET_PROFILE` the model is **ephemeral — nothing is written to disk**. |
 | `GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Persistent per-game learning: loaded as the prior when the file exists (a malformed file is rejected loudly → neutral prior), checkpointed off-thread every 1024 trained steps and flushed at exit/reset, so short sessions persist too. Atomic writes (temp + rename): a crash or full disk never tears a good profile. |
 | `GAMESCOPE_FRAMEGEN_NET_LR` / `GAMESCOPE_FRAMEGEN_NET_EVERY` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Learning rate (default `3e-4`) / train every *N*th real frame (default `1` — raise on weak present GPUs). |
 | `GAMESCOPE_FRAMEGEN_RECORD=<dir>` | `--framegen-mode motion` | Capture training tensors (one `GSFD` file per real frame, ≈1.2 MB at 1440p) into `<dir>`; bidir is not required. |
