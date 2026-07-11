@@ -40,9 +40,11 @@ import numpy as np
 
 MAGIC_SAMPLE = 0x44465347  # 'GSFD'
 MAGIC_BLOB = 0x52465347    # 'GSFR'
+BLOB_VERSION = 2           # corrected-field evidence gate + flow auxiliary
 LAYERS = ((12, 16), (16, 16), (16, 4))
 KSIZE = 3
 CHARB_EPS = 1e-3
+FLOW_AUX = 0.05     # keep a flow-learning signal where confidence was killed
 LAMBDA_DF = 0.01    # pull the flow residual toward Stage B
 LAMBDA_TV = 0.005   # smoothness of the refined flow (flow-boundary jaggies)
 LAMBDA_DC = 0.005   # keep the confidence correction gentle
@@ -237,17 +239,6 @@ def batch_loss(params, views, size, train=True):
     th = np.tanh(o[:, 0:2].transpose(0, 2, 3, 1))              # (B,size,size,2)
     dF = 2.0 * th
     Fh = F + dF
-    # Evidence gate on confidence raises (mirrors the inference shader): the
-    # net may only un-kill texels whose raw vector predicts this frame pair.
-    # feat channel 10 is the raw-field warped residual.
-    resid_c = feat[:, 10, 3:3 + size, 3:3 + size]
-    t = np.clip((resid_c - 0.03) / 0.07, 0.0, 1.0)
-    gate = 1.0 - t * t * (3.0 - 2.0 * t)
-    dc_raw = o[:, 2]
-    dc_chain = np.where(dc_raw < 0.0, 1.0, gate)
-    dc = dc_raw * dc_chain
-    ch = np.clip(conf + dc, 0.0, 1.0)
-
     # Warp the source luma along the refined flow (per view: source differs).
     warped = np.empty_like(ld)
     gy = np.empty_like(ld)
@@ -258,12 +249,26 @@ def batch_loss(params, views, size, train=True):
         cx = (px + x0) + 0.5 - Fh[i, ..., 0]
         warped[i], gy[i], gx[i] = bilinear(luma_src, cy, cx)
 
+    # Evidence gate on confidence raises (mirrors inference): a bounded
+    # correction may recover confidence only when its FINAL vector predicts
+    # this frame pair. The gate is intentionally stop-gradient; it is a safety
+    # verdict, while FLOW_AUX below supplies the rejected flow's learning path.
+    refined_resid = np.abs(warped - ld) / np.maximum(
+        1.0, np.maximum(np.abs(warped), np.abs(ld)))
+    t = np.clip((refined_resid - 0.03) / 0.07, 0.0, 1.0)
+    gate = 1.0 - t * t * (3.0 - 2.0 * t)
+    dc_raw = o[:, 2]
+    dc_chain = np.where(dc_raw < 0.0, 1.0, gate)
+    dc = dc_raw * dc_chain
+    ch = np.clip(conf + dc, 0.0, 1.0)
+
     ew = warped - ld
     rw = charb(ew)
     rfb = charb(ls_pt - ld)
     n = float(B * size * size)
 
-    data = float(np.sum(ch * rw + 0.5 * (1.0 - ch) * rfb) / n)
+    data = float(np.sum(ch * rw + 0.5 * (1.0 - ch) * rfb
+                        + FLOW_AUX * rw) / n)
     reg = (LAMBDA_DF * float(np.sum(dF * dF)) / n
            + LAMBDA_DC * float(np.sum(dc * dc)) / n)
     tvy = Fh[:, 1:, :, :] - Fh[:, :-1, :, :]
@@ -272,7 +277,8 @@ def batch_loss(params, views, size, train=True):
 
     metrics = {
         "loss": data + reg, "data": data,
-        "neutral": float(np.sum(conf * charb(bl_neutral(views, size, py, px)[0] - ld)
+        "neutral": float(np.sum((conf + FLOW_AUX)
+                                * charb(bl_neutral(views, size, py, px)[0] - ld)
                                 + 0.5 * (1.0 - conf) * rfb) / n),
         "mean_dF": float(np.mean(np.abs(dF))),
         "mean_dc": float(np.mean(dc)),
@@ -284,9 +290,10 @@ def batch_loss(params, views, size, train=True):
     do = np.zeros_like(o)
     dL_dch = (rw - 0.5 * rfb) / n
     live = ((conf + dc) > 0.0) & ((conf + dc) < 1.0)
-    do[:, 2] = dL_dch * live * dc_chain + (2.0 * LAMBDA_DC / n) * dc_raw
+    do[:, 2] = (dL_dch * live * dc_chain
+                + (2.0 * LAMBDA_DC / n) * dc * dc_chain)
 
-    dL_drw = ch / n
+    dL_drw = (ch + FLOW_AUX) / n
     dL_dwarp = dL_drw * (ew / rw)
     dL_dFh = np.empty_like(Fh)
     dL_dFh[..., 0] = -dL_dwarp * gx
@@ -336,7 +343,7 @@ def make_views(samples, idx, rng, crop, count):
 
 def export(params, path):
     with open(path, "wb") as f:
-        f.write(struct.pack("<3I", MAGIC_BLOB, 1, len(LAYERS)))
+        f.write(struct.pack("<3I", MAGIC_BLOB, BLOB_VERSION, len(LAYERS)))
         for ci, co in LAYERS:
             f.write(struct.pack("<3I", ci, co, KSIZE))
         for i in range(1, len(LAYERS) + 1):

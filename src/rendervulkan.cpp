@@ -5394,9 +5394,9 @@ void vulkan_framegen_reset( const char *reason )
 	if ( g_bFramegenDebug )
 		vk_log.infof( "framegen: reset history reason=%s", reason ? reason : "unknown" );
 
-	// C2: persist unsaved learning before the state textures go away — every
-	// mode/resolution/teardown change funnels through this reset, and the new
-	// state re-seeds from the startup prior, not from what was just learned.
+	// C2: persist unsaved learning before the state textures go away. The latest
+	// health-checked served weights remain cached process-wide and seed the new
+	// state, so resize/format resets do not throw away in-session adaptation.
 	framegen_net_profile_flush();
 
 	g_framegenHistory = {};
@@ -5936,9 +5936,10 @@ static void framegen_bind_blend( CVulkanCmdBuffer *pCmdBuffer, const gamescope::
 
 // ---- Learned field refinement (Stage C) --------------------------------------
 // A tiny convolutional net (12->16->16->4, 3x3 kernels, ~4.6k parameters)
-// refines both checked motion fields once per real frame: a bounded flow
+// refines the causal checked motion field once per real frame: a bounded flow
 // residual (at most +-2 field texels, tanh-limited in the shader) plus an
-// additive confidence recalibration. It predicts corrections on top of the
+// additive confidence recalibration. Bidir also refines the reverse field.
+// It predicts corrections on top of the
 // Stage-B field — a zero-initialized head IS Stage B, so the failure floor is
 // the current behavior — and it only ever touches the field, never pixels, so
 // the HDR rules are untouchable by construction. B4 closes the safety loop:
@@ -5946,7 +5947,8 @@ static void framegen_bind_blend( CVulkanCmdBuffer *pCmdBuffer, const gamescope::
 // clamped by the same-batch trust factor and shows up in the adapt log lines.
 // Trained offline, self-supervised, on tensors captured by the recorder below
 // (scripts/framegen-net-train.py); enabled by pointing GAMESCOPE_FRAMEGEN_NET
-// at a weights blob. Requires bidir motion mode (the net reads both fields).
+// at a weights blob. The forward path already computes both checked fields for
+// consistency, so learned prediction does not require bidir or its latency.
 static const char *framegen_net_weights_path()
 {
 	static const char *s_pszPath = []() -> const char *
@@ -5961,11 +5963,12 @@ static const char *framegen_net_weights_path()
 // layer count, then per-layer (c_in, c_out, k) dims, then all fp32 weights in
 // [c_out][ky][kx][c_in] order (c_in contiguous, for the shader's vec4 dots)
 // followed by the biases, layer by layer — the exact flat order the shader
-// indexes. The version field doubles as the FEATURE version: if the 12-channel
-// input definition or the evidence gate ever changes, bump it — stale profiles
-// and blobs then fail validation and the net falls back to a fresh prior
-// instead of silently running mismatched semantics.
+// indexes. The version field tracks feature/training semantics. V2 changes the
+// confidence gate and loss without changing tensor layout, so V1 is accepted
+// explicitly as a bounded migration prior; incompatible future layouts must
+// fail validation rather than run with silently mismatched channels.
 static constexpr uint32_t k_uFramegenNetMagic = 0x52465347u; // 'GSFR'
+static constexpr uint32_t k_uFramegenNetVersion = 2u;
 static constexpr uint32_t k_uFramegenNetLayerDims[ 3 ][ 2 ] = { { 12u, 16u }, { 16u, 16u }, { 16u, 4u } };
 static constexpr uint32_t k_uFramegenNetFloats = 4644;
 static constexpr uint32_t k_uFramegenNetTexW = 2048; // shader indexes (idx & 2047, idx >> 11)
@@ -6051,7 +6054,9 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 
 	uint32_t uHeader[ 3 ] = {};
 	bool bOk = fread( uHeader, sizeof( uHeader ), 1, pFile ) == 1
-		&& uHeader[ 0 ] == k_uFramegenNetMagic && uHeader[ 1 ] == 1u && uHeader[ 2 ] == 3u;
+		&& uHeader[ 0 ] == k_uFramegenNetMagic
+		&& ( uHeader[ 1 ] == 1u || uHeader[ 1 ] == k_uFramegenNetVersion )
+		&& uHeader[ 2 ] == 3u;
 	for ( uint32_t l = 0; bOk && l < 3; l++ )
 	{
 		uint32_t uDims[ 3 ] = {};
@@ -6073,6 +6078,11 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 	{
 		weights.clear();
 		vk_log.errorf( "framegen: net weights '%s' malformed (want 3 finite fp32 conv layers 12->16->16->4, k=3)", pszPath );
+	}
+	else if ( uHeader[ 1 ] < k_uFramegenNetVersion )
+	{
+		vk_log.infof( "framegen: net weights '%s' use legacy v%u training semantics; accepting as a bounded prior under v%u corrected-flow gating",
+			pszPath, uHeader[ 1 ], k_uFramegenNetVersion );
 	}
 	return bOk;
 }
@@ -6621,18 +6631,18 @@ static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t 
 	}
 }
 
-// Learned field refinement (Stage C), recorded with the checked fields final:
-// two dispatches of the same fused-conv shader, one per direction, each
-// writing the refined copy the warps and the quality probe consume. The
-// direction swap is pure binding symmetry — refining the reverse field is the
-// same problem with source/destination lumas exchanged, so one set of weights
-// serves both. The one-time staging->GPU weight copy rides the first batch
-// after (re)allocation. Field-res work, once per REAL frame: zero cost per
-// generated frame, and the full-res warps are untouched.
-static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH )
+// Learned field refinement (Stage C), recorded with the checked fields final.
+// The causal path refines only the forward field that advects the newest real
+// frame into the future. Bidir additionally refines the reverse field through
+// the same binding-symmetric network. This keeps forward prediction at one
+// inference dispatch per real frame instead of paying for an unused reverse
+// result. The one-time staging->GPU weight copy rides the first batch after
+// (re)allocation.
+static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH, bool bRefineReverse )
 {
-	if ( g_framegenMotion.mvFieldNet == nullptr || g_framegenMotion.mvFieldRevNet == nullptr
-		|| g_framegenMotion.netWeightsGpu == nullptr || g_framegenMotion.mvFieldRevChk == nullptr )
+	if ( g_framegenMotion.mvFieldNet == nullptr || g_framegenMotion.netWeightsGpu == nullptr
+		|| g_framegenMotion.mvFieldRevChk == nullptr
+		|| ( bRefineReverse && g_framegenMotion.mvFieldRevNet == nullptr ) )
 		return;
 
 	if ( !g_framegenMotion.bNetWeightsUploaded )
@@ -6654,14 +6664,17 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 	pCmdBuffer->pushConstants<FramegenMotionNetPush_t>( 0.0f );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 
-	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldRevNet );
-	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaCur, false );
-	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaPrev, false );
-	framegen_motion_bind_sampler( pCmdBuffer, 2, g_framegenMotion.mvFieldRevChk, true );
-	framegen_motion_bind_sampler( pCmdBuffer, 3, g_framegenMotion.mvField, true );
-	framegen_motion_bind_sampler( pCmdBuffer, 4, g_framegenMotion.netWeightsGpu, true );
-	pCmdBuffer->pushConstants<FramegenMotionNetPush_t>( 0.0f );
-	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
+	if ( bRefineReverse )
+	{
+		pCmdBuffer->bindTarget( g_framegenMotion.mvFieldRevNet );
+		framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaCur, false );
+		framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaPrev, false );
+		framegen_motion_bind_sampler( pCmdBuffer, 2, g_framegenMotion.mvFieldRevChk, true );
+		framegen_motion_bind_sampler( pCmdBuffer, 3, g_framegenMotion.mvField, true );
+		framegen_motion_bind_sampler( pCmdBuffer, 4, g_framegenMotion.netWeightsGpu, true );
+		pCmdBuffer->pushConstants<FramegenMotionNetPush_t>( 0.0f );
+		pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
+	}
 
 	g_framegenMotion.bNetActive = true;
 }
@@ -6776,7 +6789,7 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 			g_bFramegenNetWriteInFlight = false;
 		return;
 	}
-	const uint32_t uHeader[ 3 ] = { k_uFramegenNetMagic, 1u, 3u };
+	const uint32_t uHeader[ 3 ] = { k_uFramegenNetMagic, k_uFramegenNetVersion, 3u };
 	bool bOk = fwrite( uHeader, sizeof( uHeader ), 1, pFile ) == 1;
 	for ( uint32_t l = 0; bOk && l < 3; l++ )
 	{
@@ -6897,11 +6910,15 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	const uint32_t uFieldFormat = DRM_FORMAT_ABGR16161616F;
 	const uint32_t uCoarseW[2] = { std::max( 1u, div_roundup( lowW, 2u ) ), std::max( 1u, div_roundup( lowW, 4u ) ) };
 	const uint32_t uCoarseH[2] = { std::max( 1u, div_roundup( lowH, 2u ) ), std::max( 1u, div_roundup( lowH, 4u ) ) };
-	// Bidir (B3) gathers the previous frame along the reverse field, so the
-	// reverse chain and both consistency checks are structural there — it
-	// overrides GAMESCOPE_FRAMEGEN_FB=0.
+	// Bidir gathers the previous frame along the reverse field. The learned
+	// refiner also consumes the checked reverse field as evidence even in the
+	// zero-latency forward-prediction path. Both therefore require the reverse
+	// chain and symmetric consistency check, overriding GAMESCOPE_FRAMEGEN_FB=0.
 	const bool bBidir = vulkan_framegen_bidir_active();
-	const bool bFBCheck = framegen_fbcheck_enabled() || bBidir;
+	const bool bCaptureNeedsReverse = framegen_record_dir() != nullptr
+		&& g_uFramegenRecordCount < framegen_record_max();
+	const bool bNeedCheckedReverse = bBidir || framegen_net_requested() || bCaptureNeedsReverse;
+	const bool bFBCheck = framegen_fbcheck_enabled() || bNeedCheckedReverse;
 
 	// Whether the net refiner ran is re-decided every batch (see
 	// framegen_record_net); consumers must never inherit a stale verdict.
@@ -6912,9 +6929,10 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		|| g_framegenMotion.lumaPrev == nullptr || g_framegenMotion.lumaCur == nullptr || g_framegenMotion.mvField == nullptr
 		|| g_framegenMotion.mvFieldCoarse[ 1 ] == nullptr
 		|| ( bFBCheck && ( g_framegenMotion.mvFieldFwd == nullptr || g_framegenMotion.mvFieldRev == nullptr ) )
-		|| ( bBidir && g_framegenMotion.mvFieldRevChk == nullptr )
-		|| ( bBidir && framegen_net_requested() && !g_framegenMotion.bNetAllocTried )
-		|| ( bBidir && framegen_record_dir() != nullptr && !g_framegenMotion.bRecAllocTried ) )
+		|| ( bNeedCheckedReverse && g_framegenMotion.mvFieldRevChk == nullptr )
+		|| ( framegen_net_requested() && !g_framegenMotion.bNetAllocTried )
+		|| ( bBidir && framegen_net_requested() && g_framegenMotion.mvFieldRevNet == nullptr )
+		|| ( bCaptureNeedsReverse && !g_framegenMotion.bRecAllocTried ) )
 	{
 		bool bAllocated = framegen_create_intermediate( &g_framegenMotion.lumaPrev, lowW, lowH, dispatch.motionLumaFormat )
 			&& framegen_create_intermediate( &g_framegenMotion.lumaCur, lowW, lowH, dispatch.motionLumaFormat )
@@ -6930,7 +6948,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 			bAllocated = framegen_create_intermediate( &g_framegenMotion.mvFieldFwd, lowW, lowH, uFieldFormat )
 				&& framegen_create_intermediate( &g_framegenMotion.mvFieldRev, lowW, lowH, uFieldFormat );
 		}
-		if ( bAllocated && bBidir )
+		if ( bAllocated && bNeedCheckedReverse )
 			bAllocated = framegen_create_intermediate( &g_framegenMotion.mvFieldRevChk, lowW, lowH, uFieldFormat );
 		// B4 stats pair: allocated with the rest so the warps can bind the
 		// accumulator unconditionally (the shaders statically reference it).
@@ -6958,11 +6976,12 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		g_framegenMotion.mvFieldNet = nullptr;
 		g_framegenMotion.mvFieldRevNet = nullptr;
 		g_framegenMotion.bNetAllocTried = false;
-		if ( bAllocated && bBidir && framegen_net_requested() )
+		if ( bAllocated && framegen_net_requested() )
 		{
 			g_framegenMotion.bNetAllocTried = true;
-			bool bNetOk = framegen_create_intermediate( &g_framegenMotion.mvFieldNet, lowW, lowH, uFieldFormat )
-				&& framegen_create_intermediate( &g_framegenMotion.mvFieldRevNet, lowW, lowH, uFieldFormat );
+			bool bNetOk = framegen_create_intermediate( &g_framegenMotion.mvFieldNet, lowW, lowH, uFieldFormat );
+			if ( bNetOk && bBidir )
+				bNetOk = framegen_create_intermediate( &g_framegenMotion.mvFieldRevNet, lowW, lowH, uFieldFormat );
 			// The weight texture pair is resolution-independent; created once.
 			// Served weights are also a storage image (the online optimizer
 			// writes them) and a transfer source (the profile dump).
@@ -6984,7 +7003,16 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 					&& g_framegenMotion.netWeightsUpload->mappedData() != nullptr;
 				if ( bNetOk )
 				{
-					const std::vector<float> &weights = framegen_net_weights();
+					// Warm-start after a resize/format reset from the latest served
+					// weights that passed the CPU finite check. Falling back to the
+					// immutable startup prior is only needed before the first healthy
+					// online readback (or when online learning is disabled).
+					const bool bWarmStart = framegen_net_online_enabled()
+						&& g_framegenNetLiveWeights.size() == k_uFramegenNetFloats;
+					const std::vector<float> &weights = bWarmStart
+						? g_framegenNetLiveWeights : framegen_net_weights();
+					if ( bWarmStart && g_bFramegenDebug )
+						vk_log.infof( "framegen: net warm-starting recreated GPU state from the latest healthy served weights (%" PRIu64 " trained steps)", g_ulFramegenNetLiveProgress );
 					for ( uint32_t y = 0; y < k_uFramegenNetTexH; y++ )
 					{
 						const uint32_t uRowFloats = std::min( k_uFramegenNetTexW, (uint32_t)weights.size() - y * k_uFramegenNetTexW );
@@ -7054,7 +7082,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		g_framegenMotion.recFieldRev = nullptr;
 		g_framegenMotion.bRecAllocTried = false;
 		g_framegenHistory.ulNetRecordSeqNo = 0;
-		if ( bAllocated && bBidir && framegen_record_dir() != nullptr
+		if ( bAllocated && framegen_record_dir() != nullptr
 			&& g_uFramegenRecordCount < framegen_record_max() )
 		{
 			g_framegenMotion.bRecAllocTried = true;
@@ -7183,14 +7211,13 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	pCmdBuffer->pushConstants<FramegenMotionFBCheckPush_t>( framegen_adapt_fbcheck_tol(), k_flFramegenFBTolSlope );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 
-	if ( !bBidir )
+	if ( !bNeedCheckedReverse )
 		return true;
 
-	// Pass 10 (bidir only): the symmetric check for the reverse field — the
+	// Pass 10 (bidir/net/capture): the symmetric check for the reverse field — the
 	// same pass with the fields swapped (the shader is direction-agnostic: it
-	// tests field[0]'s round trip through field[1]). The bidir warp gathers the
-	// previous frame along this field, so its mislocks need the same
-	// confidence kill the forward field just received.
+	// tests field[0]'s round trip through field[1]). Bidir consumes it directly;
+	// forward learned prediction uses it as consistency evidence.
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_FBCHECK ) );
 	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldRevChk );
 	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.mvFieldRev, true );
@@ -7334,7 +7361,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// then refine both fields through the net. Everything downstream — the B4
 	// probe and the warps — binds the refined copies via
 	// framegen_motion_field() once the net has run.
-	const bool bNetRecord = bMotion && bBidir && g_framegenMotion.recField != nullptr
+	const bool bNetRecord = bMotion && g_framegenMotion.recField != nullptr
 		&& g_uFramegenRecordCount < framegen_record_max();
 	if ( bNetRecord )
 	{
@@ -7343,8 +7370,8 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		pCmdBuffer->copyImage( g_framegenMotion.mvField, g_framegenMotion.recField );
 		pCmdBuffer->copyImage( g_framegenMotion.mvFieldRevChk, g_framegenMotion.recFieldRev );
 	}
-	if ( bMotion && bBidir && g_framegenMotion.mvFieldNet != nullptr )
-		framegen_record_net( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height );
+	if ( bMotion && g_framegenMotion.mvFieldNet != nullptr )
+		framegen_record_net( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height, bBidir );
 	// C2: one online learning step per batch — gradients from this very
 	// frame pair, optimizer publish for the next. Rides the same command
 	// buffer; ~8M MACs, an order cheaper than the inference pass above.
@@ -7839,13 +7866,13 @@ void vulkan_framegen_benchmark()
 				printf( "%-8s  %-26s  %10.3f\n", res.pszName, "adapt stats probe (per real)", msAdaptProbe );
 			}
 
-			// Stage C net refinement (both directions) — also per real frame;
-			// needs GAMESCOPE_FRAMEGEN_NET + BIDIR=1 to appear. Runs first so
-			// the warp rows below bind the refined field, as in production.
-			if ( vulkan_framegen_bidir_active() && g_framegenMotion.mvFieldNet != nullptr )
+			// Stage C net refinement — one direction for causal prediction,
+			// both only when bidir is active. Runs first so the warp rows below
+			// bind the refined field, as in production.
+			if ( g_framegenMotion.mvFieldNet != nullptr )
 			{
 				double msNet = timePass( [&]( CVulkanCmdBuffer *cmd ) {
-					framegen_record_net( cmd, g_framegenMotion.width, g_framegenMotion.height );
+					framegen_record_net( cmd, g_framegenMotion.width, g_framegenMotion.height, vulkan_framegen_bidir_active() );
 				} );
 				printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion net refine (per real)", msNet );
 			}
@@ -7915,11 +7942,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				vk_log.infof( "framegen: self-supervised adaptation disabled (GAMESCOPE_FRAMEGEN_ADAPT=0)" );
 			if ( framegen_net_requested() )
 			{
-				if ( framegen_bidir_enabled() )
-					vk_log.infof( "framegen: learned field refinement active (C) — motion fields refined through the net once per real frame (bounded flow residual + confidence recalibration)" );
-				else
-					vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_NET/_NET_ONLINE ignored (the net reads both checked fields; requires GAMESCOPE_FRAMEGEN_BIDIR=1)" );
-				if ( framegen_net_online_enabled() && framegen_bidir_enabled() )
+				vk_log.infof( "framegen: learned forward-field refinement active (C) — the net improves causal motion prediction once per real frame (bounded flow residual + evidence-gated confidence)" );
+				if ( framegen_net_online_enabled() )
 					vk_log.infof( "framegen: in-situ learning active (C2) — the net keeps training on the framegen GPU against every real frame (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
 						framegen_net_online_lr(), k_uFramegenNetTrainTiles, framegen_net_online_every(),
 						framegen_net_profile_path() != nullptr
@@ -7927,12 +7951,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 							: " — ephemeral model, nothing is written to disk" );
 			}
 			if ( framegen_record_dir() != nullptr )
-			{
-				if ( framegen_bidir_enabled() )
-					vk_log.infof( "framegen: dataset capture requested — writing up to %u field-res training samples to '%s'", framegen_record_max(), framegen_record_dir() );
-				else
-					vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_RECORD ignored (samples need both checked fields; requires GAMESCOPE_FRAMEGEN_BIDIR=1)" );
-			}
+				vk_log.infof( "framegen: dataset capture requested — writing up to %u field-res training samples to '%s'", framegen_record_max(), framegen_record_dir() );
 		}
 		g_bLoggedFramegenConfig = true;
 	}

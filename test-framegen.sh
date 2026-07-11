@@ -27,9 +27,16 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# This checkout is linked against the manually built Wayland/Pixman stack.
+# Keep every benchmark/run on that ABI; invoking the binary directly against
+# distro libraries can fail at load time or, worse, mix incompatible symbols.
+export GAMESCOPE_BUILD_DIR="${GAMESCOPE_BUILD_DIR:-build-perf}"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/env-gamescope-local.sh"
+
 # Locate the gamescope binary (prefer the perf build).
 BIN=""
-for cand in "$SCRIPT_DIR/build-perf/src/gamescope" "$SCRIPT_DIR/build/src/gamescope"; do
+for cand in "$SCRIPT_DIR/$GAMESCOPE_BUILD_DIR/src/gamescope" "$SCRIPT_DIR/build-perf/src/gamescope" "$SCRIPT_DIR/build/src/gamescope"; do
     [[ -x "$cand" ]] && { BIN="$cand"; break; }
 done
 if [[ -z "$BIN" ]]; then
@@ -123,10 +130,12 @@ summarize() {
 
 cmd_run() {
     local id mode res app w h
+    local -a app_cmd
     id=$(resolve_gpu "${1:-nvidia}")
     mode="${2:-extrapolate}"
     res="${3:-1080}"
     app="${4:-vkcube}"
+    read -r -a app_cmd <<< "$app"
     read -r w h < <(res_to_dims "$res")
     local refresh="${REFRESH:-144}" limit="${LIMIT:-2}" every="${DEBUG_EVERY:-1}"
 
@@ -146,7 +155,7 @@ cmd_run() {
         "$BIN" --backend wayland --prefer-vk-device "$id"
         -W "$w" -H "$h" -r "$refresh" --framerate-limit "$limit"
         --experimental-framegen --framegen-mode "$mode" --framegen-strength 0.5
-        --framegen-debug -- $app
+        --framegen-debug -- "${app_cmd[@]}"
     )
 
     if [[ -n "${DURATION:-}" ]]; then

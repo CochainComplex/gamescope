@@ -6,7 +6,7 @@
 #include "descriptor_set.h"
 
 // Direct (no-LDS) forward extrapolation — bit-identical output to
-// cs_framegen_extrapolate.comp, but the 4-neighbour rectification cross is read
+// cs_framegen_extrapolate.comp, but the 3x3 rectification neighborhood is read
 // straight from the texture units instead of being staged through an LDS apron.
 //
 // Rationale: this pass is memory-bandwidth-bound and very light on ALU. On GPUs
@@ -53,13 +53,17 @@ void main() {
 
     vec3 predicted = currentFrame + delta * strength;
 
-    // TAA-style rectification against the current frame's 4-neighbor cross.
+    // TAA-style rectification against the current frame's full 3x3 neighborhood.
     vec3 n0 = loadCurClamped(coord + ivec2( 1, 0), sz);
     vec3 n1 = loadCurClamped(coord + ivec2(-1, 0), sz);
     vec3 n2 = loadCurClamped(coord + ivec2( 0, 1), sz);
     vec3 n3 = loadCurClamped(coord + ivec2( 0,-1), sz);
-    vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
-    vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
+    vec3 n4 = loadCurClamped(coord + ivec2( 1, 1), sz);
+    vec3 n5 = loadCurClamped(coord + ivec2(-1, 1), sz);
+    vec3 n6 = loadCurClamped(coord + ivec2( 1,-1), sz);
+    vec3 n7 = loadCurClamped(coord + ivec2(-1,-1), sz);
+    vec3 neighborMin = min(min(currentFrame, min(min(n0, n1), min(n2, n3))), min(min(n4, n5), min(n6, n7)));
+    vec3 neighborMax = max(max(currentFrame, max(max(n0, n1), max(n2, n3))), max(max(n4, n5), max(n6, n7)));
     predicted = clamp(predicted, neighborMin, neighborMax);
 
     imageStore(dst, coord, vec4(predicted, curSample.a));

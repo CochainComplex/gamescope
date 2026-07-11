@@ -66,8 +66,8 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - `GAMESCOPE_FRAMEGEN_AGREE` — per-pixel two-source agreement test in the warp (kills `conf` at full res where the two real-frame projections of the flow read different content). `=0` disables.
 - `GAMESCOPE_FRAMEGEN_BIDIR` — truthy int; opt-in **B3 bidirectional interpolation** (`vulkan_framegen_bidir_active`, `:5076`). Generated frames sit *between* the two reals (warp both toward phase `t`, blend by confidence, phase-correct crossfade fallback) instead of extrapolating past the newest — removes hold-then-jump judder and handles translucency, at the cost of presenting each real frame **one interval late** (§0 invariants #1/#4 exception; see §3.3). **Requires motion mode; mutually exclusive with `_JIT`/#06, `_VRR_HYBRID`/#01 and `_BASE`/#02** (each owns its own timeline); silently ignored otherwise (logs once).
 - `GAMESCOPE_FRAMEGEN_ADAPT` — **B4 self-supervised adaptation** (`framegen_adapt_enabled`; motion mode). Each real frame grades the field that predicted it (field-res stats probe, 14–25 µs per real); a same-batch apply pass folds a global field-trust factor into the field's confidence, and the next-batch CPU readback auto-calibrates the FB tolerance and agreement window (see §3.4). `=0` disables (B3-bit-exact warps, no probe). An explicit `_FB_TOL` pins the tolerance against auto-calibration.
-- `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned field refinement** (`framegen_net_weights_path`; requires `_BIDIR=1`). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines both checked fields once per real frame — bounded flow residual (±2 field texels, tanh-limited) + additive confidence recalibration — before the B4 probe and the warps consume them (`framegen_motion_field()`). Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
-- `GAMESCOPE_FRAMEGEN_RECORD` — directory; **Stage C dataset capture** (requires `_BIDIR=1`). Dumps raw field-res training tensors (both lumas + both checked fields, pre-refinement/pre-trust) one `GSFD` file per real frame, up to `GAMESCOPE_FRAMEGEN_RECORD_MAX` (default 1000, ~0.6–1.2 MB each — mind the disk).
+- `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned forward-field refinement** (`framegen_net_weights_path`; motion mode, no `_BIDIR` requirement). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). Bidir additionally refines the reverse field. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
+- `GAMESCOPE_FRAMEGEN_RECORD` — directory; **Stage C dataset capture** (motion mode, no `_BIDIR` requirement). Dumps raw field-res training tensors (both lumas + both checked fields, pre-refinement/pre-trust) one `GSFD` file per real frame, up to `GAMESCOPE_FRAMEGEN_RECORD_MAX` (default 1000, ~0.6–1.2 MB each — mind the disk).
 - `GAMESCOPE_FRAMEGEN_NET_ONLINE` — truthy int; **C2 in-situ learning** (see §3.5). The refiner keeps training on the framegen GPU against every real frame; works with a `_NET` blob as the prior or from a synthesized neutral init. Without `_NET_PROFILE` the model is **ephemeral — nothing is ever written to disk**. `_NET_LR` (default `3e-4`), `_NET_EVERY` (train every Nth real frame, default 1) tune it; `_NET_PROFILE=<path>` makes the learning persistent per game: loaded as the prior when present (a malformed/torn file is rejected loudly and the neutral prior used instead), checkpointed back every 1024 trained steps **off-thread** (file I/O never rides the render thread) and flushed at exit and on every framegen reset, so sessions shorter than the checkpoint interval persist too. Writes are atomic (temp + rename): a crash or a full disk can never tear an existing good profile. The served weights are health-checked every trained step; a non-finite value re-initializes the optimizer state from the prior automatically and is never persisted.
 
 ### Runtime hot path
@@ -147,7 +147,7 @@ hardware linearizes on read).
 
 | Variant | Math | Memory strategy | Dispatched when | Tradeoff / cost |
 |---|---|---|---|---|
-| **Extrapolate LDS fp32** (`cs_framegen_extrapolate.comp`) | `delta = cur−prev`; `strength = u_strength·(1−smoothstep(0.08,0.40,motion))`, `motion = max(\|Δr\|,\|Δg\|,\|Δb\|)`; `predicted = cur + delta·strength`; 5-tap (center+4-cross) neighbor clamp; **no [0,1] clamp**; alpha = `cur.a` | 10×10 LDS apron `s_cur[100]` of CURRENT only, staged once/group (`:38-57`); prev fetched at center only; ~6 → ~1.6 fetches/px | non-NVIDIA integer targets | halos fast edges, bounded by suppression + neighbor clamp; bandwidth baseline |
+| **Extrapolate LDS fp32** (`cs_framegen_extrapolate.comp`) | `delta = cur−prev`; `strength = u_strength·(1−smoothstep(0.08,0.40,motion))`, `motion = max(\|Δr\|,\|Δg\|,\|Δb\|)`; `predicted = cur + delta·strength`; full 3×3 neighbor clamp; **no [0,1] clamp**; alpha = `cur.a` | 10×10 LDS apron `s_cur[100]` of CURRENT only, staged once/group; diagonals add LDS reads but no image traffic | non-NVIDIA integer targets | preserves diagonal/thin motion better; halos bounded by suppression + neighbor clamp |
 | **Extrapolate direct** (`_extrapolate_direct.comp`) | **bit-identical** to LDS fp32 | no LDS / no barrier; neighbors via `texelFetch` straight from texture cache | **NVIDIA only** (`vendorID==0x10DE`, `:5200`) | identical output; **~30–37% faster** on NVIDIA (large L2 makes the apron pure overhead); also beats fp16 there |
 | **Extrapolate fp16** (`_extrapolate_fp16.comp`) | same math, `f16vec3` ALU; push uploaded fp32 then cast; alpha never demoted | **LDS apron stays vec4 fp32** — only ALU is fp16, bandwidth unchanged, so upside is capped | `supportsShaderFloat16 && !floatTarget`, non-NVIDIA | fp16 range/precision bands scRGB highlights → **gated off for float targets** |
 | **Extrapolate pair (+ pair_fp16)** (`_extrapolate_pair.comp`) | writes TWO slots from one dispatch; suppress term + neighbor min/max computed **once** and shared | halves the two full-res history reads across the pair | x3/x4 | same quality; halves history bandwidth at high multipliers |
@@ -155,7 +155,7 @@ hardware linearizes on read).
 | **Motion** (luma → match → warp) | see §3.2 | see §3.2 | `eff.mode==Motion && dispatch.motionSupported`; **priciest rung, shed first** | smooth pans; `conf=0` ≡ bounded extrapolate (never much worse); highest cost |
 
 **Invariant across all extrapolate variants:** alpha pinned to `current`; the *only* range bound is
-the 5-tap neighbor clamp — no `[0,1]` clamp, so UNORM stays in range while scRGB keeps HDR>1.0 and
+the 9-tap neighbor clamp — no `[0,1]` clamp, so UNORM stays in range while scRGB keeps HDR>1.0 and
 wide-gamut negatives; previous frame sampled at center only.
 
 ### 3.2 Motion mode detail
@@ -301,8 +301,9 @@ Two consumers, two latencies:
 ### 3.5 Learned field refinement (Stage C, opt-in via `GAMESCOPE_FRAMEGEN_NET=<blob>`)
 
 A tiny convolutional net (12→16→16→4 channels, 3×3 kernels, ~4.6k parameters,
-`cs_framegen_motion_net.comp`) refines both checked motion fields at field resolution, once per
-real frame — zero cost per generated frame, and the full-res warps are untouched. It predicts
+`cs_framegen_motion_net.comp`) refines the checked forward motion field at field resolution once per
+real frame — zero cost per generated frame, no future-frame dependency, and the full-res warp is
+untouched. Bidir additionally refines the checked reverse field. It predicts
 **corrections, not pixels**: a flow residual bounded to ±2 field texels (`2·tanh`) and an additive
 confidence recalibration, on top of the Stage-B field. Safety is structural, three layers deep:
 
@@ -319,13 +320,14 @@ both directions' flow/conf/round-trip error, destination luma, source luma warpe
 (the photometric evidence), the B4-style magnitude-normalized residual, and a task-conditioning
 flag (reserved). Refining the reverse field is the same problem with the lumas swapped, so **one
 set of weights serves both dispatches** (binding symmetry, the fbcheck trick). Weights ride a
-2048-wide `R32F` texture uploaded once via a mappable staging image; requires `_BIDIR=1` (the net
-reads both checked fields).
+2048-wide `R32F` texture uploaded once via a mappable staging image. The forward consistency pass
+already produces both checked fields, so learned forward prediction does not require `_BIDIR`.
 
 **Training** is the same self-supervision B4 measures: warp the source luma along the refined
-flow; each texel pays either the warp error (× refined confidence) or the crossfade-fallback error
-(× complement) — jointly teaching "fix the flow where fixable, drop confidence where not, raise it
-where the warp is right". Capture with `GAMESCOPE_FRAMEGEN_RECORD`, train with
+flow; each texel pays either the warp error (× refined confidence) or the fallback error
+(× complement), plus a small confidence-independent flow term so rejected vectors remain
+trainable. Confidence can rise only when the final corrected vector reconstructs the observed
+pair. Capture with `GAMESCOPE_FRAMEGEN_RECORD`, train with
 `scripts/framegen-net-train.py` (numpy-only, CPU, minutes), deploy the blob, and validate with the
 live A/B the adapt log provides (net vs no-net `resid`/`bad%` on the same content).
 
@@ -356,6 +358,8 @@ continually re-earning the distance on fresh frames — a model that works *temp
 scene, structurally. The prior is, in order: a `GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>` file if it
 exists (which also gets the served weights written back every 1024 steps — persistent per-game
 learning), the `_NET` blob, or a synthesized neutral init (He hidden layers, zero head). Validated
+served weights are also retained across in-process resize/format resets and warm-start the recreated
+GPU state, so a swapchain transition does not restart adaptation from the startup prior. Observed
 live: from a neutral prior on vkmark, the confidence head recovers ~10 points of killed field
 within seconds; warm-started from an offline blob it holds the blob's precision while tracking
 (see `doc/framegen-proposals/README.md` for the measured A/B).

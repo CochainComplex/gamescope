@@ -19,10 +19,14 @@
 // online): the refined confidence arbitrates a competition between the
 // warp's photometric error and the crossfade fallback's error —
 //   L = ch*charb(warp(src, F+dF) - dst) + 0.5*(1-ch)*charb(src - dst)
+//     + FLOW_AUX*charb(warp(src, F+dF) - dst)
 //     + LAMBDA_DF*|dF|^2 + LAMBDA_DC*dc^2
 // so the flow head learns to fix what is fixable and the confidence head
-// learns to route around what is not. Ground truth is the real frame the
-// batch is generating from — training data never exists anywhere but here.
+// learns to route around what is not. FLOW_AUX gives rejected vectors a small
+// training signal; without it ch=0 also zeroed the flow gradient, making
+// recovery impossible. Confidence raises are still gated by the corrected
+// vector's measured evidence. Ground truth is the real frame the batch is
+// generating from — training data never exists anywhere but here.
 //
 // Direction symmetry as everywhere in this file family: the reverse field
 // trains through the same code with the luma/field bindings swapped, in a
@@ -73,6 +77,7 @@ const int B3_OFF = 4640;
 const int N_PARAMS = 4644;
 
 const float CHARB_EPS = 1e-3f;
+const float FLOW_AUX = 0.05f;
 const float LAMBDA_DF = 0.01f;
 const float LAMBDA_DC = 0.005f;
 
@@ -205,18 +210,17 @@ void main() {
 
         float ld = texelFetch(s_samplers[1], q, 0).r;
         float lsp = texelFetch(s_samplers[0], q, 0).r;
-        // The same evidence gate on confidence raises the inference shader
-        // applies (raw-field residual; constant w.r.t. the parameters, so it
-        // is a plain multiplier in the chain rule).
-        vec3 rawWg = bilinearGrad(vec2(q) + 0.5f - X0.xy, sz);
-        float rawResid = abs(rawWg.x - ld) / max(1.0f, max(abs(rawWg.x), abs(ld)));
-        float gate = 1.0f - smoothstep(0.03f, 0.10f, rawResid);
+        vec3 wg = bilinearGrad(vec2(q) + 0.5f - Fh, sz);
+        // Same corrected-field evidence gate as inference. Treat the gate as
+        // stop-gradient: it is a safety verdict, not a shortcut through which
+        // the confidence loss should reshape flow.
+        float refinedResid = abs(wg.x - ld) / max(1.0f, max(abs(wg.x), abs(ld)));
+        float gate = 1.0f - smoothstep(0.03f, 0.10f, refinedResid);
         float dcChain = o[2] < 0.0f ? 1.0f : gate;
         float dc = o[2] * dcChain;
         float chRaw = X0.z + dc;
         float ch = clamp(chRaw, 0.0f, 1.0f);
 
-        vec3 wg = bilinearGrad(vec2(q) + 0.5f - Fh, sz);
         float ew = wg.x - ld;
         float rw = sqrt(ew * ew + CHARB_EPS * CHARB_EPS);
         float efb = lsp - ld;
@@ -226,10 +230,11 @@ void main() {
         // optimizer divides by the slice count for the global mean.
         float dLdCh = (rw - 0.5f * rfb) * invN;
         float live = (chRaw > 0.0f && chRaw < 1.0f) ? 1.0f : 0.0f;
-        float do2 = dLdCh * live * dcChain + (2.0f * LAMBDA_DC * invN) * o[2];
+        float do2 = dLdCh * live * dcChain
+            + (2.0f * LAMBDA_DC * invN) * dc * dcChain;
 
         // d warp / d Fh = -(gx, gy); charbonnier chain.
-        float dLdWarp = (ch * invN) * (ew / rw);
+        float dLdWarp = ((ch + FLOW_AUX) * invN) * (ew / rw);
         vec2 dLdFh = -dLdWarp * wg.yz;
         vec2 dLddF = dLdFh + (2.0f * LAMBDA_DF * invN) * dF;
         vec2 do01 = dLddF * 2.0f * (1.0f - th * th);

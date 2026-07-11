@@ -43,11 +43,11 @@ on top of it.
 | Variable | Requires | Effect |
 |---|---|---|
 | `GAMESCOPE_FRAMEGEN_BIDIR=1` | `--framegen-mode motion`; **excludes** `GAMESCOPE_FRAMEGEN_JIT`, `GAMESCOPE_FRAMEGEN_VRR_HYBRID`, `GAMESCOPE_FRAMEGEN_BASE` | Bidirectional interpolation — smoothest motion, but real frames present **one interval late**. |
-| `GAMESCOPE_FRAMEGEN_NET=<blob>` | `GAMESCOPE_FRAMEGEN_BIDIR=1` | Learned field refiner; value is the path to a `GSFR` weights blob (see below). Empty / unreadable → disabled, not fatal. |
-| `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | `GAMESCOPE_FRAMEGEN_BIDIR=1`; `NET` blob optional | In-situ learning (C2): the refiner keeps training on the framegen GPU against every real frame, tracking the current scene. Without a `NET` blob it starts from a neutral prior; without `NET_PROFILE` the model is **ephemeral — nothing is written to disk**. |
+| `GAMESCOPE_FRAMEGEN_NET=<blob>` | `--framegen-mode motion` | Learned causal forward-field refiner; value is the path to a `GSFR` weights blob (see below). Bidir is optional. Empty / unreadable → disabled, not fatal. |
+| `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | `--framegen-mode motion`; `NET` blob optional | In-situ learning (C2): the forward refiner keeps training on the framegen GPU against every real frame, tracking the current scene. Without a `NET` blob it starts from a neutral prior; without `NET_PROFILE` the model is **ephemeral — nothing is written to disk**. |
 | `GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Persistent per-game learning: loaded as the prior when the file exists (a malformed file is rejected loudly → neutral prior), checkpointed off-thread every 1024 trained steps and flushed at exit/reset, so short sessions persist too. Atomic writes (temp + rename): a crash or full disk never tears a good profile. |
 | `GAMESCOPE_FRAMEGEN_NET_LR` / `GAMESCOPE_FRAMEGEN_NET_EVERY` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Learning rate (default `3e-4`) / train every *N*th real frame (default `1` — raise on weak present GPUs). |
-| `GAMESCOPE_FRAMEGEN_RECORD=<dir>` | `GAMESCOPE_FRAMEGEN_BIDIR=1` | Capture training tensors (one `GSFD` file per real frame, ≈1.2 MB at 1440p) into `<dir>`. |
+| `GAMESCOPE_FRAMEGEN_RECORD=<dir>` | `--framegen-mode motion` | Capture training tensors (one `GSFD` file per real frame, ≈1.2 MB at 1440p) into `<dir>`; bidir is not required. |
 | `GAMESCOPE_FRAMEGEN_RECORD_MAX` | `GAMESCOPE_FRAMEGEN_RECORD` set | Cap on captured frames (default `1000`). |
 | `GAMESCOPE_FRAMEGEN_JIT=1` | **dedicated framegen queue**; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #06 JIT display-clock pacing (a no-op without the dedicated queue). |
 | `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` | **dedicated queue + connector actually in VRR**; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #01 VRR hybrid — real frames present VRR-style, the generated frame flips mid-interval on a timer (falls back to fixed-refresh **live** when VRR isn't active). |
@@ -144,9 +144,10 @@ along with these hardening/quality passes:
   window to the content on the CPU one batch later (loosening the round-trip
   kill only where ambiguity is measurably harmless, widening the agreement
   window by the measured temporal-noise floor).
-- **Learned field refinement** (opt-in, `GAMESCOPE_FRAMEGEN_NET=<weights>`,
-  bidir motion mode) — a ~4.6k-parameter fused-conv net refines both checked
-  motion fields once per real frame at field resolution: a tanh-bounded flow
+- **Learned forward-field refinement** (opt-in,
+  `GAMESCOPE_FRAMEGEN_NET=<weights>`, motion mode) — a ~4.6k-parameter
+  fused-conv net refines the causal checked field once per real frame at field
+  resolution (and the reverse field only for opt-in bidir): a tanh-bounded flow
   residual plus a confidence recalibration, learned from the residual error
   classes the hand-written consistency checks can't express (flow-boundary
   smoothing, occlusion inpainting, confidence-vs-usefulness calibration). A

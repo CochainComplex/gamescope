@@ -29,7 +29,7 @@ uniform framegen_params_t {
 // History and output are the same resolution, so every fetch is 1:1 — texelFetch
 // skips the sampler's normalized-coordinate math and bilinear hardware entirely.
 //
-// The rectification below reads the current frame's 4-neighbor cross, so an 8x8
+// The rectification below reads the current frame's 3x3 neighborhood, so an 8x8
 // workgroup touches a 10x10 apron of the current frame. Load that apron into LDS
 // once, cooperatively, and every neighbor read after that is a shared-memory hit
 // instead of a texture fetch: ~6 fetches/pixel collapses to ~1.6 (current tile) +
@@ -77,16 +77,20 @@ void main() {
 
     vec3 predicted = currentFrame + delta * strength;
 
-    // Rectify against the local neighborhood of the current frame (TAA-style),
-    // read straight from LDS. Ghosting is the prediction overshooting into values
-    // not present around the pixel; clamping to the 4-neighbor cross keeps edge
-    // motion but cannot invent colors.
+    // Rectify against the current frame's full 3x3 neighborhood (TAA-style),
+    // read straight from the already-populated LDS apron. Including diagonals
+    // avoids pinning diagonal edges and one-pixel geometry to the center color;
+    // it adds no image traffic on this tiled path.
     vec3 n0 = s_cur[lc.y * TILE_W + (lc.x + 1)].rgb;
     vec3 n1 = s_cur[lc.y * TILE_W + (lc.x - 1)].rgb;
     vec3 n2 = s_cur[(lc.y + 1) * TILE_W + lc.x].rgb;
     vec3 n3 = s_cur[(lc.y - 1) * TILE_W + lc.x].rgb;
-    vec3 neighborMin = min(currentFrame, min(min(n0, n1), min(n2, n3)));
-    vec3 neighborMax = max(currentFrame, max(max(n0, n1), max(n2, n3)));
+    vec3 n4 = s_cur[(lc.y + 1) * TILE_W + (lc.x + 1)].rgb;
+    vec3 n5 = s_cur[(lc.y + 1) * TILE_W + (lc.x - 1)].rgb;
+    vec3 n6 = s_cur[(lc.y - 1) * TILE_W + (lc.x + 1)].rgb;
+    vec3 n7 = s_cur[(lc.y - 1) * TILE_W + (lc.x - 1)].rgb;
+    vec3 neighborMin = min(min(currentFrame, min(min(n0, n1), min(n2, n3))), min(min(n4, n5), min(n6, n7)));
+    vec3 neighborMax = max(max(currentFrame, max(max(n0, n1), max(n2, n3))), max(max(n4, n5), max(n6, n7)));
     predicted = clamp(predicted, neighborMin, neighborMax);
 
     // The neighborhood clamp is the only range bound we want: UNORM targets stay
