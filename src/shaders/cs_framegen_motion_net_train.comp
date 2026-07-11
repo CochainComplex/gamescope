@@ -46,11 +46,14 @@ uniform motion_net_train_t {
     uint  u_seed;      // per-frame tile-placement seed (derived from seqno)
     uint  u_sliceBase; // first slice row this dispatch writes
     float u_mode;      // task-conditioning input (must match inference)
-    float u_pad0;
+    uint  u_sceneCutGuard;
 };
 
 // The gradient slice image: one row per tile, width = parameter count.
 layout(binding = 1, r32f) writeonly uniform image2D u_grad;
+// B4 stats. The CPU always allocates this tiny storage image for online
+// learning; when the B4 probe is enabled, [88] carries its same-batch cut flag.
+layout(binding = 2, r32ui) readonly uniform uimage2D u_stats;
 
 // s_samplers[0] = source luma  (frame the field warps FROM)
 // s_samplers[1] = destination luma (frame the field predicts = ground truth)
@@ -116,6 +119,18 @@ vec3 bilinearGrad(vec2 c, ivec2 sz) {
 void main() {
     uint li = gl_LocalInvocationIndex;
     ivec2 sz = textureSize(s_samplers[2], 0);
+
+    // A hard cut is not a learnable motion sample. Every invocation observes
+    // the same global flag, so returning before the first barrier is uniform.
+    // Zero the complete slice row: Adam then receives no cut gradient (only its
+    // normal decay toward the safe prior) and cannot teach the flow head to fit
+    // two unrelated images or permanently depress confidence after a menu cut.
+    if (u_sceneCutGuard != 0u && imageLoad(u_stats, ivec2(88, 0)).r != 0u) {
+        int row = int(u_sliceBase + gl_WorkGroupID.x);
+        for (uint i = li; i < uint(N_PARAMS); i += 64u)
+            imageStore(u_grad, ivec2(int(i), row), vec4(0.0f));
+        return;
+    }
 
     // Tile placement: hashed, deterministic per (frame, tile) — replayable
     // offline against the recorder's tensors for gradient verification.

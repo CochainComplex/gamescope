@@ -49,6 +49,14 @@ void main() {
 
     vec4 fwdField = texture(s_samplers[2], uv);
     vec4 revField = texture(s_samplers[3], uv);
+    if (fwdField.a < -0.5f || revField.a < -0.5f) {
+        // A hard cut has no meaningful in-between geometry. Pick the nearest
+        // real endpoint instead of creating a dissolve or a warped double image.
+        imageStore(dst, coord, t < 0.5f
+            ? texture(s_samplers[0], uv)
+            : texture(s_samplers[1], uv));
+        return;
+    }
     vec2 mvUvF = fwdField.rg * u_lowResScale / vec2(outSize);
     vec2 mvUvR = revField.rg * u_lowResScale / vec2(outSize);
     float confF = clamp(fwdField.b, 0.0f, 1.0f);

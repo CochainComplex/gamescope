@@ -297,6 +297,8 @@ Add `--framegen-debug` and watch the terminal:
 - `framegen: generated N frame(s) …` → it's generating. ✅
 - `bidirectional interpolation requested` / `learned field refinement active` /
   `self-supervised adaptation active` → those modes are on.
+- `content scene cut detected` → motion mode deliberately presented a real
+  endpoint instead of predicting across unrelated content.
 - `… ignored (requires …)` → you enabled a mode without its requirement (e.g.
   `GAMESCOPE_FRAMEGEN_BIDIR=1` without `--framegen-mode motion`, or combined
   with a mode that owns its own timeline like base-layer/VRR/JIT).

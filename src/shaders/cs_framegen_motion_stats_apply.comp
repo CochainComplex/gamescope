@@ -26,19 +26,75 @@ uniform motion_stats_apply_t {
     // Lo, full fallback above Hi.
     float u_trustLo;
     float u_trustHi;
-    float u_pad0;
-    float u_pad1;
+    float u_sceneHistSection;
+    float u_sceneHistGlobal;
+    float u_sceneResid;
+    float u_sceneUnreliable;
+    uint  u_sceneMinSections;
+    uint  u_detectOnly;
 };
 
-// The motion field, scaled in place (.b *= trust; .rg/.a untouched).
+// The motion field, scaled in place (.b *= trust). A cut sets .b=0 and uses a
+// negative .a sentinel after the FB diagnostic has already been consumed.
 layout(binding = 1, rgba16f) uniform image2D u_field;
 // The stats counters (see cs_framegen_motion_stats.comp for the layout), on
 // the second target binding.
-layout(binding = 2, r32ui) readonly uniform uimage2D u_stats;
+layout(binding = 2, r32ui) uniform uimage2D u_stats;
 
 shared float s_trust;
+shared uint s_sceneCut;
+
+const uint HIST_PREV_BASE = 16u;
+const uint HIST_CUR_BASE = 52u;
+const uint HIST_BINS = 4u;
+const uint SCENE_CUT_STAT = 88u;
+
+void detectSceneCut() {
+    uint total = imageLoad(u_stats, ivec2(0, 0)).r;
+    uint bad = imageLoad(u_stats, ivec2(2, 0)).r;
+    uint killed = imageLoad(u_stats, ivec2(3, 0)).r;
+    uint changedSections = 0u;
+    uint globalL1 = 0u;
+
+    for (uint section = 0u; section < 9u; section++) {
+        uint sectionCount = 0u;
+        uint sectionL1 = 0u;
+        for (uint bin = 0u; bin < HIST_BINS; bin++) {
+            uint hp = imageLoad(u_stats, ivec2(int(HIST_PREV_BASE + section * HIST_BINS + bin), 0)).r;
+            uint hc = imageLoad(u_stats, ivec2(int(HIST_CUR_BASE + section * HIST_BINS + bin), 0)).r;
+            sectionCount += hp;
+            sectionL1 += hp > hc ? hp - hc : hc - hp;
+        }
+        globalL1 += sectionL1;
+        // Half the normalized L1 distance is histogram total variation [0,1].
+        float sectionDistance = float(sectionL1) / float(max(2u * sectionCount, 1u));
+        changedSections += sectionDistance > u_sceneHistSection ? 1u : 0u;
+    }
+
+    float globalDistance = float(globalL1) / float(max(2u * total, 1u));
+    float meanResid = float(imageLoad(u_stats, ivec2(1, 0)).r) / (1024.0f * float(max(total, 1u)));
+    float unreliable = float(min(bad + killed, total)) / float(max(total, 1u));
+    bool cut = total != 0u
+        && changedSections >= u_sceneMinSections
+        && globalDistance > u_sceneHistGlobal
+        && meanResid > u_sceneResid
+        && unreliable > u_sceneUnreliable;
+
+    imageStore(u_stats, ivec2(int(SCENE_CUT_STAT), 0), uvec4(cut ? 1u : 0u));
+    imageStore(u_stats, ivec2(89, 0), uvec4(changedSections));
+    imageStore(u_stats, ivec2(90, 0), uvec4(uint(clamp(globalDistance, 0.0f, 1.0f) * 1024.0f + 0.5f)));
+}
 
 void main() {
+    // One tiny dispatch finalizes the cross-workgroup histogram before the
+    // field-sized confidence pass. Keeping this separate avoids re-reading 72
+    // histogram counters once per field workgroup or once per output pixel.
+    if (u_detectOnly != 0u) {
+        if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u)
+            detectSceneCut();
+        return;
+    }
+
     // One stats read per workgroup, broadcast through LDS; before the
     // bounds-check return so the barrier stays uniform.
     if (gl_LocalInvocationIndex == 0u) {
@@ -47,6 +103,7 @@ void main() {
         uint uKilled = imageLoad(u_stats, ivec2(3, 0)).r;
         float alive = float(max(int(uTotal) - int(uKilled), 1));
         s_trust = 1.0f - smoothstep(u_trustLo, u_trustHi, float(uBad) / alive);
+        s_sceneCut = imageLoad(u_stats, ivec2(int(SCENE_CUT_STAT), 0)).r;
     }
     barrier();
 
@@ -55,9 +112,14 @@ void main() {
     if (p.x >= sz.x || p.y >= sz.y)
         return;
 
-    if (s_trust >= 1.0f)
+    if (s_trust >= 1.0f && s_sceneCut == 0u)
         return;
 
     vec4 field = imageLoad(u_field, p);
-    imageStore(u_field, p, vec4(field.rg, field.b * s_trust, field.a));
+    // Negative .a is an internal scene-cut sentinel. The FB error stored there
+    // has already been consumed by the stats pass, and every downstream warp
+    // can now choose a non-synthetic endpoint without another stats binding.
+    imageStore(u_field, p, s_sceneCut != 0u
+        ? vec4(field.rg, 0.0f, -1.0f)
+        : vec4(field.rg, field.b * s_trust, field.a));
 }

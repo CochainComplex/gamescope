@@ -55,7 +55,7 @@ float colorError(vec3 a, vec3 b) {
 // bilinear field, avoiding hard 8x8 cells and winner flicker.
 vec4 reconstructField(vec2 uv, vec3 currentFrame, vec2 invOutSize) {
     vec4 bilinearField = texture(s_samplers[2], uv);
-    if (u_guidedReconstruction < 0.5f)
+    if (bilinearField.a < -0.5f || u_guidedReconstruction < 0.5f)
         return bilinearField;
 
     ivec2 fieldSize = textureSize(s_samplers[2], 0);
@@ -143,6 +143,10 @@ void main() {
     vec3 currentFrame = currentSample.rgb;
 
     vec4 field = reconstructField(uv, currentFrame, invOutSize);
+    if (field.a < -0.5f) {
+        imageStore(dst, coord, currentSample);
+        return;
+    }
     vec2 flow = field.rg;
     float conf = clamp(field.b, 0.0f, 1.0f);
     vec2 flowUv = flow * u_lowResScale * invOutSize;

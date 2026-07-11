@@ -66,7 +66,7 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - `GAMESCOPE_FRAMEGEN_FB_TOL` — float, clamped `[0.05, 8.0]`, default `0.75`; the FB round-trip tolerance in low-res texels (larger = more forgiving = fewer kills).
 - `GAMESCOPE_FRAMEGEN_AGREE` — per-pixel two-source agreement test in the warp (kills `conf` at full res where the two real-frame projections of the flow read different content). `=0` disables.
 - `GAMESCOPE_FRAMEGEN_BIDIR` — truthy int; opt-in **B3 bidirectional interpolation** (`vulkan_framegen_bidir_active`, `:5294`). Generated frames sit *between* the two reals (warp both toward phase `t`, blend by confidence, phase-correct crossfade fallback) instead of extrapolating past the newest — removes hold-then-jump judder and handles translucency, at the cost of presenting each real frame **one interval late** (§0 invariants #1/#4 exception; see §3.3). **Requires motion mode; mutually exclusive with `_JIT`/#06, `_VRR_HYBRID`/#01 and `_BASE`/#02** (each owns its own timeline); silently ignored otherwise (logs once).
-- `GAMESCOPE_FRAMEGEN_ADAPT` — **B4 self-supervised adaptation** (`framegen_adapt_enabled`; motion mode). Each real frame grades the field that predicted it (field-res stats probe, 14–25 µs per real); a same-batch apply pass folds a global field-trust factor into the field's confidence, and the next-batch CPU readback auto-calibrates the FB tolerance and agreement window (see §3.4). `=0` disables (B3-bit-exact warps, no probe). An explicit `_FB_TOL` pins the tolerance against auto-calibration.
+- `GAMESCOPE_FRAMEGEN_ADAPT` — **B4 self-supervised adaptation** (`framegen_adapt_enabled`; motion mode). Each real frame grades the field that predicted it (field-res stats probe, measured 20–39 µs per real at 1080p–4K on Radeon 890M); a same-batch apply pass folds a global field-trust factor into the field's confidence and rejects content scene cuts from nine regional luminance histograms, while the next-batch CPU readback auto-calibrates the FB tolerance and agreement window (see §3.4). `=0` disables (B3-bit-exact warps, no probe). An explicit `_FB_TOL` pins the tolerance against auto-calibration.
 - `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned forward-field refinement** (`framegen_net_weights_path`; motion mode, no `_BIDIR` requirement). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). Bidir additionally refines the reverse field. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
 - `GAMESCOPE_FRAMEGEN_RECORD` — directory; **Stage C dataset capture** (motion mode, no `_BIDIR` requirement). Dumps raw field-res training tensors (both lumas + both checked fields, pre-refinement/pre-trust) one `GSFD` file per real frame, up to `GAMESCOPE_FRAMEGEN_RECORD_MAX` (default 1000, ~0.6–1.2 MB each — mind the disk).
 - `GAMESCOPE_FRAMEGEN_NET_ONLINE` — truthy int; **C2 in-situ learning** (see §3.5). The refiner keeps training on the framegen GPU against every real frame; works with a `_NET` blob as the prior or from a synthesized neutral init. Without `_NET_PROFILE` the model is **ephemeral — nothing is ever written to disk**. `_NET_LR` (default `3e-4`), `_NET_EVERY` (train every Nth real frame, default 1) tune it; `_NET_PROFILE=<path>` makes the learning persistent per game: loaded as the prior when present (a malformed/torn file is rejected loudly and the neutral prior used instead), checkpointed back every 1024 trained steps **off-thread** (file I/O never rides the render thread) and flushed at exit and on every framegen reset, so sessions shorter than the checkpoint interval persist too. Writes are atomic (temp + rename): a crash or a full disk can never tear an existing good profile. The served weights are health-checked every trained step; a non-finite value re-initializes the optimizer state from the prior automatically and is never persisted.
@@ -299,10 +299,12 @@ consistency check, a field-res **stats probe** (`cs_framegen_motion_stats.comp`,
 `framegen_record_adapt_probe`) warps the previous frame's luma along the final checked field and
 compares it against the current frame's luma per texel — a direct measurement of "would this field
 have predicted the frame we actually got", which is the exact bet every generated slot in the
-coming interval places. Per-texel verdicts LDS-reduce into a 16×1 `R32_UINT` counter image
+coming interval places. Per-texel verdicts LDS-reduce into a 96×1 `R32_UINT` counter image
 (total / residual sum / mispredicting-but-surviving count / killed count / static-texel noise
-floor / an 8-bin histogram of the FB round-trip error B2 already stores in `field.a`). Cost:
-14–25 µs per REAL frame (1080p–2160p), zero per generated frame.
+floor / an 8-bin histogram of the FB round-trip error B2 already stores in `field.a` / four-bin
+luminance histograms for both real frames over a 3×3 screen partition). Measured probe cost on the
+Radeon 890M is 20 µs at 1080p, 24–25 µs at 1440p and 39 µs at 4K per REAL frame, zero per generated
+frame.
 
 Two consumers, two latencies:
 
@@ -318,6 +320,14 @@ Two consumers, two latencies:
   trust into the field (which the warps already fetch per pixel) is load-bearing — reading the
   stats image from the full-res warps, even once per workgroup, measured ~10% of the warp on
   NVIDIA (repeated surface loads of one texel serialize on the cache).
+- **GPU, same batch, content-cut guard**: a one-workgroup finalize pass compares the nine regional
+  histogram pairs, then requires three independent signals before declaring a cut: at least seven
+  regions changed, global histogram total variation above 0.25, and both motion-compensated
+  residual and unreliable-field coverage are high. A pan can break correspondence without changing
+  regional distributions; particle chaos can kill confidence without satisfying the histogram
+  tests. On a cut, a negative internal `field.a` sentinel makes causal warps copy the newest real
+  frame and bidir choose the nearest endpoint. The sentinel is retained into Ultra history with
+  zero confidence, so the unrelated interval cannot become a false acceleration estimate.
 - **CPU, next batch** (`framegen_adapt_consume`): the counters copy into a host-mapped readback
   image; the one-batch-in-flight guarantee makes the mapped read race-free (parsed only after
   `hasCompletedFramegen`). Slow EMAs (1/8) drive two auto-calibrations: the **FB tolerance**
@@ -329,7 +339,7 @@ Two consumers, two latencies:
 
 `GAMESCOPE_FRAMEGEN_ADAPT=0` disables all of it (B3-bit-exact warps, no probe). With
 `--framegen-debug`, consume logs
-`adapt resid=… bad=…% killed=…% noise=… fbP75=… -> fbTol=… agree=…/…`.
+`adapt resid=… bad=…% killed=…% noise=… fbP75=… scene=… -> fbTol=… agree=…/…`.
 
 ### 3.5 Learned field refinement (Stage C, opt-in via `GAMESCOPE_FRAMEGEN_NET=<blob>`)
 
@@ -382,7 +392,9 @@ training tile, forward + full backprop in LDS, per-tile gradient written as one 
 image — **no float atomics**, `VK_EXT_shader_atomic_float` isn't universal) and one optimizer
 dispatch (`cs_framegen_motion_net_opt.comp`; one thread per parameter: slice-mean, Adam,
 **decay toward the prior**, and an EMA publish). ~8M MACs per step — an order of magnitude below
-the inference pass; `_NET_EVERY=N` strides it for weak GPUs. Three structural properties do the
+the inference pass; `_NET_EVERY=N` strides it for weak GPUs. Training is recorded after the B4
+scene verdict: a content cut writes zero to every gradient slice, so Adam sees no unlearnable
+cross-scene motion (only its normal decay toward the prior). Three structural properties do the
 safety work: training reads the RAW fields (the net never trains on its own output); inference
 serves a slow EMA of the fast weights (the served function moves calmly — same
 calmer-than-the-signal rule as the B4 EMAs); and the fast weights relax toward the prior every

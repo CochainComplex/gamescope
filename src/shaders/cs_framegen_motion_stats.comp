@@ -11,7 +11,7 @@
 // field texel. The residual is a direct measurement of "would this field have
 // predicted the frame we actually got" — the exact question every generated
 // slot in the coming interval bets on. The per-texel verdicts reduce to a
-// handful of scene-level counters in a 16x1 R32_UINT stats image:
+// handful of scene-level counters in a 96x1 R32_UINT stats image:
 //
 //   [0] total texels          [1] sum residual (x1024)
 //   [2] mispredicting texels (confidence survived the checks, residual didn't)
@@ -20,11 +20,15 @@
 //   [6..13] histogram of the round-trip error the FB check stored in field.a,
 //           8 bins x 0.25 field texels
 //   [14] sum |mv| (x64)       [15] reserved
+//   [16..51] previous-frame luma histogram (9 screen sections x 4 bins)
+//   [52..87] current-frame luma histogram  (9 screen sections x 4 bins)
+//   [88] scene-cut verdict    [89] changed sections
+//   [90] global histogram distance (x1024) [91..95] reserved
 //
-// The warps read [0]/[2]/[3] in the SAME batch (a global field-trust factor);
-// the CPU reads everything back one batch later to auto-calibrate the FB
-// tolerance and agreement window. Run twice per batch: once with u_clearOnly
-// (one workgroup zeroes the image) and once over the field.
+// The apply pass consumes the counters in the SAME batch (field trust + scene
+// verdict); the CPU reads everything back one batch later to auto-calibrate
+// the FB tolerance and agreement window. Run twice per batch: once with
+// u_clearOnly (one workgroup zeroes the image) and once over the field.
 layout(
   local_size_x = 8,
   local_size_y = 8,
@@ -51,20 +55,36 @@ layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 // s_samplers[0] = lumaPrev, [1] = lumaCur (finest pyramid level, bilinear),
 // [2] = checked motion field (.rg = mv in field texels, .b = conf, .a = fb err).
 
-const uint STAT_COUNT = 16u;
+const uint STAT_COUNT = 96u;
+const uint HIST_PREV_BASE = 16u;
+const uint HIST_CUR_BASE = 52u;
+const uint HIST_BINS = 4u;
 shared uint s_acc[STAT_COUNT];
+
+uint lumaBin(float luma) {
+    // Compress linear-light HDR into a stable [0,1) range. These boundaries
+    // correspond to approximately 0.05, 0.18 and 0.54 in linear light, so
+    // the histogram retains useful shadow/midtone/highlight separation in SDR
+    // without clipping scRGB highlights into one unbounded bucket.
+    float v = max(luma, 0.0f);
+    float mapped = v / (1.0f + v);
+    if (mapped < 0.05f) return 0u;
+    if (mapped < 0.15f) return 1u;
+    if (mapped < 0.35f) return 2u;
+    return 3u;
+}
 
 void main() {
     uint li = gl_LocalInvocationIndex;
 
     if (u_clearOnly != 0u) {
-        if (li < STAT_COUNT)
-            imageStore(u_stats, ivec2(int(li), 0), uvec4(0u));
+        for (uint i = li; i < STAT_COUNT; i += gl_WorkGroupSize.x * gl_WorkGroupSize.y)
+            imageStore(u_stats, ivec2(int(i), 0), uvec4(0u));
         return;
     }
 
-    if (li < STAT_COUNT)
-        s_acc[li] = 0u;
+    for (uint i = li; i < STAT_COUNT; i += gl_WorkGroupSize.x * gl_WorkGroupSize.y)
+        s_acc[i] = 0u;
     barrier();
 
     ivec2 sz = textureSize(s_samplers[2], 0);
@@ -83,6 +103,7 @@ void main() {
         vec2 uv = (vec2(p) + vec2(0.5f)) * invSz;
         float lc = texture(s_samplers[1], uv).r;
         float lp = texture(s_samplers[0], uv - F * invSz).r;
+        float lpUnwarped = texelFetch(s_samplers[0], p, 0).r;
         float nrm = max(1.0f, max(abs(lc), abs(lp)));
         float resid = abs(lc - lp) / nrm;
         float mvMag = abs(F.x) + abs(F.y);
@@ -100,9 +121,20 @@ void main() {
         }
         atomicAdd(s_acc[6u + min(uint(max(fbErr, 0.0f) * 4.0f), 7u)], 1u);
         atomicAdd(s_acc[14], uint(clamp(mvMag, 0.0f, 64.0f) * 64.0f + 0.5f));
+
+        // A sectioned histogram distinguishes a real cut from large coherent
+        // motion: a pan changes pixel correspondence but usually preserves the
+        // regional luma distribution. Nine sections prevent a local explosion,
+        // HUD transition, or particle emitter from becoming a global verdict.
+        uvec2 sectionXY = min(uvec2(p) * 3u / uvec2(sz), uvec2(2u));
+        uint section = sectionXY.y * 3u + sectionXY.x;
+        atomicAdd(s_acc[HIST_PREV_BASE + section * HIST_BINS + lumaBin(lpUnwarped)], 1u);
+        atomicAdd(s_acc[HIST_CUR_BASE + section * HIST_BINS + lumaBin(lc)], 1u);
     }
 
     barrier();
-    if (li < STAT_COUNT && s_acc[li] != 0u)
-        imageAtomicAdd(u_stats, ivec2(int(li), 0), s_acc[li]);
+    for (uint i = li; i < STAT_COUNT; i += gl_WorkGroupSize.x * gl_WorkGroupSize.y) {
+        if (s_acc[i] != 0u)
+            imageAtomicAdd(u_stats, ivec2(int(i), 0), s_acc[i]);
+    }
 }

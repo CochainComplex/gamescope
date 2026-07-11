@@ -1,7 +1,7 @@
 # 07 — Frames-only SOTA alignment: what we have, what's missing
 
-Status: **design map / gap analysis**; Gap E1 implemented
-(`scripts/framegen-net-eval.py`), the rest design-only. Maps
+Status: **design map / gap analysis**; Gaps E1 and B implemented
+(`scripts/framegen-net-eval.py` and the B4 GPU scene-cut guard). Maps
 [`../research-framegen.md`](../research-framegen.md) onto the shipped pipeline and
 proposals #01–#06, then sketches the genuine gaps that are worth building.
 
@@ -62,20 +62,20 @@ existing captures. This splits Gap E honestly:
 E1 already **unblocks measuring** the other gaps structurally; E2 is what lets us
 grade the final colour frame the way the literature does.
 
-### Gap B — Content-based scene-cut detection · nearly free · high safety value
-`invalidate_history()` fires only on timing/format triggers (`idle_frame_gap`,
-`frame_gap`, EOTF/layer changes). A hard cut with steady frametime — camera
-teleport, menu open, flashbang — is extrapolated *across the cut*, producing one
-smeared generated frame. FSR 3 uses **histogram-based scene-change detection**
-for exactly this — a luminance histogram over 9 image sections, triggered on a
-significant delta (§4, verified against the GPUOpen Optical Flow docs). We
-already build a low-res luma pyramid every frame and an 8-bin FB histogram; add a
-global luma-histogram delta (or reuse the B4
-residual spike) as a `scene_cut` trigger that invalidates history and
-duplicates rather than generates that interval. This also makes the ladder's
-"re-probe full quality only on a scene change" recovery fire on *real* scene
-changes instead of only format changes — a correctness win, not just artifact
-removal. Reuses existing reductions; a handful of lines.
+### Gap B — Content-based scene-cut detection · implemented
+The B4 probe now accumulates four-bin luminance histograms for both real frames
+over a 3×3 screen partition. A tiny same-pipeline finalize dispatch declares a
+cut only when at least seven regions, global histogram total variation,
+motion-compensated residual, and unreliable-field coverage all cross
+conservative thresholds. This conjunction is important: camera motion can hurt
+pixel correspondence while preserving regional distributions, and particle
+chaos can kill most field confidence without being a cut. The verdict is
+encoded into the final field after its FB diagnostic has been consumed. Causal
+warps duplicate the newest real endpoint; bidir chooses the nearest endpoint;
+Ultra/Extreme history receives zero confidence so the cut cannot seed a false
+acceleration. No CPU round trip, future frame, vendor API, or per-generated-frame
+stats read is added. Measured B4 cost is 20–39 µs per real at 1080p–4K on the
+Radeon 890M, and a 1M-asteroid camera-motion stress run produced no false cuts.
 
 ### Gap A (flagship quality item) — Disocclusion background reservoir · moderate cost · opt-in
 **The single biggest frames-only quality gap.** On a disocclusion (revealed
@@ -154,11 +154,9 @@ frame as a research direction after Gaps E/B/A land.
 
 ## Recommended order
 
-`E → B → A → D`. **E1 is done** (`framegen-net-eval.py`); E2 (colour-frame
-capture) is the next small step and lets us grade the final frame the way the
-literature does. B is nearly free and removes a whole visible artifact class. A
-is the flagship frames-only quality gain. D is the long-horizon ceiling. #03
-stays a baseline, annotated per Part 3.
+`E → B → A → D`. **E1 and B are done**; E2 (colour-frame capture) is the next
+small measurement step and A is the flagship frames-only quality gain. D is the
+long-horizon ceiling. #03 stays a baseline, annotated per Part 3.
 
 ## Cross-check provenance (2026-07-11)
 

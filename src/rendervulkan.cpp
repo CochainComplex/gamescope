@@ -4821,10 +4821,22 @@ struct FramegenMotionStatsApplyPush_t
 {
 	float trustLo;
 	float trustHi;
-	float pad0, pad1;
+	float sceneHistSection;
+	float sceneHistGlobal;
+	float sceneResid;
+	float sceneUnreliable;
+	uint32_t sceneMinSections;
+	uint32_t detectOnly;
 
-	FramegenMotionStatsApplyPush_t( float flTrustLo, float flTrustHi )
-		: trustLo( flTrustLo ), trustHi( flTrustHi ), pad0( 0.0f ), pad1( 0.0f )
+	FramegenMotionStatsApplyPush_t( float flTrustLo, float flTrustHi, bool bDetectOnly )
+		: trustLo( flTrustLo )
+		, trustHi( flTrustHi )
+		, sceneHistSection( 0.35f )
+		, sceneHistGlobal( 0.25f )
+		, sceneResid( 0.12f )
+		, sceneUnreliable( 0.55f )
+		, sceneMinSections( 7u )
+		, detectOnly( bDetectOnly ? 1u : 0u )
 	{
 	}
 };
@@ -4850,10 +4862,10 @@ struct FramegenMotionNetTrainPush_t
 	uint32_t seed;
 	uint32_t sliceBase;
 	float mode;
-	float pad0;
+	uint32_t sceneCutGuard;
 
-	FramegenMotionNetTrainPush_t( uint32_t uSeed, uint32_t uSliceBase )
-		: seed( uSeed ), sliceBase( uSliceBase ), mode( 0.0f ), pad0( 0.0f )
+	FramegenMotionNetTrainPush_t( uint32_t uSeed, uint32_t uSliceBase, bool bSceneCutGuard )
+		: seed( uSeed ), sliceBase( uSliceBase ), mode( 0.0f ), sceneCutGuard( bSceneCutGuard ? 1u : 0u )
 	{
 	}
 };
@@ -4908,10 +4920,10 @@ struct FramegenMotionResources_t
 	// rejects stale history when shared-queue admission skipped an interval.
 	gamescope::OwningRc<CVulkanTexture> mvFieldHistory;
 	uint64_t uMotionHistoryFrameId = 0;
-	// Self-supervised adaptation (B4): the 16x1 R32_UINT counter image the
-	// stats probe atomically accumulates into (read by the warps in the same
-	// batch as a global field-trust factor), and its host-mapped linear copy
-	// the CPU parses one batch later to auto-calibrate thresholds. 64 bytes
+	// Self-supervised adaptation (B4): the 96x1 R32_UINT counter image the
+	// stats probe atomically accumulates into (applied to the motion field in
+	// the same batch), and its host-mapped linear copy the CPU parses one batch
+	// later to auto-calibrate thresholds. 384 bytes
 	// each; allocated with the other motion intermediates so the warps can
 	// bind the accumulator unconditionally.
 	gamescope::OwningRc<CVulkanTexture> statsAccum;
@@ -6445,6 +6457,7 @@ static constexpr float k_flFramegenAdaptResidLow = 0.045f;
 // space window needs a substantially larger offset than the block measure.
 static constexpr float k_flFramegenAdaptNoiseToAgree = 6.0f;
 static constexpr float k_flFramegenAdaptAgreeOffMax = 0.15f;
+static constexpr uint32_t k_uFramegenStatsCount = 96u;
 
 FramegenMotionStatsPush_t::FramegenMotionStatsPush_t( bool bClearOnly )
 	: clearOnly( bClearOnly ? 1u : 0u )
@@ -6506,7 +6519,7 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 		return;
 	h.ulAdaptConsumedSeqNo = h.ulAdaptStatsSeqNo;
 
-	uint32_t s[ 16 ];
+	uint32_t s[ k_uFramegenStatsCount ];
 	memcpy( s, g_framegenMotion.statsReadback->mappedData(), sizeof( s ) );
 	const uint32_t uTotal = s[ 0 ];
 	// Sanity: a resolution far past 8K at field res would be a stale/garbage
@@ -6519,6 +6532,11 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 	const float flBadFrac = (float)s[ 2 ] / (float)uAlive;
 	const float flKilledFrac = (float)s[ 3 ] / (float)uTotal;
 	const float flMvMean = ( (float)s[ 14 ] / 64.0f ) / (float)uTotal;
+	if ( s[ 88 ] != 0u )
+	{
+		vk_log.infof( "framegen: content scene cut detected (%u/9 sections, histogram distance %.2f); presenting a real endpoint",
+			s[ 89 ], (float)s[ 90 ] / 1024.0f );
+	}
 	// Noise floor only when enough static texels back it (a fully-moving frame
 	// has no static sample; keep the previous estimate).
 	const float flNoise = s[ 5 ] >= 64u ? ( (float)s[ 4 ] / 1024.0f ) / (float)s[ 5 ] : -1.0f;
@@ -6574,9 +6592,10 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 	static uint64_t s_uAdaptDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uAdaptDebugLogCounter ) )
 	{
-		vk_log.infof( "framegen: adapt resid=%.3f bad=%.1f%% killed=%.1f%% noise=%.4f fbP75=%.2f mv=%.1f -> fbTol=%.2f agree=%.2f/%.2f",
+		vk_log.infof( "framegen: adapt resid=%.3f bad=%.1f%% killed=%.1f%% noise=%.4f fbP75=%.2f mv=%.1f scene=%u(%u/9 hist=%.2f) -> fbTol=%.2f agree=%.2f/%.2f",
 			flResid, flBadFrac * 100.0f, flKilledFrac * 100.0f,
 			h.flAdaptNoiseEma, h.flAdaptFbP75Ema, flMvMean,
+			s[ 88 ], s[ 89 ], (float)s[ 90 ] / 1024.0f,
 			framegen_adapt_fbcheck_tol(), framegen_adapt_agree_lo(), framegen_adapt_agree_hi() );
 	}
 }
@@ -6695,8 +6714,8 @@ static void framegen_motion_bind_sampler( CVulkanCmdBuffer *pCmdBuffer, uint32_t
 // counters in the host-mapped readback for the CPU-side threshold
 // calibration. The command buffer's barrier tracking orders all of it
 // (accumulate -> apply is a WAR on the field, covered by the execution
-// dependency of the stats image's own barrier). Field-res work plus a 64-byte
-// copy: ~10 microseconds.
+// dependency of the stats image's own barrier). Field-res work plus a 384-byte
+// copy: still sub-kilobyte and intended to remain in the microsecond range.
 static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH )
 {
 	if ( g_framegenMotion.statsAccum == nullptr || g_framegenMotion.statsReadback == nullptr )
@@ -6715,22 +6734,27 @@ static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t 
 	pCmdBuffer->dispatch( 1, 1 );
 	pCmdBuffer->pushConstants<FramegenMotionStatsPush_t>( false );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
-	pCmdBuffer->copyImage( g_framegenMotion.statsAccum, g_framegenMotion.statsReadback );
-
 	// Scale the field confidence by the measured trust; in bidir the reverse
 	// field carries the same scene-level verdict.
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_STATS_APPLY ) );
 	pCmdBuffer->bindTarget( framegen_motion_field() );
 	pCmdBuffer->bindTarget2( g_framegenMotion.statsAccum );
-	pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>( k_flFramegenTrustLo, k_flFramegenTrustHi );
+	// Finalize the sectioned histogram once. This dispatch writes stats[88],
+	// then the field-sized pass broadcasts that verdict one read per workgroup.
+	pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>( k_flFramegenTrustLo, k_flFramegenTrustHi, true );
+	pCmdBuffer->dispatch( 1, 1 );
+	pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>( k_flFramegenTrustLo, k_flFramegenTrustHi, false );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 	if ( vulkan_framegen_bidir_active() && framegen_motion_field_rev() != nullptr )
 	{
 		pCmdBuffer->bindTarget( framegen_motion_field_rev() );
 		pCmdBuffer->bindTarget2( g_framegenMotion.statsAccum );
-		pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>( k_flFramegenTrustLo, k_flFramegenTrustHi );
+		pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>( k_flFramegenTrustLo, k_flFramegenTrustHi, false );
 		pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 	}
+	// Copy after scene finalization so the next-batch debug/CPU consumer sees
+	// the same verdict that this batch's warps consumed.
+	pCmdBuffer->copyImage( g_framegenMotion.statsAccum, g_framegenMotion.statsReadback );
 }
 
 // Learned field refinement (Stage C), recorded with the checked fields final.
@@ -6790,11 +6814,11 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 // and the one-batch-in-flight rule serializes everything across batches.
 // Training reads the RAW fields: the net never trains on its own output.
 // Returns true when this batch also carries a profile-dump copy.
-static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer )
+static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, bool bSceneCutGuard )
 {
 	FramegenMotionResources_t &m = g_framegenMotion;
 	if ( m.netState == nullptr || m.netGradSlices == nullptr || m.netWeightsPrior == nullptr
-		|| m.mvFieldRevChk == nullptr || m.width < 16 || m.height < 16 )
+		|| m.statsAccum == nullptr || m.mvFieldRevChk == nullptr || m.width < 16 || m.height < 16 )
 		return false;
 
 	const uint32_t uOptGroups = div_roundup( k_uFramegenNetFloats, 64u );
@@ -6831,21 +6855,23 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer )
 
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET_TRAIN ) );
 	pCmdBuffer->bindTarget( m.netGradSlices );
+	pCmdBuffer->bindTarget2( m.statsAccum );
 	framegen_motion_bind_sampler( pCmdBuffer, 0, m.lumaPrev, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 1, m.lumaCur, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 2, m.mvField, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 3, m.mvFieldRevChk, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 4, m.netState, true );
-	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed, 0u );
+	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed, 0u, bSceneCutGuard );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
 	pCmdBuffer->bindTarget( m.netGradSlices );
+	pCmdBuffer->bindTarget2( m.statsAccum );
 	framegen_motion_bind_sampler( pCmdBuffer, 0, m.lumaCur, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 1, m.lumaPrev, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 2, m.mvFieldRevChk, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 3, m.mvField, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 4, m.netState, true );
-	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed ^ 0x55555555u, uHalf );
+	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed ^ 0x55555555u, uHalf, bSceneCutGuard );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
 	bindOpt();
@@ -7067,20 +7093,21 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		g_framegenMotion.statsAccum = nullptr;
 		g_framegenMotion.statsReadback = nullptr;
 		g_framegenHistory.ulAdaptStatsSeqNo = 0;
-		if ( bAllocated && framegen_adapt_enabled( eQuality ) )
+		if ( bAllocated && ( framegen_adapt_enabled( eQuality )
+			|| ( framegen_net_requested( eQuality ) && framegen_net_online_enabled() ) ) )
 		{
 			CVulkanTexture::createFlags accumFlags;
 			accumFlags.bStorage = true;
 			accumFlags.bTransferSrc = true;
 			g_framegenMotion.statsAccum = new CVulkanTexture();
-			bAllocated = g_framegenMotion.statsAccum->BInit( 16, 1, 1u, DRM_FORMAT_R32UI, accumFlags );
+			bAllocated = g_framegenMotion.statsAccum->BInit( k_uFramegenStatsCount, 1, 1u, DRM_FORMAT_R32UI, accumFlags );
 			if ( bAllocated )
 			{
 				CVulkanTexture::createFlags readbackFlags;
 				readbackFlags.bMappable = true;
 				readbackFlags.bTransferDst = true;
 				g_framegenMotion.statsReadback = new CVulkanTexture();
-				bAllocated = g_framegenMotion.statsReadback->BInit( 16, 1, 1u, DRM_FORMAT_R32UI, readbackFlags );
+				bAllocated = g_framegenMotion.statsReadback->BInit( k_uFramegenStatsCount, 1, 1u, DRM_FORMAT_R32UI, readbackFlags );
 			}
 		}
 		// Stage C intermediates. Failures here disable the feature, not the
@@ -7510,19 +7537,18 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	}
 	if ( bMotion && g_framegenMotion.mvFieldNet != nullptr )
 		framegen_record_net( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height, bBidir );
-	// C2: one online learning step per batch — gradients from this very
-	// frame pair, optimizer publish for the next. Rides the same command
-	// buffer; ~8M MACs, an order cheaper than the inference pass above.
-	// True = the batch also carries the served-weights readback copy that
-	// feeds the CPU health check and the profile persistence.
-	const bool bNetStateReadback = g_framegenMotion.bNetActive && framegen_net_online_enabled()
-		&& framegen_record_net_train( pCmdBuffer.get() );
-
 	// B4: with the field final, record the quality probe — the warps below
 	// read its verdict in this same batch, the CPU next batch.
 	const bool bAdaptProbe = bMotion && framegen_adapt_enabled( eff.quality );
 	if ( bAdaptProbe )
 		framegen_record_adapt_probe( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height );
+
+	// C2: train after the probe so a content cut can zero every gradient slice
+	// before Adam sees it. Same-batch inference still used the pre-step weights;
+	// the optimizer publishes only for the next batch. When adaptation is
+	// explicitly disabled, training retains its previous unguarded behavior.
+	const bool bNetStateReadback = g_framegenMotion.bNetActive && framegen_net_online_enabled()
+		&& framegen_record_net_train( pCmdBuffer.get(), bAdaptProbe );
 	if ( bMotion )
 	{
 		// Each warp reads the shared motion field(s) and history; keep per-slot.
@@ -8014,7 +8040,7 @@ void vulkan_framegen_benchmark()
 			} );
 			printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion setup (per real)", msMotionPrep );
 
-			// B4 stats probe (clear + accumulate + 64-byte readback copy) —
+			// B4 stats probe (clear + accumulate + 384-byte readback copy) —
 			// recorded after setup in production, so its cost adds to the
 			// per-real tail, not per-slot.
 			if ( framegen_adapt_enabled( g_eFramegenQuality ) )

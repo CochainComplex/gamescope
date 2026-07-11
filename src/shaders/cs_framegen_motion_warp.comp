@@ -46,6 +46,10 @@ void main() {
     vec3 currentFrame = currentSample.rgb;
 
     vec4 mvSample = texture(s_samplers[2], uv);
+    if (mvSample.a < -0.5f) {
+        imageStore(dst, coord, currentSample);
+        return;
+    }
     vec2 mvLow = mvSample.rg;                       // prev->cur flow, low-res texels
     float conf = clamp(mvSample.b, 0.0f, 1.0f);
 

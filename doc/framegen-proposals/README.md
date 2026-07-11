@@ -167,6 +167,12 @@ along with these hardening/quality passes:
   window to the content on the CPU one batch later (loosening the round-trip
   kill only where ambiguity is measurably harmless, widening the agreement
   window by the measured temporal-noise floor).
+- **Content scene-cut rejection** (part of adaptation at high and above) — four-bin luminance
+  histograms over nine screen regions distinguish a hard content cut from coherent motion, while
+  prediction residual and failed-field coverage provide independent confirmation. The verdict is
+  finalized once on the GPU in the same batch; causal prediction duplicates the newest endpoint
+  and bidirectional prediction chooses the nearest real endpoint, so unrelated scenes are never
+  warped or dissolved together. The 1M-asteroid/camera-motion stress test produced no false cuts.
 - **Learned forward-field refinement** (opt-in,
   `GAMESCOPE_FRAMEGEN_NET=<weights>`, motion mode) — a ~4.6k-parameter
   fused-conv net refines the causal checked field once per real frame at field
@@ -234,8 +240,8 @@ build on top of that foundation.
    the shipped pipeline and proposals #01–#06: which SOTA ideas are already in
    the tree (extrapolation-first, quadratic acceleration, per-pixel color-match
    arbitration, UI post-composite), and the genuine frames-only gaps worth
-   building — a perceptual/temporal validation harness, content-based scene-cut
-   detection, a GFFE-style disocclusion background reservoir, and an optional
-   color-domain shading-correction net head. **Design map / gap analysis**; its
-   Gap E1 structural/temporal validation harness is implemented
-   (`scripts/framegen-net-eval.py`).
+   building — a perceptual/temporal validation harness, a GFFE-style
+   disocclusion background reservoir, and an optional color-domain
+   shading-correction net head. **Design map / gap analysis**; Gap E1's
+   structural/temporal evaluator (`scripts/framegen-net-eval.py`) and Gap B's
+   GPU content scene-cut guard are implemented.

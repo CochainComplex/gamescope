@@ -195,8 +195,12 @@ This is a prototype. Keep the following in mind:
 * **Scene changes.** Prediction history is dropped automatically on focus
   change, overlay/notification appearance or disappearance, SDR↔HDR/EOTF
   changes, resolution or format changes, and long frame gaps, so stale content
-  is never smeared across a scene transition. Generation resumes one frame
-  later. Overlay-only repaints (e.g. a MangoHud update) never count as game
+  is never smeared across a scene transition. High and higher motion tiers also
+  compare nine regional luminance histograms plus motion-compensated prediction
+  error in the same GPU batch. A content cut with steady frametime duplicates
+  the newest real frame instead of extrapolating across unrelated images (or
+  selects the nearest real endpoint in bidirectional mode). Overlay-only
+  repaints (e.g. a MangoHud update) never count as game
   frames and always win over a pending generated frame. Screenshots and
   pipewire streaming captures run separate passes and don't interact with
   frame generation.
