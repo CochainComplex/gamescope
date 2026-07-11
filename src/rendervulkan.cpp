@@ -5329,6 +5329,28 @@ static bool framegen_bidir_enabled()
 	return s_bEnabled;
 }
 
+// Experimental low-latency cadence compromise. The accepted bidir baseline
+// places generated phases on the measured-gap grid (k/gap), which keeps warp
+// distance and endpoint latency low but leaves a larger final jump whenever
+// the source gap exceeds the multiplier. A value in [0,1] moves those phases
+// part-way toward the uniform multiplier grid without changing queue drain or
+// flip timing. Zero is the exact established behavior; keep it the default
+// until live A/B proves a non-zero compromise improves both motion and image.
+static float framegen_bidir_phase_bias()
+{
+	static const float s_flBias = []()
+	{
+		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS" );
+		if ( pszEnv == nullptr || *pszEnv == '\0' )
+			return 0.0f;
+		char *pEnd = nullptr;
+		const float fl = strtof( pszEnv, &pEnd );
+		return pEnd != pszEnv && *pEnd == '\0' && std::isfinite( fl )
+			? std::clamp( fl, 0.0f, 1.0f ) : 0.0f;
+	}();
+	return s_flBias;
+}
+
 bool vulkan_framegen_bidir_active()
 {
 	return framegen_bidir_enabled()
@@ -7907,9 +7929,16 @@ static bool framegen_submit_batch( uint32_t nFirstSlot, uint32_t nGapVblanks, ui
 	// with framegen_jit_submit below, where it is a display-clock measurement.
 	std::vector<FramegenSlotRequest_t> requests;
 	requests.reserve( nGenerate );
-	for ( uint32_t k = nFirstSlot; k < nFirstSlot + nGenerate; k++ )
+	const float flBidirPhaseBias = vulkan_framegen_bidir_active()
+		? framegen_bidir_phase_bias() : 0.0f;
+	for ( uint32_t i = 0; i < nGenerate; i++ )
 	{
-		const float phase = (float)k / (float)nGapVblanks;
+		const uint32_t k = nFirstSlot + i;
+		const float flGapPhase = (float)k / (float)nGapVblanks;
+		const float flUniformPhase = (float)( i + 1u ) / (float)( nGenerate + 1u );
+		const float phase = flBidirPhaseBias > 0.0f
+			? flGapPhase + ( flUniformPhase - flGapPhase ) * flBidirPhaseBias
+			: flGapPhase;
 		// Effective forward coefficient: temporal placement scaled by the user
 		// strength (0.5 is neutral, reproducing the classic x2 half-way step).
 		// Idle refill can move past the originally expected next-real slot when
@@ -8389,8 +8418,13 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		{
 			const bool bBidirActive = vulkan_framegen_bidir_active();
 			if ( bBidirActive )
+			{
 				vk_log.infof( "framegen: bidirectional quality path — symmetric checked forward/reverse fields%s; causal acceleration, Extreme color-guided reconstruction, reservoir and shading are not scheduled",
 					framegen_agreement_enabled( g_eFramegenQuality ) ? " + full-resolution agreement" : "" );
+				if ( framegen_bidir_phase_bias() > 0.0f )
+					vk_log.infof( "framegen: experimental bidir phase bias %.2f — low-latency queue timing preserved; generated phases move partially from k/gap toward uniform multiplier spacing",
+						framegen_bidir_phase_bias() );
+			}
 			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Low )
 				vk_log.infof( "framegen: low quality — forward matcher + constant-velocity warp only" );
 			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Medium )

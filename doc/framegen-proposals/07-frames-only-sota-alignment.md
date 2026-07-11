@@ -157,6 +157,22 @@ starting profile showed all 4499 non-confidence floats bit-identical; only 139
 of 144 confidence-row weights and its bias moved. The original user profile was
 never written during the experiment.
 
+### Rejected experiment — full bidir display-grid pacing
+A live 1M-asteroid x4 trial replaced the low-latency `k/gap` phase queue with
+uniform `.25/.50/.75` phases and display-clock-spaced flips across the whole
+measured interval. Camera cadence was steadier, proving the prior burst/hold
+pattern is perceptible when the source gap exceeds the multiplier. The overall
+trade was still negative: later uncertain warps produced much more blur and
+edge-tear behavior, while holding the real endpoint for the full grid felt
+clearly less responsive. The implementation was removed rather than hidden
+behind a default.
+
+The conservative follow-up is `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS` (default
+`0`). It preserves the accepted queue timing and endpoint latency exactly, and
+only blends generated phases part-way from `k/gap` toward uniform multiplier
+spacing. This is an A/B control, not a claimed quality default; any promotion
+requires the live result to retain baseline sharpness and responsiveness.
+
 ### Gap D — Color-domain shading correction · bounded frames-only form implemented
 Non-geometric motion — lagging shadows, reflections, specular — is
 *unrepresentable* as a motion vector, so no field refinement can fix it. GFFE's

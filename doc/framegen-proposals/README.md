@@ -79,6 +79,7 @@ untested, so enable one at a time.
 | `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE=1` | Force the shared-queue regime (disables the dedicated-queue features `GAMESCOPE_FRAMEGEN_JIT` / `GAMESCOPE_FRAMEGEN_VRR_HYBRID`). |
 | `GAMESCOPE_FRAMEGEN_BENCHMARK` | Run the shader microbenchmark, then exit before output creation (**presence-only** — even `=0` triggers it). |
 | `GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW=1` | Restore experimental endpoint-trained flow correction/confidence raises in bidir for A/B only. Default off because it produced heavy intermediate-frame artifacts in live x4 testing. |
+| `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS=0…1` | Experimental low-latency bidir cadence A/B. Blends generated phases from the sharp/snappy `k/gap` baseline toward uniform multiplier spacing without changing flip timing. Default `0`; full display-grid pacing was rejected as blurrier, more edge-torn, and less responsive. |
 
 ### The learned refiner (Stage C) in four steps
 

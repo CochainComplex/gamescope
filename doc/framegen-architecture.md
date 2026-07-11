@@ -322,6 +322,12 @@ Bidir removes it by generating BETWEEN the two real frames instead of past the n
   but introduces hold/jump judder; reusing rejected flow restores sharpness by reintroducing the
   tearing/shape artifacts the checks rejected. Do not change this trade without E2 final-color
   temporal evidence or a genuinely independent motion/depth signal.
+- **Rejected full-grid pacing experiment:** coupling x4 phases to `.25/.50/.75` and spacing their
+  flips uniformly across a long measured gap made low-rate camera motion steadier, but live 1M-
+  asteroid A/B produced substantially more blur and edge-tear artifacts and felt less responsive.
+  It increased both uncertain late-phase displacement and endpoint latency. The display-target
+  implementation was removed. `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS` is the conservative follow-up:
+  it keeps the accepted immediate queue timing and moves phases only fractionally; default zero.
 - **Scheduling** (the substantive change): the pending queue becomes the **presentation
   timeline**. A recording real frame appends `[interp(k/gap)…, realN]` (never clears — nothing is
   stale; phases interpolate the *measured, just-completed* interval, so bidir never speculates
@@ -576,7 +582,9 @@ slots even after a fast interval. `nGenerate = min(gap−1, max(1, eff.multiplie
 than the whole-vblank gap** (the final slot *is* the next real frame). Shared-queue caps to 1.
 Per slot (`submit_batch:5335-5340`): `phase = k/nGapVblanks`; `strength = clamp(phase ·
 (g_flFramegenStrength / 0.5), 0, k_flFramegenMaxForwardStrength=1.5)`. `strength 0.5` reproduces the
-classic x2 half-step.
+classic x2 half-step. The opt-in `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS` blends bidir's generated
+phases part-way toward `j/(nGenerate+1)` without changing its established queue/flip timing;
+zero is bit-exact to the baseline.
 
 ### 4.4 Monotonic degradation ladder (#04, `:5849-5896`)
 

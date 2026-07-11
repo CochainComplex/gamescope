@@ -196,7 +196,9 @@ about one frame of lag**, so avoid it for fast/competitive shooters. Great for
 single-player, racing, scenery. Extreme's causal acceleration, guided
 reconstruction, disocclusion reservoir and shading-persistence correction do
 not run in this mode; bidirectional interpolation uses two checked endpoint
-fields instead.
+fields instead. `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS=0.25` is an experimental
+compromise for low-source-rate A/B: it slightly evens generated phase spacing
+without adding flip latency. The default `0` is the established sharp/snappy path.
 
 ### d) Base-layer — fixes blurry menus / HUD
 ```bash
@@ -213,7 +215,9 @@ GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 gamescope --prefer-vk-device "$PRESENT" --adapti
 Keeps your monitor's adaptive-sync (FreeSync/G-Sync) working *with* frame
 generation. **Only does something on a real VRR monitor that's actually in VRR
 mode** — on an ordinary monitor (and most laptop screens) it quietly does
-nothing and falls back to normal.
+nothing and falls back to normal. This uses the causal timeline and cannot be
+combined with bidirectional interpolation; requesting both keeps VRR hybrid and
+ignores bidirectional mode.
 
 ### f) AI refiner (most experimental)
 ```bash
