@@ -1,19 +1,27 @@
-# Frame-generation design proposals
+# Frame generation — engineer's reference
 
-This directory collects forward-looking design proposals for gamescope's
-experimental compositor-side frame generation. Each specifies motivation, the
-Vulkan mechanisms, concrete integration points in the tree, a latency/throughput
-analysis, an adversarial risk table, and a testing plan. Most are **design
-documents**; each proposal's `Status:` line says whether it has since been
-implemented. Of the numbered proposals, #04 is implemented and #01, #02 and #06
-have env-gated prototypes; #07 is a research-to-implementation map rather than a
-single mechanism; the **quick reference** below lists every flag and toggle and
-exactly what each one needs.
+The terse engineer's reference for gamescope's compositor-side frame generation.
+Three things live here: the complete **flag / toggle reference**, **how the
+shipped pipeline works** (and where each piece comes from in the literature), and
+the forward-looking **design proposals** this directory grew out of. It's the
+reference; the other framegen docs are the tutorial, the deep dive, and the
+survey:
 
-> **Just want to use it?** Start with the plain-language
-> [**How-To guide**](../framegen-howto.md) — two-card setup, how to connect the
-> display, copy-paste commands per mode, and current limitations. The tables
-> below are the terse engineer's reference.
+- 🕹️ [**How-To**](../framegen-howto.md) — plain-language setup: the two-card split, wiring the display, copy-paste commands per mode, current limits. **Start here to *use* it.**
+- 🔧 [**Architecture**](../framegen-architecture.md) — the deep implementation map: end-to-end dataflow, the algorithmic branches, the decision state machine, resource design, and the §3.6 prior-art table.
+- 📚 [**Research survey**](../research-framegen.md) — the frames-only state of the art this pipeline is measured against (primary-source cross-checked).
+
+**What's shipped vs. proposed.** Everything in the
+[quick reference](#quick-reference-enabling-each-feature) below **exists in the
+tree today** — the master switch, the motion-quality stack, bidirectional
+interpolation, the learned refiner + in-situ training, and the #04 degradation
+ladder all ship (the alternative placement modes — base-layer, VRR-hybrid, JIT —
+as env-gated prototypes). The numbered [proposals](#proposals) are the roadmap and
+carry their own authoritative `Status:` lines: **#04 implemented**; **#01 / #02 /
+#06** env-gated prototypes; **#03 / #05** design-only; **#07** a
+research-to-implementation map (its Gap E1 evaluator is built). Each design doc
+specifies motivation, the Vulkan mechanisms, concrete integration points, a
+latency/throughput analysis, an adversarial risk table, and a testing plan.
 
 ## Quick reference: enabling each feature
 
@@ -100,7 +108,7 @@ only un-kill vectors that predict the current frame pair) — without that
 gate, mid-training miscalibration showed up on screen as small squares of
 stale content.
 
-## Context: how the shipped features work
+## How the shipped pipeline works
 
 Frame generation itself (enabled with `--experimental-framegen`) is in the tree,
 along with these hardening/quality passes:
