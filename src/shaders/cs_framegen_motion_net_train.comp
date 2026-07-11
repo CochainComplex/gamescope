@@ -123,6 +123,7 @@ vec3 bilinearGrad(vec2 c, ivec2 sz) {
 void main() {
     uint li = gl_LocalInvocationIndex;
     ivec2 sz = textureSize(s_samplers[2], 0);
+    bool conservativeBidir = (u_flags & 4u) != 0u;
 
     // A hard cut is not a learnable motion sample. Every invocation observes
     // the same global flag, so returning before the first barrier is uniform.
@@ -224,7 +225,10 @@ void main() {
         ivec2 q = origin + ivec2(cx, cy);
         vec4 X0 = texelFetch(s_samplers[2], q, 0);
         vec2 th = tanh(vec2(o[0], o[1]));
-        vec2 dF = 2.0f * th;
+        // Endpoint photometric loss cannot identify a trustworthy path through
+        // intermediate time. Conservative bidir therefore trains against the
+        // checked field itself and sends no gradient into either flow head.
+        vec2 dF = conservativeBidir ? vec2(0.0f) : 2.0f * th;
         vec2 Fh = X0.xy + dF;
 
         float ld = texelFetch(s_samplers[1], q, 0).r;
@@ -235,8 +239,14 @@ void main() {
         // the confidence loss should reshape flow.
         float refinedResid = abs(wg.x - ld) / max(1.0f, max(abs(wg.x), abs(ld)));
         float gate = 1.0f - smoothstep(0.03f, 0.10f, refinedResid);
-        float dcChain = o[2] < 0.0f ? 1.0f : gate;
-        float dc = o[2] * dcChain;
+        // Bidir ML is a veto, never an authority: it may route an unreliable
+        // checked vector toward the phase-correct crossfade, but cannot raise
+        // confidence. Define the zero hinge from the negative side so a neutral
+        // output can learn a suppression when the fallback wins.
+        float dcChain = conservativeBidir
+            ? (o[2] <= 0.0f ? 1.0f : 0.0f)
+            : (o[2] < 0.0f ? 1.0f : gate);
+        float dc = conservativeBidir ? min(o[2], 0.0f) : o[2] * dcChain;
         float chRaw = X0.z + dc;
         float ch = clamp(chRaw, 0.0f, 1.0f);
 
@@ -256,7 +266,9 @@ void main() {
         float dLdWarp = ((ch + FLOW_AUX) * invN) * (ew / rw);
         vec2 dLdFh = -dLdWarp * wg.yz;
         vec2 dLddF = dLdFh + (2.0f * LAMBDA_DF * invN) * dF;
-        vec2 do01 = dLddF * 2.0f * (1.0f - th * th);
+        vec2 do01 = conservativeBidir
+            ? vec2(0.0f)
+            : dLddF * 2.0f * (1.0f - th * th);
 
         // Head four learns whether the previous interval's aligned luma trend
         // persisted into the now-observed destination. This is the causal target
@@ -265,7 +277,7 @@ void main() {
         // evidence stop-gradient; this head is a focus verdict, not another route
         // for reshaping flow.
         float do3 = 0.0f;
-        if ((u_flags & 2u) != 0u) {
+        if (!conservativeBidir && (u_flags & 2u) != 0u) {
             vec2 prevPos = vec2(q) + 0.5f - Fh;
             vec4 oldField = texture(s_samplers[6], prevPos / vec2(sz));
             float oldConf = clamp(oldField.b, 0.0f, 1.0f);
@@ -327,11 +339,11 @@ void main() {
         int pos = int(i) / C_MID;
         int px = pos % T2, py = pos / T2;
         float g = 0.0f;
-        if (s_a2[i] > 0.0f) {
-            // Keep the new objective out of the shared trunk: online shading
-            // adaptation trains only W3/b3 row four. The established flow and
-            // confidence representation therefore remains governed exclusively by
-            // its original loss, avoiding cross-head regression.
+        if (!conservativeBidir && s_a2[i] > 0.0f) {
+            // Causal shading adaptation trains only W3/b3 row four, hence the
+            // co<3 limit. Conservative bidir freezes the trunk altogether:
+            // only W3/b3's confidence row receives a gradient, preventing an
+            // endpoint loss from silently reshaping the geometry representation.
             for (int co = 0; co < 3; co++)
             for (int tap = 0; tap < 9; tap++) {
                 int ox = px - tap % 3, oy = py - tap / 3;

@@ -71,9 +71,12 @@ uniform motion_net_t {
     // Task-conditioning input channel the net was trained with (0 =
     // endpoint/pair supervision; reserved for future objectives).
     float u_mode;
-    float u_pad0;
-    float u_pad1;
-    float u_pad2;
+    // Output policy. Causal prediction enables all three. Conservative bidir
+    // keeps the FB-checked trajectory, permits confidence reductions only,
+    // and cannot emit the causal shading focus.
+    float u_flowScale;
+    float u_confidenceRaiseScale;
+    float u_shadingScale;
 };
 
 // The refined field (.rg = flow + bounded residual, .b = recalibrated
@@ -282,7 +285,7 @@ void main() {
     if (op.x >= sz.x || op.y >= sz.y)
         return;
     vec4 X0 = texelFetch(s_samplers[2], op, 0);
-    vec2 dF = 2.0f * tanh(vec2(o0, o1));
+    vec2 dF = u_flowScale * 2.0f * tanh(vec2(o0, o1));
     // Confidence raises are gated by the CORRECTED field's evidence. Gating
     // on the raw residual made the bounded flow head unable to rehabilitate a
     // rejected vector: even a correction that reconstructed this frame pair
@@ -294,11 +297,13 @@ void main() {
     float ld = texelFetch(s_samplers[1], op, 0).r;
     float lw = texture(s_samplers[0], refinedUv).r;
     float resid = abs(ld - lw) / max(1.0f, max(abs(ld), abs(lw)));
-    float dc = o2 < 0.0f ? o2 : o2 * (1.0f - smoothstep(0.03f, 0.10f, resid));
+    float dc = o2 < 0.0f
+        ? o2
+        : u_confidenceRaiseScale * o2 * (1.0f - smoothstep(0.03f, 0.10f, resid));
     imageStore(u_refined, op, vec4(X0.xy + dF, clamp(X0.z + dc, 0.0f, 1.0f), X0.w));
     // max(tanh, 0) makes every legacy/neutral zero head bit-exact off. Online
     // training can raise focus only where a color trend survived across three
     // causally observed real frames; negative evidence parks safely at zero.
-    float focus = max(tanh(o3), 0.0f);
+    float focus = u_shadingScale * max(tanh(o3), 0.0f);
     imageStore(u_shadingFocus, op, vec4(focus, 0.0f, 0.0f, 0.0f));
 }

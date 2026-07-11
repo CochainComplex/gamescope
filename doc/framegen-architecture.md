@@ -69,9 +69,10 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - `GAMESCOPE_FRAMEGEN_ADAPT` — **B4 self-supervised adaptation** (`framegen_adapt_enabled`; motion mode). Each real frame grades the field that predicted it (field-res stats probe, measured 20–39 µs per real at 1080p–4K on Radeon 890M); a same-batch apply pass folds a global field-trust factor into the field's confidence and rejects content scene cuts from nine regional luminance histograms, while the next-batch CPU readback auto-calibrates the FB tolerance and agreement window (see §3.4). `=0` disables (B3-bit-exact warps, no probe). An explicit `_FB_TOL` pins the tolerance against auto-calibration.
 - `GAMESCOPE_FRAMEGEN_RESERVOIR` — Extreme causal mode only, default on; `=0` disables the three-real-frame screen-space disocclusion resolver for live A/B attribution. It is never allocated or sampled by lower tiers or bidirectional interpolation.
 - `GAMESCOPE_FRAMEGEN_SHADING` — Extreme causal mode with the learned net only, default on; `=0` disables fourth-head in-situ supervision and the final bounded color-trend correction for an otherwise-identical net/queue A/B. Lower tiers and bidir never consume the focus map.
-- `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned forward-field refinement** (`framegen_net_weights_path`; motion mode, no `_BIDIR` requirement). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). In Extreme, output four is additionally a zero-neutral shading-persistence focus map; it never predicts pixels. Bidir additionally refines the reverse field. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
+- `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned refinement** (`framegen_net_weights_path`; motion High+). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). In Extreme causal mode, output four is additionally a zero-neutral shading-persistence focus map; it never predicts pixels. **Bidir's default contract is stricter:** both directions keep their FB-checked geometry bit-exact and ML may only lower confidence. Endpoint reconstruction cannot prove that a vector traces a valid intermediate-time path. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
+- `GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW` — truthy int; **experimental attribution switch, default off**. Restores the old learned flow correction and confidence raises in bidir. Live 1M-asteroid x4 testing found better endpoint/camera response but substantially more intermediate-frame artifacts, so this is not a production quality setting.
 - `GAMESCOPE_FRAMEGEN_RECORD` — directory; **Stage C dataset capture** (motion mode, no `_BIDIR` requirement). Dumps raw field-res training tensors (both lumas + both checked fields, pre-refinement/pre-trust) one `GSFD` file per real frame, up to `GAMESCOPE_FRAMEGEN_RECORD_MAX` (default 1000, ~0.6–1.2 MB each — mind the disk).
-- `GAMESCOPE_FRAMEGEN_NET_ONLINE` — truthy int; **C2 in-situ learning** (see §3.5). The refiner keeps training on the framegen GPU against every real frame; works with a `_NET` blob as the prior or from a synthesized neutral init. Without `_NET_PROFILE` the model is **ephemeral — nothing is ever written to disk**. `_NET_LR` (default `3e-4`), `_NET_EVERY` (train every Nth real frame, default 1) tune it; `_NET_PROFILE=<path>` makes the learning persistent per game: loaded as the prior when present (a malformed/torn file is rejected loudly and the neutral prior used instead), checkpointed back every 1024 trained steps **off-thread** (file I/O never rides the render thread) and flushed at exit and on every framegen reset, so sessions shorter than the checkpoint interval persist too. Writes are atomic (temp + rename): a crash or a full disk can never tear an existing good profile. The served weights are health-checked every trained step; a non-finite value re-initializes the optimizer state from the prior automatically and is never persisted.
+- `GAMESCOPE_FRAMEGEN_NET_ONLINE` — truthy int; **C2 in-situ learning** (see §3.5). The causal refiner keeps training all established flow/confidence outputs on the framegen GPU. Conservative bidir trains **only the final confidence row/bias**, with flow heads and the shared trunk frozen; its learned output can only suppress a checked vector. Works with a `_NET` blob as the prior or from a synthesized neutral init. Without `_NET_PROFILE` the model is **ephemeral — nothing is ever written to disk**. `_NET_LR` (default `3e-4`), `_NET_EVERY` (train every Nth real frame, default 1) tune it; `_NET_PROFILE=<path>` makes the learning persistent per game: loaded as the prior when present (a malformed/torn file is rejected loudly and the neutral prior used instead), checkpointed back every 1024 trained steps on an **owned worker thread** (file I/O never rides the render thread) and joined before exit/reset performs its final flush, so sessions shorter than the checkpoint interval persist without a detached-writer teardown race. Writes are atomic (temp + rename): a crash or a full disk can never tear an existing good profile. The served weights are health-checked every trained step; a non-finite value re-initializes the optimizer state from the prior automatically and is never persisted.
 
 ### Runtime hot path
 - **`framegen_record_real_frame()`** `rendervulkan.cpp:5682` — the scheduler; called from the tail of `vulkan_composite` (`:6216`) for base-layer, non-partial, non-pipewire, non-override, non-Vulkan-swapchain commits only.
@@ -300,6 +301,16 @@ Bidir removes it by generating BETWEEN the two real frames instead of past the n
   translucency (both motion layers fade on schedule), temporally smooth (killed regions dissolve
   instead of hold-jumping). No TAA clamp needed (no term invents colors) — the bidir warp is
   *cheaper* than the forward warp (0.095 vs 0.136 ms @1080p int on Blackwell).
+- **Learned policy** (`cs_framegen_motion_net.comp`): the endpoint-trained net runs for both
+  checked directions, but defaults to a **confidence veto**. Its flow scale and positive-confidence
+  scale are zero, so `.rg` remains bit-exact to the FB-checked field and `.b` can only decrease.
+  Online training recomputes the raw-field fallback competition but backpropagates only into W3's
+  confidence row/bias; flow rows, shading row and the shared trunk receive exact-zero gradients.
+  This is not merely a clamp: two endpoint-photometrically-equivalent vectors can trace different
+  intermediate paths (aperture/repeated-texture ambiguity), so endpoint supervision is not an
+  independent validator for VFI geometry. `_NET_BIDIR_FLOW=1` retains the rejected full-flow path
+  for controlled attribution. Causal acceleration, guided reconstruction, the three-frame
+  reservoir and shading persistence are forward-prediction mechanisms and are not scheduled here.
 - **Scheduling** (the substantive change): the pending queue becomes the **presentation
   timeline**. A recording real frame appends `[interp(k/gap)…, realN]` (never clears — nothing is
   stale; phases interpolate the *measured, just-completed* interval, so bidir never speculates
@@ -368,16 +379,17 @@ Two consumers, two latencies:
 ### 3.5 Learned field refinement (Stage C, opt-in via `GAMESCOPE_FRAMEGEN_NET=<blob>`)
 
 A tiny convolutional net (12→16→16→4 channels, 3×3 kernels, ~4.6k parameters,
-`cs_framegen_motion_net.comp`) refines the checked forward motion field at field resolution once per
-real frame, with no future-frame dependency. Bidir additionally refines the checked reverse field.
-It predicts **corrections, not pixels**: a flow residual bounded to ±2 field texels (`2·tanh`), an
-additive confidence recalibration, and in Extreme a zero-neutral shading-persistence focus. Safety
-is structural, three layers deep:
+`cs_framegen_motion_net.comp`) processes the checked forward motion field at field resolution once
+per real frame, with no future-frame dependency. Causal prediction serves **corrections, not
+pixels**: a flow residual bounded to ±2 field texels (`2·tanh`), an additive confidence
+recalibration, and in Extreme a zero-neutral shading-persistence focus. Bidir processes the checked
+reverse field too, but defaults to confidence-only service: no learned flow, no confidence raise,
+no shading focus. Safety is structural, three layers deep:
 
 1. a zero final layer IS Stage B (the trainer zero-initializes the head, so the failure floor is
    the current behavior, and `--init` exports a bit-neutral blob);
-2. the corrections are bounded by construction (tanh flow, clamped confidence), so the worst a bad
-   checkpoint can do is limited;
+2. causal corrections are bounded by construction (tanh flow, clamped confidence); bidir goes
+   further and preserves checked geometry while allowing ML only to select the safe crossfade;
 3. the B4 probe grades (and trust-scales) the **refined** field — the one the warps consume — so a
    mispredicting net is clamped in the same batch and shows up in the `adapt resid=…` log lines.
 
@@ -394,13 +406,23 @@ set of weights serves both dispatches** (binding symmetry, the fbcheck trick). W
 2048-wide `R32F` texture uploaded once via a mappable staging image. The forward consistency pass
 already produces both checked fields, so learned forward prediction does not require `_BIDIR`.
 
-**Training** is the same self-supervision B4 measures: warp the source luma along the refined
+**Causal training** is the same self-supervision B4 measures: warp the source luma along the refined
 flow; each texel pays either the warp error (× refined confidence) or the fallback error
 (× complement), plus a small confidence-independent flow term so rejected vectors remain
 trainable. Confidence can rise only when the final corrected vector reconstructs the observed
 pair. Capture with `GAMESCOPE_FRAMEGEN_RECORD`, train with
 `scripts/framegen-net-train.py` (numpy-only, CPU, minutes), deploy the blob, and validate with the
 live A/B the adapt log provides (net vs no-net `resid`/`bad%` on the same content).
+
+**Bidir training deliberately has a different authority boundary.** It evaluates the fallback
+competition on the raw checked field, sets both flow-output gradients to zero, forbids positive
+confidence, and stops confidence backpropagation at W3: only the confidence output row/bias can
+change. This retains in-situ scene adaptation without allowing an endpoint-only objective to alter
+intermediate-time geometry or the shared representation. In the 1M-asteroid x4 validation, the
+legacy persisted profile produced heavy artifacts; no-net was very good; a neutral net was better;
+and confidence-only ML was best. After 1812 online steps, a binary profile comparison confirmed
+that all 4499 non-confidence parameters were unchanged; only 139 of 144 confidence-row weights plus
+its bias moved. The user profile was never modified during this A/B.
 
 **Kernel shape** (measured on NVIDIA Blackwell; re-benchmark on the present GPU before tuning):
 one fused dispatch per direction, 8×8 output tiles from 14×14 feature tiles (3-texel receptive
@@ -423,7 +445,8 @@ and is charged to Extreme's normal timestamp/degradation rung.
 
 **In-situ learning (C2, `GAMESCOPE_FRAMEGEN_NET_ONLINE=1`).** The net keeps training *on the
 framegen GPU while it serves*, so the correction function tracks the current scene instead of
-whatever an offline blob was fit to. Per real frame, riding the same batch command buffer: two
+whatever an offline blob was fit to. Causal mode trains flow+confidence; conservative bidir trains
+only the confidence output row described above. Per real frame, riding the same batch command buffer: two
 gradient dispatches (`cs_framegen_motion_net_train.comp`; each workgroup = one hash-placed 4×4
 training tile, forward + full backprop in LDS, per-tile gradient written as one row of a slice
 image — **no float atomics**, `VK_EXT_shader_atomic_float` isn't universal) and one optimizer

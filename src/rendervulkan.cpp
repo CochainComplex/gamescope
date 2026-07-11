@@ -4845,16 +4845,21 @@ struct FramegenMotionStatsApplyPush_t
 	}
 };
 
-// Learned field refinement (Stage C): the task-conditioning input channel the
-// net was trained with (0 = endpoint/pair supervision; reserved for future
-// objectives — see cs_framegen_motion_net.comp).
+// Learned field refinement (Stage C). Bidir uses the same fixed feature
+// encoding as existing profiles, but can independently suppress geometry,
+// confidence raises and the causal shading head at the output boundary.
 struct FramegenMotionNetPush_t
 {
 	float mode;
-	float pad0, pad1, pad2;
+	float flowScale;
+	float confidenceRaiseScale;
+	float shadingScale;
 
-	explicit FramegenMotionNetPush_t( float flMode )
-		: mode( flMode ), pad0( 0.0f ), pad1( 0.0f ), pad2( 0.0f )
+	FramegenMotionNetPush_t( float flMode, bool bConservativeBidir )
+		: mode( flMode )
+		, flowScale( bConservativeBidir ? 0.0f : 1.0f )
+		, confidenceRaiseScale( bConservativeBidir ? 0.0f : 1.0f )
+		, shadingScale( bConservativeBidir ? 0.0f : 1.0f )
 	{
 	}
 };
@@ -4868,9 +4873,12 @@ struct FramegenMotionNetTrainPush_t
 	float mode;
 	uint32_t flags;
 
-	FramegenMotionNetTrainPush_t( uint32_t uSeed, uint32_t uSliceBase, bool bSceneCutGuard, bool bShadingHistoryValid )
+	FramegenMotionNetTrainPush_t( uint32_t uSeed, uint32_t uSliceBase, bool bSceneCutGuard,
+		bool bShadingHistoryValid, bool bConservativeBidir )
 		: seed( uSeed ), sliceBase( uSliceBase ), mode( 0.0f )
-		, flags( ( bSceneCutGuard ? 1u : 0u ) | ( bShadingHistoryValid ? 2u : 0u ) )
+		, flags( ( bSceneCutGuard ? 1u : 0u )
+			| ( bShadingHistoryValid ? 2u : 0u )
+			| ( bConservativeBidir ? 4u : 0u ) )
 	{
 	}
 };
@@ -6037,8 +6045,11 @@ static void framegen_bind_blend( CVulkanCmdBuffer *pCmdBuffer, const gamescope::
 // refines the causal checked motion field once per real frame: a bounded flow
 // residual (at most +-2 field texels, tanh-limited in the shader), additive
 // confidence recalibration, and a zero-neutral shading-persistence focus.
-// Bidir also refines the reverse field but never consumes the causal focus.
-// It predicts corrections on top of the
+// Bidir runs the same network in both directions, but by default treats it as
+// a conservative confidence veto: endpoint photometric supervision cannot
+// prove that a learned vector is a valid in-between trajectory. The checked
+// geometry therefore stays untouched and confidence can only go down.
+// The causal path predicts corrections on top of the
 // Stage-B field — a zero-initialized head IS Stage B, so the failure floor is
 // the current behavior. The fourth head never predicts pixels; Extreme uses it
 // to gate a separately bounded analytic color trend. B4 closes the field safety loop:
@@ -6086,6 +6097,22 @@ static bool framegen_net_online_enabled()
 {
 	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_NET_ONLINE" ) );
 	return s_bEnabled;
+}
+
+// Endpoint reconstruction has an aperture-problem null space: several motion
+// vectors can sample the same next-frame color while tracing very different
+// paths through bidirectional intermediate phases. Keep learned bidir geometry
+// behind an explicit attribution switch until a true intermediate-time target
+// exists; confidence-only service/training is the safe default.
+static bool framegen_net_bidir_flow_enabled()
+{
+	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW" ) );
+	return s_bEnabled;
+}
+
+static bool framegen_net_bidir_conservative()
+{
+	return vulkan_framegen_bidir_active() && !framegen_net_bidir_flow_enabled();
 }
 
 static float framegen_net_online_lr()
@@ -6141,6 +6168,11 @@ static uint64_t g_ulFramegenNetProgress = 0;                     // trained step
 static uint64_t g_ulFramegenNetLiveProgress = 0;                 // progress at the cached readback
 static std::atomic<uint64_t> g_ulFramegenNetSavedProgress = { 0 }; // progress at the last successful write
 static std::atomic<bool> g_bFramegenNetWriteInFlight = { false };
+// Periodic profile I/O is off the render thread, but the worker remains owned:
+// reset/exit joins it before touching the same temp path or destroying process
+// state. A detached writer plus a bounded poll can outlive a forced shutdown
+// and race libc/static teardown.
+static std::thread g_framegenNetWriteThread;
 
 static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &weights, bool bLogMissing )
 {
@@ -6852,6 +6884,7 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 	}
 
 	const uint32_t pg = 8; // = the shader's output tile
+	const bool bConservativeBidir = framegen_net_bidir_conservative();
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET ) );
 	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldNet );
 	pCmdBuffer->bindTarget2( g_framegenMotion.netShadingFocus );
@@ -6860,7 +6893,7 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 	framegen_motion_bind_sampler( pCmdBuffer, 2, g_framegenMotion.mvField, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 3, g_framegenMotion.mvFieldRevChk, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 4, g_framegenMotion.netWeightsGpu, true );
-	pCmdBuffer->pushConstants<FramegenMotionNetPush_t>( 0.0f );
+	pCmdBuffer->pushConstants<FramegenMotionNetPush_t>( 0.0f, bConservativeBidir );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 
 	if ( bRefineReverse )
@@ -6872,7 +6905,7 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 		framegen_motion_bind_sampler( pCmdBuffer, 2, g_framegenMotion.mvFieldRevChk, true );
 		framegen_motion_bind_sampler( pCmdBuffer, 3, g_framegenMotion.mvField, true );
 		framegen_motion_bind_sampler( pCmdBuffer, 4, g_framegenMotion.netWeightsGpu, true );
-		pCmdBuffer->pushConstants<FramegenMotionNetPush_t>( 0.0f );
+		pCmdBuffer->pushConstants<FramegenMotionNetPush_t>( 0.0f, bConservativeBidir );
 		pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 	}
 
@@ -6946,6 +6979,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	g_ulFramegenNetProgress++;
 	const uint32_t uHalf = k_uFramegenNetTrainTiles / 2;
 	const uint32_t uSeed = m.uNetTrainStep * 0x9E3779B9u + 0x61C88647u;
+	const bool bConservativeBidir = framegen_net_bidir_conservative();
 	const int nReservoirRead = framegen_luma_reservoir_read_index();
 	const bool bShadingHistoryValid = eQuality == GamescopeFramegenQuality::Extreme
 		&& framegen_shading_enabled( eQuality )
@@ -6968,7 +7002,8 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	framegen_motion_bind_sampler( pCmdBuffer, 4, m.netState, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 5, pOlderLuma, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 6, pOlderField, false );
-	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed, 0u, bSceneCutGuard, bShadingHistoryValid );
+	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed, 0u,
+		bSceneCutGuard, bShadingHistoryValid, bConservativeBidir );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
 	pCmdBuffer->bindTarget( m.netGradSlices );
@@ -6978,12 +7013,13 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	framegen_motion_bind_sampler( pCmdBuffer, 2, m.mvFieldRevChk, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 3, m.mvField, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 4, m.netState, true );
-	// Reverse-field tiles continue training the shared flow/confidence heads,
-	// but cannot supervise a causal future-color trend. Bind valid fallbacks and
-	// write an exact zero gradient for head four.
+	// Reverse-field tiles cannot supervise a causal future-color trend. In the
+	// conservative bidir policy, both directions train only the confidence
+	// output row; the geometry heads and shared trunk remain fixed at the prior.
 	framegen_motion_bind_sampler( pCmdBuffer, 5, m.lumaPrev, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 6, m.mvField, false );
-	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed ^ 0x55555555u, uHalf, bSceneCutGuard, false );
+	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed ^ 0x55555555u, uHalf,
+		bSceneCutGuard, false, bConservativeBidir );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
 	bindOpt();
@@ -7006,7 +7042,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 // disk mid-write can never tear an existing good profile — the file at the
 // final path is always a complete, validated-format snapshot or absent. Every
 // fwrite AND the fclose are checked (the buffered tail is where ENOSPC bites).
-// Runs on a detached worker for periodic checkpoints — file I/O on the render
+// Runs on an owned worker for periodic checkpoints — file I/O on the render
 // thread is a frametime spike — and synchronously for the exit/reset flush.
 static void framegen_net_profile_write_file( std::vector<float> weights, uint64_t ulProgress, bool bFromWorker )
 {
@@ -7063,12 +7099,13 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 // including after Vulkan teardown; never touches the GPU.
 static void framegen_net_profile_flush()
 {
+	// The atomic is the cheap scheduling gate; the thread object is the lifetime
+	// proof. Joining has no polling timeout and guarantees an older checkpoint
+	// cannot rename over the newer synchronous flush below.
+	if ( g_framegenNetWriteThread.joinable() )
+		g_framegenNetWriteThread.join();
 	if ( framegen_net_profile_path() == nullptr || g_framegenNetLiveWeights.size() != k_uFramegenNetFloats )
 		return;
-	// A checkpoint worker may still be renaming; give it a moment so an older
-	// snapshot can't land after (and thus over) this newer one.
-	for ( int i = 0; i < 100 && g_bFramegenNetWriteInFlight.load(); i++ )
-		usleep( 1000 );
 	if ( g_ulFramegenNetLiveProgress == g_ulFramegenNetSavedProgress.load() )
 		return;
 	framegen_net_profile_write_file( g_framegenNetLiveWeights, g_ulFramegenNetLiveProgress, false );
@@ -7127,7 +7164,12 @@ static void framegen_net_profile_consume()
 		&& g_ulFramegenNetLiveProgress - g_ulFramegenNetSavedProgress.load() >= (uint64_t)k_uFramegenNetProfileInterval
 		&& !g_bFramegenNetWriteInFlight.exchange( true ) )
 	{
-		std::thread( framegen_net_profile_write_file, g_framegenNetLiveWeights, g_ulFramegenNetLiveProgress, true ).detach();
+		// A completed worker remains joinable until reaped. The atomic false
+		// guarantees this join cannot wait on active I/O in the normal cadence.
+		if ( g_framegenNetWriteThread.joinable() )
+			g_framegenNetWriteThread.join();
+		g_framegenNetWriteThread = std::thread( framegen_net_profile_write_file,
+			g_framegenNetLiveWeights, g_ulFramegenNetLiveProgress, true );
 	}
 }
 
@@ -8339,7 +8381,11 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			vk_log.infof( "framegen: base-layer generation + late overlay composite requested (#02) — predicting on the pre-upscale game layer, overlays/cursor composite fresh onto generated frames" );
 		if ( g_eFramegenMode == GamescopeFramegenMode::Motion )
 		{
-			if ( g_eFramegenQuality == GamescopeFramegenQuality::Low )
+			const bool bBidirActive = vulkan_framegen_bidir_active();
+			if ( bBidirActive )
+				vk_log.infof( "framegen: bidirectional quality path — symmetric checked forward/reverse fields%s; causal acceleration, Extreme color-guided reconstruction, reservoir and shading are not scheduled",
+					framegen_agreement_enabled( g_eFramegenQuality ) ? " + full-resolution agreement" : "" );
+			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Low )
 				vk_log.infof( "framegen: low quality — forward matcher + constant-velocity warp only" );
 			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Medium )
 				vk_log.infof( "framegen: medium quality — reverse consistency + full-resolution agreement enabled" );
@@ -8358,15 +8404,22 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				vk_log.infof( "framegen: self-supervised adaptation disabled (GAMESCOPE_FRAMEGEN_ADAPT=0)" );
 			if ( framegen_net_requested( g_eFramegenQuality ) )
 			{
-				vk_log.infof( "framegen: learned forward-field refinement active (C) — the net improves causal motion prediction once per real frame (bounded flow residual + evidence-gated confidence)" );
-				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme )
+				const bool bConservativeBidir = framegen_net_bidir_conservative();
+				if ( bConservativeBidir )
+					vk_log.infof( "framegen: learned bidirectional confidence veto active (C) — FB-checked geometry is preserved, confidence can only decrease; GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW=1 restores experimental endpoint-trained flow correction" );
+				else
+					vk_log.infof( "framegen: learned forward-field refinement active (C) — the net improves causal motion prediction once per real frame (bounded flow residual + evidence-gated confidence)" );
+				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme && !bBidirActive )
 					vk_log.infof( "framegen: causal shading-persistence head %s — three-frame in-situ supervision, bounded color-trend correction (GAMESCOPE_FRAMEGEN_SHADING=0 disables for A/B)",
 						framegen_shading_enabled( g_eFramegenQuality ) ? "enabled" : "disabled" );
 				if ( framegen_net_online_enabled() )
-					vk_log.infof( "framegen: in-situ learning active (C2) — the net keeps training on the framegen GPU against every real frame (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
+					vk_log.infof( "framegen: in-situ learning active (C2) — %s against every real frame (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
+						bConservativeBidir
+							? "bidir trains only the conservative confidence output row; geometry heads and shared trunk stay frozen"
+							: "the net keeps training on the framegen GPU",
 						framegen_net_online_lr(), k_uFramegenNetTrainTiles, framegen_net_online_every(),
 						framegen_net_profile_path() != nullptr
-							? " — persistent per-game profile (checkpointed off-thread, flushed at exit/reset, atomic replace)"
+							? " — persistent per-game profile (checkpointed on an owned worker, flushed at exit/reset, atomic replace)"
 							: " — ephemeral model, nothing is written to disk" );
 			}
 			else if ( g_eFramegenQuality < GamescopeFramegenQuality::High

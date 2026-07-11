@@ -193,7 +193,10 @@ GAMESCOPE_FRAMEGEN_BIDIR=1 gamescope --prefer-vk-device "$PRESENT" …
 Blends *between* two real frames instead of guessing ahead — the smoothest
 result and the best with see-through effects (smoke, glass). **Trade-off: adds
 about one frame of lag**, so avoid it for fast/competitive shooters. Great for
-single-player, racing, scenery.
+single-player, racing, scenery. Extreme's causal acceleration, guided
+reconstruction, disocclusion reservoir and shading-persistence correction do
+not run in this mode; bidirectional interpolation uses two checked endpoint
+fields instead.
 
 ### d) Base-layer — fixes blurry menus / HUD
 ```bash
@@ -221,8 +224,11 @@ A tiny neural net cleans up the motion and **learns your game as you play**.
 It works with zero-latency forward prediction; at Extreme it also learns a
 three-frame-validated focus mask for tightly bounded shadow/reflection/specular
 color trends. `GAMESCOPE_FRAMEGEN_SHADING=0` disables only that color-trend
-head for A/B. Bidirectional mode is optional but intentionally does not use the
-causal shading head.
+head for A/B. In bidirectional mode, ML is intentionally conservative: it keeps
+both checked motion fields unchanged, can only lower confidence toward the
+phase-correct crossfade, and in-situ training updates only that confidence
+output row. This avoids endpoint-trained flow corrections that look valid on
+the two real frames but trace an artifacting path between them.
 Newest and least-tested; turn it off if anything looks worse. To remember what it learned between sessions, add
 `GAMESCOPE_FRAMEGEN_NET_PROFILE=$HOME/fg-<gamename>.bin`.
 

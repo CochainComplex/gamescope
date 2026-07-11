@@ -119,6 +119,44 @@ depth/MVs that GFFE actually uses. The luma ping-pong copy costs 4–9 us per re
 frame at 1080p–4K on Radeon 890M; the conditional full-res search is charged to
 the Extreme rung and disappears as soon as the deadline ladder drops to Ultra.
 
+### Rejected experiment — temporal global-camera prior
+Two causal variants used the preceding checked field as a global translation
+hint: filling low-confidence vectors, then only biasing the coarsest matcher's
+small-motion tie-break. Both improved mouse/camera responsiveness in live 1M-
+asteroid testing, but both reduced image quality through visible jitter and
+artifacts relative to the established local matcher. The complete experiment
+was removed. A single global translation is not a reliable substitute for
+local motion under parallax, rotation, acceleration, particles, disocclusion,
+or independently moving layers, and applying the same prior to forward and
+reverse matching can correlate errors that the FB check is meant to reject.
+Do not reintroduce this path without E2 full-color temporal metrics and an
+independent validation signal that cannot reinforce the proposal it grades.
+
+### Corrected contract — bidirectional ML is a confidence veto
+The learned flow head had the same validation circularity in a subtler form.
+Its self-supervised endpoint loss can improve `warp(source, flow) ≈ endpoint`,
+but repeated texture and aperture ambiguity leave multiple vectors with nearly
+the same endpoint residual. Those vectors trace different trajectories at
+`t=0.25/0.5/0.75`; applying a persisted endpoint-trained correction to both
+directions produced heavy artifacts in the 1M-asteroid x4 bidir test even while
+the B4 endpoint statistics looked acceptable.
+
+Bidir now preserves both FB-checked vectors exactly and treats ML only as a
+confidence veto: negative confidence corrections survive, positive corrections
+and the flow/shading outputs are scaled to zero. Online learning remains in
+situ, but recomputes its loss on the raw checked field and writes gradients only
+for W3's confidence row/bias. The flow rows, shading row, and shared trunk are
+frozen, so the endpoint objective cannot reshape geometry indirectly. The old
+path is retained only as `GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW=1` for controlled
+attribution.
+
+Live ordering was unambiguous: persisted full-flow profile (artifact-heavy) <
+no net (very good) < neutral net (better) < confidence-only learned profile
+(best). After 1812 confidence-only steps, binary comparison against the protected
+starting profile showed all 4499 non-confidence floats bit-identical; only 139
+of 144 confidence-row weights and its bias moved. The original user profile was
+never written during the experiment.
+
 ### Gap D — Color-domain shading correction · bounded frames-only form implemented
 Non-geometric motion — lagging shadows, reflections, specular — is
 *unrepresentable* as a motion vector, so no field refinement can fix it. GFFE's

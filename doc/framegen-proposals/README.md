@@ -55,9 +55,9 @@ on top of it.
 | Variable | Requires | Effect |
 |---|---|---|
 | `GAMESCOPE_FRAMEGEN_BIDIR=1` | `--framegen-mode motion`; **excludes** `GAMESCOPE_FRAMEGEN_JIT`, `GAMESCOPE_FRAMEGEN_VRR_HYBRID`, `GAMESCOPE_FRAMEGEN_BASE` | Bidirectional interpolation — smoothest motion, but real frames present **one interval late**. |
-| `GAMESCOPE_FRAMEGEN_NET=<blob>` | `--framegen-mode motion --framegen-quality high|ultra|extreme` | Learned causal forward-field refiner; value is the path to a `GSFR` weights blob (see below). Bidir is optional. Empty / unreadable → disabled, not fatal. |
-| `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | motion `high`/`ultra`/`extreme`; `NET` blob optional | In-situ learning (C2): the forward refiner keeps training on the framegen GPU against every real frame, tracking the current scene. Without a `NET` blob it starts from a neutral prior; without `NET_PROFILE` the model is **ephemeral — nothing is written to disk**. |
-| `GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Persistent per-game learning: loaded as the prior when the file exists (a malformed file is rejected loudly → neutral prior), checkpointed off-thread every 1024 trained steps and flushed at exit/reset, so short sessions persist too. Atomic writes (temp + rename): a crash or full disk never tears a good profile. |
+| `GAMESCOPE_FRAMEGEN_NET=<blob>` | `--framegen-mode motion --framegen-quality high|ultra|extreme` | Learned causal flow/confidence refiner; value is a `GSFR` weights blob. In bidir it defaults to confidence-veto-only: checked flow is preserved and confidence can only decrease. Empty / unreadable → disabled, not fatal. |
+| `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | motion `high`/`ultra`/`extreme`; `NET` blob optional | In-situ learning (C2): causal mode trains flow+confidence; bidir trains only the conservative confidence output row and freezes geometry/trunk. Without a `NET` blob it starts from a neutral prior; without `NET_PROFILE` the model is **ephemeral — nothing is written to disk**. |
+| `GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Persistent per-game learning: loaded as the prior when the file exists (a malformed file is rejected loudly → neutral prior), checkpointed on an owned worker every 1024 trained steps and joined before the exit/reset flush, so short sessions persist without a detached-writer race. Atomic writes (temp + rename): a crash or full disk never tears a good profile. |
 | `GAMESCOPE_FRAMEGEN_NET_LR` / `GAMESCOPE_FRAMEGEN_NET_EVERY` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Learning rate (default `3e-4`) / train every *N*th real frame (default `1` — raise on weak present GPUs). |
 | `GAMESCOPE_FRAMEGEN_RECORD=<dir>` | `--framegen-mode motion` | Capture training tensors (one `GSFD` file per real frame, ≈1.2 MB at 1440p) into `<dir>`; bidir is not required. |
 | `GAMESCOPE_FRAMEGEN_RECORD_MAX` | `GAMESCOPE_FRAMEGEN_RECORD` set | Cap on captured frames (default `1000`). |
@@ -78,6 +78,7 @@ untested, so enable one at a time.
 | `GAMESCOPE_FRAMEGEN_DEBUG_EVERY` | Log every *N*th framegen event (default `60`; needs `--framegen-debug`). |
 | `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE=1` | Force the shared-queue regime (disables the dedicated-queue features `GAMESCOPE_FRAMEGEN_JIT` / `GAMESCOPE_FRAMEGEN_VRR_HYBRID`). |
 | `GAMESCOPE_FRAMEGEN_BENCHMARK` | Run the shader microbenchmark, then exit before output creation (**presence-only** — even `=0` triggers it). |
+| `GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW=1` | Restore experimental endpoint-trained flow correction/confidence raises in bidir for A/B only. Default off because it produced heavy intermediate-frame artifacts in live x4 testing. |
 
 ### The learned refiner (Stage C) in four steps
 
@@ -186,8 +187,8 @@ along with these hardening/quality passes:
 - **Learned forward-field refinement** (opt-in,
   `GAMESCOPE_FRAMEGEN_NET=<weights>`, motion mode) — a ~4.6k-parameter
   fused-conv net refines the causal checked field once per real frame at field
-  resolution (and the reverse field only for opt-in bidir): a tanh-bounded flow
-  residual plus a confidence recalibration, learned from the residual error
+  resolution: a tanh-bounded flow residual plus a confidence recalibration,
+  learned from the residual error
   classes the hand-written consistency checks can't express (flow-boundary
   smoothing, occlusion inpainting, confidence-vs-usefulness calibration). A
   zero-initialized head is exactly the unrefined pipeline, the corrections
@@ -198,6 +199,12 @@ along with these hardening/quality passes:
   motion + lightweight correction net" template of GFFE (Wu et al., ACM TOG
   2024, arXiv 2406.18551), though GFFE's correction net refines shading/color
   while ours refines the motion field (research §3).
+  **Bidir uses a stricter contract:** it runs both directions but preserves the
+  FB-checked vectors, forbids confidence raises, and updates only the final
+  confidence row online. Endpoint photometric supervision cannot distinguish
+  repeated-texture/aperture matches that reconstruct both real frames yet take
+  a wrong path through intermediate time. Full learned bidir flow remains an
+  explicit debug A/B, not a quality tier.
 
 The techniques above have recognizable ancestors in the frame-generation
 literature (block-matching optical flow, video frame interpolation, quadratic-
