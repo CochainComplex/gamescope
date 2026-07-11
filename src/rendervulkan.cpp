@@ -6863,11 +6863,11 @@ static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t 
 
 // Learned field refinement (Stage C), recorded with the checked fields final.
 // The causal path refines only the forward field that advects the newest real
-// frame into the future. Bidir additionally refines the reverse field through
-// the same binding-symmetric network. This keeps forward prediction at one
-// inference dispatch per real frame instead of paying for an unused reverse
-// result. The one-time staging->GPU weight copy rides the first batch after
-// (re)allocation.
+// frame into the future. Bidir additionally processes the reverse field through
+// the same binding-symmetric network (confidence-veto-only by default). This
+// keeps forward prediction at one inference dispatch per real frame instead of
+// paying for an unused reverse result. The one-time staging->GPU weight copy
+// rides the first batch after (re)allocation.
 static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH, bool bRefineReverse )
 {
 	if ( g_framegenMotion.mvFieldNet == nullptr || g_framegenMotion.netWeightsGpu == nullptr
@@ -7056,7 +7056,13 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 
 	char szTmp[ 1024 ];
 	if ( (size_t)snprintf( szTmp, sizeof( szTmp ), "%s.tmp", pszPath ) >= sizeof( szTmp ) )
+	{
+		errno = ENAMETOOLONG;
+		fail( "temporary path for" );
+		if ( bFromWorker )
+			g_bFramegenNetWriteInFlight = false;
 		return;
+	}
 	FILE *pFile = fopen( szTmp, "wb" );
 	if ( pFile == nullptr )
 	{
@@ -8413,10 +8419,10 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 					vk_log.infof( "framegen: causal shading-persistence head %s — three-frame in-situ supervision, bounded color-trend correction (GAMESCOPE_FRAMEGEN_SHADING=0 disables for A/B)",
 						framegen_shading_enabled( g_eFramegenQuality ) ? "enabled" : "disabled" );
 				if ( framegen_net_online_enabled() )
-					vk_log.infof( "framegen: in-situ learning active (C2) — %s against every real frame (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
+					vk_log.infof( "framegen: in-situ learning active (C2) — %s (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
 						bConservativeBidir
-							? "bidir trains only the conservative confidence output row; geometry heads and shared trunk stay frozen"
-							: "the net keeps training on the framegen GPU",
+							? "each real frame trains only bidir's conservative confidence output row; geometry heads and shared trunk stay frozen"
+							: "the net keeps training on the framegen GPU against every real frame",
 						framegen_net_online_lr(), k_uFramegenNetTrainTiles, framegen_net_online_every(),
 						framegen_net_profile_path() != nullptr
 							? " — persistent per-game profile (checkpointed on an owned worker, flushed at exit/reset, atomic replace)"

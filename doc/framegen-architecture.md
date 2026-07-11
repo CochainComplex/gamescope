@@ -162,6 +162,10 @@ hardware linearizes on read).
 | **Motion ultra** | high + retained-field acceleration warp | one field copy per estimated interval + one low-res field sample per output pixel | `eff.quality==Ultra` | bounded second-order forward prediction |
 | **Motion extreme** | ultra + color-guided reconstruction + three-frame disocclusion resolver; optional learned shading focus | bounded boundary hypotheses; two 1/8-res luma history images; with net, one low-res focus write and a bounded color-trend term in the existing warp | `eff.quality==Extreme` | maximum causal frames-only quality on an idle second GPU |
 
+The Ultra/Extreme acceleration, guided reconstruction, reservoir and shading entries are causal
+only. Bidir uses its symmetric checked-field warp at every tier; High+ adds B4 and optional
+confidence-only ML, but does not schedule those causal extensions.
+
 **Invariant across all extrapolate variants:** alpha pinned to `current`; the *only* range bound is
 the 9-tap neighbor clamp — no `[0,1]` clamp, so UNORM stays in range while scRGB keeps HDR>1.0 and
 wide-gamut negatives; previous frame sampled at center only.
@@ -311,6 +315,13 @@ Bidir removes it by generating BETWEEN the two real frames instead of past the n
   independent validator for VFI geometry. `_NET_BIDIR_FLOW=1` retains the rejected full-flow path
   for controlled attribution. Causal acceleration, guided reconstruction, the three-frame
   reservoir and shading persistence are forward-prediction mechanisms and are not scheduled here.
+- **Fast-camera residual:** when both directions fail validation over a large source interval, the
+  only information-preserving fallback is the phase-correct endpoint crossfade. At ~20 fps the
+  endpoints are ~50 ms apart, so violent camera motion can briefly look like a soft paint/splash
+  edge before the next real endpoint clears it. Hard endpoint selection removes the blended color
+  but introduces hold/jump judder; reusing rejected flow restores sharpness by reintroducing the
+  tearing/shape artifacts the checks rejected. Do not change this trade without E2 final-color
+  temporal evidence or a genuinely independent motion/depth signal.
 - **Scheduling** (the substantive change): the pending queue becomes the **presentation
   timeline**. A recording real frame appends `[interp(k/gap)…, realN]` (never clears — nothing is
   stale; phases interpolate the *measured, just-completed* interval, so bidir never speculates

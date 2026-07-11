@@ -2,8 +2,8 @@
 
 Status: **design map / gap analysis**; Gaps E1, B, bounded frames-only A, and a
 bounded frames-only form of D implemented (`scripts/framegen-net-eval.py`, the
-B4 GPU scene-cut guard, the Extreme disocclusion reservoir, and the causal
-shading-persistence head). Maps
+B4 GPU scene-cut guard, the Extreme disocclusion reservoir, the causal
+shading-persistence head, and the conservative bidir ML authority boundary). Maps
 [`../research-framegen.md`](../research-framegen.md) onto the shipped pipeline and
 proposals #01–#06, then sketches the genuine gaps that are worth building.
 

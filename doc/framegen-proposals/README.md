@@ -93,7 +93,9 @@ untested, so enable one at a time.
    (Stage B) vs refined field and the deltas — the structural/temporal view the
    scalar training residual misses (proposal #07, Gap E1). Grades the *field*, at
    field-resolution luma; colour-domain LPIPS/FvVDP need the E2 capture extension.
-4. **Use** it: `GAMESCOPE_FRAMEGEN_NET=weights.bin GAMESCOPE_FRAMEGEN_BIDIR=1 gamescope --experimental-framegen --framegen-mode motion … `
+4. **Use** it: `GAMESCOPE_FRAMEGEN_NET=weights.bin gamescope --experimental-framegen --framegen-mode motion … `
+   Add `_BIDIR=1` for confidence-veto-only interpolation; the blob's learned flow
+   remains causal unless the explicit `_NET_BIDIR_FLOW=1` debug A/B is set.
 
 Or skip the offline steps entirely: `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` trains
 in-situ on the framegen GPU while serving — by itself this is the fully

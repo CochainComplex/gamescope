@@ -271,6 +271,10 @@ can keep up (see limits).
 
 **Per mode**
 - **Bidirectional** adds ~1 frame of lag — don't use it for reaction-heavy games.
+  At 20 fps that interval alone is ~50 ms. Anti-lag/Reflex must pace the game on
+  the **render GPU** where input is sampled; a Mesa/RADV setting on a downstream
+  AMD presenter cannot reduce an NVIDIA-rendered game's input queue. Generated
+  frames improve motion cadence, not the 20 Hz input sampling rate.
 - **VRR mode** needs a real VRR (FreeSync/G-Sync) monitor actively in VRR; it
   does nothing on ordinary screens or typical laptop panels.
 - **Base-layer** and **bidirectional** can't be used at the same time. So can't
@@ -307,8 +311,9 @@ the generation)
 Add `--framegen-debug` and watch the terminal:
 
 - `framegen: generated N frame(s) …` → it's generating. ✅
-- `bidirectional interpolation requested` / `learned field refinement active` /
-  `self-supervised adaptation active` → those modes are on.
+- `bidirectional interpolation requested` / `learned bidirectional confidence
+  veto active` / `self-supervised adaptation active` → the conservative bidir
+  ML path is on. Causal mode instead logs `learned forward-field refinement`.
 - `content scene cut detected` → motion mode deliberately presented a real
   endpoint instead of predicting across unrelated content.
 - `… ignored (requires …)` → you enabled a mode without its requirement (e.g.
