@@ -8,6 +8,14 @@ motion-compensated generated-frame path with a real optical-flow field produced 
 **render** (dGPU) side by NVIDIA's fixed-function Optical Flow Accelerator (OFA), shipped
 across PCIe as a small dmabuf.
 
+**Related work / prior art:** this is essentially the **DLSS 3** route — a
+fixed-function optical-flow accelerator feeding frame generation. Note **DLSS 4
+replaced the OFA with a learned AI flow network** (the OFA underperformed on
+games — UI, particles, specular; research [`../research-framegen.md`](../research-framegen.md)
+§4), so a learned flow front-end — **SEA-RAFT** (ECCV 2024, arXiv 2405.14793) or
+**NeuFlow v2** (arXiv 2408.10161), research §2 — is the strategic endpoint; the
+fixed-function donor is best treated as a measurement baseline.
+
 ---
 
 ## Motivation / problem it solves

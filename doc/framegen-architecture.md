@@ -404,6 +404,38 @@ validates every served weight before persistence; on failure it forces both opti
 the served weight texture through the prior upload before the next inference, closing the old
 one-batch "detected but still served" window.
 
+### 3.6 Prior art — how the algorithm maps to the literature
+
+Everything above is home-grown, but each piece has a recognizable ancestor in
+the frame-generation literature. The table maps our components to the closest
+published method and states how ours differs; full citations (venue + DOI/arXiv,
+each primary-source cross-checked) live in
+[`research-framegen.md`](research-framegen.md), and
+[proposal #07](framegen-proposals/07-frames-only-sota-alignment.md) argues the
+alignment and the remaining gaps. We are **frames-only** — no engine motion
+vectors, depth, or G-buffers — so the engine-integrated methods below are
+*analogs, not ports*.
+
+| Our component | Closest published method | How ours differs |
+|---|---|---|
+| Forward extrapolation as the zero-latency default (§0, §3.1) | **GFFE** (Wu et al., ACM TOG 2024, arXiv 2406.18551, DOI 10.1145/3687923); frames-only baseline **DMVFN** (Hu et al., CVPR 2023, arXiv 2303.09875) | GFFE uses rendered depth+MVs and a layered background buffer; we have neither. DMVFN is the closest frames-only peer. |
+| Pyramidal SAD block-matcher (§3.2, stage 2) | **AMD FSR 3** FidelityFX Optical Flow (GPUOpen): 8×8 blocks, 24×24 SAD search, luma-pyramid coarse-to-fine | Same classical construction; learned flow (**RIFE**; **SEA-RAFT**, ECCV 2024, arXiv 2405.14793) is the ML alternative we don't run. |
+| Two-source agreement / fallback arbitration (§3.2, stage 3) | **FSR 3**: blends optical-flow vs MV interpolation, *preferring the better color match* (GPUOpen) | We arbitrate per-pixel between the motion gather and the bounded extrapolation, by the same color-match logic. |
+| Forward-backward consistency check (§3.2, stage 2.5) | Classical **forward-backward / left-right flow-consistency** occlusion detection (standard across optical-flow & VFI) | Standard technique; no single survey paper to cite. |
+| Ultra quadratic acceleration (§3.2.1) | **Mob-FGSR** (Yang et al., SIGGRAPH 2024, DOI 10.1145/3641519.3657424): quadratic / uniform-acceleration motion | Mob-FGSR forms it in *world space* from depth+MVs; we form it in *screen space* from two consecutive motion fields. |
+| Extreme guided reconstruction (§3.2.1) | Motion-boundary ownership from **dense optical flow** (research §2); edge-aware joint upsampling | Local contribution: a hypothesis-testing software approximation — no flow net or vendor block. |
+| Bidirectional interpolation (§3.3) | The **VFI** family — **RIFE** (Huang et al., ECCV 2022, arXiv 2011.06294), **FILM** (Reda et al., ECCV 2022, arXiv 2202.04901) | The interpolation regime and its intrinsic ≥1-interval latency (§0). Ours is a hand-written warp-blend, not a learned VFI net. |
+| Learned field refiner, Stage C (§3.5) | **GFFE**'s lightweight correction-CNN template (its Shading Correction Network); self-supervision cf. **FILM/RIFE** | GFFE's SCN refines *shading/color*; ours refines the *motion field*. Same "heuristic motion + small net" shape. |
+| B4 adaptation + C2 in-situ learning (§3.4, §3.5) | Online / test-time adaptation | No direct frames-only precedent in the surveyed work; home-grown. |
+
+The prototypes cross-reference the literature too: **#02** base-layer late
+UI/cursor composite is the survey's UI-compositing recommendation (research §5;
+cf. DLSS 4 UI handling, FSR reactive masks); **#03** optical-flow donor is the
+DLSS 3 hardware-OFA route — noting DLSS 4 *replaced* the OFA with a learned flow
+net (research §4), so a learned front-end (**SEA-RAFT** / **NeuFlow v2**, §2) is
+the strategic endpoint; **#01/#06** timed/JIT pacing echo DLSS 4's hardware flip
+metering (§4).
+
 ---
 
 ## 4. The decision state machine

@@ -130,6 +130,10 @@ along with these hardening/quality passes:
   two-source agreement test** in the warp (the flow is projected from both
   real frames; pixels where the projections read different content fall back
   individually, so edge errors degrade cleanly instead of double-exposing).
+  *Prior art:* the block-matching + SAD + luma-pyramid construction is the
+  classical, non-learned analog of AMD FSR 3's FidelityFX Optical Flow (GPUOpen);
+  the two-source color-match arbitration mirrors FSR 3's optical-flow-vs-MV blend
+  (see [research](../research-framegen.md) §4).
 - **Bidirectional interpolation** (`GAMESCOPE_FRAMEGEN_BIDIR=1`, opt-in,
   motion mode) — generated frames sit *between* the two real frames: both are
   warped toward the slot's phase (the current frame along the forward field,
@@ -140,7 +144,10 @@ along with these hardening/quality passes:
   translucent content correctly. The real frame rides the pending queue
   behind its interpolations and presents one interval late (the intrinsic
   interpolation latency; hence opt-in), degrading to zero added latency
-  whenever the game keeps up with refresh.
+  whenever the game keeps up with refresh. *Prior art:* the video-frame-
+  interpolation regime — bidirectional warp-and-blend with occlusion side-
+  selection, as in RIFE (Huang et al., ECCV 2022) and FILM (Reda et al., ECCV
+  2022); the one-interval latency is VFI's intrinsic cost (research §0–1).
 - **Self-supervised online adaptation** (default on in motion mode,
   `GAMESCOPE_FRAMEGEN_ADAPT=0` disables) — every real frame is ground truth
   for the motion field just estimated from it: a microseconds-scale probe
@@ -163,9 +170,18 @@ along with these hardening/quality passes:
   are bounded by construction, and the adaptation probe grades the refined
   field — so a bad checkpoint is clamped in the same batch. Trained offline,
   self-supervised, on tensors captured with `GAMESCOPE_FRAMEGEN_RECORD`
-  (`scripts/framegen-net-train.py`, numpy-only).
+  (`scripts/framegen-net-train.py`, numpy-only). *Prior art:* the "heuristic
+  motion + lightweight correction net" template of GFFE (Wu et al., ACM TOG
+  2024, arXiv 2406.18551), though GFFE's correction net refines shading/color
+  while ours refines the motion field (research §3).
 
-The proposals below build on top of that foundation.
+The techniques above have recognizable ancestors in the frame-generation
+literature (block-matching optical flow, video frame interpolation, quadratic-
+motion extrapolation, lightweight correction nets); each is cited inline, and
+the full mapping — venues + DOIs/arXiv, primary-source cross-checked — is the
+prior-art table in [`framegen-architecture.md`](../framegen-architecture.md) §3.6,
+drawn from the [research survey](../research-framegen.md). The proposals below
+build on top of that foundation.
 
 ## Proposals
 

@@ -6,6 +6,12 @@ notes for divergences and open validation)
 Scope: `src/rendervulkan.cpp`, `src/rendervulkan.hpp`, `src/steamcompmgr.cpp`, `src/Backends/DRMBackend.cpp`, `src/shaders/cs_framegen_extrapolate.comp`
 Depends on: the existing experimental framegen path (commits `313b9af`, `c33daa3`).
 
+**Related work / prior art:** compositing UI/HUD *after* generation is the frame-
+generation survey's explicit recommendation for content that does not follow
+scene motion (research [`../research-framegen.md`](../research-framegen.md) §5);
+vendor pipelines do the same via HUD-less color / reactive masks (AMD FSR) or
+learned UI handling (NVIDIA DLSS 4).
+
 ---
 
 ## Implementation notes (divergences from the draft below)
