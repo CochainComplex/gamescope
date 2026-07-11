@@ -175,10 +175,12 @@ Choose the cost explicitly for the display/framegen GPU:
 | `medium` | + reverse consistency and edge agreement | balanced quality/cost |
 | `high` | + self-tuning; optional AI | recommended default |
 | `ultra` | + bounded acceleration prediction from the preceding checked field | fast present GPUs |
-| `extreme` | + full-resolution color-guided motion-layer reconstruction | idle second GPU, maximum forward quality |
+| `extreme` | + color-guided motion-layer reconstruction and a three-real-frame disocclusion resolver | idle second GPU, maximum forward quality |
 
 Gamescope automatically walks downward through these levels if measured GPU
 time misses the display deadline. It never oscillates upward within a scene.
+The Extreme disocclusion search is on by default and never affects lower tiers;
+set `GAMESCOPE_FRAMEGEN_RESERVOIR=0` only for live A/B attribution.
 
 ### c) Bidirectional — the smoothest motion
 ```

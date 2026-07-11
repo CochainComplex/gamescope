@@ -30,13 +30,16 @@ uniform motion_accel_t {
     // Extreme tier: reconstruct a full-resolution motion-layer verdict from
     // the four low-resolution field texels covering this output pixel.
     float u_guidedReconstruction;
-    float u_pad0;
+    // Low-resolution real-frame luma from two intervals ago is available and
+    // consecutive with both motion fields.
+    float u_reservoirValid;
     float u_pad1;
     float u_pad2;
 };
 
 // s_samplers[0] = previousReal, [1] = currentReal,
-// [2] = current final motion field, [3] = preceding final motion field.
+// [2] = current final motion field, [3] = preceding final motion field,
+// [4] = real-frame luma from two intervals ago (Extreme reservoir).
 
 float colorError(vec3 a, vec3 b) {
     vec3 d = abs(a - b);
@@ -129,6 +132,117 @@ vec4 coherentHistoryField(vec2 uv, vec2 currentFlow) {
     return bestField;
 }
 
+bool insideUv(vec2 uv, vec2 halfTexel) {
+    return all(greaterThanEqual(uv, halfTexel))
+        && all(lessThanEqual(uv, vec2(1.0f) - halfTexel));
+}
+
+// Frames-only disocclusion recovery. FB inconsistency tells us that the
+// centre flow cannot explain this newly revealed pixel, but not which side of
+// a foreground/background boundary owns it. Search the eight adjacent field
+// hypotheses and accept a different layer only when it stays photometrically
+// coherent across THREE real frames. The two-interval-old luma reservoir is
+// evidence, not a blind history blend: the output uses the freshest current
+// color belonging to the validated layer, avoiding a two-frame trail and a
+// full-resolution historical-color read.
+vec3 reservoirCandidate(vec2 uv, vec2 invOutSize, vec2 baselineFlow,
+                        float baselineConf, float fbError,
+                        out float reservoirTrust) {
+    reservoirTrust = 0.0f;
+    vec3 bestColor = vec3(0.0f);
+    if (u_reservoirValid < 0.5f || u_historyValid < 0.5f
+            || u_guidedReconstruction < 0.5f)
+        return bestColor;
+
+    // Do not turn global B4 distrust into a full-screen history search. A
+    // reservoir lookup needs the LOCAL occlusion evidence carried in .a as
+    // well as low confidence in the centre hypothesis.
+    float occlusion = smoothstep(0.35f, 1.5f, fbError)
+        * (1.0f - smoothstep(0.20f, 0.55f, baselineConf));
+    if (occlusion <= 0.0f)
+        return bestColor;
+
+    ivec2 fieldSize = textureSize(s_samplers[2], 0);
+    ivec2 center = clamp(ivec2(floor(uv * vec2(fieldSize))),
+                         ivec2(0), fieldSize - 1);
+    const ivec2 offsets[8] = ivec2[8](
+        ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0),
+        ivec2( 1,  0), ivec2(-1, 1),  ivec2(0, 1),  ivec2( 1, 1));
+
+    float bestScore = 1e30f;
+    float bestTemporal = 1e30f;
+    float bestEvidence = 0.0f;
+    float bestSeparation = 0.0f;
+    vec2 halfTexel = 0.5f * invOutSize;
+
+    for (int i = 0; i < 8; i++) {
+        ivec2 fp = clamp(center + offsets[i], ivec2(0), fieldSize - 1);
+        vec4 candidate = texelFetch(s_samplers[2], fp, 0);
+        float candidateConf = clamp(candidate.b, 0.0f, 1.0f);
+        float separation = length(candidate.rg - baselineFlow);
+        // Require a genuinely different, locally consistent layer. These
+        // cheap field tests normally reject before any full-resolution color
+        // fetches, keeping chaotic/global distrust cases bounded.
+        if (candidate.a < -0.5f || candidate.a > 0.75f
+                || candidateConf < 0.35f || separation < 0.35f)
+            continue;
+
+        vec2 flowUv = candidate.rg * u_lowResScale * invOutSize;
+        vec4 oldField = texture(s_samplers[3], uv - flowUv);
+        float oldConf = clamp(oldField.b, 0.0f, 1.0f);
+        if (oldField.a < -0.5f || oldConf < 0.35f)
+            continue;
+
+        vec2 accel = candidate.rg - oldField.rg;
+        accel = sign(accel) * max(abs(accel) - vec2(0.05f), vec2(0.0f));
+        float speed = max(0.5f, max(length(candidate.rg), length(oldField.rg)));
+        float accelRatio = length(accel) / speed;
+        float accelTrust = candidateConf * oldConf
+            * (1.0f - smoothstep(0.35f, 1.0f, accelRatio));
+        accel = clamp(accel, vec2(-u_accelMax), vec2(u_accelMax));
+
+        float accelCoeff = 0.5f * u_strength * (u_strength + 1.0f);
+        vec2 futureFlow = candidate.rg * u_strength
+            + accel * (accelCoeff * accelTrust);
+        vec2 curUv = uv - futureFlow * u_lowResScale * invOutSize;
+        vec2 prevUv = curUv - flowUv;
+        vec2 olderUv = prevUv - oldField.rg * u_lowResScale * invOutSize;
+        if (!insideUv(curUv, halfTexel) || !insideUv(prevUv, halfTexel)
+                || !insideUv(olderUv, halfTexel))
+            continue;
+
+        vec3 curColor = texture(s_samplers[1], curUv).rgb;
+        vec3 prevColor = texture(s_samplers[0], prevUv).rgb;
+        float olderLuma = texture(s_samplers[4], olderUv).r;
+        float prevLuma = dot(prevColor, vec3(0.2126f, 0.7152f, 0.0722f));
+        float lumaError = abs(prevLuma - olderLuma)
+            / max(1.0f, max(abs(prevLuma), abs(olderLuma)));
+        float temporal = max(colorError(curColor, prevColor), lumaError);
+        if (isnan(temporal) || isinf(temporal))
+            continue;
+
+        vec2 spatial = vec2(offsets[i]);
+        // A small prior toward the nearer and slower layer resolves otherwise
+        // equal candidates without overriding photometric evidence. In common
+        // parallax this prefers background over a fast foreground occluder.
+        float fasterPenalty = max(0.0f, length(candidate.rg) - length(baselineFlow));
+        float score = temporal + 0.0025f * dot(spatial, spatial)
+            + 0.004f * fasterPenalty;
+        if (score < bestScore) {
+            bestScore = score;
+            bestTemporal = temporal;
+            bestEvidence = candidateConf * oldConf;
+            bestSeparation = separation;
+            bestColor = curColor;
+        }
+    }
+
+    float temporalTrust = 1.0f - smoothstep(0.025f, 0.10f, bestTemporal);
+    float layerTrust = smoothstep(0.35f, 1.0f, bestSeparation);
+    reservoirTrust = 0.85f * occlusion * temporalTrust * layerTrust * bestEvidence;
+    return bestColor;
+}
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 outSize = imageSize(dst);
@@ -191,6 +305,16 @@ void main() {
     float disagree = max(max(dd.r, dd.g), dd.b);
     float nrm = max(1.0f, max(max(abs(predictedMotion.r), abs(predictedMotion.g)), abs(predictedMotion.b)));
     conf *= 1.0f - smoothstep(u_agreeLo, u_agreeHi, disagree / nrm);
+
+    // At a locally diagnosed disocclusion, a three-frame-consistent adjacent
+    // layer can replace the invalid centre gather. The conservative trust cap
+    // and final fallback blend keep an ambiguous search from becoming a hard
+    // foreground/background toggle at the real-frame cadence.
+    float reservoirTrust;
+    vec3 reservoirColor = reservoirCandidate(
+        uv, invOutSize, flow, conf, field.a, reservoirTrust);
+    predictedMotion = mix(predictedMotion, reservoirColor, reservoirTrust);
+    conf = max(conf, reservoirTrust);
 
     // Same bounded pixel-space fallback as every lower motion tier.
     vec3 delta = currentFrame - previousFrame;

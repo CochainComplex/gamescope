@@ -4751,15 +4751,18 @@ struct FramegenMotionAccelPush_t
 	float accelMax;
 	float historyValid;
 	float guidedReconstruction;
-	float pad0, pad1, pad2;
+	float reservoirValid;
+	float pad1, pad2;
 
 	FramegenMotionAccelPush_t( float flStrength, float flLo, float flHi, float flScale,
-		float flAgreeLo, float flAgreeHi, float flAccelMax, bool bHistoryValid, bool bGuidedReconstruction )
+		float flAgreeLo, float flAgreeHi, float flAccelMax, bool bHistoryValid,
+		bool bGuidedReconstruction, bool bReservoirValid )
 		: strength( flStrength ), suppressLo( flLo ), suppressHi( flHi ), lowResScale( flScale )
 		, agreeLo( flAgreeLo ), agreeHi( flAgreeHi ), accelMax( flAccelMax )
 		, historyValid( bHistoryValid ? 1.0f : 0.0f )
 		, guidedReconstruction( bGuidedReconstruction ? 1.0f : 0.0f )
-		, pad0( 0.0f ), pad1( 0.0f ), pad2( 0.0f )
+		, reservoirValid( bReservoirValid ? 1.0f : 0.0f )
+		, pad1( 0.0f ), pad2( 0.0f )
 	{
 	}
 };
@@ -4920,6 +4923,15 @@ struct FramegenMotionResources_t
 	// rejects stale history when shared-queue admission skipped an interval.
 	gamescope::OwningRc<CVulkanTexture> mvFieldHistory;
 	uint64_t uMotionHistoryFrameId = 0;
+	// Extreme-quality frames-only disocclusion evidence. This low-resolution
+	// image contains luma from two intervals ago: a batch samples it during
+	// every warp, then refreshes it from lumaPrev after all warps complete. The
+	// internally-owned copy avoids retaining a third output-ring slot, and luma
+	// is sufficient because history validates a layer rather than supplying
+	// the displayed color.
+	gamescope::OwningRc<CVulkanTexture> lumaReservoir[2];
+	uint64_t uLumaReservoirFrameId[2] = {};
+	bool bLumaReservoirAllocTried = false;
 	// Self-supervised adaptation (B4): the 96x1 R32_UINT counter image the
 	// stats probe atomically accumulates into (applied to the motion field in
 	// the same batch), and its host-mapped linear copy the CPU parses one batch
@@ -5457,6 +5469,8 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.ulNetProfileConsumedSeqNo = 0;
 	// Temporal acceleration must never cross a scene/cadence discontinuity.
 	g_framegenMotion.uMotionHistoryFrameId = 0;
+	g_framegenMotion.uLumaReservoirFrameId[0] = 0;
+	g_framegenMotion.uLumaReservoirFrameId[1] = 0;
 	g_framegenHistory.pLastBaseTexture = nullptr;
 	// Release the retained output-ring slots so a ring rebuild is never blocked
 	// by history holding a reference to an old image, and so the next real frame
@@ -6266,6 +6280,17 @@ static bool framegen_create_intermediate( gamescope::OwningRc<CVulkanTexture> *p
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
 }
 
+static bool framegen_create_luma_reservoir( gamescope::OwningRc<CVulkanTexture> *ppTexture,
+	uint32_t width, uint32_t height, uint32_t drmFormat )
+{
+	CVulkanTexture::createFlags createFlags;
+	createFlags.bSampled = true;
+	createFlags.bTransferDst = true;
+
+	*ppTexture = new CVulkanTexture();
+	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
+}
+
 static bool framegen_format_supports_sampled_storage( uint32_t drmFormat )
 {
 	VkFormat format = DRMFormatToVulkan( drmFormat, false );
@@ -6392,6 +6417,22 @@ static bool framegen_agreement_enabled( GamescopeFramegenQuality eQuality )
 	static const bool s_bEnabled = []()
 	{
 		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_AGREE" );
+		return pszEnv == nullptr || env_to_bool( pszEnv );
+	}();
+	return s_bEnabled;
+}
+
+// Extreme-only three-frame disocclusion evidence. Default on as part of the
+// Extreme quality contract; the environment switch exists for live A/B cost
+// and artifact attribution without changing any lower quality rung.
+static bool framegen_reservoir_enabled( GamescopeFramegenQuality eQuality )
+{
+	if ( eQuality != GamescopeFramegenQuality::Extreme )
+		return false;
+
+	static const bool s_bEnabled = []()
+	{
+		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RESERVOIR" );
 		return pszEnv == nullptr || env_to_bool( pszEnv );
 	}();
 	return s_bEnabled;
@@ -7049,6 +7090,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	// chain and symmetric consistency check, overriding GAMESCOPE_FRAMEGEN_FB=0.
 	const bool bBidir = vulkan_framegen_bidir_active();
 	const bool bNeedMotionHistory = eQuality >= GamescopeFramegenQuality::Ultra && !bBidir;
+	const bool bNeedLumaReservoir = framegen_reservoir_enabled( eQuality ) && !bBidir;
 	const bool bCaptureNeedsReverse = framegen_record_dir() != nullptr
 		&& g_uFramegenRecordCount < framegen_record_max();
 	const bool bNeedCheckedReverse = bBidir || framegen_net_requested( eQuality ) || bCaptureNeedsReverse;
@@ -7069,6 +7111,13 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		|| ( bBidir && framegen_net_requested( eQuality ) && g_framegenMotion.mvFieldRevNet == nullptr )
 		|| ( bCaptureNeedsReverse && !g_framegenMotion.bRecAllocTried ) )
 	{
+		// Full-resolution history is keyed to the same reset as these field
+		// resources. Drop it before rebuilding a different-sized pyramid.
+		g_framegenMotion.lumaReservoir[0] = nullptr;
+		g_framegenMotion.lumaReservoir[1] = nullptr;
+		g_framegenMotion.uLumaReservoirFrameId[0] = 0;
+		g_framegenMotion.uLumaReservoirFrameId[1] = 0;
+		g_framegenMotion.bLumaReservoirAllocTried = false;
 		bool bAllocated = framegen_create_intermediate( &g_framegenMotion.lumaPrev, lowW, lowH, dispatch.motionLumaFormat )
 			&& framegen_create_intermediate( &g_framegenMotion.lumaCur, lowW, lowH, dispatch.motionLumaFormat )
 			&& framegen_create_intermediate( &g_framegenMotion.mvField, lowW, lowH, uFieldFormat );
@@ -7258,6 +7307,24 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		g_framegenMotion.lumaFormat = dispatch.motionLumaFormat;
 	}
 
+	// The luma reservoir is an Extreme-only enhancement, not a prerequisite
+	// for motion generation. Allocation failure leaves the established guided
+	// warp intact and is not retried every frame.
+	if ( bNeedLumaReservoir && !g_framegenMotion.bLumaReservoirAllocTried )
+	{
+		g_framegenMotion.bLumaReservoirAllocTried = true;
+		const bool bReservoirOk = framegen_create_luma_reservoir( &g_framegenMotion.lumaReservoir[0],
+			lowW, lowH, dispatch.motionLumaFormat )
+			&& framegen_create_luma_reservoir( &g_framegenMotion.lumaReservoir[1],
+				lowW, lowH, dispatch.motionLumaFormat );
+		if ( !bReservoirOk )
+		{
+			g_framegenMotion.lumaReservoir[0] = nullptr;
+			g_framegenMotion.lumaReservoir[1] = nullptr;
+			vk_log.errorf( "framegen: luma-reservoir allocation failed; keeping the Extreme guided warp without third-frame disocclusion evidence" );
+		}
+	}
+
 	const uint32_t pg = 8;
 
 	// Pass 1: downscale both real frames to the base low-res luma pair.
@@ -7380,6 +7447,19 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 		&& g_framegenMotion.uMotionHistoryFrameId != 0
 		&& g_framegenMotion.uMotionHistoryFrameId + 1u == g_framegenHistory.currentFrameId;
 	const bool bGuided = eQuality == GamescopeFramegenQuality::Extreme;
+	int nReservoirRead = -1;
+	for ( uint32_t i = 0; i < 2; i++ )
+	{
+		if ( g_framegenMotion.uLumaReservoirFrameId[i] != 0
+			&& g_framegenMotion.uLumaReservoirFrameId[i] + 2u == g_framegenHistory.currentFrameId )
+		{
+			nReservoirRead = (int)i;
+			break;
+		}
+	}
+	const bool bReservoirValid = bGuided && bHistoryValid
+		&& nReservoirRead >= 0
+		&& g_framegenMotion.lumaReservoir[nReservoirRead] != nullptr;
 	// Extreme uses the accelerated shader even during the first interval: its
 	// full-resolution field reconstruction does not need temporal history.
 	const bool bAccelPipeline = bHistoryValid || bGuided;
@@ -7405,10 +7485,19 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	if ( bAccelPipeline )
 	{
 		framegen_motion_bind_sampler( pCmdBuffer, 3, g_framegenMotion.mvFieldHistory, false );
+		// Bind a valid image even while the reservoir is warming. The push
+		// constant prevents the shader from reading slot 4 until its frame-ID
+		// chain and the preceding motion field are both consecutive.
+		pCmdBuffer->bindTexture( 4, bReservoirValid
+			? gamescope::Rc<CVulkanTexture>( g_framegenMotion.lumaReservoir[nReservoirRead] )
+			: gamescope::Rc<CVulkanTexture>( g_framegenMotion.lumaPrev ) );
+		pCmdBuffer->setTextureSrgb( 4, false );
+		pCmdBuffer->setSamplerUnnormalized( 4, false );
+		pCmdBuffer->setSamplerNearest( 4, false );
 		pCmdBuffer->pushConstants<FramegenMotionAccelPush_t>( flStrength,
 			k_flFramegenSuppressLo, k_flFramegenSuppressHi,
 			(float)k_uFramegenMotionDownscale, flAgreeLo, flAgreeHi,
-			1.0f, bHistoryValid, bGuided );
+			1.0f, bHistoryValid, bGuided, bReservoirValid );
 	}
 	else
 	{
@@ -7596,6 +7685,35 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	{
 		pCmdBuffer->copyImage( framegen_motion_field(), g_framegenMotion.mvFieldHistory );
 		g_framegenMotion.uMotionHistoryFrameId = g_framegenHistory.currentFrameId;
+	}
+	// Preserve two-interval-old real-frame luma without extending the
+	// output-ring lifetime. Every warp above reads the old reservoir first;
+	// this same-command-buffer copy is ordered after those reads and publishes
+	// lumaPrev for the next consecutive Extreme batch. At 1/8 resolution this
+	// is 1/64 the texel traffic of copying the full color frame. Two tiny images
+	// retain both current-2 (for JIT/refill slots of this same interval) and
+	// current-1 (for the next interval); a refill finds the latter already
+	// published and records no redundant copy.
+	if ( bMotion && !bBidir && eff.quality == GamescopeFramegenQuality::Extreme
+		&& g_framegenMotion.lumaReservoir[0] != nullptr
+		&& g_framegenMotion.lumaReservoir[1] != nullptr )
+	{
+		int nExisting = -1;
+		int nRead = -1;
+		for ( uint32_t i = 0; i < 2; i++ )
+		{
+			if ( g_framegenMotion.uLumaReservoirFrameId[i] == g_framegenHistory.previousFrameId )
+				nExisting = (int)i;
+			if ( g_framegenMotion.uLumaReservoirFrameId[i] != 0
+				&& g_framegenMotion.uLumaReservoirFrameId[i] + 2u == g_framegenHistory.currentFrameId )
+				nRead = (int)i;
+		}
+		if ( nExisting < 0 )
+		{
+			const int nTarget = nRead == 0 ? 1 : 0;
+			pCmdBuffer->copyImage( g_framegenMotion.lumaPrev, g_framegenMotion.lumaReservoir[nTarget] );
+			g_framegenMotion.uLumaReservoirFrameId[nTarget] = g_framegenHistory.previousFrameId;
+		}
 	}
 
 	g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
@@ -8025,14 +8143,20 @@ void vulkan_framegen_benchmark()
 				if ( g_eFramegenQuality >= GamescopeFramegenQuality::Ultra
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 					cmd->copyImage( framegen_motion_field(), g_framegenMotion.mvFieldHistory );
+				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme
+					&& g_framegenMotion.lumaReservoir[0] != nullptr )
+					cmd->copyImage( g_framegenMotion.lumaPrev, g_framegenMotion.lumaReservoir[0] );
 				g_device.submit( std::move( cmd ) );
 				g_device.waitIdle();
 				if ( g_eFramegenQuality >= GamescopeFramegenQuality::Ultra
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 				{
-					g_framegenMotion.uMotionHistoryFrameId = 1;
-					g_framegenHistory.currentFrameId = 2;
+					g_framegenMotion.uMotionHistoryFrameId = 2;
+					g_framegenHistory.currentFrameId = 3;
 				}
+				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme
+					&& g_framegenMotion.lumaReservoir[0] != nullptr )
+					g_framegenMotion.uLumaReservoirFrameId[0] = 1;
 			}
 
 			double msMotionPrep = timePass( [&]( CVulkanCmdBuffer *cmd ) {
@@ -8071,6 +8195,16 @@ void vulkan_framegen_benchmark()
 					: g_eFramegenQuality == GamescopeFramegenQuality::Ultra
 						? "motion accel warp (per gen)" : "motion warp (per gen)",
 				msMotionWarp );
+
+			if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme
+				&& g_framegenMotion.lumaReservoir[0] != nullptr )
+			{
+				double msReservoirUpdate = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+					cmd->copyImage( g_framegenMotion.lumaPrev, g_framegenMotion.lumaReservoir[0] );
+				} );
+				printf( "%-8s  %-26s  %10.3f\n", res.pszName,
+					"luma reservoir copy (real)", msReservoirUpdate );
+			}
 
 			// Bidir (B3): the setup number above already includes the extra
 			// reverse-field check when bidir is active; the two-frame warp is
@@ -8134,7 +8268,10 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Ultra )
 				vk_log.infof( "framegen: ultra quality — confidence-gated causal temporal acceleration enabled after one consecutive field warm-up" );
 			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme )
-				vk_log.infof( "framegen: extreme quality — full-resolution color-guided motion reconstruction + causal temporal acceleration enabled" );
+				vk_log.infof( "framegen: extreme quality — color-guided reconstruction + causal acceleration%s",
+					framegen_reservoir_enabled( g_eFramegenQuality )
+						? " + three-real-frame disocclusion reservoir enabled"
+						: " (disocclusion reservoir disabled by GAMESCOPE_FRAMEGEN_RESERVOIR=0)" );
 			if ( framegen_adapt_enabled( g_eFramegenQuality ) )
 				vk_log.infof( "framegen: self-supervised adaptation active (B4) — each real frame grades the field that predicted it; blend trust follows same-batch, thresholds auto-calibrate next batch (GAMESCOPE_FRAMEGEN_ADAPT=0 disables)" );
 			else if ( g_eFramegenQuality < GamescopeFramegenQuality::High )

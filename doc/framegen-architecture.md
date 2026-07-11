@@ -67,6 +67,7 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - `GAMESCOPE_FRAMEGEN_AGREE` — per-pixel two-source agreement test in the warp (kills `conf` at full res where the two real-frame projections of the flow read different content). `=0` disables.
 - `GAMESCOPE_FRAMEGEN_BIDIR` — truthy int; opt-in **B3 bidirectional interpolation** (`vulkan_framegen_bidir_active`, `:5294`). Generated frames sit *between* the two reals (warp both toward phase `t`, blend by confidence, phase-correct crossfade fallback) instead of extrapolating past the newest — removes hold-then-jump judder and handles translucency, at the cost of presenting each real frame **one interval late** (§0 invariants #1/#4 exception; see §3.3). **Requires motion mode; mutually exclusive with `_JIT`/#06, `_VRR_HYBRID`/#01 and `_BASE`/#02** (each owns its own timeline); silently ignored otherwise (logs once).
 - `GAMESCOPE_FRAMEGEN_ADAPT` — **B4 self-supervised adaptation** (`framegen_adapt_enabled`; motion mode). Each real frame grades the field that predicted it (field-res stats probe, measured 20–39 µs per real at 1080p–4K on Radeon 890M); a same-batch apply pass folds a global field-trust factor into the field's confidence and rejects content scene cuts from nine regional luminance histograms, while the next-batch CPU readback auto-calibrates the FB tolerance and agreement window (see §3.4). `=0` disables (B3-bit-exact warps, no probe). An explicit `_FB_TOL` pins the tolerance against auto-calibration.
+- `GAMESCOPE_FRAMEGEN_RESERVOIR` — Extreme causal mode only, default on; `=0` disables the three-real-frame screen-space disocclusion resolver for live A/B attribution. It is never allocated or sampled by lower tiers or bidirectional interpolation.
 - `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned forward-field refinement** (`framegen_net_weights_path`; motion mode, no `_BIDIR` requirement). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). Bidir additionally refines the reverse field. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
 - `GAMESCOPE_FRAMEGEN_RECORD` — directory; **Stage C dataset capture** (motion mode, no `_BIDIR` requirement). Dumps raw field-res training tensors (both lumas + both checked fields, pre-refinement/pre-trust) one `GSFD` file per real frame, up to `GAMESCOPE_FRAMEGEN_RECORD_MAX` (default 1000, ~0.6–1.2 MB each — mind the disk).
 - `GAMESCOPE_FRAMEGEN_NET_ONLINE` — truthy int; **C2 in-situ learning** (see §3.5). The refiner keeps training on the framegen GPU against every real frame; works with a `_NET` blob as the prior or from a synthesized neutral init. Without `_NET_PROFILE` the model is **ephemeral — nothing is ever written to disk**. `_NET_LR` (default `3e-4`), `_NET_EVERY` (train every Nth real frame, default 1) tune it; `_NET_PROFILE=<path>` makes the learning persistent per game: loaded as the prior when present (a malformed/torn file is rejected loudly and the neutral prior used instead), checkpointed back every 1024 trained steps **off-thread** (file I/O never rides the render thread) and flushed at exit and on every framegen reset, so sessions shorter than the checkpoint interval persist too. Writes are atomic (temp + rename): a crash or a full disk can never tear an existing good profile. The served weights are health-checked every trained step; a non-finite value re-initializes the optimizer state from the prior automatically and is never persisted.
@@ -157,7 +158,7 @@ hardware linearizes on read).
 | **Motion medium** | low + reverse match / FB check + full-res agreement | reverse chain once per real | `eff.quality==Medium` | rejects disocclusions and boundary bleed |
 | **Motion high** | medium + B4 adaptation; optional learned refiner/training | default; compatible with the pre-tier path | `eff.quality==High` | self-tuning quality with optional ML |
 | **Motion ultra** | high + retained-field acceleration warp | one field copy per estimated interval + one low-res field sample per output pixel | `eff.quality==Ultra` | bounded second-order forward prediction |
-| **Motion extreme** | ultra + full-resolution color-guided field reconstruction | four field hypotheses and four real-frame correspondence samples per output pixel | `eff.quality==Extreme` | maximum causal boundary quality on an idle second GPU |
+| **Motion extreme** | ultra + color-guided field reconstruction + three-frame disocclusion resolver | four covering hypotheses everywhere; bounded eight-neighbour search only at locally FB-inconsistent/low-confidence pixels; two 1/8-res luma history images | `eff.quality==Extreme` | maximum causal boundary quality on an idle second GPU |
 
 **Invariant across all extrapolate variants:** alpha pinned to `current`; the *only* range bound is
 the 9-tap neighbor clamp — no `[0,1]` clamp, so UNORM stays in range while scRGB keeps HDR>1.0 and
@@ -256,6 +257,28 @@ unambiguously; smooth or textureless regions retain the bilinear field. The prec
 selected from the history layer whose velocity is nearest to that reconstructed current flow, so a
 foreground/background mixture cannot masquerade as acceleration. This is a causal, vendor-neutral
 software approximation of the most valuable part of dense optical flow: motion-boundary ownership.
+
+The Extreme disocclusion resolver extends that ownership test across a third
+real frame without retaining another output-ring slot. Two internally owned
+1/8-resolution luma images form a frame-ID-keyed ping-pong: one remains the
+`current-2` evidence for every initial/JIT/refill warp of the current interval,
+while the other receives `lumaPrev` (`current-1`) after the warps and becomes
+evidence for the next interval. Refill sees that ID already published and skips
+the copy. This preserves the five-slot output-ring proof and costs only a
+field-resolution image copy (measured 4–9 us per real at 1080p–4K on Radeon
+890M).
+
+The shader searches the eight adjacent field hypotheses only where centre
+confidence is low **and** `.a` reports a large local FB round-trip error. A
+candidate must be a distinct, FB-consistent motion layer; its reprojected path
+through the preceding field must remain on-screen and agree across current
+color, previous color, and the two-interval-old luma. The accepted output color
+always comes from the newest real frame, not the reservoir, so the mechanism
+cannot create a stale historical-color trail. Its capped trust blends into the
+same bounded fallback as every lower causal tier. Scene-cut sentinels, skipped
+field IDs, allocation failure, bidir, or a ladder step to Ultra disable it
+without a separate pipeline. This is screen-space evidence, not depth: it
+cannot reconstruct out-of-screen or long-hidden content.
 
 ### 3.3 Bidirectional interpolation (B3, `GAMESCOPE_FRAMEGEN_BIDIR=1`, opt-in)
 

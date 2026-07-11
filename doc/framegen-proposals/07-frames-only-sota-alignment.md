@@ -1,7 +1,8 @@
 # 07 — Frames-only SOTA alignment: what we have, what's missing
 
-Status: **design map / gap analysis**; Gaps E1 and B implemented
-(`scripts/framegen-net-eval.py` and the B4 GPU scene-cut guard). Maps
+Status: **design map / gap analysis**; Gaps E1, B, and the bounded frames-only
+form of A implemented (`scripts/framegen-net-eval.py`, the B4 GPU scene-cut
+guard, and the Extreme disocclusion reservoir). Maps
 [`../research-framegen.md`](../research-framegen.md) onto the shipped pipeline and
 proposals #01–#06, then sketches the genuine gaps that are worth building.
 
@@ -24,7 +25,7 @@ forward path; SOTA alignment is about the `motion` path.
 | Research idea (see research-framegen.md) | In tree today | Assessment |
 |---|---|---|
 | **Extrapolation as the games-appropriate default** (zero added latency); interpolation is opt-in for its ≥1-frame latency (§0, Recommendations) | `extrapolate` default; `motion` forward path; `GAMESCOPE_FRAMEGEN_BIDIR` opt-in interpolation that presents one interval late | **Aligned by design.** The latency taxonomy is baked into the mode/bidir split. |
-| **Heuristic motion + a lightweight correction net** is the real-time frontier — the GFFE template (§3, Rec 1) | 3-level luma pyramid block matcher → FB check → per-pixel agreement → self-supervised adaptation → ~4.6k-param field-refiner net | **Same shape.** We built GFFE's "cheap motion + small CNN" skeleton, minus its disocclusion machinery (Part 2, Gap A) and its color-domain correction (Gap D). |
+| **Heuristic motion + a lightweight correction net** is the real-time frontier — the GFFE template (§3, Rec 1) | 3-level luma pyramid block matcher → FB check → per-pixel agreement → self-supervised adaptation → ~4.6k-param field-refiner net → bounded screen-space disocclusion reservoir | **Same shape within frames-only limits.** The remaining major GFFE gap is its depth/MV-backed layered world-space background, which a compositor cannot reproduce; color-domain correction remains Gap D. |
 | **Quadratic / uniform-acceleration motion** (Mob-FGSR, KF1) | Ultra tier: `mvFieldHistory` gives a 2-field second derivative → quadratic through 3 causal positions, deadzoned + accel-capped + confidence-gated (`cs_framegen_motion_warp_accel.comp`) | **Implemented, frames-only variant.** Mob-FGSR does this in world space from depth+MVs; we do it in screen space on the *motion field*. Ours is the correct choice given no depth. |
 | **Hybrid "prefer whichever source gives the better color match"** at block level (FSR 3, §4, Recommendations) | Per-pixel two-source agreement + FB round-trip + confidence blend to the bounded pixel-space fallback | **Conceptually equivalent** — a home-grown per-pixel version of FSR's block-level color-match arbitration. |
 | **UI/HUD must be composited after generation** (KF, §5) | Proposal **#02** base-layer generation + late overlay/cursor composite (prototyped, `GAMESCOPE_FRAMEGEN_BASE=1`) | **This *is* the research's UI recommendation.** Already prototyped. |
@@ -77,7 +78,7 @@ acceleration. No CPU round trip, future frame, vendor API, or per-generated-fram
 stats read is added. Measured B4 cost is 20–39 µs per real at 1080p–4K on the
 Radeon 890M, and a 1M-asteroid camera-motion stress run produced no false cuts.
 
-### Gap A (flagship quality item) — Disocclusion background reservoir · moderate cost · opt-in
+### Gap A — Disocclusion background reservoir · implemented, Extreme only
 **The single biggest frames-only quality gap.** On a disocclusion (revealed
 background) the pipeline can only kill confidence and fall back to bounded
 pixel-space extrapolation → hold-then-ghost. GFFE's core contribution is
@@ -91,19 +92,31 @@ frame — it still consumes rendered-frame **depth and MVs**, on which its layer
 background buffer and world-space projection depend. We have neither, so our
 version is necessarily coarser.
 
-Frames-only sketch that fits our architecture: we retain 2 real frames today but
-the output ring is already 5 while framegen is on, so retain 2–3 more *by
-reference* (zero-copy). Reproject each along its (already-computed) motion field
-into the current frame; where the forward field's FB check kills confidence
-**and** the region reads as newly-revealed (current has content the
-warped-previous lacks), sample the reprojected background reservoir instead of
-the bounded fallback, selecting by color agreement. Without depth we cannot
-accumulate a true layered background buffer or world-space-project it; the honest
-frames-only substitute is screen-space motion-field reprojection of the retained
-frames + photometric selection, which recovers *static and dynamic* disocclusions
-but **not** out-of-screen ones (Part 4). Gate behind the **extreme tier / opt-in** (it costs extra history reads on the bandwidth-bound present
-GPU), budget it through the degradation ladder, and keep it in the fp32/HDR
-path. This is the item that moves us from "GFFE skeleton" to "GFFE."
+The implemented frames-only form deliberately does **not** retain another
+output-ring image: that would increase the pin set and break the five-slot ring's
+"always one free composite target" proof while a dedicated-queue batch is still
+reading. Instead, two internally owned 1/8-resolution luma images retain the
+two-interval-old evidence needed by both the current batch and same-interval JIT
+refills. Each image carries a real-frame ID; skipped estimates, invalidations,
+scene cuts, and non-consecutive history cannot consume it.
+
+At a full-resolution pixel, the Extreme warp enters the reservoir search only
+when the centre field has both low confidence and a large local FB round-trip
+error. It tests the eight adjacent field hypotheses, rejects candidates that are
+not a distinct, locally FB-consistent layer, reprojects each through the retained
+preceding field, rejects any path leaving the screen, and requires photometric
+agreement across **current color → previous color → two-interval-old luma**. The
+winning layer supplies its color from the **current** real frame, never from
+history; this uses the reservoir as causal evidence without creating a stale
+color trail. Trust is capped and blended back into the established bounded
+fallback. `GAMESCOPE_FRAMEGEN_RESERVOIR=0` provides live A/B attribution.
+
+This recovers one-field-neighbourhood static/dynamic boundary disocclusions. It
+still cannot recover content that is out of screen, hidden for many frames, or
+correctly depth-order arbitrary overlapping motions. Those require the engine
+depth/MVs that GFFE actually uses. The luma ping-pong copy costs 4–9 us per real
+frame at 1080p–4K on Radeon 890M; the conditional full-res search is charged to
+the Extreme rung and disappears as soon as the deadline ladder drops to Ultra.
 
 ### Gap D (research-grade, later) — Color-domain shading correction head · high cost · high ceiling
 The net refines the motion **field** only; it never touches color. Non-geometric
@@ -154,8 +167,8 @@ frame as a research direction after Gaps E/B/A land.
 
 ## Recommended order
 
-`E → B → A → D`. **E1 and B are done**; E2 (colour-frame capture) is the next
-small measurement step and A is the flagship frames-only quality gain. D is the
+`E → B → A → D`. **E1, B, and bounded frames-only A are done**; E2
+(colour-frame capture) is the next small measurement step and D is the
 long-horizon ceiling. #03 stays a baseline, annotated per Part 3.
 
 ## Cross-check provenance (2026-07-11)

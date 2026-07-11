@@ -34,7 +34,7 @@ on top of it.
 |---|---|---|
 | `--experimental-framegen` | — | **Master switch** — required by every feature below. |
 | `--framegen-mode` | **`extrapolate`** · `motion` · `blend` | Algorithm. `motion` unlocks the whole motion-quality stack (FB / agreement / adaptation / bidir / learned net). `blend` is interpolation for debugging only. |
-| `--framegen-quality` | `low` · `medium` · **`high`** · `ultra` · `extreme` | Motion cost/quality ceiling. Low = forward match; medium = +FB/agreement; high = +adaptation and optional ML; ultra = +causal temporal acceleration; extreme = +full-resolution color-guided field reconstruction. Deadline degradation walks down these tiers. |
+| `--framegen-quality` | `low` · `medium` · **`high`** · `ultra` · `extreme` | Motion cost/quality ceiling. Low = forward match; medium = +FB/agreement; high = +adaptation and optional ML; ultra = +causal temporal acceleration; extreme = +color-guided field reconstruction and bounded three-frame disocclusion recovery. Deadline degradation walks down these tiers. |
 | `--framegen-multiplier` | **`2`** · `3` · `4` | Presented-to-real ratio (inserts up to *N*−1 generated frames per real frame); also sizes the output image pool. |
 | `--framegen-strength` | `0.0`–`1.0` (**`0.5`**) | Forward extrapolation step size. |
 | `--framegen-debug` | — | Per-frame logging (rate set by `GAMESCOPE_FRAMEGEN_DEBUG_EVERY`). |
@@ -46,6 +46,7 @@ on top of it.
 | `GAMESCOPE_FRAMEGEN_FB` | on | Forward-backward consistency check — kills mislock / disocclusion fizzle. |
 | `GAMESCOPE_FRAMEGEN_AGREE` | on | Per-pixel two-source agreement — kills double-exposed / ghosted edges. |
 | `GAMESCOPE_FRAMEGEN_ADAPT` | on | Self-supervised adaptation — per-frame field trust + CPU auto-calibration. |
+| `GAMESCOPE_FRAMEGEN_RESERVOIR` | on in causal `extreme` | Three-real-frame screen-space disocclusion resolver; `=0` disables it for A/B attribution. Never scheduled below Extreme or in bidir. |
 | `GAMESCOPE_FRAMEGEN_FB_TOL` | `0.75` | FB round-trip tolerance (texels); **setting it pins the value** against `GAMESCOPE_FRAMEGEN_ADAPT`'s auto-calibration. |
 
 ### Opt-in modes — off by default
@@ -240,8 +241,8 @@ build on top of that foundation.
    the shipped pipeline and proposals #01–#06: which SOTA ideas are already in
    the tree (extrapolation-first, quadratic acceleration, per-pixel color-match
    arbitration, UI post-composite), and the genuine frames-only gaps worth
-   building — a perceptual/temporal validation harness, a GFFE-style
-   disocclusion background reservoir, and an optional color-domain
-   shading-correction net head. **Design map / gap analysis**; Gap E1's
-   structural/temporal evaluator (`scripts/framegen-net-eval.py`) and Gap B's
-   GPU content scene-cut guard are implemented.
+   building — a perceptual/temporal validation harness, a frames-only
+   disocclusion reservoir, and an optional color-domain shading-correction net
+   head. **Design map / gap analysis**; Gap E1's structural/temporal evaluator
+   (`scripts/framegen-net-eval.py`), Gap B's GPU content scene-cut guard, and
+   Gap A's bounded Extreme resolver are implemented.

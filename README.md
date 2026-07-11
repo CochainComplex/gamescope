@@ -31,7 +31,7 @@ The generation is essentially **free** because it runs on silicon that would oth
 Under the hood it's a staged, self-correcting motion pipeline:
 
 - **Motion estimation** — a 3-level coarse-to-fine luma **pyramid block matcher** (full search only at the coarsest level, ≈±128 px reach), **sub-pixel parabolic** refinement, seeded ±1 search down the levels, and vector-median seeding to kill tear-like mislocks.
-- **Artifact control** — a **forward-backward consistency check** (round-trip a vector; if it doesn't close, drop its confidence — kills disocclusion/mislock fizzle), a **per-pixel two-source agreement test** that stops ghosted double-exposures at edges, and TAA-style neighbourhood clamping so the warp can never invent colours.
+- **Artifact control** — a **forward-backward consistency check** (round-trip a vector; if it doesn't close, drop its confidence — kills disocclusion/mislock fizzle), a **per-pixel two-source agreement test** that stops ghosted double-exposures at edges, TAA-style neighbourhood clamping, and an Extreme-tier three-real-frame reservoir that validates adjacent background motion before filling a newly revealed boundary.
 - **Extrapolate *or* interpolate** — default **forward extrapolation** (zero added latency), or true **bidirectional interpolation** (warp *both* real frames to the in-between phase, confidence-blend, phase-correct crossfade in the gaps) for the smoothest motion at the cost of ~1 frame of latency.
 - **It learns** — a small (~4.6k-param) **convolutional refiner net** cleans up the motion fields (bounded flow residual + confidence recalibration), trainable offline from captured frames *or* **learning in-situ on the GPU while you play**, with per-game persistence. On top of that a **self-supervised loop** grades every real frame against the prediction that targeted it and auto-tunes its own thresholds.
 - **Pacing & display** — **display-clock (KMS pageflip) JIT pacing** places each generated frame against the real vblank cadence; a **VRR/adaptive-sync-compatible** hybrid; and a **base-layer** path that composites HUD/cursor *after* generation so UI text stays crisp.
@@ -189,7 +189,10 @@ This is a prototype. Keep the following in mind:
   retains and reprojects the preceding checked field to make a bounded causal
   acceleration prediction; `extreme` reconstructs a per-pixel motion-layer
   verdict from nearby field hypotheses using full-resolution color
-  correspondence before applying that acceleration. The timestamp ladder
+  correspondence before applying that acceleration, then uses two-interval-old
+  luma to validate adjacent background motion at locally diagnosed
+  disocclusions. The displayed color still comes from the newest real frame,
+  not history. The timestamp ladder
   sheds these tiers one at a time before falling back to plain extrapolation
   or reducing the multiplier.
 * **Scene changes.** Prediction history is dropped automatically on focus
@@ -366,7 +369,7 @@ See `gamescope --help` for a full list of options.
 * `-f`: create a full-screen window.
 * `--experimental-framegen`: enable experimental compositor-side frame generation (x2–x4). Implies `--force-composite`; disables adaptive sync and tearing while active. See [Experimental frame generation](#experimental-frame-generation).
 * `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency), `motion` (motion-compensated, higher quality/cost) or `blend` (debug).
-* `--framegen-quality`: motion quality/cost ceiling: `low`, `medium`, `high` (default), `ultra`, or `extreme`. Lower tiers skip whole passes; `ultra` adds causal temporal acceleration and `extreme` adds full-resolution color-guided motion reconstruction.
+* `--framegen-quality`: motion quality/cost ceiling: `low`, `medium`, `high` (default), `ultra`, or `extreme`. Lower tiers skip whole passes; `ultra` adds causal temporal acceleration and `extreme` adds full-resolution color-guided motion reconstruction plus a bounded three-frame disocclusion resolver (`GAMESCOPE_FRAMEGEN_RESERVOIR=0` disables only the latter for A/B testing).
 * `--framegen-strength`: forward-extrapolation step for `extrapolate`/`motion` modes, `0.0`–`1.0` (default `0.5`). Lower values reduce ghosting.
 * `--framegen-multiplier`: generated-frame multiplier, `2` (default), `3` or `4`. The number of frames actually displayed adapts to empty vblanks; on a dedicated framegen queue gamescope may speculatively prepare candidates that are later dropped if real content arrives first.
 * `--framegen-debug`: log framegen history, dispatch, and present cadence.
