@@ -5,11 +5,12 @@
 
 #include "descriptor_set.h"
 
-// Ultra-quality causal motion warp. In addition to the current checked field,
+// Ultra/Extreme causal motion warp. In addition to the current checked field,
 // it reads the preceding interval's final field and reprojects that field to
 // the current content position. Their difference is a constant-acceleration
-// estimate; no future frame, application motion vector, optical-flow API, or
-// vendor extension is required.
+// estimate; Extreme also reconstructs per-pixel motion-layer ownership. No
+// future frame, application motion vector, optical-flow API, or vendor
+// extension is required.
 layout(
   local_size_x = 8,
   local_size_y = 8,
@@ -26,10 +27,107 @@ uniform motion_accel_t {
     // Component-wise acceleration cap in field texels per real interval^2.
     float u_accelMax;
     float u_historyValid;
+    // Extreme tier: reconstruct a full-resolution motion-layer verdict from
+    // the four low-resolution field texels covering this output pixel.
+    float u_guidedReconstruction;
+    float u_pad0;
+    float u_pad1;
+    float u_pad2;
 };
 
 // s_samplers[0] = previousReal, [1] = currentReal,
 // [2] = current final motion field, [3] = preceding final motion field.
+
+float colorError(vec3 a, vec3 b) {
+    vec3 d = abs(a - b);
+    float scale = max(1.0f, max(
+        max(max(abs(a.r), abs(a.g)), abs(a.b)),
+        max(max(abs(b.r), abs(b.g)), abs(b.b))));
+    return max(max(d.r, d.g), d.b) / scale;
+}
+
+// The estimator deliberately works at 1/8 resolution for throughput. Plain
+// bilinear upsampling is correct inside a motion layer, but it creates a
+// physically impossible average vector at foreground/background boundaries.
+// Test the four covering hypotheses against the full-resolution real frames
+// and select one only when (a) their flows actually diverge and (b) one has a
+// meaningfully better correspondence. Smooth and ambiguous areas retain the
+// bilinear field, avoiding hard 8x8 cells and winner flicker.
+vec4 reconstructField(vec2 uv, vec3 currentFrame, vec2 invOutSize) {
+    vec4 bilinearField = texture(s_samplers[2], uv);
+    if (u_guidedReconstruction < 0.5f)
+        return bilinearField;
+
+    ivec2 fieldSize = textureSize(s_samplers[2], 0);
+    vec2 fieldPos = uv * vec2(fieldSize) - vec2(0.5f);
+    ivec2 base = ivec2(floor(fieldPos));
+
+    vec4 bestField = bilinearField;
+    float bestScore = 1e30f;
+    float secondScore = 1e30f;
+    float maxFlowSpread = 0.0f;
+
+    for (int dy = 0; dy <= 1; dy++) {
+        for (int dx = 0; dx <= 1; dx++) {
+            ivec2 fieldCoord = clamp(base + ivec2(dx, dy), ivec2(0), fieldSize - 1);
+            vec4 candidate = texelFetch(s_samplers[2], fieldCoord, 0);
+            vec2 candidateUv = candidate.rg * u_lowResScale * invOutSize;
+            vec3 matchedPrevious = texture(s_samplers[0], uv - candidateUv).rgb;
+
+            vec2 samplePos = vec2(fieldCoord) + vec2(0.5f);
+            vec2 spatialDelta = samplePos - uv * vec2(fieldSize);
+            float score = colorError(currentFrame, matchedPrevious)
+                + 0.0125f * dot(spatialDelta, spatialDelta)
+                + 0.025f * (1.0f - clamp(candidate.b, 0.0f, 1.0f));
+
+            maxFlowSpread = max(maxFlowSpread, length(candidate.rg - bilinearField.rg));
+            if (score < bestScore) {
+                secondScore = bestScore;
+                bestScore = score;
+                bestField = candidate;
+            } else if (score < secondScore) {
+                secondScore = score;
+            }
+        }
+    }
+
+    float boundaryTrust = smoothstep(0.25f, 1.0f, maxFlowSpread);
+    float winnerTrust = smoothstep(0.0025f, 0.04f, secondScore - bestScore);
+    return mix(bilinearField, bestField, boundaryTrust * winnerTrust);
+}
+
+// Select history from the same motion layer as the reconstructed current
+// flow. This is temporal nearest-neighbour association, not another velocity
+// estimate: the quadratic predictor below remains bounded and confidence
+// gated. It prevents a bilinear old foreground/background mixture from being
+// mistaken for acceleration at precisely the edges Extreme is repairing.
+vec4 coherentHistoryField(vec2 uv, vec2 currentFlow) {
+    if (u_guidedReconstruction < 0.5f)
+        return texture(s_samplers[3], uv);
+
+    ivec2 fieldSize = textureSize(s_samplers[3], 0);
+    vec2 fieldPos = uv * vec2(fieldSize) - vec2(0.5f);
+    ivec2 base = ivec2(floor(fieldPos));
+    vec4 bestField = texture(s_samplers[3], uv);
+    float bestScore = 1e30f;
+
+    for (int dy = 0; dy <= 1; dy++) {
+        for (int dx = 0; dx <= 1; dx++) {
+            ivec2 fieldCoord = clamp(base + ivec2(dx, dy), ivec2(0), fieldSize - 1);
+            vec4 candidate = texelFetch(s_samplers[3], fieldCoord, 0);
+            vec2 samplePos = vec2(fieldCoord) + vec2(0.5f);
+            vec2 spatialDelta = samplePos - uv * vec2(fieldSize);
+            float score = abs(candidate.r - currentFlow.x) + abs(candidate.g - currentFlow.y)
+                + 0.0125f * dot(spatialDelta, spatialDelta)
+                + 0.05f * (1.0f - clamp(candidate.b, 0.0f, 1.0f));
+            if (score < bestScore) {
+                bestScore = score;
+                bestField = candidate;
+            }
+        }
+    }
+    return bestField;
+}
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -44,7 +142,7 @@ void main() {
     vec4 currentSample = texelFetch(s_samplers[1], coord, 0);
     vec3 currentFrame = currentSample.rgb;
 
-    vec4 field = texture(s_samplers[2], uv);
+    vec4 field = reconstructField(uv, currentFrame, invOutSize);
     vec2 flow = field.rg;
     float conf = clamp(field.b, 0.0f, 1.0f);
     vec2 flowUv = flow * u_lowResScale * invOutSize;
@@ -53,7 +151,11 @@ void main() {
     // flow backward aligns its sample with the same moving content. Confidence
     // from both intervals is required: a disocclusion or an uncertain old
     // match must reduce to the established constant-velocity result.
-    vec4 oldField = texture(s_samplers[3], uv - flowUv);
+    // Avoid touching undefined history during the first interval. Multiplying
+    // a sampled NaN by historyValid=0 would still be NaN under IEEE rules.
+    vec4 oldField = vec4(flow, conf, 0.0f);
+    if (u_historyValid > 0.5f)
+        oldField = coherentHistoryField(uv - flowUv, flow);
     vec2 accel = flow - oldField.rg;
 
     // Remove the sub-pel noise floor before extrapolating a second derivative.

@@ -6,8 +6,9 @@ Vulkan mechanisms, concrete integration points in the tree, a latency/throughput
 analysis, an adversarial risk table, and a testing plan. Most are **design
 documents**; each proposal's `Status:` line says whether it has since been
 implemented. Of the numbered proposals, #04 is implemented and #01, #02 and #06
-have env-gated prototypes; the **quick reference** below lists every flag and
-toggle and exactly what each one needs.
+have env-gated prototypes; #07 is a research-to-implementation map rather than a
+single mechanism; the **quick reference** below lists every flag and toggle and
+exactly what each one needs.
 
 > **Just want to use it?** Start with the plain-language
 > [**How-To guide**](../framegen-howto.md) — two-card setup, how to connect the
@@ -25,7 +26,7 @@ on top of it.
 |---|---|---|
 | `--experimental-framegen` | — | **Master switch** — required by every feature below. |
 | `--framegen-mode` | **`extrapolate`** · `motion` · `blend` | Algorithm. `motion` unlocks the whole motion-quality stack (FB / agreement / adaptation / bidir / learned net). `blend` is interpolation for debugging only. |
-| `--framegen-quality` | `low` · `medium` · **`high`** · `ultra` | Motion cost/quality ceiling. Low = forward match; medium = +FB/agreement; high = +adaptation and optional ML; ultra = +causal temporal acceleration. Deadline degradation walks down these tiers. |
+| `--framegen-quality` | `low` · `medium` · **`high`** · `ultra` · `extreme` | Motion cost/quality ceiling. Low = forward match; medium = +FB/agreement; high = +adaptation and optional ML; ultra = +causal temporal acceleration; extreme = +full-resolution color-guided field reconstruction. Deadline degradation walks down these tiers. |
 | `--framegen-multiplier` | **`2`** · `3` · `4` | Presented-to-real ratio (inserts up to *N*−1 generated frames per real frame); also sizes the output image pool. |
 | `--framegen-strength` | `0.0`–`1.0` (**`0.5`**) | Forward extrapolation step size. |
 | `--framegen-debug` | — | Per-frame logging (rate set by `GAMESCOPE_FRAMEGEN_DEBUG_EVERY`). |
@@ -44,8 +45,8 @@ on top of it.
 | Variable | Requires | Effect |
 |---|---|---|
 | `GAMESCOPE_FRAMEGEN_BIDIR=1` | `--framegen-mode motion`; **excludes** `GAMESCOPE_FRAMEGEN_JIT`, `GAMESCOPE_FRAMEGEN_VRR_HYBRID`, `GAMESCOPE_FRAMEGEN_BASE` | Bidirectional interpolation — smoothest motion, but real frames present **one interval late**. |
-| `GAMESCOPE_FRAMEGEN_NET=<blob>` | `--framegen-mode motion --framegen-quality high|ultra` | Learned causal forward-field refiner; value is the path to a `GSFR` weights blob (see below). Bidir is optional. Empty / unreadable → disabled, not fatal. |
-| `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | motion `high`/`ultra`; `NET` blob optional | In-situ learning (C2): the forward refiner keeps training on the framegen GPU against every real frame, tracking the current scene. Without a `NET` blob it starts from a neutral prior; without `NET_PROFILE` the model is **ephemeral — nothing is written to disk**. |
+| `GAMESCOPE_FRAMEGEN_NET=<blob>` | `--framegen-mode motion --framegen-quality high|ultra|extreme` | Learned causal forward-field refiner; value is the path to a `GSFR` weights blob (see below). Bidir is optional. Empty / unreadable → disabled, not fatal. |
+| `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | motion `high`/`ultra`/`extreme`; `NET` blob optional | In-situ learning (C2): the forward refiner keeps training on the framegen GPU against every real frame, tracking the current scene. Without a `NET` blob it starts from a neutral prior; without `NET_PROFILE` the model is **ephemeral — nothing is written to disk**. |
 | `GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Persistent per-game learning: loaded as the prior when the file exists (a malformed file is rejected loudly → neutral prior), checkpointed off-thread every 1024 trained steps and flushed at exit/reset, so short sessions persist too. Atomic writes (temp + rename): a crash or full disk never tears a good profile. |
 | `GAMESCOPE_FRAMEGEN_NET_LR` / `GAMESCOPE_FRAMEGEN_NET_EVERY` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Learning rate (default `3e-4`) / train every *N*th real frame (default `1` — raise on weak present GPUs). |
 | `GAMESCOPE_FRAMEGEN_RECORD=<dir>` | `--framegen-mode motion` | Capture training tensors (one `GSFD` file per real frame, ≈1.2 MB at 1440p) into `<dir>`; bidir is not required. |
@@ -68,14 +69,20 @@ untested, so enable one at a time.
 | `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE=1` | Force the shared-queue regime (disables the dedicated-queue features `GAMESCOPE_FRAMEGEN_JIT` / `GAMESCOPE_FRAMEGEN_VRR_HYBRID`). |
 | `GAMESCOPE_FRAMEGEN_BENCHMARK` | Run the shader microbenchmark, then exit before output creation (**presence-only** — even `=0` triggers it). |
 
-### The learned refiner (Stage C) in three steps
+### The learned refiner (Stage C) in four steps
 
 1. **Capture** a representative scene (writes `GSFD` files):
    `GAMESCOPE_FRAMEGEN_BIDIR=1 GAMESCOPE_FRAMEGEN_RECORD=/tmp/fg gamescope --experimental-framegen --framegen-mode motion … `
 2. **Train** (numpy only, CPU, minutes):
    `scripts/framegen-net-train.py --data /tmp/fg --out weights.bin`
    (`--init --out neutral.bin` writes an untrained blob that is bit-identical to Stage B.)
-3. **Use** it: `GAMESCOPE_FRAMEGEN_NET=weights.bin GAMESCOPE_FRAMEGEN_BIDIR=1 gamescope --experimental-framegen --framegen-mode motion … `
+3. **Evaluate** before shipping the blob (numpy only, CPU):
+   `scripts/framegen-net-eval.py --data /tmp/fg --net weights.bin`
+   reports SSIM / edge-structure / `bad%` / temporal-stability for the neutral
+   (Stage B) vs refined field and the deltas — the structural/temporal view the
+   scalar training residual misses (proposal #07, Gap E1). Grades the *field*, at
+   field-resolution luma; colour-domain LPIPS/FvVDP need the E2 capture extension.
+4. **Use** it: `GAMESCOPE_FRAMEGEN_NET=weights.bin GAMESCOPE_FRAMEGEN_BIDIR=1 gamescope --experimental-framegen --framegen-mode motion … `
 
 Or skip the offline steps entirely: `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` trains
 in-situ on the framegen GPU while serving — by itself this is the fully
@@ -198,3 +205,13 @@ The proposals below build on top of that foundation.
    and a slew-limited frametime EMA. Fixes the phase-vs-vblank sawtooth in the
    marginal 40–59 fps regime and adds the missing "skip when keeping up" guard.
    **Prototype implemented** (`GAMESCOPE_FRAMEGEN_JIT=1`, dedicated queue only).
+7. [Frames-only SOTA alignment: what we have, what's missing](07-frames-only-sota-alignment.md)
+   — maps the [frame-generation research survey](../research-framegen.md) onto
+   the shipped pipeline and proposals #01–#06: which SOTA ideas are already in
+   the tree (extrapolation-first, quadratic acceleration, per-pixel color-match
+   arbitration, UI post-composite), and the genuine frames-only gaps worth
+   building — a perceptual/temporal validation harness, content-based scene-cut
+   detection, a GFFE-style disocclusion background reservoir, and an optional
+   color-domain shading-correction net head. **Design map / gap analysis**; its
+   Gap E1 structural/temporal validation harness is implemented
+   (`scripts/framegen-net-eval.py`).

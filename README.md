@@ -173,8 +173,11 @@ This is a prototype. Keep the following in mind:
   (default, compatible with the previous behavior) adds self-supervised
   adaptation and permits the optional learned refiner; `ultra` additionally
   retains and reprojects the preceding checked field to make a bounded causal
-  acceleration prediction. The timestamp ladder sheds these tiers one at a
-  time before falling back to plain extrapolation or reducing the multiplier.
+  acceleration prediction; `extreme` reconstructs a per-pixel motion-layer
+  verdict from nearby field hypotheses using full-resolution color
+  correspondence before applying that acceleration. The timestamp ladder
+  sheds these tiers one at a time before falling back to plain extrapolation
+  or reducing the multiplier.
 * **Scene changes.** Prediction history is dropped automatically on focus
   change, overlay/notification appearance or disappearance, SDR↔HDR/EOTF
   changes, resolution or format changes, and long frame gaps, so stale content
@@ -345,7 +348,7 @@ See `gamescope --help` for a full list of options.
 * `-f`: create a full-screen window.
 * `--experimental-framegen`: enable experimental compositor-side frame generation (x2–x4). Implies `--force-composite`; disables adaptive sync and tearing while active. See [Experimental frame generation](#experimental-frame-generation).
 * `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency), `motion` (motion-compensated, higher quality/cost) or `blend` (debug).
-* `--framegen-quality`: motion quality/cost ceiling: `low`, `medium`, `high` (default), or `ultra`. Lower tiers skip whole passes; `ultra` adds causal temporal-acceleration prediction.
+* `--framegen-quality`: motion quality/cost ceiling: `low`, `medium`, `high` (default), `ultra`, or `extreme`. Lower tiers skip whole passes; `ultra` adds causal temporal acceleration and `extreme` adds full-resolution color-guided motion reconstruction.
 * `--framegen-strength`: forward-extrapolation step for `extrapolate`/`motion` modes, `0.0`–`1.0` (default `0.5`). Lower values reduce ghosting.
 * `--framegen-multiplier`: generated-frame multiplier, `2` (default), `3` or `4`. The number of frames actually displayed adapts to empty vblanks; on a dedicated framegen queue gamescope may speculatively prepare candidates that are later dropped if real content arrives first.
 * `--framegen-debug`: log framegen history, dispatch, and present cadence.

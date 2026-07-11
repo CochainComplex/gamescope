@@ -17,7 +17,7 @@
 #   LIMIT=2            game fps = REFRESH / LIMIT (the gap framegen fills; 2 => x2)
 #   DEBUG_EVERY=1      log every Nth framegen event (1 = exact counts, higher = less spam)
 #   DURATION=          seconds to auto-stop a 'run' (empty = until you close the window)
-#   QUALITY=high       motion tier: low | medium | high | ultra
+#   QUALITY=high       motion tier: low | medium | high | ultra | extreme
 #
 # Examples:
 #   ./test-framegen.sh bench amd
@@ -88,7 +88,7 @@ cmd_gpus() {
 
 cmd_bench() {
     local id quality="${QUALITY:-high}"; id=$(resolve_gpu "${1:-nvidia}")
-    case "$quality" in low|medium|high|ultra) ;; *) echo "error: QUALITY must be low|medium|high|ultra" >&2; exit 1 ;; esac
+    case "$quality" in low|medium|high|ultra|extreme) ;; *) echo "error: QUALITY must be low|medium|high|ultra|extreme" >&2; exit 1 ;; esac
     echo "# framegen GPU microbenchmark — device $id"
     echo "# quality=$quality (compare extrapolate variants and the selected motion pipeline)"
     GAMESCOPE_FRAMEGEN_BENCHMARK=1 "$BIN" --backend headless --prefer-vk-device "$id" \
@@ -143,7 +143,7 @@ cmd_run() {
     local refresh="${REFRESH:-144}" limit="${LIMIT:-2}" every="${DEBUG_EVERY:-1}" quality="${QUALITY:-high}"
 
     case "$mode" in extrapolate|motion|blend) ;; *) echo "error: mode must be extrapolate|motion|blend" >&2; exit 1 ;; esac
-    case "$quality" in low|medium|high|ultra) ;; *) echo "error: QUALITY must be low|medium|high|ultra" >&2; exit 1 ;; esac
+    case "$quality" in low|medium|high|ultra|extreme) ;; *) echo "error: QUALITY must be low|medium|high|ultra|extreme" >&2; exit 1 ;; esac
     if ! command -v "${app%% *}" >/dev/null 2>&1; then
         echo "error: test app '${app%% *}' not found in PATH" >&2; exit 1
     fi

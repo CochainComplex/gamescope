@@ -174,7 +174,8 @@ Choose the cost explicitly for the display/framegen GPU:
 | `low` | forward motion match only | older or bandwidth-limited GPUs |
 | `medium` | + reverse consistency and edge agreement | balanced quality/cost |
 | `high` | + self-tuning; optional AI | recommended default |
-| `ultra` | + bounded acceleration prediction from three causal intervals | fastest present GPUs, maximum forward quality |
+| `ultra` | + bounded acceleration prediction from the preceding checked field | fast present GPUs |
+| `extreme` | + full-resolution color-guided motion-layer reconstruction | idle second GPU, maximum forward quality |
 
 Gamescope automatically walks downward through these levels if measured GPU
 time misses the display deadline. It never oscillates upward within a scene.
@@ -219,6 +220,10 @@ It works with zero-latency forward prediction; bidirectional mode is optional.
 Newest and least-tested; turn it off if anything looks worse. To remember what it learned between sessions, add
 `GAMESCOPE_FRAMEGEN_NET_PROFILE=$HOME/fg-<gamename>.bin`.
 
+Power users can also train the net offline on a captured scene and measure it
+before use (`scripts/framegen-net-train.py` then `scripts/framegen-net-eval.py`)
+— see [The learned refiner (Stage C)](framegen-proposals/README.md#the-learned-refiner-stage-c-in-four-steps).
+
 ---
 
 ## 6. Which one should I use?
@@ -231,7 +236,7 @@ Newest and least-tested; turn it off if anything looks worse. To remember what i
 | Competitive / fast shooter (lowest lag) | **Simple** (a), *not* bidirectional |
 | Crisp menus and HUD | add **Base-layer** (d) |
 | You own a FreeSync/G-Sync monitor | add **VRR** (e) |
-| Maximum quality without added latency | **Motion ultra + AI** (f) |
+| Maximum quality without added latency | **Motion extreme + AI** (f) |
 | Smoothest output, one-frame latency acceptable | **Bidirectional + AI** |
 
 Start with `--framegen-multiplier 2`. Try `3` or `4` only if the present card
@@ -258,7 +263,9 @@ can keep up (see limits).
   does nothing on ordinary screens or typical laptop panels.
 - **Base-layer** and **bidirectional** can't be used at the same time. So can't
   bidirectional and VRR, or bidirectional and JIT — pick one "smart" mode.
-- **AI refiner** needs bidirectional turned on.
+- **AI refiner** needs `--framegen-mode motion` and `--framegen-quality high`
+  or above; bidirectional is optional (it works in the zero-latency forward
+  path too).
 
 **Older / weaker present cards** (this matters because the *present* card does
 the generation)
@@ -277,8 +284,9 @@ the generation)
 - The performance tuning is automatic: on newer hardware it uses packed-fp16
   shaders, on others it falls back — you don't set this.
 - If quality drops because the card is overloaded, gamescope automatically
-  steps *down* (motion → simpler → fewer extra frames) to avoid stutter, and
-  steps back up when there's headroom.
+  steps *down* (motion → simpler → fewer extra frames) to avoid stutter. The
+  step-down holds for the rest of the scene (it never oscillates back up
+  mid-scene); full quality is re-probed only at the next scene change.
 
 ---
 
@@ -290,7 +298,8 @@ Add `--framegen-debug` and watch the terminal:
 - `bidirectional interpolation requested` / `learned field refinement active` /
   `self-supervised adaptation active` → those modes are on.
 - `… ignored (requires …)` → you enabled a mode without its requirement (e.g.
-  the AI refiner without bidirectional).
+  `GAMESCOPE_FRAMEGEN_BIDIR=1` without `--framegen-mode motion`, or combined
+  with a mode that owns its own timeline like base-layer/VRR/JIT).
 
 | Problem | Likely cause / fix |
 |---------|--------------------|

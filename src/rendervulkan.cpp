@@ -4654,6 +4654,8 @@ static const char *framegen_quality_name_of( GamescopeFramegenQuality eQuality )
 			return "high";
 		case GamescopeFramegenQuality::Ultra:
 			return "ultra";
+		case GamescopeFramegenQuality::Extreme:
+			return "extreme";
 		default:
 			return "unknown";
 	}
@@ -4748,12 +4750,16 @@ struct FramegenMotionAccelPush_t
 	float agreeHi;
 	float accelMax;
 	float historyValid;
+	float guidedReconstruction;
+	float pad0, pad1, pad2;
 
 	FramegenMotionAccelPush_t( float flStrength, float flLo, float flHi, float flScale,
-		float flAgreeLo, float flAgreeHi, float flAccelMax, bool bHistoryValid )
+		float flAgreeLo, float flAgreeHi, float flAccelMax, bool bHistoryValid, bool bGuidedReconstruction )
 		: strength( flStrength ), suppressLo( flLo ), suppressHi( flHi ), lowResScale( flScale )
 		, agreeLo( flAgreeLo ), agreeHi( flAgreeHi ), accelMax( flAccelMax )
 		, historyValid( bHistoryValid ? 1.0f : 0.0f )
+		, guidedReconstruction( bGuidedReconstruction ? 1.0f : 0.0f )
+		, pad0( 0.0f ), pad1( 0.0f ), pad2( 0.0f )
 	{
 	}
 };
@@ -5334,7 +5340,7 @@ struct FramegenEffective_t
 static uint32_t framegen_max_degrade_steps()
 {
 	// Each motion quality level is a real command-recording rung. Low still has
-	// one final step to extrapolate; ultra therefore contributes four rungs.
+	// one final step to extrapolate; Extreme therefore contributes five rungs.
 	const uint32_t nMotionRung = g_eFramegenMode == GamescopeFramegenMode::Motion
 		? (uint32_t)g_eFramegenQuality + 1u : 0u;
 	const uint32_t nMultiplierRungs = (uint32_t)std::max( 0, g_nFramegenMultiplier - 2 );
@@ -6239,10 +6245,10 @@ static bool framegen_create_intermediate( gamescope::OwningRc<CVulkanTexture> *p
 	createFlags.bStorage = true;
 	createFlags.bSampled = true;
 	// Dataset capture copies the lumas and fields out to mapped readbacks.
-	// Ultra also rotates the final field into a retained transfer destination.
+	// Ultra and Extreme also rotate the final field into a retained transfer destination.
 	createFlags.bTransferSrc = framegen_record_dir() != nullptr
-		|| g_eFramegenQuality == GamescopeFramegenQuality::Ultra;
-	createFlags.bTransferDst = g_eFramegenQuality == GamescopeFramegenQuality::Ultra;
+		|| g_eFramegenQuality >= GamescopeFramegenQuality::Ultra;
+	createFlags.bTransferDst = g_eFramegenQuality >= GamescopeFramegenQuality::Ultra;
 
 	*ppTexture = new CVulkanTexture();
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
@@ -7016,7 +7022,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	// zero-latency forward-prediction path. Both therefore require the reverse
 	// chain and symmetric consistency check, overriding GAMESCOPE_FRAMEGEN_FB=0.
 	const bool bBidir = vulkan_framegen_bidir_active();
-	const bool bNeedMotionHistory = eQuality == GamescopeFramegenQuality::Ultra && !bBidir;
+	const bool bNeedMotionHistory = eQuality >= GamescopeFramegenQuality::Ultra && !bBidir;
 	const bool bCaptureNeedsReverse = framegen_record_dir() != nullptr
 		&& g_uFramegenRecordCount < framegen_record_max();
 	const bool bNeedCheckedReverse = bBidir || framegen_net_requested( eQuality ) || bCaptureNeedsReverse;
@@ -7342,12 +7348,16 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	float flStrength, GamescopeFramegenQuality eQuality )
 {
 	const uint32_t pg = 8;
-	const bool bAccel = eQuality == GamescopeFramegenQuality::Ultra
+	const bool bHistoryValid = eQuality >= GamescopeFramegenQuality::Ultra
 		&& g_framegenMotion.mvFieldHistory != nullptr
 		&& g_framegenMotion.uMotionHistoryFrameId != 0
 		&& g_framegenMotion.uMotionHistoryFrameId + 1u == g_framegenHistory.currentFrameId;
+	const bool bGuided = eQuality == GamescopeFramegenQuality::Extreme;
+	// Extreme uses the accelerated shader even during the first interval: its
+	// full-resolution field reconstruction does not need temporal history.
+	const bool bAccelPipeline = bHistoryValid || bGuided;
 
-	pCmdBuffer->bindPipeline( g_device.pipeline( bAccel
+	pCmdBuffer->bindPipeline( g_device.pipeline( bAccelPipeline
 		? SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL : SHADER_TYPE_FRAMEGEN_MOTION_WARP ) );
 	pCmdBuffer->bindTarget( pTarget );
 	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
@@ -7365,13 +7375,13 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	const bool bAgree = framegen_agreement_enabled( eQuality );
 	const float flAgreeLo = bAgree ? framegen_effective_agree_lo( eQuality ) : 1e5f;
 	const float flAgreeHi = bAgree ? framegen_effective_agree_hi( eQuality ) : 1e6f;
-	if ( bAccel )
+	if ( bAccelPipeline )
 	{
 		framegen_motion_bind_sampler( pCmdBuffer, 3, g_framegenMotion.mvFieldHistory, false );
 		pCmdBuffer->pushConstants<FramegenMotionAccelPush_t>( flStrength,
 			k_flFramegenSuppressLo, k_flFramegenSuppressHi,
 			(float)k_uFramegenMotionDownscale, flAgreeLo, flAgreeHi,
-			1.0f, true );
+			1.0f, bHistoryValid, bGuided );
 	}
 	else
 	{
@@ -7555,7 +7565,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// after every slot has read the preceding one. Command-buffer barriers order
 	// the read-before-copy, and the frame-ID check in framegen_warp_slot rejects
 	// this history if a later shared-queue interval is skipped.
-	if ( bMotion && !bBidir && eff.quality == GamescopeFramegenQuality::Ultra
+	if ( bMotion && !bBidir && eff.quality >= GamescopeFramegenQuality::Ultra
 		&& g_framegenMotion.mvFieldHistory != nullptr )
 	{
 		pCmdBuffer->copyImage( framegen_motion_field(), g_framegenMotion.mvFieldHistory );
@@ -7986,12 +7996,12 @@ void vulkan_framegen_benchmark()
 			{
 				auto cmd = g_device.commandBuffer();
 				framegen_prepare_motion( cmd.get(), res.nWidth, res.nHeight, dispatch, g_eFramegenQuality );
-				if ( g_eFramegenQuality == GamescopeFramegenQuality::Ultra
+				if ( g_eFramegenQuality >= GamescopeFramegenQuality::Ultra
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 					cmd->copyImage( framegen_motion_field(), g_framegenMotion.mvFieldHistory );
 				g_device.submit( std::move( cmd ) );
 				g_device.waitIdle();
-				if ( g_eFramegenQuality == GamescopeFramegenQuality::Ultra
+				if ( g_eFramegenQuality >= GamescopeFramegenQuality::Ultra
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 				{
 					g_framegenMotion.uMotionHistoryFrameId = 1;
@@ -8030,8 +8040,10 @@ void vulkan_framegen_benchmark()
 				framegen_warp_slot( cmd, pOut, g_flFramegenStrength, g_eFramegenQuality );
 			} );
 			printf( "%-8s  %-26s  %10.3f\n", res.pszName,
-				g_eFramegenQuality == GamescopeFramegenQuality::Ultra
-					? "motion accel warp (per gen)" : "motion warp (per gen)",
+				g_eFramegenQuality == GamescopeFramegenQuality::Extreme
+					? "motion guided warp (per gen)"
+					: g_eFramegenQuality == GamescopeFramegenQuality::Ultra
+						? "motion accel warp (per gen)" : "motion warp (per gen)",
 				msMotionWarp );
 
 			// Bidir (B3): the setup number above already includes the extra
@@ -8095,6 +8107,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				vk_log.infof( "framegen: medium quality — reverse consistency + full-resolution agreement enabled" );
 			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Ultra )
 				vk_log.infof( "framegen: ultra quality — confidence-gated causal temporal acceleration enabled after one consecutive field warm-up" );
+			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme )
+				vk_log.infof( "framegen: extreme quality — full-resolution color-guided motion reconstruction + causal temporal acceleration enabled" );
 			if ( framegen_adapt_enabled( g_eFramegenQuality ) )
 				vk_log.infof( "framegen: self-supervised adaptation active (B4) — each real frame grades the field that predicted it; blend trust follows same-batch, thresholds auto-calibrate next batch (GAMESCOPE_FRAMEGEN_ADAPT=0 disables)" );
 			else if ( g_eFramegenQuality < GamescopeFramegenQuality::High )

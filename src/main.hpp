@@ -102,8 +102,11 @@ enum class GamescopeFramegenQuality : uint32_t
     // This preserves the behavior that predates explicit quality tiers.
     High,
     // Add confidence-gated temporal acceleration from the preceding checked
-    // field. This is the most expensive causal forward-prediction path.
+    // field.
     Ultra,
+    // Add full-resolution, color-guided reconstruction of the low-resolution
+    // field at motion boundaries. This is the most expensive causal path.
+    Extreme,
 };
 
 extern bool g_bExperimentalFramegen;

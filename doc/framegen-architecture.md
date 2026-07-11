@@ -46,7 +46,7 @@ path; the opt-in **bidir** mode (`GAMESCOPE_FRAMEGEN_BIDIR=1`, §3.3) deliberate
 |---|---|---|
 | `--experimental-framegen` | `g_bExperimentalFramegen` | master enable; forces the full-composite path |
 | `--framegen-mode {extrapolate\|motion\|blend}` | `g_eFramegenMode` | default `extrapolate`; `blend` is debug-only |
-| `--framegen-quality {low\|medium\|high\|ultra}` | `g_eFramegenQuality` | motion cost ceiling; default `high` preserves the pre-tier pipeline |
+| `--framegen-quality {low\|medium\|high\|ultra\|extreme}` | `g_eFramegenQuality` | motion cost ceiling; default `high` preserves the pre-tier pipeline |
 | `--framegen-multiplier {2,3,4}` | `g_nFramegenMultiplier` | validated, `exit(1)` on bad value; also *sizes the output pool* |
 | `--framegen-strength <0.0-1.0>` | `g_flFramegenStrength` | validated finite float forward step; malformed or out-of-range values fail startup |
 | `--framegen-debug` | `g_bFramegenDebug`, `g_uFramegenDebugEvery` | see §8 observability |
@@ -62,10 +62,10 @@ Parse sites `main.cpp:139-160, 842-880`; benchmark early-exit `main.cpp:1094-110
 - `GAMESCOPE_FRAMEGEN_BASE` — truthy int; opt-in **#02 base-layer generation** prototype (`rendervulkan.cpp:4919` `framegen_base_layer_enabled`). Generates on the pre-upscale game layer (`layers[0].tex`), then the present-time consume runs a **late composite** (`framegen_base_present_composite`, `:5350`) against the *live* `FrameInfo_t` — generated frames go through the full FSR/color pipeline and carry fresh overlays + latest cursor. Unlike JIT/hybrid it does **not** need the dedicated queue; it self-selects per frame via `framegen_base_layer_usable` (`:4939`: layer 0 is the base plane, non-YCbCr, no ReShade, format supports sampled+storage) and falls back **live** to output-space generation for unusable scenes.
 
 Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution — see §3.2):
-- `GAMESCOPE_FRAMEGEN_FB` — forward-backward consistency check (`framegen_fbcheck_enabled`, `:5644`; runs the coarse-to-fine matcher a second time reverse-anchored and kills confidence where the round trip doesn't close). `=0` disables.
+- `GAMESCOPE_FRAMEGEN_FB` — forward-backward consistency check (`framegen_fbcheck_enabled`, `:6332`; runs the coarse-to-fine matcher a second time reverse-anchored and kills confidence where the round trip doesn't close). `=0` disables.
 - `GAMESCOPE_FRAMEGEN_FB_TOL` — float, clamped `[0.05, 8.0]`, default `0.75`; the FB round-trip tolerance in low-res texels (larger = more forgiving = fewer kills).
 - `GAMESCOPE_FRAMEGEN_AGREE` — per-pixel two-source agreement test in the warp (kills `conf` at full res where the two real-frame projections of the flow read different content). `=0` disables.
-- `GAMESCOPE_FRAMEGEN_BIDIR` — truthy int; opt-in **B3 bidirectional interpolation** (`vulkan_framegen_bidir_active`, `:5076`). Generated frames sit *between* the two reals (warp both toward phase `t`, blend by confidence, phase-correct crossfade fallback) instead of extrapolating past the newest — removes hold-then-jump judder and handles translucency, at the cost of presenting each real frame **one interval late** (§0 invariants #1/#4 exception; see §3.3). **Requires motion mode; mutually exclusive with `_JIT`/#06, `_VRR_HYBRID`/#01 and `_BASE`/#02** (each owns its own timeline); silently ignored otherwise (logs once).
+- `GAMESCOPE_FRAMEGEN_BIDIR` — truthy int; opt-in **B3 bidirectional interpolation** (`vulkan_framegen_bidir_active`, `:5294`). Generated frames sit *between* the two reals (warp both toward phase `t`, blend by confidence, phase-correct crossfade fallback) instead of extrapolating past the newest — removes hold-then-jump judder and handles translucency, at the cost of presenting each real frame **one interval late** (§0 invariants #1/#4 exception; see §3.3). **Requires motion mode; mutually exclusive with `_JIT`/#06, `_VRR_HYBRID`/#01 and `_BASE`/#02** (each owns its own timeline); silently ignored otherwise (logs once).
 - `GAMESCOPE_FRAMEGEN_ADAPT` — **B4 self-supervised adaptation** (`framegen_adapt_enabled`; motion mode). Each real frame grades the field that predicted it (field-res stats probe, 14–25 µs per real); a same-batch apply pass folds a global field-trust factor into the field's confidence, and the next-batch CPU readback auto-calibrates the FB tolerance and agreement window (see §3.4). `=0` disables (B3-bit-exact warps, no probe). An explicit `_FB_TOL` pins the tolerance against auto-calibration.
 - `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned forward-field refinement** (`framegen_net_weights_path`; motion mode, no `_BIDIR` requirement). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). Bidir additionally refines the reverse field. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
 - `GAMESCOPE_FRAMEGEN_RECORD` — directory; **Stage C dataset capture** (motion mode, no `_BIDIR` requirement). Dumps raw field-res training tensors (both lumas + both checked fields, pre-refinement/pre-trust) one `GSFD` file per real frame, up to `GAMESCOPE_FRAMEGEN_RECORD_MAX` (default 1000, ~0.6–1.2 MB each — mind the disk).
@@ -78,7 +78,7 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - **`IBackend::SupportsFramegen()`** (`backend.h`, new virtual) — default false; DRM + nested-Wayland return true; `CDeferredBackend` delegates to its child (`DeferredBackend.h:224`). Gates the feature to backends that can actually consume generated frames and pay the forced-composite/no-VRR tax.
 
 ### Shader build wiring (`src/meson.build`)
-The 23 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) and registered unconditionally by the `SHADER()` macro table; `MOTION_WARP_ACCEL` is the ultra-tier addition. **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays**, so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
+The 23 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) and registered unconditionally by the `SHADER()` macro table; `MOTION_WARP_ACCEL` serves Ultra acceleration and Extreme guided reconstruction. **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays**, so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
 
 ---
 
@@ -149,14 +149,15 @@ hardware linearizes on read).
 | Variant | Math | Memory strategy | Dispatched when | Tradeoff / cost |
 |---|---|---|---|---|
 | **Extrapolate LDS fp32** (`cs_framegen_extrapolate.comp`) | `delta = cur−prev`; `strength = u_strength·(1−smoothstep(0.08,0.40,motion))`, `motion = max(\|Δr\|,\|Δg\|,\|Δb\|)`; `predicted = cur + delta·strength`; full 3×3 neighbor clamp; **no [0,1] clamp**; alpha = `cur.a` | 10×10 LDS apron `s_cur[100]` of CURRENT only, staged once/group; diagonals add LDS reads but no image traffic | non-NVIDIA integer targets | preserves diagonal/thin motion better; halos bounded by suppression + neighbor clamp |
-| **Extrapolate direct** (`_extrapolate_direct.comp`) | **bit-identical** to LDS fp32 | no LDS / no barrier; neighbors via `texelFetch` straight from texture cache | **NVIDIA only** (`vendorID==0x10DE`, `:5200`) | identical output; **~30–37% faster** on NVIDIA (large L2 makes the apron pure overhead); also beats fp16 there |
+| **Extrapolate direct** (`_extrapolate_direct.comp`) | **bit-identical** to LDS fp32 | no LDS / no barrier; neighbors via `texelFetch` straight from texture cache | **NVIDIA only** (`vendorID==0x10DE`, `:6303`) | identical output; **~30–37% faster** on NVIDIA (large L2 makes the apron pure overhead); also beats fp16 there |
 | **Extrapolate fp16** (`_extrapolate_fp16.comp`) | same math, `f16vec3` ALU; push uploaded fp32 then cast; alpha never demoted | **LDS apron stays vec4 fp32** — only ALU is fp16, bandwidth unchanged, so upside is capped | `supportsShaderFloat16 && !floatTarget`, non-NVIDIA | fp16 range/precision bands scRGB highlights → **gated off for float targets** |
 | **Extrapolate pair (+ pair_fp16)** (`_extrapolate_pair.comp`) | writes TWO slots from one dispatch; suppress term + neighbor min/max computed **once** and shared | halves the two full-res history reads across the pair | x3/x4 | same quality; halves history bandwidth at high multipliers |
 | **Blend** — DEBUG ONLY (`cs_framegen_blend.comp`) | `mix(prev, cur, phase)` full vec4 **including alpha**; **INTERPOLATION**; no suppression/rectification | normalized-coord **bilinear** `texture()` (the only framegen shader using sampler filtering) | `eff.mode==Blend` only | structurally violates invariant #4 → judder; reference lever |
 | **Motion low** | forward luma pyramid + hierarchical match + constant-velocity warp | no reverse field, stats, or ML dispatches | `eff.quality==Low` | cheapest motion-compensated tier |
 | **Motion medium** | low + reverse match / FB check + full-res agreement | reverse chain once per real | `eff.quality==Medium` | rejects disocclusions and boundary bleed |
 | **Motion high** | medium + B4 adaptation; optional learned refiner/training | default; compatible with the pre-tier path | `eff.quality==High` | self-tuning quality with optional ML |
-| **Motion ultra** | high + retained-field acceleration warp | one field copy per estimated interval + one low-res field sample per output pixel | `eff.quality==Ultra` | most advanced zero-added-latency forward prediction |
+| **Motion ultra** | high + retained-field acceleration warp | one field copy per estimated interval + one low-res field sample per output pixel | `eff.quality==Ultra` | bounded second-order forward prediction |
+| **Motion extreme** | ultra + full-resolution color-guided field reconstruction | four field hypotheses and four real-frame correspondence samples per output pixel | `eff.quality==Extreme` | maximum causal boundary quality on an idle second GPU |
 
 **Invariant across all extrapolate variants:** alpha pinned to `current`; the *only* range bound is
 the 9-tap neighbor clamp — no `[0,1]` clamp, so UNORM stays in range while scRGB keeps HDR>1.0 and
@@ -228,7 +229,7 @@ Because `predicted = mix(predictedExtra, predictedMotion, conf)`, **motion is a 
 extrapolate** — `conf=0` reproduces the bounded extrapolate output exactly, so it can never be much
 worse even where matching fails.
 
-#### 3.2.1 Ultra causal acceleration
+#### 3.2.1 Ultra causal acceleration and Extreme guided reconstruction
 
 `cs_framegen_motion_warp_accel.comp` uses a third causal interval without requiring application
 motion vectors, a vendor optical-flow block, or a future frame. After an ultra batch's warps finish,
@@ -245,6 +246,16 @@ agreement still decides whether the motion gather reaches the output. The retain
 real-frame ID. If shared-queue admission skips even one interval, the ID is non-consecutive and the
 original constant-velocity shader runs instead. Scene invalidation clears the ID. Lower tiers never
 allocate, copy, bind, or dispatch this path.
+
+Extreme treats the 1/8-resolution field as a set of motion hypotheses instead of bilinearly
+turning a foreground vector and a background vector into a vector that no object followed. For each
+full-resolution output pixel, `reconstructField` evaluates the four covering field texels by
+gathering the previous real frame along each candidate and comparing it with the current pixel.
+It selects a discrete layer only when the candidates' vectors diverge and one correspondence wins
+unambiguously; smooth or textureless regions retain the bilinear field. The preceding interval is
+selected from the history layer whose velocity is nearest to that reconstructed current flow, so a
+foreground/background mixture cannot masquerade as acceleration. This is a causal, vendor-neutral
+software approximation of the most valuable part of dense optical flow: motion-boundary ownership.
 
 ### 3.3 Bidirectional interpolation (B3, `GAMESCOPE_FRAMEGEN_BIDIR=1`, opt-in)
 
@@ -460,7 +471,7 @@ idle/dormant stretch never moves the rung.
 
 **Rung ordering** (`framegen_effective_config`): applies `n` degradations to the ceiling
 `{g_eFramegenMode, g_eFramegenQuality, max(2, g_nFramegenMultiplier)}`. Motion walks
-**ultra → high → medium → low → extrapolate**, beginning wherever the user set the ceiling, then
+**extreme → ultra → high → medium → low → extrapolate**, beginning wherever the user set the ceiling, then
 the multiplier steps toward x2. `framegen_max_degrade_steps()` counts the selected quality rank plus
 the final motion-to-extrapolate step and multiplier notches. There is deliberately **no "stop generating" rung** — the ladder always keeps
 generating (so its GPU-time input never starves); the genuine "even x2 overruns" case is left to the
@@ -594,7 +605,9 @@ cache hit.
 - **Microbenchmark** `vulkan_framegen_benchmark` (`:5505`) — times the *real* production helpers over
   a 3-res × 2-format sweep {1080p/1440p/2160p} × {ABGR2101010 int, ABGR16161616F float}, `nIters=200`,
   own 2-query pool, `waitIdle`-serialized; marks the production-selected variant with `(*)`. Empirical
-  basis for the NVIDIA=direct choice. (Note: it checks only `timestampPeriod==0`, **not**
+  basis for the NVIDIA=direct choice. On Radeon 890M, Extreme versus Ultra warp cost measured
+  0.649 vs 0.587 ms at 1440p integer and 1.517 vs 1.411 ms at 2160p integer (200 dispatch mean),
+  a 4–11% premium for the full-resolution boundary verdict. (Note: it checks only `timestampPeriod==0`, **not**
   `timestampValidBits`, unlike the live path — weaker guard.)
 - **Live measurement → ladder** (dedicated queue only): timestamp ring → non-blocking readback in
   `framegenGarbageCollect` → 7/8 EMA per (rung, gen-count). On the shared queue there are no

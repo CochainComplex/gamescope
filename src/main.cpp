@@ -276,7 +276,7 @@ const char usage[] =
 	"  --framegen-multiplier 2        generated-frame multiplier (2, 3 or 4); actual count adapts to the frame gap\n"
 	"  --framegen-mode MODE           generated-frame algorithm: 'extrapolate' (default, low latency),\n"
 	"                                 'motion' (motion-compensated, higher quality/cost) or 'blend' (debug)\n"
-	"  --framegen-quality LEVEL       motion quality/cost ceiling: 'low', 'medium', 'high' (default), or 'ultra'\n"
+	"  --framegen-quality LEVEL       motion quality/cost ceiling: 'low', 'medium', 'high' (default), 'ultra', or 'extreme'\n"
 	"  --framegen-strength 0.5        extrapolation step for 'extrapolate'/'motion' modes (0.0-1.0); lower reduces ghosting\n"
 	"  --framegen-debug               log framegen history, dispatch, and present cadence\n"
 	"  --composite-debug              draw frame markers on alternating corners of the screen when compositing\n"
@@ -883,9 +883,11 @@ int main(int argc, char **argv)
 						g_eFramegenQuality = GamescopeFramegenQuality::High;
 					else if ( strcmp( optarg, "ultra" ) == 0 )
 						g_eFramegenQuality = GamescopeFramegenQuality::Ultra;
+					else if ( strcmp( optarg, "extreme" ) == 0 )
+						g_eFramegenQuality = GamescopeFramegenQuality::Extreme;
 					else
 					{
-						fprintf( stderr, "gamescope: --framegen-quality must be 'low', 'medium', 'high' or 'ultra'\n" );
+						fprintf( stderr, "gamescope: --framegen-quality must be 'low', 'medium', 'high', 'ultra' or 'extreme'\n" );
 						return 1;
 					}
 				} else if (strcmp(opt_name, "framegen-strength") == 0) {
