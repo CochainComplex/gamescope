@@ -215,10 +215,14 @@ nothing and falls back to normal.
 ### f) AI refiner (most experimental)
 ```bash
 GAMESCOPE_FRAMEGEN_NET_ONLINE=1 gamescope --prefer-vk-device "$PRESENT" \
-  --experimental-framegen --framegen-mode motion --framegen-quality high …
+  --experimental-framegen --framegen-mode motion --framegen-quality extreme …
 ```
 A tiny neural net cleans up the motion and **learns your game as you play**.
-It works with zero-latency forward prediction; bidirectional mode is optional.
+It works with zero-latency forward prediction; at Extreme it also learns a
+three-frame-validated focus mask for tightly bounded shadow/reflection/specular
+color trends. `GAMESCOPE_FRAMEGEN_SHADING=0` disables only that color-trend
+head for A/B. Bidirectional mode is optional but intentionally does not use the
+causal shading head.
 Newest and least-tested; turn it off if anything looks worse. To remember what it learned between sessions, add
 `GAMESCOPE_FRAMEGEN_NET_PROFILE=$HOME/fg-<gamename>.bin`.
 

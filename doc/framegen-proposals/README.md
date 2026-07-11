@@ -19,7 +19,7 @@ ladder all ship (the alternative placement modes — base-layer, VRR-hybrid, JIT
 as env-gated prototypes). The numbered [proposals](#proposals) are the roadmap and
 carry their own authoritative `Status:` lines: **#04 implemented**; **#01 / #02 /
 #06** env-gated prototypes; **#03 / #05** design-only; **#07** a
-research-to-implementation map (its Gap E1 evaluator is built). Each design doc
+research-to-implementation map (E1 plus bounded frames-only Gaps A/B/D are built). Each design doc
 specifies motivation, the Vulkan mechanisms, concrete integration points, a
 latency/throughput analysis, an adversarial risk table, and a testing plan.
 
@@ -34,7 +34,7 @@ on top of it.
 |---|---|---|
 | `--experimental-framegen` | — | **Master switch** — required by every feature below. |
 | `--framegen-mode` | **`extrapolate`** · `motion` · `blend` | Algorithm. `motion` unlocks the whole motion-quality stack (FB / agreement / adaptation / bidir / learned net). `blend` is interpolation for debugging only. |
-| `--framegen-quality` | `low` · `medium` · **`high`** · `ultra` · `extreme` | Motion cost/quality ceiling. Low = forward match; medium = +FB/agreement; high = +adaptation and optional ML; ultra = +causal temporal acceleration; extreme = +color-guided field reconstruction and bounded three-frame disocclusion recovery. Deadline degradation walks down these tiers. |
+| `--framegen-quality` | `low` · `medium` · **`high`** · `ultra` · `extreme` | Motion cost/quality ceiling. Low = forward match; medium = +FB/agreement; high = +adaptation and optional ML; ultra = +causal temporal acceleration; extreme = +color-guided reconstruction, bounded three-frame disocclusion recovery, and optional learned shading focus. Deadline degradation walks down these tiers. |
 | `--framegen-multiplier` | **`2`** · `3` · `4` | Presented-to-real ratio (inserts up to *N*−1 generated frames per real frame); also sizes the output image pool. |
 | `--framegen-strength` | `0.0`–`1.0` (**`0.5`**) | Forward extrapolation step size. |
 | `--framegen-debug` | — | Per-frame logging (rate set by `GAMESCOPE_FRAMEGEN_DEBUG_EVERY`). |
@@ -47,6 +47,7 @@ on top of it.
 | `GAMESCOPE_FRAMEGEN_AGREE` | on | Per-pixel two-source agreement — kills double-exposed / ghosted edges. |
 | `GAMESCOPE_FRAMEGEN_ADAPT` | on | Self-supervised adaptation — per-frame field trust + CPU auto-calibration. |
 | `GAMESCOPE_FRAMEGEN_RESERVOIR` | on in causal `extreme` | Three-real-frame screen-space disocclusion resolver; `=0` disables it for A/B attribution. Never scheduled below Extreme or in bidir. |
+| `GAMESCOPE_FRAMEGEN_SHADING` | on in causal `extreme` with ML | Fourth-head causal shading-persistence supervision plus bounded color-trend correction; `=0` disables only these for an otherwise-identical net/queue A/B. |
 | `GAMESCOPE_FRAMEGEN_FB_TOL` | `0.75` | FB round-trip tolerance (texels); **setting it pins the value** against `GAMESCOPE_FRAMEGEN_ADAPT`'s auto-calibration. |
 
 ### Opt-in modes — off by default
@@ -108,6 +109,14 @@ Confidence *raises* are photometrically evidence-gated per texel (the net can
 only un-kill vectors that predict the current frame pair) — without that
 gate, mid-training miscalibration showed up on screen as small squares of
 stale content.
+
+GSFR v3 uses the formerly reserved fourth output as an Extreme-only
+shading-persistence focus. In-situ training checks a reprojected third causal
+frame before rewarding the head, and updates only its final row/bias; the
+shared motion trunk cannot regress from this loss. The warp, not the net,
+forms a phase-scaled RGB trend and caps it to 8% of local magnitude per real
+interval. Offline v3 training currently leaves this head neutral; v1/v2 blobs
+are accepted only after the undefined row is forcibly zeroed.
 
 ## How the shipped pipeline works
 
@@ -244,5 +253,6 @@ build on top of that foundation.
    building — a perceptual/temporal validation harness, a frames-only
    disocclusion reservoir, and an optional color-domain shading-correction net
    head. **Design map / gap analysis**; Gap E1's structural/temporal evaluator
-   (`scripts/framegen-net-eval.py`), Gap B's GPU content scene-cut guard, and
-   Gap A's bounded Extreme resolver are implemented.
+   (`scripts/framegen-net-eval.py`), Gap B's GPU content scene-cut guard, Gap
+   A's bounded Extreme resolver, and Gap D's bounded causal shading-focus form
+   are implemented. E2 full-color perceptual capture remains open.

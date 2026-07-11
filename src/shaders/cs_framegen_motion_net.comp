@@ -10,11 +10,10 @@
 // — once per real frame, zero cost per generated frame.
 //
 // The net predicts CORRECTIONS, not pixels: a bounded flow residual
-// (2*tanh(o), at most +-2 field texels) and an additive confidence
-// recalibration, applied on top of the Stage-B field. A zero final layer is
-// therefore exactly the Stage-B output — safe by construction — and the
-// worst a bad checkpoint can do is bounded by construction too. It never
-// touches image content, so the HDR pipeline is unaffected.
+// (2*tanh(o), at most +-2 field texels), an additive confidence recalibration,
+// and a zero-neutral focus gate for a separately bounded causal color trend.
+// A zero final layer is therefore exactly the Stage-B output with no shading
+// correction. The fourth head never emits color itself.
 //
 // Inputs per field texel (12 channels, mirrored EXACTLY by the trainer in
 // scripts/framegen-net-train.py — keep them in lockstep): both directions'
@@ -81,6 +80,9 @@ uniform motion_net_t {
 // confidence, .a = round-trip error passed through). A conv reads an apron
 // of RAW neighbors, so refinement can never be in place.
 layout(binding = 1, rgba16f) writeonly uniform image2D u_refined;
+// Low-resolution focus map consumed only by Extreme's existing warp. RGBA16F
+// matches the universally required motion-field format; only .r is used.
+layout(binding = 2, rgba16f) writeonly uniform image2D u_shadingFocus;
 
 // s_samplers[0] = source luma (bilinear; the frame the field warps FROM)
 // s_samplers[1] = destination luma (the frame the field predicts)
@@ -258,21 +260,22 @@ void main() {
         s_w4[i] = wload4(L3_OFF / 4 + int(i));
     barrier();
 
-    // Phase D: conv3 (16 -> 4, linear) — exactly one output texel per
-    // thread. Channel 3 is reserved and never evaluated.
+    // Phase D: conv3 (16 -> 4, linear) — exactly one output texel per thread.
     int cx = int(li) % TILE, cy = int(li) / TILE;
     vec4 b3 = s_w4[L3_BIAS4];
-    float o0 = b3.x, o1 = b3.y, o2 = b3.z;
+    float o0 = b3.x, o1 = b3.y, o2 = b3.z, o3 = b3.w;
     for (int tap = 0; tap < 9; tap++) {
         int ab = ((cy + tap / 3) * A2 + (cx + tap % 3)) * 4;
         vec4 a0 = s_feat4[ab + 0];
         vec4 a1 = s_feat4[ab + 1];
         vec4 a2 = s_feat4[ab + 2];
         vec4 a3 = s_feat4[ab + 3];
-        int w0 = (0 * 9 + tap) * 4, w1 = (1 * 9 + tap) * 4, w2 = (2 * 9 + tap) * 4;
+        int w0 = (0 * 9 + tap) * 4, w1 = (1 * 9 + tap) * 4;
+        int w2 = (2 * 9 + tap) * 4, w3 = (3 * 9 + tap) * 4;
         o0 += dot(a0, s_w4[w0]) + dot(a1, s_w4[w0 + 1]) + dot(a2, s_w4[w0 + 2]) + dot(a3, s_w4[w0 + 3]);
         o1 += dot(a0, s_w4[w1]) + dot(a1, s_w4[w1 + 1]) + dot(a2, s_w4[w1 + 2]) + dot(a3, s_w4[w1 + 3]);
         o2 += dot(a0, s_w4[w2]) + dot(a1, s_w4[w2 + 1]) + dot(a2, s_w4[w2 + 2]) + dot(a3, s_w4[w2 + 3]);
+        o3 += dot(a0, s_w4[w3]) + dot(a1, s_w4[w3 + 1]) + dot(a2, s_w4[w3 + 2]) + dot(a3, s_w4[w3 + 3]);
     }
 
     ivec2 op = tileOrigin + ivec2(cx, cy);
@@ -293,4 +296,9 @@ void main() {
     float resid = abs(ld - lw) / max(1.0f, max(abs(ld), abs(lw)));
     float dc = o2 < 0.0f ? o2 : o2 * (1.0f - smoothstep(0.03f, 0.10f, resid));
     imageStore(u_refined, op, vec4(X0.xy + dF, clamp(X0.z + dc, 0.0f, 1.0f), X0.w));
+    // max(tanh, 0) makes every legacy/neutral zero head bit-exact off. Online
+    // training can raise focus only where a color trend survived across three
+    // causally observed real frames; negative evidence parks safely at zero.
+    float focus = max(tanh(o3), 0.0f);
+    imageStore(u_shadingFocus, op, vec4(focus, 0.0f, 0.0f, 0.0f));
 }

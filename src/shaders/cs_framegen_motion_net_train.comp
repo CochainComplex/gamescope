@@ -46,7 +46,7 @@ uniform motion_net_train_t {
     uint  u_seed;      // per-frame tile-placement seed (derived from seqno)
     uint  u_sliceBase; // first slice row this dispatch writes
     float u_mode;      // task-conditioning input (must match inference)
-    uint  u_sceneCutGuard;
+    uint  u_flags;     // bit 0: scene-cut guard, bit 1: causal shading history
 };
 
 // The gradient slice image: one row per tile, width = parameter count.
@@ -61,6 +61,8 @@ layout(binding = 2, r32ui) readonly uniform uimage2D u_stats;
 //                 the net must not train on its own output)
 // s_samplers[3] = the opposite-direction raw field
 // s_samplers[4] = optimizer state (row 0 = fast weights, 4644-wide)
+// s_samplers[5] = two-interval-old luma (only with flags bit 1)
+// s_samplers[6] = preceding final motion field (only with flags bit 1)
 layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 
 const int C_IN  = 12;
@@ -83,13 +85,15 @@ const float CHARB_EPS = 1e-3f;
 const float FLOW_AUX = 0.05f;
 const float LAMBDA_DF = 0.01f;
 const float LAMBDA_DC = 0.005f;
+const float LAMBDA_SHADE = 0.01f;
+const float SHADE_LOSS = 0.25f;
 
 shared float s_feat[T0 * T0 * C_IN];  // 1200
 shared float s_a1[T1 * T1 * C_MID];   // 1024
 shared float s_a2[T2 * T2 * C_MID];   // 576
 shared float s_da1[T1 * T1 * C_MID];  // 1024
 shared float s_da2[T2 * T2 * C_MID];  // 576
-shared float s_do[LT * LT * 3];       // 48
+shared float s_do[LT * LT * 4];       // 64
 shared float s_w[2320];               // current layer's weights (largest)
 
 float wfast(int idx) {
@@ -125,7 +129,7 @@ void main() {
     // Zero the complete slice row: Adam then receives no cut gradient (only its
     // normal decay toward the safe prior) and cannot teach the flow head to fit
     // two unrelated images or permanently depress confidence after a menu cut.
-    if (u_sceneCutGuard != 0u && imageLoad(u_stats, ivec2(88, 0)).r != 0u) {
+    if ((u_flags & 1u) != 0u && imageLoad(u_stats, ivec2(88, 0)).r != 0u) {
         int row = int(u_sliceBase + gl_WorkGroupID.x);
         for (uint i = li; i < uint(N_PARAMS); i += 64u)
             imageStore(u_grad, ivec2(int(i), row), vec4(0.0f));
@@ -205,8 +209,8 @@ void main() {
     // ---- Head + loss gradients at the 4x4 loss positions -------------------
     for (uint i = li; i < uint(LT * LT); i += 64u) {
         int cx = int(i) % LT, cy = int(i) / LT;
-        float o[3];
-        for (int c = 0; c < 3; c++) {
+        float o[4];
+        for (int c = 0; c < 4; c++) {
             float acc = s_w[576 + c]; // b3, chunk-relative
             for (int tap = 0; tap < 9; tap++) {
                 int ab = ((cy + tap / 3) * T2 + (cx + tap % 3)) * C_MID;
@@ -254,10 +258,44 @@ void main() {
         vec2 dLddF = dLdFh + (2.0f * LAMBDA_DF * invN) * dF;
         vec2 do01 = dLddF * 2.0f * (1.0f - th * th);
 
-        uint b = i * 3u;
+        // Head four learns whether the previous interval's aligned luma trend
+        // persisted into the now-observed destination. This is the causal target
+        // the future warp needs: unlike a two-frame loss, it cannot win merely by
+        // copying every current difference. Keep the trend and all geometry
+        // evidence stop-gradient; this head is a focus verdict, not another route
+        // for reshaping flow.
+        float do3 = 0.0f;
+        if ((u_flags & 2u) != 0u) {
+            vec2 prevPos = vec2(q) + 0.5f - Fh;
+            vec4 oldField = texture(s_samplers[6], prevPos / vec2(sz));
+            float oldConf = clamp(oldField.b, 0.0f, 1.0f);
+            vec2 olderPos = prevPos - oldField.xy;
+            float lold = texture(s_samplers[5], olderPos / vec2(sz)).r;
+            float scale = max(1.0f, max(abs(wg.x), max(abs(ld), abs(lold))));
+            float trend = clamp(wg.x - lold, -0.10f * scale, 0.10f * scale);
+            float trendN = abs(trend) / scale;
+            float focusTanh = tanh(o[3]);
+            float focus = max(focusTanh, 0.0f);
+            bool valid = X0.z >= 0.35f && oldConf >= 0.35f && oldField.a >= -0.5f
+                && trendN >= 0.005f && trendN <= 0.10f
+                && all(greaterThanEqual(olderPos, vec2(0.5f)))
+                && all(lessThanEqual(olderPos, vec2(sz) - vec2(0.5f)));
+            if (valid) {
+                float es = wg.x + focus * trend - ld;
+                float rs = sqrt(es * es + CHARB_EPS * CHARB_EPS);
+                // Define the derivative at the zero-neutral hinge from the positive
+                // side so a useful trend can wake the head from an exact zero prior.
+                float dFocus = o[3] >= 0.0f ? 1.0f - focusTanh * focusTanh : 0.0f;
+                do3 = SHADE_LOSS * invN
+                    * ((es / rs) * trend + 2.0f * LAMBDA_SHADE * focus) * dFocus;
+            }
+        }
+
+        uint b = i * 4u;
         s_do[b + 0u] = do01.x;
         s_do[b + 1u] = do01.y;
         s_do[b + 2u] = do2;
+        s_do[b + 3u] = do3;
     }
     barrier();
 
@@ -269,18 +307,18 @@ void main() {
         if (i < 576u) {
             int co = int(i) / 144, rem = int(i) % 144;
             int tap = rem / C_MID, ci = rem % C_MID;
-            if (co < 3) {
+            if (co < 4) {
                 for (int p = 0; p < LT * LT; p++) {
                     int px = p % LT, py = p / LT;
                     int ap = ((py + tap / 3) * T2 + (px + tap % 3)) * C_MID + ci;
-                    g += s_a2[ap] * s_do[p * 3 + co];
+                    g += s_a2[ap] * s_do[p * 4 + co];
                 }
             }
         } else {
             int co = int(i) - 576;
-            if (co < 3)
+            if (co < 4)
                 for (int p = 0; p < LT * LT; p++)
-                    g += s_do[p * 3 + co];
+                    g += s_do[p * 4 + co];
         }
         imageStore(u_grad, ivec2(W3_OFF + int(i), row), vec4(g));
     }
@@ -290,11 +328,15 @@ void main() {
         int px = pos % T2, py = pos / T2;
         float g = 0.0f;
         if (s_a2[i] > 0.0f) {
+            // Keep the new objective out of the shared trunk: online shading
+            // adaptation trains only W3/b3 row four. The established flow and
+            // confidence representation therefore remains governed exclusively by
+            // its original loss, avoiding cross-head regression.
             for (int co = 0; co < 3; co++)
             for (int tap = 0; tap < 9; tap++) {
                 int ox = px - tap % 3, oy = py - tap / 3;
                 if (ox >= 0 && ox < LT && oy >= 0 && oy < LT)
-                    g += s_w[(co * 9 + tap) * C_MID + ci] * s_do[(oy * LT + ox) * 3 + co];
+                    g += s_w[(co * 9 + tap) * C_MID + ci] * s_do[(oy * LT + ox) * 4 + co];
             }
         }
         s_da2[i] = g;

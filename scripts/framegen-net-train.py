@@ -9,8 +9,10 @@ GAMESCOPE_FRAMEGEN_NET.
 
 The objective is the same self-supervision Stage B4 grades with: the field
 maps the source frame onto the destination frame, so the destination IS the
-ground truth. The net predicts a bounded flow residual (2*tanh, +-2 field
-texels) and an additive confidence recalibration; the loss warps the source
+ground truth. The offline objective predicts a bounded flow residual (2*tanh,
++-2 field texels) and an additive confidence recalibration; output four stays
+at its zero-neutral causal-shading default because GSFD v1 has no third-frame
+tensor. The loss warps the source
 luma along the refined flow and charges each texel either the warp error
 (weighted by the refined confidence) or the crossfade-fallback error
 (weighted by the complement) — teaching both heads jointly: fix the flow
@@ -40,7 +42,7 @@ import numpy as np
 
 MAGIC_SAMPLE = 0x44465347  # 'GSFD'
 MAGIC_BLOB = 0x52465347    # 'GSFR'
-BLOB_VERSION = 2           # corrected-field evidence gate + flow auxiliary
+BLOB_VERSION = 3           # + zero-neutral causal shading-focus output
 LAYERS = ((12, 16), (16, 16), (16, 4))
 KSIZE = 3
 CHARB_EPS = 1e-3

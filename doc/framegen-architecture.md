@@ -68,7 +68,8 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - `GAMESCOPE_FRAMEGEN_BIDIR` — truthy int; opt-in **B3 bidirectional interpolation** (`vulkan_framegen_bidir_active`, `:5294`). Generated frames sit *between* the two reals (warp both toward phase `t`, blend by confidence, phase-correct crossfade fallback) instead of extrapolating past the newest — removes hold-then-jump judder and handles translucency, at the cost of presenting each real frame **one interval late** (§0 invariants #1/#4 exception; see §3.3). **Requires motion mode; mutually exclusive with `_JIT`/#06, `_VRR_HYBRID`/#01 and `_BASE`/#02** (each owns its own timeline); silently ignored otherwise (logs once).
 - `GAMESCOPE_FRAMEGEN_ADAPT` — **B4 self-supervised adaptation** (`framegen_adapt_enabled`; motion mode). Each real frame grades the field that predicted it (field-res stats probe, measured 20–39 µs per real at 1080p–4K on Radeon 890M); a same-batch apply pass folds a global field-trust factor into the field's confidence and rejects content scene cuts from nine regional luminance histograms, while the next-batch CPU readback auto-calibrates the FB tolerance and agreement window (see §3.4). `=0` disables (B3-bit-exact warps, no probe). An explicit `_FB_TOL` pins the tolerance against auto-calibration.
 - `GAMESCOPE_FRAMEGEN_RESERVOIR` — Extreme causal mode only, default on; `=0` disables the three-real-frame screen-space disocclusion resolver for live A/B attribution. It is never allocated or sampled by lower tiers or bidirectional interpolation.
-- `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned forward-field refinement** (`framegen_net_weights_path`; motion mode, no `_BIDIR` requirement). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). Bidir additionally refines the reverse field. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
+- `GAMESCOPE_FRAMEGEN_SHADING` — Extreme causal mode with the learned net only, default on; `=0` disables fourth-head in-situ supervision and the final bounded color-trend correction for an otherwise-identical net/queue A/B. Lower tiers and bidir never consume the focus map.
+- `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned forward-field refinement** (`framegen_net_weights_path`; motion mode, no `_BIDIR` requirement). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). In Extreme, output four is additionally a zero-neutral shading-persistence focus map; it never predicts pixels. Bidir additionally refines the reverse field. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
 - `GAMESCOPE_FRAMEGEN_RECORD` — directory; **Stage C dataset capture** (motion mode, no `_BIDIR` requirement). Dumps raw field-res training tensors (both lumas + both checked fields, pre-refinement/pre-trust) one `GSFD` file per real frame, up to `GAMESCOPE_FRAMEGEN_RECORD_MAX` (default 1000, ~0.6–1.2 MB each — mind the disk).
 - `GAMESCOPE_FRAMEGEN_NET_ONLINE` — truthy int; **C2 in-situ learning** (see §3.5). The refiner keeps training on the framegen GPU against every real frame; works with a `_NET` blob as the prior or from a synthesized neutral init. Without `_NET_PROFILE` the model is **ephemeral — nothing is ever written to disk**. `_NET_LR` (default `3e-4`), `_NET_EVERY` (train every Nth real frame, default 1) tune it; `_NET_PROFILE=<path>` makes the learning persistent per game: loaded as the prior when present (a malformed/torn file is rejected loudly and the neutral prior used instead), checkpointed back every 1024 trained steps **off-thread** (file I/O never rides the render thread) and flushed at exit and on every framegen reset, so sessions shorter than the checkpoint interval persist too. Writes are atomic (temp + rename): a crash or a full disk can never tear an existing good profile. The served weights are health-checked every trained step; a non-finite value re-initializes the optimizer state from the prior automatically and is never persisted.
 
@@ -158,7 +159,7 @@ hardware linearizes on read).
 | **Motion medium** | low + reverse match / FB check + full-res agreement | reverse chain once per real | `eff.quality==Medium` | rejects disocclusions and boundary bleed |
 | **Motion high** | medium + B4 adaptation; optional learned refiner/training | default; compatible with the pre-tier path | `eff.quality==High` | self-tuning quality with optional ML |
 | **Motion ultra** | high + retained-field acceleration warp | one field copy per estimated interval + one low-res field sample per output pixel | `eff.quality==Ultra` | bounded second-order forward prediction |
-| **Motion extreme** | ultra + color-guided field reconstruction + three-frame disocclusion resolver | four covering hypotheses everywhere; bounded eight-neighbour search only at locally FB-inconsistent/low-confidence pixels; two 1/8-res luma history images | `eff.quality==Extreme` | maximum causal boundary quality on an idle second GPU |
+| **Motion extreme** | ultra + color-guided reconstruction + three-frame disocclusion resolver; optional learned shading focus | bounded boundary hypotheses; two 1/8-res luma history images; with net, one low-res focus write and a bounded color-trend term in the existing warp | `eff.quality==Extreme` | maximum causal frames-only quality on an idle second GPU |
 
 **Invariant across all extrapolate variants:** alpha pinned to `current`; the *only* range bound is
 the 9-tap neighbor clamp — no `[0,1]` clamp, so UNORM stays in range while scRGB keeps HDR>1.0 and
@@ -368,10 +369,10 @@ Two consumers, two latencies:
 
 A tiny convolutional net (12→16→16→4 channels, 3×3 kernels, ~4.6k parameters,
 `cs_framegen_motion_net.comp`) refines the checked forward motion field at field resolution once per
-real frame — zero cost per generated frame, no future-frame dependency, and the full-res warp is
-untouched. Bidir additionally refines the checked reverse field. It predicts
-**corrections, not pixels**: a flow residual bounded to ±2 field texels (`2·tanh`) and an additive
-confidence recalibration, on top of the Stage-B field. Safety is structural, three layers deep:
+real frame, with no future-frame dependency. Bidir additionally refines the checked reverse field.
+It predicts **corrections, not pixels**: a flow residual bounded to ±2 field texels (`2·tanh`), an
+additive confidence recalibration, and in Extreme a zero-neutral shading-persistence focus. Safety
+is structural, three layers deep:
 
 1. a zero final layer IS Stage B (the trainer zero-initializes the head, so the failure floor is
    the current behavior, and `--init` exports a bit-neutral blob);
@@ -380,7 +381,11 @@ confidence recalibration, on top of the Stage-B field. Safety is structural, thr
 3. the B4 probe grades (and trust-scales) the **refined** field — the one the warps consume — so a
    mispredicting net is clamped in the same batch and shows up in the `adapt resid=…` log lines.
 
-It never touches image content — HDR rules unaffected by construction. Inputs per texel (12
+The fourth head does not synthesize color: the Extreme warp applies an analytic aligned
+`current-previous` color trend, phase-scaled, capped to 8% of local magnitude per interval, and
+multiplied by focus, current/old field confidence, acceleration consistency, and a moderate-change
+band. The output remains in the existing sampled color domain (sRGB views decode; scRGB is linear),
+with no `[0,1]` clamp, preserving HDR highlights and wide-gamut negatives. Inputs per texel (12
 channels; `scripts/framegen-net-train.py` mirrors them exactly and the two must stay in lockstep):
 both directions' flow/conf/round-trip error, destination luma, source luma warped along the field
 (the photometric evidence), the B4-style magnitude-normalized residual, and a task-conditioning
@@ -407,6 +412,15 @@ work split (2.3× worse; quadruples activation loads). Costs 0.59/1.05/2.29 ms p
 opt-in; a `packHalf2x16` LDS variant and a `VK_KHR_cooperative_matrix` path are the known next
 steps if a bigger net earns them.
 
+On Radeon 890M with the v3 online path, causal inference measured
+0.567/1.008/2.184 ms per real at 1080p/1440p/2160p integer; the fixed 16-tile
+training + Adam + profile-readback copy measured 0.35–0.38 ms at every
+resolution. With a neutral (zero-focus) head, the isolated
+`GAMESCOPE_FRAMEGEN_SHADING=0` A/B measured 0.044/0.055/0.142 ms additional
+Extreme-warp cost per generated frame at those resolutions. This is the cached
+low-res focus sample and branch floor; active-focus cost depends on mask density
+and is charged to Extreme's normal timestamp/degradation rung.
+
 **In-situ learning (C2, `GAMESCOPE_FRAMEGEN_NET_ONLINE=1`).** The net keeps training *on the
 framegen GPU while it serves*, so the correction function tracks the current scene instead of
 whatever an offline blob was fit to. Per real frame, riding the same batch command buffer: two
@@ -431,6 +445,16 @@ GPU state, so a swapchain transition does not restart adaptation from the startu
 live: from a neutral prior on vkmark, the confidence head recovers ~10 points of killed field
 within seconds; warm-started from an offline blob it holds the blob's precision while tracking
 (see `doc/framegen-proposals/README.md` for the measured A/B).
+
+**Causal shading supervision (Extreme only).** The old luma reservoir and preceding final field
+reproject a third observed frame onto each forward training tile. Head four learns whether the
+aligned `older→previous` luma trend actually persisted into the now-known current real frame. This
+avoids the invalid two-frame objective that would reward blindly repeating every difference. Only
+the fourth output row/bias receive this loss; it cannot perturb the shared trunk or the established
+flow/confidence heads. Reverse tiles write an exact zero shading gradient. Detected scene cuts,
+disabled B4/cut detection, stale frame IDs, JIT/refill of the same real pair, missing resources,
+lower tiers, and bidir all disable the objective. GSFR v3 activates the head; v1/v2 blobs are migrated only after forcibly zeroing their
+formerly undefined fourth row and bias.
 
 Optimizer robustness is two-layered. The GPU rejects non-finite gradient slices, clamps each
 parameter gradient to the necessary `[-1,1]` bound implied by the offline trainer's global-norm
@@ -460,7 +484,7 @@ vectors, depth, or G-buffers — so the engine-integrated methods below are
 | Ultra quadratic acceleration (§3.2.1) | **Mob-FGSR** (Yang et al., SIGGRAPH 2024, DOI 10.1145/3641519.3657424): quadratic / uniform-acceleration motion | Mob-FGSR forms it in *world space* from depth+MVs; we form it in *screen space* from two consecutive motion fields. |
 | Extreme guided reconstruction (§3.2.1) | Motion-boundary ownership from **dense optical flow** (research §2); edge-aware joint upsampling | Local contribution: a hypothesis-testing software approximation — no flow net or vendor block. |
 | Bidirectional interpolation (§3.3) | The **VFI** family — **RIFE** (Huang et al., ECCV 2022, arXiv 2011.06294), **FILM** (Reda et al., ECCV 2022, arXiv 2202.04901) | The interpolation regime and its intrinsic ≥1-interval latency (§0). Ours is a hand-written warp-blend, not a learned VFI net. |
-| Learned field refiner, Stage C (§3.5) | **GFFE**'s lightweight correction-CNN template (its Shading Correction Network); self-supervision cf. **FILM/RIFE** | GFFE's SCN refines *shading/color*; ours refines the *motion field*. Same "heuristic motion + small net" shape. |
+| Learned refiner + shading focus, Stage C (§3.5) | **GFFE**'s lightweight correction-CNN template (its Shading Correction Network); self-supervision cf. **FILM/RIFE** | Main heads refine the *motion field*; Extreme's fourth head gates a bounded analytic color trend. Unlike GFFE SCN, it has no output-res feature warp or invented RGB. |
 | B4 adaptation + C2 in-situ learning (§3.4, §3.5) | Online / test-time adaptation | No direct frames-only precedent in the surveyed work; home-grown. |
 
 The prototypes cross-reference the literature too: **#02** base-layer late
@@ -671,7 +695,8 @@ cache hit.
   measured direct-pair shader yet).
 - **Microbenchmark** `vulkan_framegen_benchmark` (`:5505`) — times the *real* production helpers over
   a 3-res × 2-format sweep {1080p/1440p/2160p} × {ABGR2101010 int, ABGR16161616F float}, `nIters=200`,
-  own 2-query pool, `waitIdle`-serialized; marks the production-selected variant with `(*)`. Empirical
+  own 2-query pool, `waitIdle`-serialized; marks the production-selected variant with `(*)` and,
+  when online ML is enabled, reports inference and training separately. Empirical
   basis for the NVIDIA=direct choice. On Radeon 890M, Extreme versus Ultra warp cost measured
   0.649 vs 0.587 ms at 1440p integer and 1.517 vs 1.411 ms at 2160p integer (200 dispatch mean),
   a 4–11% premium for the full-resolution boundary verdict. (Note: it checks only `timestampPeriod==0`, **not**
@@ -738,7 +763,7 @@ cache hit.
 - **Config semantics.** Framegen strength and multiplier both use strict parsers plus fatal range validation;
   `GAMESCOPE_FRAMEGEN_BENCHMARK` is presence-only, `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE` / `_JIT` /
   `_VRR_HYBRID` / `_BASE` / `_BIDIR` need a truthy int, and the Stage-B knobs `_FB` / `_AGREE` / `_ADAPT` are default-on
-  (`=0` to disable) with `_FB_TOL`/`_NET_LR` floats, `_NET`/`_RECORD`/`_NET_PROFILE` paths and `_RECORD_MAX`/`_NET_EVERY` uints. All eighteen `GAMESCOPE_FRAMEGEN_*` env vars are undocumented in `--help`.
+  (`=0` to disable) with `_FB_TOL`/`_NET_LR` floats, `_NET`/`_RECORD`/`_NET_PROFILE` paths and `_RECORD_MAX`/`_NET_EVERY` uints. All nineteen `GAMESCOPE_FRAMEGEN_*` env vars are undocumented in `--help`.
 - **Backend nuances.** The ring 3↔5 size is fixed at allocation — a mid-session framegen enable/disable
   requires a full `vulkan_remake_output_images` (`waitIdle` + reset), *not* a live adjustment. The
   Wayland generated-frame present hard-nulls planes 1..7 (overlays/cursor dropped for a generated

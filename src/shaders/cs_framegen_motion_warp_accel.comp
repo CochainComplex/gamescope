@@ -33,13 +33,15 @@ uniform motion_accel_t {
     // Low-resolution real-frame luma from two intervals ago is available and
     // consecutive with both motion fields.
     float u_reservoirValid;
-    float u_pad1;
+    // The net's zero-neutral causal shading-persistence focus map is valid.
+    float u_shadingValid;
     float u_pad2;
 };
 
 // s_samplers[0] = previousReal, [1] = currentReal,
 // [2] = current final motion field, [3] = preceding final motion field,
-// [4] = real-frame luma from two intervals ago (Extreme reservoir).
+// [4] = real-frame luma from two intervals ago (Extreme reservoir),
+// [5] = learned low-resolution shading-persistence focus.
 
 float colorError(vec3 a, vec3 b) {
     vec3 d = abs(a - b);
@@ -305,6 +307,41 @@ void main() {
     float disagree = max(max(dd.r, dd.g), dd.b);
     float nrm = max(1.0f, max(max(abs(predictedMotion.r), abs(predictedMotion.g)), abs(predictedMotion.b)));
     conf *= 1.0f - smoothstep(u_agreeLo, u_agreeHi, disagree / nrm);
+
+    // Non-geometric color motion cannot be represented by a flow vector:
+    // moving highlights, shadows and reflections may be spatially aligned yet
+    // change consistently over time. Head four predicts only whether that
+    // aligned current-minus-previous trend persisted in earlier observed
+    // frames; the actual residual remains analytic, causal and tightly bounded.
+    // Sample focus at the current-frame source position, not the future output
+    // pixel, so it follows the same material as the color gather.
+    if (u_shadingValid > 0.5f) {
+        float focus = texture(s_samplers[5], uv - futureUv).r;
+        if (isnan(focus) || isinf(focus))
+            focus = 0.0f;
+        focus = clamp(focus, 0.0f, 1.0f);
+        // A neutral legacy/new head is exactly zero across the frame. This
+        // coherent branch leaves that common case at one cached low-res sample;
+        // learned maps usually remain sparse, confining the extra ALU too.
+        if (focus > (1.0f / 256.0f)) {
+            vec3 colorTrend = predictedMotion - predictedMotionPrev;
+            float trendMag = max(max(abs(colorTrend.r), abs(colorTrend.g)), abs(colorTrend.b));
+            float trendN = trendMag / nrm;
+            float temporalTrust = clamp(oldField.b, 0.0f, 1.0f)
+                * (1.0f - smoothstep(0.35f, 1.0f, accelRatio));
+            float focusBand = smoothstep(0.005f, 0.015f, trendN)
+                * (1.0f - smoothstep(0.08f, 0.12f, trendN));
+            float shadingTrust = 0.75f * focus * conf * temporalTrust * focusBand;
+            // At most eight percent of local magnitude per real interval. Slot
+            // strength supplies the temporal phase, so x3 slots remain distinct
+            // and no correction jumps a whole interval early.
+            vec3 maxResidual = vec3(0.08f * nrm);
+            vec3 shadingResidual = clamp(colorTrend * u_strength,
+                                         -maxResidual, maxResidual);
+            if (!any(isnan(shadingResidual)) && !any(isinf(shadingResidual)))
+                predictedMotion += shadingResidual * shadingTrust;
+        }
+    }
 
     // At a locally diagnosed disocclusion, a three-frame-consistent adjacent
     // layer can replace the invalid centre gather. The conservative trust cap

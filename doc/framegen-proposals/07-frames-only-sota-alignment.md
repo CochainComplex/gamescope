@@ -1,8 +1,9 @@
 # 07 — Frames-only SOTA alignment: what we have, what's missing
 
-Status: **design map / gap analysis**; Gaps E1, B, and the bounded frames-only
-form of A implemented (`scripts/framegen-net-eval.py`, the B4 GPU scene-cut
-guard, and the Extreme disocclusion reservoir). Maps
+Status: **design map / gap analysis**; Gaps E1, B, bounded frames-only A, and a
+bounded frames-only form of D implemented (`scripts/framegen-net-eval.py`, the
+B4 GPU scene-cut guard, the Extreme disocclusion reservoir, and the causal
+shading-persistence head). Maps
 [`../research-framegen.md`](../research-framegen.md) onto the shipped pipeline and
 proposals #01–#06, then sketches the genuine gaps that are worth building.
 
@@ -25,7 +26,7 @@ forward path; SOTA alignment is about the `motion` path.
 | Research idea (see research-framegen.md) | In tree today | Assessment |
 |---|---|---|
 | **Extrapolation as the games-appropriate default** (zero added latency); interpolation is opt-in for its ≥1-frame latency (§0, Recommendations) | `extrapolate` default; `motion` forward path; `GAMESCOPE_FRAMEGEN_BIDIR` opt-in interpolation that presents one interval late | **Aligned by design.** The latency taxonomy is baked into the mode/bidir split. |
-| **Heuristic motion + a lightweight correction net** is the real-time frontier — the GFFE template (§3, Rec 1) | 3-level luma pyramid block matcher → FB check → per-pixel agreement → self-supervised adaptation → ~4.6k-param field-refiner net → bounded screen-space disocclusion reservoir | **Same shape within frames-only limits.** The remaining major GFFE gap is its depth/MV-backed layered world-space background, which a compositor cannot reproduce; color-domain correction remains Gap D. |
+| **Heuristic motion + a lightweight correction net** is the real-time frontier — the GFFE template (§3, Rec 1) | 3-level luma pyramid matcher → FB/agreement/adaptation → ~4.6k-param field refiner + causal shading-focus head → bounded screen-space disocclusion reservoir | **Same shape within frames-only limits.** The remaining major GFFE gaps are its depth/MV-backed layered world-space background and full feature-domain SCN, neither of which a compositor can reproduce cheaply. |
 | **Quadratic / uniform-acceleration motion** (Mob-FGSR, KF1) | Ultra tier: `mvFieldHistory` gives a 2-field second derivative → quadratic through 3 causal positions, deadzoned + accel-capped + confidence-gated (`cs_framegen_motion_warp_accel.comp`) | **Implemented, frames-only variant.** Mob-FGSR does this in world space from depth+MVs; we do it in screen space on the *motion field*. Ours is the correct choice given no depth. |
 | **Hybrid "prefer whichever source gives the better color match"** at block level (FSR 3, §4, Recommendations) | Per-pixel two-source agreement + FB round-trip + confidence blend to the bounded pixel-space fallback | **Conceptually equivalent** — a home-grown per-pixel version of FSR's block-level color-match arbitration. |
 | **UI/HUD must be composited after generation** (KF, §5) | Proposal **#02** base-layer generation + late overlay/cursor composite (prototyped, `GAMESCOPE_FRAMEGEN_BASE=1`) | **This *is* the research's UI recommendation.** Already prototyped. |
@@ -118,20 +119,37 @@ depth/MVs that GFFE actually uses. The luma ping-pong copy costs 4–9 us per re
 frame at 1080p–4K on Radeon 890M; the conditional full-res search is charged to
 the Extreme rung and disappears as soon as the deadline ladder drops to Ultra.
 
-### Gap D (research-grade, later) — Color-domain shading correction head · high cost · high ceiling
-The net refines the motion **field** only; it never touches color. Non-geometric
-motion — lagging shadows, reflections, specular — is *unrepresentable* as a
-motion vector, so no field refinement can fix it. GFFE's Shading Correction
-Network repairs exactly this: a *lightweight flow-based* net that warps internal
-features by a predicted flow and outputs a **focus-mask-blended color refinement**
-(§3, verified against the paper's Appendix D). Add a simpler analog — an optional
-second net head predicting a **bounded** color residual on the warped output,
-gated to a focus mask (motion confident yet photometric residual high =
-shading-only motion). Bounded-by-construction keeps it degradation-safe and
-HDR-safe (residual in linear light); the B4/perceptual probe grades it so a bad
-checkpoint is clamped in-batch, same discipline as the field net. Highest
-quality ceiling but highest cost (output-res or tiled) and hardest to train —
-frame as a research direction after Gaps E/B/A land.
+### Gap D — Color-domain shading correction · bounded frames-only form implemented
+Non-geometric motion — lagging shadows, reflections, specular — is
+*unrepresentable* as a motion vector, so no field refinement can fix it. GFFE's
+Shading Correction Network repairs this with a flow-based feature warp and a
+focus-mask-blended color refinement (§3, verified against Appendix D).
+
+The implemented compositor-safe analog reuses the existing CNN's formerly
+reserved fourth output as a **zero-neutral persistence focus**, written to one
+1/8-resolution image. It does not ask the net to hallucinate RGB. During online
+training, the two-interval-old luma reservoir and preceding field reproject a
+third causal frame: the head learns whether an aligned `older→previous` luma
+trend actually persisted into the now-known current real frame. A two-frame
+loss was rejected because it would reward repeating every mismatch. The new
+loss updates only output row four/bias, never the shared trunk or established
+flow/confidence heads; reverse tiles, cuts, stale IDs, refills, lower tiers and
+bidir provide exactly zero shading gradient.
+
+Extreme's existing full-resolution warp then extrapolates the aligned
+`current-previous` RGB trend under the learned focus. It is phase-scaled, capped
+to 8% of local magnitude per interval, confidence/history/acceleration gated,
+restricted to moderate changes, finite-checked, and never `[0,1]` clamped. A
+zero/v1/v2 head is bit-neutral; legacy blobs have their previously undefined
+fourth row forcibly zeroed before use. `GAMESCOPE_FRAMEGEN_SHADING=0` disables
+both supervision and correction for isolated A/B.
+
+This is deliberately below a full SCN: no output-resolution feature network,
+no invented color, and no claim that it can handle arbitrary view-dependent
+effects. E2 full-color capture and LPIPS/DISTS/FvVDP remain required to tune and
+validate the final color result perceptually. The bounded form preserves the
+split-net cost model and degradation safety while providing a causal mechanism
+for persistent lighting/color trends.
 
 ## Part 3 — Annotations to existing proposals (no new work)
 
@@ -167,9 +185,9 @@ frame as a research direction after Gaps E/B/A land.
 
 ## Recommended order
 
-`E → B → A → D`. **E1, B, and bounded frames-only A are done**; E2
-(colour-frame capture) is the next small measurement step and D is the
-long-horizon ceiling. #03 stays a baseline, annotated per Part 3.
+`E → B → A → D`. **E1, B, bounded frames-only A, and bounded frames-only D are
+done**; E2 (colour-frame capture) is the next measurement step, while a full
+feature-domain SCN remains the long-horizon ceiling. #03 stays a baseline.
 
 ## Cross-check provenance (2026-07-11)
 
