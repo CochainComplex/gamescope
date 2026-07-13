@@ -46,6 +46,7 @@
 #include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
+#include "framegen/settings.hpp"
 #include "framegen/temporal.hpp"
 
 #include "cs_composite_blit.h"
@@ -191,6 +192,12 @@ static void vk_errorf(VkResult result, const char *fmt, ...) {
 	vk_log.errorf("%s (VkResult: %d)", buf, result);
 }
 
+[[noreturn]] void vulkan_check_fatal( VkResult result, const char *expression )
+{
+	vk_errorf( result, "%s failed!", expression );
+	abort();
+}
+
 static const char *vk_device_type_name( VkPhysicalDeviceType eType )
 {
 	switch ( eType )
@@ -257,8 +264,7 @@ static void debug_log_drm_device( const char *pszPrefix, drmDevice *pDrmDevice )
 		VkResult check_res = VK_SUCCESS; \
 		if ( ( check_res = ( x ) ) != VK_SUCCESS ) \
 		{ \
-			vk_errorf( check_res, #x " failed!" ); \
-			abort(); \
+			vulkan_check_fatal( check_res, #x ); \
 		} \
 	} while ( 0 )
 
@@ -1888,207 +1894,6 @@ bool CVulkanDevice::hasCompleted(uint64_t sequence)
 	uint64_t currentSeqNo = 0;
 	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
 	return currentSeqNo >= sequence;
-}
-
-// Submit frame-generation work. With a dedicated framegen queue, this runs on
-// the second queue: it waits on the composite's scratch-timeline value (so it
-// never reads a half-written output image) and signals its own framegen
-// timeline, meaning a slow generation can never sit in front of the next
-// composite on the realtime queue. Without a second queue it forwards to the
-// normal shared-queue submit, where in-order execution provides the same
-// ordering (at the cost of the head-of-line blocking this feature removes).
-uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer, uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung, uint32_t nGeneratedCount )
-{
-	if ( !m_bHasFramegenQueue )
-	{
-		const uint64_t ulSeqNo = submit( std::move( cmdBuffer ) );
-		if ( nQuerySlot >= 0 )
-			m_framegenQuerySlotBySeqNo.emplace( ulSeqNo,
-				FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount } );
-		return ulSeqNo;
-	}
-
-	CVulkanCmdBuffer *pRaw = cmdBuffer.get();
-	pRaw->end();
-
-	const uint64_t nextSeqNo = ++m_framegenSeqNo;
-
-	VkSemaphore waitSemaphores[1] = { m_scratchTimelineSemaphore };
-	uint64_t waitValues[1] = { ulWaitCompositeSeqNo };
-	// Nothing in this command buffer is independent of the just-composited real
-	// frame. Wait at the earliest execution scope so the opening TOP_OF_PIPE
-	// timestamp cannot run before the semaphore and accidentally charge
-	// composite-wait time to the framegen degradation ladder. ALL_COMMANDS also
-	// keeps future non-compute setup/copy passes inside the same dependency.
-	VkPipelineStageFlags waitStages[1] = { VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
-
-	VkSemaphore signalSemaphores[1] = { m_framegenTimeline->pVkSemaphore };
-	uint64_t signalValues[1] = { nextSeqNo };
-
-	const bool bWait = ulWaitCompositeSeqNo != 0;
-
-	VkTimelineSemaphoreSubmitInfo timelineInfo = {
-		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-		.waitSemaphoreValueCount = bWait ? 1u : 0u,
-		.pWaitSemaphoreValues = bWait ? waitValues : nullptr,
-		.signalSemaphoreValueCount = 1,
-		.pSignalSemaphoreValues = signalValues,
-	};
-
-	VkCommandBuffer rawCmdBuffer = pRaw->rawBuffer();
-	VkSubmitInfo submitInfo = {
-		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-		.pNext = &timelineInfo,
-		.waitSemaphoreCount = bWait ? 1u : 0u,
-		.pWaitSemaphores = bWait ? waitSemaphores : nullptr,
-		.pWaitDstStageMask = bWait ? waitStages : nullptr,
-		.commandBufferCount = 1,
-		.pCommandBuffers = &rawCmdBuffer,
-		.signalSemaphoreCount = 1,
-		.pSignalSemaphores = signalSemaphores,
-	};
-
-	vk_check( vk.QueueSubmit( m_framegenQueue, 1, &submitInfo, VK_NULL_HANDLE ) );
-
-	m_pendingFramegenCmdBufs.emplace( nextSeqNo, std::move( cmdBuffer ) );
-	// Associate the timestamp ring slot (if any), ladder rung, and generated-count
-	// with its seqNo, so readback can attribute measured cost to the exact batch
-	// shape. A rung's cost is not stable across x2-like and x4-like gaps.
-	if ( nQuerySlot >= 0 )
-		m_framegenQuerySlotBySeqNo.emplace( nextSeqNo, FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount } );
-	return nextSeqNo;
-}
-
-bool CVulkanDevice::hasCompletedFramegen( uint64_t sequence )
-{
-	if ( !m_bHasFramegenQueue )
-		return hasCompleted( sequence );
-
-	uint64_t currentSeqNo = 0;
-	vk_check( vk.GetSemaphoreCounterValue( device(), m_framegenTimeline->pVkSemaphore, &currentSeqNo ) );
-	return currentSeqNo >= sequence;
-}
-
-// Record the opening timestamp of a framegen batch. Rotates the query-pool ring,
-// resets that slot's two queries, and writes a TOP_OF_PIPE timestamp. Returns the
-// slot for framegenTimestampEnd / submitFramegen, or -1 when measurement is off.
-int CVulkanDevice::framegenTimestampBegin( CVulkanCmdBuffer *pCmdBuffer )
-{
-	if ( m_framegenQueryPool == VK_NULL_HANDLE || m_uFramegenQueryRingDepth == 0 || pCmdBuffer == nullptr )
-		return -1;
-
-	const uint32_t nSlot = m_uFramegenQueryHead;
-	m_uFramegenQueryHead = ( m_uFramegenQueryHead + 1 ) % m_uFramegenQueryRingDepth;
-
-	VkCommandBuffer raw = pCmdBuffer->rawBuffer();
-	vk.CmdResetQueryPool( raw, m_framegenQueryPool, nSlot * 2, 2 );
-	vk.CmdWriteTimestamp( raw, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_framegenQueryPool, nSlot * 2 );
-	return (int)nSlot;
-}
-
-// Record the closing timestamp of a framegen batch (BOTTOM_OF_PIPE). Must be
-// called while the command buffer is still recording, before submitFramegen ends it.
-void CVulkanDevice::framegenTimestampEnd( CVulkanCmdBuffer *pCmdBuffer, int nSlot )
-{
-	if ( nSlot < 0 || m_framegenQueryPool == VK_NULL_HANDLE || pCmdBuffer == nullptr )
-		return;
-
-	vk.CmdWriteTimestamp( pCmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_framegenQueryPool, (uint32_t)nSlot * 2 + 1 );
-}
-
-void CVulkanDevice::framegenResetRungCosts()
-{
-	// A scene reset may race logically with an already-submitted batch on the
-	// dedicated queue. Its command buffer still completes and is recycled, but
-	// its timing belongs to the old scene and must not re-seed the fresh ladder.
-	m_framegenQuerySlotBySeqNo.clear();
-	m_ulFramegenLastRawGpuTimeNs = 0;
-	for ( uint32_t r = 0; r < kFramegenLadderSlots; r++ )
-		for ( uint32_t c = 0; c < kFramegenGeneratedCountSlots; c++ )
-		{
-			m_aFramegenRungCostNs[ r ][ c ] = 0;
-			m_aFramegenRungSamples[ r ][ c ] = 0;
-		}
-}
-
-void CVulkanDevice::waitFramegen( uint64_t sequence )
-{
-	if ( !m_bHasFramegenQueue )
-	{
-		wait( sequence, false );
-		return;
-	}
-
-	VkSemaphoreWaitInfo waitInfo = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-		.semaphoreCount = 1,
-		.pSemaphores = &m_framegenTimeline->pVkSemaphore,
-		.pValues = &sequence,
-	};
-	vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
-}
-
-// Recycle dedicated-queue command buffers and consume timestamp queries whose
-// owning timeline has completed. Shared-queue command buffers are recycled by
-// garbageCollect(), but their framegen query associations live here too so the
-// deadline ladder behaves identically on single-queue devices.
-void CVulkanDevice::framegenGarbageCollect()
-{
-	if ( m_pendingFramegenCmdBufs.empty() && m_framegenQuerySlotBySeqNo.empty() )
-		return;
-
-	uint64_t currentSeqNo = 0;
-	const VkSemaphore completionTimeline = m_bHasFramegenQueue
-		? m_framegenTimeline->pVkSemaphore : m_scratchTimelineSemaphore;
-	vk_check( vk.GetSemaphoreCounterValue( device(), completionTimeline, &currentSeqNo ) );
-
-	if ( m_bHasFramegenQueue )
-	{
-		for ( auto it = m_pendingFramegenCmdBufs.begin(); it != m_pendingFramegenCmdBufs.end(); )
-		{
-			if ( it->first > currentSeqNo )
-				break; // ordered by seqNo: nothing later has completed either
-
-			it->second->reset();
-			m_unusedCmdBufs.push_back( std::move( it->second ) );
-			it = m_pendingFramegenCmdBufs.erase( it );
-		}
-	}
-
-	// A completed timeline signal makes both timestamps available. Read without
-	// WAIT_BIT so this maintenance path can never stall the compositor thread.
-	for ( auto it = m_framegenQuerySlotBySeqNo.begin(); it != m_framegenQuerySlotBySeqNo.end(); )
-	{
-		if ( it->first > currentSeqNo )
-			break;
-
-		const uint32_t nSlot = it->second.nSlot;
-		const uint32_t nRung = it->second.nRung;
-		const uint32_t nGeneratedCount = it->second.nGeneratedCount;
-		uint64_t ts[2] = { 0, 0 };
-		const VkResult res = vk.GetQueryPoolResults( device(), m_framegenQueryPool, nSlot * 2, 2,
-			sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT );
-		const uint64_t ulTimestampMask = m_uFramegenTimestampValidBits >= 64
-			? UINT64_MAX : ( ( 1ull << m_uFramegenTimestampValidBits ) - 1ull );
-		const uint64_t ulGpuTicks = ( ts[1] - ts[0] ) & ulTimestampMask;
-		if ( res == VK_SUCCESS && ulGpuTicks != 0
-			&& nRung < kFramegenLadderSlots && nGeneratedCount < kFramegenGeneratedCountSlots )
-		{
-			// Timestamp values wrap at timestampValidBits, which can be less
-			// than 64 even though GetQueryPoolResults returns uint64_t values.
-			// Modular subtraction above keeps a wrap-crossing batch valid.
-			const uint64_t ulGpuNs = (uint64_t)( double( ulGpuTicks ) * m_flFramegenTimestampPeriodNs );
-			m_ulFramegenLastRawGpuTimeNs = ulGpuNs;
-			// Fold into this exact batch shape with a symmetric slow EMA (7/8).
-			// A single anomalous batch must not shed quality for the whole scene,
-			// and x2-like gaps must not inherit x4-like batch timings.
-			uint64_t &ulRungCost = m_aFramegenRungCostNs[ nRung ][ nGeneratedCount ];
-			ulRungCost = ( ulRungCost == 0 ) ? ulGpuNs : ( ulRungCost * 7 + ulGpuNs ) / 8;
-			if ( m_aFramegenRungSamples[ nRung ][ nGeneratedCount ] != UINT32_MAX )
-				m_aFramegenRungSamples[ nRung ][ nGeneratedCount ]++;
-		}
-		it = m_framegenQuerySlotBySeqNo.erase( it );
-	}
 }
 
 void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
@@ -5050,29 +4855,15 @@ static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope:
 
 static const char *framegen_color_record_dir()
 {
-	static const char *s_pszDir = []() -> const char *
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RECORD_COLOR" );
-		return ( pszEnv != nullptr && *pszEnv != '\0' ) ? pszEnv : nullptr;
-	}();
+	static const char *s_pszDir = gamescope::framegen::non_empty_setting(
+		getenv( "GAMESCOPE_FRAMEGEN_RECORD_COLOR" ) );
 	return s_pszDir;
 }
 
 static uint32_t framegen_color_record_uint( const char *pszName, uint32_t uDefault, bool bAllowZero )
 {
-	const char *pszValue = getenv( pszName );
-	if ( pszValue == nullptr || *pszValue == '\0' )
-		return uDefault;
-
-	errno = 0;
-	char *pEnd = nullptr;
-	const unsigned long long ullValue = strtoull( pszValue, &pEnd, 10 );
-	if ( errno != 0 || pEnd == pszValue || *pEnd != '\0' || ullValue > UINT32_MAX
-		|| ( !bAllowZero && ullValue == 0 ) )
-	{
-		return uDefault;
-	}
-	return (uint32_t)ullValue;
+	return gamescope::framegen::parse_uint32_setting(
+		getenv( pszName ), bAllowZero ).value_or( uDefault );
 }
 
 static uint32_t framegen_color_record_max()
@@ -5121,13 +4912,9 @@ static float framegen_color_record_phase_tolerance()
 	// let targeted sweeps reject intervals outside OFFSET/SPAN +/- tolerance.
 	static const float s_flTolerance = []()
 	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RECORD_COLOR_PHASE_TOLERANCE" );
-		if ( pszEnv == nullptr || *pszEnv == '\0' )
-			return 1.0f;
-		char *pEnd = nullptr;
-		const float fl = strtof( pszEnv, &pEnd );
-		return pEnd != pszEnv && *pEnd == '\0' && std::isfinite( fl )
-			? std::clamp( fl, 0.0f, 1.0f ) : 1.0f;
+		const auto value = gamescope::framegen::parse_finite_float_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_RECORD_COLOR_PHASE_TOLERANCE" ) );
+		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 1.0f;
 	}();
 	return s_flTolerance;
 }
@@ -5247,13 +5034,9 @@ static float framegen_bidir_phase_bias()
 {
 	static const float s_flBias = []()
 	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS" );
-		if ( pszEnv == nullptr || *pszEnv == '\0' )
-			return 0.0f;
-		char *pEnd = nullptr;
-		const float fl = strtof( pszEnv, &pEnd );
-		return pEnd != pszEnv && *pEnd == '\0' && std::isfinite( fl )
-			? std::clamp( fl, 0.0f, 1.0f ) : 0.0f;
+		const auto value = gamescope::framegen::parse_finite_float_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS" ) );
+		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 0.0f;
 	}();
 	return s_flBias;
 }
@@ -5268,13 +5051,9 @@ static float framegen_bidir_one_sided_strength()
 {
 	static const float s_flStrength = []()
 	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION" );
-		if ( pszEnv == nullptr || *pszEnv == '\0' )
-			return 0.0f;
-		char *pEnd = nullptr;
-		const float fl = strtof( pszEnv, &pEnd );
-		return pEnd != pszEnv && *pEnd == '\0' && std::isfinite( fl )
-			? std::clamp( fl, 0.0f, 1.0f ) : 0.0f;
+		const auto value = gamescope::framegen::parse_finite_float_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION" ) );
+		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 0.0f;
 	}();
 	return s_flStrength;
 }
@@ -6046,11 +5825,8 @@ static void framegen_bind_blend( CVulkanCmdBuffer *pCmdBuffer, const gamescope::
 // consistency, so learned prediction does not require bidir or its latency.
 static const char *framegen_net_weights_path()
 {
-	static const char *s_pszPath = []() -> const char *
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_NET" );
-		return ( pszEnv != nullptr && *pszEnv != '\0' ) ? pszEnv : nullptr;
-	}();
+	static const char *s_pszPath = gamescope::framegen::non_empty_setting(
+		getenv( "GAMESCOPE_FRAMEGEN_NET" ) );
 	return s_pszPath;
 }
 
@@ -6099,31 +5875,25 @@ static float framegen_net_online_lr()
 {
 	static const float s_flLr = []()
 	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_NET_LR" );
-		float fl = pszEnv != nullptr ? (float)atof( pszEnv ) : 0.0f;
-		return ( fl > 0.0f && fl <= 0.1f ) ? fl : 3e-4f;
+		const auto value = gamescope::framegen::parse_finite_float_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_NET_LR" ) );
+		return value.has_value() && *value > 0.0f && *value <= 0.1f
+			? *value : 3e-4f;
 	}();
 	return s_flLr;
 }
 
 static uint32_t framegen_net_online_every()
 {
-	static const uint32_t s_uEvery = []() -> uint32_t
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_NET_EVERY" );
-		int n = pszEnv != nullptr ? atoi( pszEnv ) : 0;
-		return n > 0 ? (uint32_t)n : 1u;
-	}();
+	static const uint32_t s_uEvery = gamescope::framegen::parse_uint32_setting(
+		getenv( "GAMESCOPE_FRAMEGEN_NET_EVERY" ), false ).value_or( 1u );
 	return s_uEvery;
 }
 
 static const char *framegen_net_profile_path()
 {
-	static const char *s_pszPath = []() -> const char *
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_NET_PROFILE" );
-		return ( pszEnv != nullptr && *pszEnv != '\0' ) ? pszEnv : nullptr;
-	}();
+	static const char *s_pszPath = gamescope::framegen::non_empty_setting(
+		getenv( "GAMESCOPE_FRAMEGEN_NET_PROFILE" ) );
 	return s_pszPath;
 }
 
@@ -6246,21 +6016,15 @@ static bool framegen_net_requested( GamescopeFramegenQuality eQuality )
 // samples (default 1000 — mind the disk; ~0.6 MB per 1080p sample).
 static const char *framegen_record_dir()
 {
-	static const char *s_pszDir = []() -> const char *
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RECORD" );
-		return ( pszEnv != nullptr && *pszEnv != '\0' ) ? pszEnv : nullptr;
-	}();
+	static const char *s_pszDir = gamescope::framegen::non_empty_setting(
+		getenv( "GAMESCOPE_FRAMEGEN_RECORD" ) );
 	return s_pszDir;
 }
 
 static uint32_t framegen_record_max()
 {
-	static const uint32_t s_uMax = []() -> uint32_t
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RECORD_MAX" );
-		return ( pszEnv != nullptr && atoi( pszEnv ) > 0 ) ? (uint32_t)atoi( pszEnv ) : 1000u;
-	}();
+	static const uint32_t s_uMax = gamescope::framegen::parse_uint32_setting(
+		getenv( "GAMESCOPE_FRAMEGEN_RECORD_MAX" ), false ).value_or( 1000u );
 	return s_uMax;
 }
 
@@ -6404,10 +6168,10 @@ static float framegen_fbcheck_tol_base()
 		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_FB_TOL" );
 		if ( pszEnv != nullptr && *pszEnv != '\0' )
 		{
-			const float flTol = (float)atof( pszEnv );
-			if ( std::isfinite( flTol ) )
-				return std::clamp( flTol, 0.05f, 8.0f );
-			vk_log.errorf( "framegen: GAMESCOPE_FRAMEGEN_FB_TOL is non-finite; using 0.75" );
+			const auto value = gamescope::framegen::parse_finite_float_setting( pszEnv );
+			if ( value.has_value() )
+				return std::clamp( *value, 0.05f, 8.0f );
+			vk_log.errorf( "framegen: GAMESCOPE_FRAMEGEN_FB_TOL is not a finite number; using 0.75" );
 		}
 		return 0.75f;
 	}();
@@ -7331,7 +7095,7 @@ static void framegen_net_profile_consume()
 	}
 	for ( uint32_t i = 0; i < k_uFramegenNetFloats; i++ )
 	{
-		if ( !std::isfinite( weights[ i ] ) )
+		if ( !gamescope::framegen::is_finite_binary32( weights[ i ] ) )
 		{
 			vk_log.errorf( "framegen: net weights went non-finite at step %u — reinitializing from the prior (consider a lower GAMESCOPE_FRAMEGEN_NET_LR)", g_framegenMotion.uNetTrainStep );
 			// framegen_record_net runs before the optimizer-init dispatch in the
@@ -8808,7 +8572,7 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 	const uint64_t ulSpanNs = ulNowNs - c.anchorTimeNs;
 	const float flPhase = (float)( c.referenceTimeNs - c.anchorTimeNs ) / (float)ulSpanNs;
 	const float flTargetPhase = (float)uReferenceOffset / (float)uEndpointOffset;
-	if ( !std::isfinite( flPhase ) || flPhase <= 0.05f || flPhase >= 0.95f
+	if ( !gamescope::framegen::is_finite_binary32( flPhase ) || flPhase <= 0.05f || flPhase >= 0.95f
 		|| std::abs( flPhase - flTargetPhase ) > framegen_color_record_phase_tolerance() )
 	{
 		reseed();

@@ -3,6 +3,7 @@
 #include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
+#include "framegen/settings.hpp"
 #include "framegen/temporal.hpp"
 
 #include <algorithm>
@@ -180,6 +181,41 @@ static void test_net_profile_contract()
 		std::span<float>( weights.data(), weights.size() - 1u ) ) );
 }
 
+static void test_numeric_settings_contract()
+{
+	using namespace gamescope::framegen;
+
+	static_assert( is_finite_binary32( 0.0f ) );
+	static_assert( is_finite_binary32( -std::numeric_limits<float>::max() ) );
+	static_assert( !is_finite_binary32( std::numeric_limits<float>::infinity() ) );
+	static_assert( !is_finite_binary32( std::numeric_limits<float>::quiet_NaN() ) );
+
+	CHECK( non_empty_setting( nullptr ) == nullptr );
+	CHECK( non_empty_setting( "" ) == nullptr );
+	const char path[] = "/tmp/framegen-profile";
+	CHECK( non_empty_setting( path ) == path );
+
+	CHECK( !parse_finite_float_setting( nullptr ).has_value() );
+	CHECK( !parse_finite_float_setting( "" ).has_value() );
+	CHECK( !parse_finite_float_setting( "value" ).has_value() );
+	CHECK( !parse_finite_float_setting( "0.5suffix" ).has_value() );
+	CHECK( !parse_finite_float_setting( "nan" ).has_value() );
+	CHECK( !parse_finite_float_setting( "inf" ).has_value() );
+	CHECK( !parse_finite_float_setting( "1e999" ).has_value() );
+	CHECK( parse_finite_float_setting( "0.5" ).value_or( -1.0f ) == 0.5f );
+	CHECK( parse_finite_float_setting( "-2.25" ).value_or( 0.0f ) == -2.25f );
+
+	CHECK( !parse_uint32_setting( nullptr, true ).has_value() );
+	CHECK( !parse_uint32_setting( "", true ).has_value() );
+	CHECK( !parse_uint32_setting( "0", false ).has_value() );
+	CHECK( parse_uint32_setting( "0", true ).value_or( 1u ) == 0u );
+	CHECK( parse_uint32_setting( "4294967295", false ).value_or( 0u ) == UINT32_MAX );
+	CHECK( !parse_uint32_setting( "4294967296", false ).has_value() );
+	CHECK( !parse_uint32_setting( "-1", false ).has_value() );
+	CHECK( !parse_uint32_setting( "12suffix", false ).has_value() );
+	CHECK( parse_uint32_setting( "12", false ).value_or( 0u ) == 12u );
+}
+
 static void test_temporal_policy()
 {
 	using namespace gamescope::framegen;
@@ -342,6 +378,7 @@ int main()
 	test_learned_net_layout();
 	test_names();
 	test_net_profile_contract();
+	test_numeric_settings_contract();
 	test_temporal_policy();
 	test_dispatch_policy();
 	test_push_constant_encoding();

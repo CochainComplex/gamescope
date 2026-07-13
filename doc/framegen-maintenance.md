@@ -13,8 +13,10 @@ symbols below.
 | CLI and environment | `src/main.cpp` | parsing, validation, debug controls |
 | Framegen types and quality policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/quality vocabulary and pure degradation-ladder resolution |
 | Temporal and dispatch policy | `src/framegen/temporal.hpp`, `src/framegen/dispatch_policy.hpp` | pure phase/cadence math and capability-to-strategy selection |
+| Numeric and setting contracts | `src/framegen/numeric.hpp`, `src/framegen/settings.hpp` | fast-math-safe fp32 classification and strict scalar/path parsing |
 | Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp`, `src/framegen/net_profile.hpp` | CPU/GLSL ABI, tensor layout, and GSFR validation/migration |
-| Vulkan execution | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch, queues, timestamps, ML execution |
+| Vulkan scheduling and algorithms | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch recording, and ML execution |
+| Queue and timestamp execution | `src/framegen/device.cpp`, `src/rendervulkan.hpp` | framegen submission, completion, command-buffer retirement, and GPU-time accounting |
 | Presentation choice | `src/steamcompmgr.cpp` | real/generated/repeat arbitration and timed flips |
 | Backend present | `src/Backends/DRMBackend.cpp`, `src/Backends/WaylandBackend.cpp` | final generated-frame substitution |
 | Algorithms | `src/shaders/cs_framegen_*.comp` | extrapolation, motion estimation, validation, warp, ML |
@@ -24,11 +26,13 @@ symbols below.
 Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
 
-The `src/framegen` headers are deliberately stateless and header-only: they add
-no link boundary to command recording. Keep mutable Vulkan resources, history,
-and submission ordering together until they can move behind one explicit owner
-with a proven lifetime. Splitting tightly coupled dispatch helpers merely to
-reduce line count is not an architectural improvement and can hide ordering or
+The `src/framegen` policy and contract headers are deliberately stateless and
+header-only: they add no link boundary to command recording. `device.cpp` is a
+narrow exception for `CVulkanDevice` queue/timestamp methods; the class remains
+the sole owner of that state. Keep mutable algorithm resources, history, and
+dispatch ordering together until they can move behind one explicit owner with a
+proven lifetime. Splitting tightly coupled dispatch helpers merely to reduce
+line count is not an architectural improvement and can hide ordering or
 ownership bugs.
 
 ## Non-negotiable runtime contracts
@@ -122,8 +126,15 @@ Other duplicated ABI constants require the same treatment:
   for metadata construction, strict validation, finite-weight checks, and the
   v1/v2 shading-head migration. A format change requires an explicit
   compatibility policy and matching tool updates. Serialized finite-weight
-  checks inspect IEEE-754 bits because the production C++ build uses
-  `-ffast-math`; do not replace them with `std::isfinite`.
+  checks use `src/framegen/numeric.hpp` to inspect IEEE-754 bits because the
+  production C++ build uses `-ffast-math`; do not replace them with
+  `std::isfinite`. The same rule applies to GPU readbacks, measured capture
+  phases, CLI input, and environment floats.
+- Framegen scalar environment settings use the complete-string parsers in
+  `src/framegen/settings.hpp`. Keep range policy at each caller: some settings
+  clamp a valid finite number while others fall back when it is out of range.
+  Malformed, overflowing, NaN, and infinite values must never reach dispatch
+  math.
 - GSFD and GSCF capture versions are public analysis-file formats. Reject unknown
   versions rather than partially interpreting them.
 - B4's 96-counter layout is shared by the stats, apply, training, and CPU

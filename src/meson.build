@@ -134,6 +134,7 @@ src = [
   'wlserver.cpp',
   'vblankmanager.cpp',
   'rendervulkan.cpp',
+  'framegen/device.cpp',
   'log.cpp',
   'ime.cpp',
   'mangoapp.cpp',

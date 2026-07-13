@@ -11,11 +11,13 @@ and the implementation are authoritative when a proposal describes an older shap
 ## 0. Scope and the one organizing fact
 
 `src/rendervulkan.cpp` owns scheduling, resource lifetime, motion preparation,
-generation, timestamp feedback, and online learning. The `cs_framegen_*.comp`
-shaders are the algorithmic surface. `src/steamcompmgr.cpp` is the present arbiter;
-the DRM/Wayland backends and FROG WSI layer carry dual-GPU and present-timing
-plumbing. `doc/framegen-proposals/` records the roadmap and the rationale behind
-implemented or rejected prototypes.
+generation, and online learning. `src/framegen/device.cpp` contains the
+`CVulkanDevice` framegen queue, completion, command-buffer retirement, and GPU
+timestamp methods without owning separate state. The `cs_framegen_*.comp`
+shaders are the algorithmic surface. `src/steamcompmgr.cpp` is the present
+arbiter; the DRM/Wayland backends and FROG WSI layer carry dual-GPU and
+present-timing plumbing. `doc/framegen-proposals/` records the roadmap and the
+rationale behind implemented or rejected prototypes.
 
 **Target topology (drives every design choice):** the game renders on a strong GPU,
 the completed frame crosses through dma-buf, and the display-connected GPU
@@ -113,8 +115,8 @@ The 21 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) 
    composited image`.
 6. **Generation on the framegen queue.** If generating, `framegen_submit_batch` records
    the whole interval into **one** `markFramegen()` command buffer, brackets it with GPU timestamps,
-   and submits via `submitFramegen`. With queue index 1 it waits the composite
-   scratch-timeline value, `QueueSubmit`s to `m_framegenQueue`, and signals `m_framegenTimeline`;
+   and submits via `submitFramegen` (`src/framegen/device.cpp`). With queue index 1 it waits the
+   composite scratch-timeline value, `QueueSubmit`s to `m_framegenQueue`, and signals `m_framegenTimeline`;
    single-queue devices submit in order on the normal scratch timeline. `framegen_submit_batch`
    appends `PendingGenerated_t` entries and pins `genReadA/B = previousReal/currentReal`,
    `genReadSeqNo = batch seqNo`. Then `force_repaint()` in `src/steamcompmgr.cpp`
@@ -731,8 +733,8 @@ lockless structures safe (§6).
   -> a 54-set pool; routed by `CVulkanCmdBuffer::m_bFramegen` set by `markFramegen()`. **No completion
   tracking** — a bare modulo counter, safe *only* because of the one-batch-in-flight guard.
 - **Command-buffer split.** Generation into its own `CVulkanCmdBuffer` from the shared pool, submitted
-  via `submitFramegen`: the second-queue path uses raw `vk.QueueSubmit` plus the dedicated framegen
-  timeline, while the fallback uses normal `submit` plus the scratch timeline. Each path recycles
+  via `submitFramegen` in `src/framegen/device.cpp`: the second-queue path uses raw `vk.QueueSubmit`
+  plus the dedicated framegen timeline, while the fallback uses normal `submit` plus the scratch timeline. Each path recycles
   through the command buffer's owning timeline (`framegenGarbageCollect` handles the dedicated path).
 - **Finalized motion-field cache.** `uMotionFieldFrameId` identifies the checked/refined/trust-scaled
   field still resident in `mvField`/`mvFieldNet`. Same-pair JIT and idle refills reuse it and run only

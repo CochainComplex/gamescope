@@ -1,13 +1,12 @@
 #pragma once
 
 #include "net_layout.hpp"
+#include "numeric.hpp"
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <span>
 
 namespace gamescope::framegen
@@ -70,13 +69,6 @@ using NetProfileMetadata = std::array<uint32_t, k_uFramegenNetProfileMetadataWor
 // the same tensor shape but left output channel four undefined, so migration
 // preserves every established flow/confidence parameter and zeroes only that
 // legacy shading row and bias.
-[[nodiscard]] constexpr bool net_profile_weight_is_finite( float weight )
-{
-	// Gamescope is compiled with -ffast-math, under which std::isfinite may be
-	// folded to true. GSFR stores IEEE-754 fp32, so inspect the exponent bits.
-	return ( std::bit_cast<uint32_t>( weight ) & 0x7f800000u ) != 0x7f800000u;
-}
-
 [[nodiscard]] inline bool validate_and_migrate_net_profile_weights(
 	uint32_t version, std::span<float> weights )
 {
@@ -85,7 +77,7 @@ using NetProfileMetadata = std::array<uint32_t, k_uFramegenNetProfileMetadataWor
 		return false;
 	for ( const float weight : weights )
 	{
-		if ( !net_profile_weight_is_finite( weight ) )
+		if ( !is_finite_binary32( weight ) )
 			return false;
 	}
 
@@ -100,9 +92,6 @@ using NetProfileMetadata = std::array<uint32_t, k_uFramegenNetProfileMetadataWor
 
 static_assert( k_uFramegenNetProfileMetadataWords == 12u,
 	"GSFR metadata must contain one header and three layer descriptors" );
-static_assert( sizeof( float ) == sizeof( uint32_t )
-	&& std::numeric_limits<float>::is_iec559,
-	"GSFR weights require IEEE-754 binary32 host floats" );
 static_assert( k_uFramegenNetShadingVersion <= k_uFramegenNetVersion,
 	"GSFR shading semantics must be supported by the current profile version" );
 

@@ -852,6 +852,8 @@ return (what + to - 1) & ~(to - 1);
 
 class CVulkanDevice;
 
+[[noreturn]] void vulkan_check_fatal( VkResult result, const char *expression );
+
 struct VulkanTimelineSemaphore_t
 {
 	~VulkanTimelineSemaphore_t();
