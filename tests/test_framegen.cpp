@@ -1,3 +1,4 @@
+#include "framegen/adaptation.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
@@ -215,6 +216,94 @@ static void test_numeric_settings_contract()
 	CHECK( !parse_uint32_setting( "-1", false ).has_value() );
 	CHECK( !parse_uint32_setting( "12suffix", false ).has_value() );
 	CHECK( parse_uint32_setting( "12", false ).value_or( 0u ) == 12u );
+}
+
+static void test_adaptation_policy()
+{
+	using namespace gamescope::framegen;
+
+	static_assert( k_uAdaptationStatsCount == 96u );
+	static_assert( k_flAdaptationTrustLo == 0.15f );
+	static_assert( k_flAdaptationTrustHi == 0.45f );
+	static_assert( k_flAdaptationBadResidual == 0.10f );
+
+	std::array<uint32_t, k_uAdaptationStatsCount> stats = {};
+	CHECK( !decode_adaptation_stats( stats ).has_value() );
+	stats[ 0 ] = k_uAdaptationMaxTotal + 1u;
+	CHECK( !decode_adaptation_stats( stats ).has_value() );
+
+	stats = {};
+	stats[ 0 ] = 100u;
+	stats[ 1 ] = 10u * 1024u;
+	stats[ 2 ] = 20u;
+	stats[ 3 ] = 20u;
+	stats[ 4 ] = 5u * 1024u;
+	stats[ 5 ] = 100u;
+	stats[ 6 ] = 24u;
+	stats[ 7 ] = 51u;
+	stats[ 14 ] = 100u * 64u;
+	stats[ 88 ] = 1u;
+	stats[ 89 ] = 7u;
+	stats[ 90 ] = 512u;
+	const auto measurement = decode_adaptation_stats( stats );
+	CHECK( measurement.has_value() );
+	CHECK_NEAR( measurement->residual, 0.10f, 1e-7f );
+	CHECK_NEAR( measurement->badFraction, 0.25f, 1e-7f );
+	CHECK_NEAR( measurement->killedFraction, 0.20f, 1e-7f );
+	CHECK_NEAR( measurement->motionMean, 1.0f, 1e-7f );
+	CHECK_NEAR( measurement->noise, 0.05f, 1e-7f );
+	CHECK_NEAR( measurement->fbP75, 0.50f, 1e-7f );
+	CHECK( measurement->sceneCut == 1u );
+	CHECK( measurement->changedSections == 7u );
+	CHECK( measurement->sceneHistogramDistanceQ10 == 512u );
+	CHECK_NEAR( scene_histogram_distance( *measurement ), 0.50f, 1e-7f );
+
+	AdaptationState state;
+	update_adaptation_state( state, *measurement, 0.75f, false );
+	CHECK_NEAR( state.residualEma, 0.10f, 1e-7f );
+	CHECK_NEAR( state.noiseEma, 0.05f, 1e-7f );
+	CHECK_NEAR( state.fbP75Ema, 0.50f, 1e-7f );
+	CHECK( state.fbTolerance == -1.0f );
+	CHECK_NEAR( state.agreementOffset, k_flAdaptationAgreementOffsetMax, 1e-7f );
+	CHECK_NEAR( active_agreement_lo( state, 0.12f ), 0.27f, 1e-7f );
+	CHECK_NEAR( active_agreement_hi( state, 0.45f ), 0.75f, 1e-7f );
+
+	float ema = -1.0f;
+	fold_adaptation_ema( ema, -1.0f );
+	CHECK( ema == -1.0f );
+	fold_adaptation_ema( ema, 0.5f );
+	CHECK( ema == 0.5f );
+	fold_adaptation_ema( ema, 1.0f );
+	CHECK_NEAR( ema, 0.5625f, 1e-7f );
+
+	AdaptationMeasurement ambiguous = *measurement;
+	ambiguous.residual = 0.04f;
+	ambiguous.noise = -1.0f;
+	ambiguous.fbP75 = 2.0f;
+	AdaptationState adaptive;
+	update_adaptation_state( adaptive, ambiguous, 0.75f, false );
+	CHECK_NEAR( adaptive.fbTolerance, 2.5f, 1e-7f );
+	CHECK( adaptive.noiseEma == -1.0f );
+	CHECK( adaptive.agreementOffset == 0.0f );
+
+	AdaptationState pinned;
+	update_adaptation_state( pinned, ambiguous, 0.75f, true );
+	CHECK( pinned.fbTolerance == -1.0f );
+
+	stats = {};
+	stats[ 0 ] = 100u;
+	stats[ 6 ] = 74u;
+	stats[ 7 ] = 1u;
+	const auto percentileBoundary = decode_adaptation_stats( stats );
+	CHECK( percentileBoundary.has_value() );
+	CHECK_NEAR( percentileBoundary->fbP75, 0.50f, 1e-7f );
+	CHECK( percentileBoundary->noise == -1.0f );
+
+	stats[ 6 ] = 74u;
+	stats[ 7 ] = 0u;
+	const auto incompleteHistogram = decode_adaptation_stats( stats );
+	CHECK( incompleteHistogram.has_value() );
+	CHECK( incompleteHistogram->fbP75 == -1.0f );
 }
 
 static void test_temporal_policy()
@@ -480,6 +569,7 @@ int main()
 	test_names();
 	test_net_profile_contract();
 	test_numeric_settings_contract();
+	test_adaptation_policy();
 	test_temporal_policy();
 	test_scheduling_policy();
 	test_dispatch_policy();

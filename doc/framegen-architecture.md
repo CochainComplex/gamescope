@@ -12,13 +12,15 @@ and the implementation are authoritative when a proposal describes an older shap
 
 `src/rendervulkan.cpp` owns scheduling state, resource lifetime, motion preparation,
 generation, and online learning. Stateless cadence/deadline planning lives in
-`src/framegen/scheduling.hpp` and is inlined into that owner. `src/framegen/device.cpp` contains the
-`CVulkanDevice` framegen queue, completion, command-buffer retirement, and GPU
-timestamp methods without owning separate state. The `cs_framegen_*.comp`
-shaders are the algorithmic surface. `src/steamcompmgr.cpp` is the present
-arbiter; the DRM/Wayland backends and FROG WSI layer carry dual-GPU and
-present-timing plumbing. `doc/framegen-proposals/` records the roadmap and the
-rationale behind implemented or rejected prototypes.
+`src/framegen/scheduling.hpp`; B4 counter decoding and threshold policy live in
+`src/framegen/adaptation.hpp`. Both are inlined into that owner and hold no
+Vulkan resources. `src/framegen/device.cpp` contains the `CVulkanDevice`
+framegen queue, completion, command-buffer retirement, and GPU timestamp methods
+without owning separate state. The `cs_framegen_*.comp` shaders are the
+algorithmic surface. `src/steamcompmgr.cpp` is the present arbiter; the
+DRM/Wayland backends and FROG WSI layer carry dual-GPU and present-timing
+plumbing. `doc/framegen-proposals/` records the roadmap and the rationale behind
+implemented or rejected prototypes.
 
 **Target topology (drives every design choice):** the game renders on a strong GPU,
 the completed frame crosses through dma-buf, and the display-connected GPU
@@ -401,12 +403,14 @@ Two consumers, two latencies:
   zero confidence, so the unrelated interval cannot become a false acceleration estimate.
 - **CPU, next batch** (`framegen_adapt_consume`): the counters copy into a host-mapped readback
   image; the one-batch-in-flight guarantee makes the mapped read race-free (parsed only after
-  `hasCompletedFramegen`). Slow EMAs (1/8) drive two auto-calibrations: the **FB tolerance**
-  loosens (up to 2.5 texels) only on *ambiguity-without-error* — round trips fail while measured
-  prediction error stays low (periodic textures: fences, grilles, tiling), where the kill would
-  reintroduce fizzle; and the **agreement window** widens by the measured static-scene noise floor
-  (film grain, dithering) so inherent temporal noise stops mass-killing the motion term. An
-  explicit `GAMESCOPE_FRAMEGEN_FB_TOL` pins the tolerance (auto-cal keeps its hands off).
+  `hasCompletedFramegen`). `src/framegen/adaptation.hpp` owns the stateless counter decoder, slow
+  EMAs (1/8), and two derived calibrations. The **FB tolerance** loosens (up to 2.5 texels) only on
+  *ambiguity-without-error* — round trips fail while measured prediction error stays low (periodic
+  textures: fences, grilles, tiling), where the kill would reintroduce fizzle; and the
+  **agreement window** widens by the measured static-scene noise floor (film grain, dithering) so
+  inherent temporal noise stops mass-killing the motion term. An explicit
+  `GAMESCOPE_FRAMEGEN_FB_TOL` pins the tolerance (auto-cal keeps its hands off). The renderer still
+  owns completion, scene invalidation, readback lifetime, and application to the next dispatch.
 
 `GAMESCOPE_FRAMEGEN_ADAPT=0` disables all of it (B3-bit-exact warps, no probe). With
 `--framegen-debug`, consume logs

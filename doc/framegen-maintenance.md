@@ -13,6 +13,7 @@ symbols below.
 | CLI and environment | `src/main.cpp` | parsing, validation, debug controls |
 | Framegen types and quality policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/quality vocabulary and pure degradation-ladder resolution |
 | Temporal, scheduling, and dispatch policy | `src/framegen/temporal.hpp`, `src/framegen/scheduling.hpp`, `src/framegen/dispatch_policy.hpp` | pure phase math, cadence/deadline planning, and capability-to-strategy selection |
+| Self-supervised adaptation policy | `src/framegen/adaptation.hpp` | B4 counter decoding, EMA state, and next-batch threshold derivation |
 | Numeric and setting contracts | `src/framegen/numeric.hpp`, `src/framegen/settings.hpp` | fast-math-safe fp32 classification and strict scalar/path parsing |
 | Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp`, `src/framegen/net_profile.hpp` | CPU/GLSL ABI, tensor layout, and GSFR validation/migration |
 | Vulkan scheduling and algorithms | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch recording, and ML execution |
@@ -21,7 +22,7 @@ symbols below.
 | Backend present | `src/Backends/DRMBackend.cpp`, `src/Backends/WaylandBackend.cpp` | final generated-frame substitution |
 | Algorithms | `src/shaders/cs_framegen_*.comp` | extrapolation, motion estimation, validation, warp, ML |
 | Offline ML tools | `scripts/framegen-net-*.py` | GSFD parsing, training, GSFR evaluation |
-| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, dispatch, ABI encoding, net layout, and GSFR compatibility matrices |
+| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, adaptation, dispatch, ABI encoding, net layout, and GSFR compatibility matrices |
 
 Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
@@ -32,11 +33,14 @@ header-only: they add no link boundary to command recording. In particular,
 keep-up thresholds, and deadline-ladder transitions; it does not own clocks,
 timestamp queries, history, or the decision to submit. `device.cpp` is a
 narrow exception for `CVulkanDevice` queue/timestamp methods; the class remains
-the sole owner of that state. Keep mutable algorithm resources, history, and
-dispatch ordering together until they can move behind one explicit owner with a
-proven lifetime. Splitting tightly coupled dispatch helpers merely to reduce
-line count is not an architectural improvement and can hide ordering or
-ownership bugs.
+the sole owner of that state. `adaptation.hpp` similarly owns only deterministic
+counter decoding and threshold math. `rendervulkan.cpp` retains the mapped-memory
+completion gate, readback sequence ownership, scene lifetime, logging, and the
+dispatches that consume those thresholds. Keep mutable algorithm resources,
+history, and dispatch ordering together until they can move behind one explicit
+owner with a proven lifetime. Splitting tightly coupled dispatch helpers merely
+to reduce line count is not an architectural improvement and can hide ordering
+or ownership bugs.
 
 ## Non-negotiable runtime contracts
 
@@ -145,7 +149,9 @@ Other duplicated ABI constants require the same treatment:
 - GSFD and GSCF capture versions are public analysis-file formats. Reject unknown
   versions rather than partially interpreting them.
 - B4's 96-counter layout is shared by the stats, apply, training, and CPU
-  readback paths.
+  readback paths. `src/framegen/adaptation.hpp` is the CPU source of truth for
+  the image width, counter interpretation, EMA, and derived thresholds. A shader
+  layout change requires matching decoder and boundary-test changes.
 - `k_uFramegenDescriptorSets` must cover the maximum dispatch count of one legal
   batch. Its current value is 30; it does not permit a second batch in flight.
 

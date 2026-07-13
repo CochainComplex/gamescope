@@ -73,13 +73,20 @@ For a smoothness-first 120 Hz test, add this option before
   --framerate-limit 30 \
 ```
 
-This aligns each real frame plus its three generated frames to four display
-vblanks. It is vendor-agnostic and does not change reconstruction quality, but
-it deliberately caps the game and therefore adds input latency when the game
-could otherwise render above 30 fps. Keep it optional rather than treating it
-as a general frame-generation default. A game that falls below 30 fps still
-needs repeats because x4 cannot produce enough distinct display frames for
-120 Hz.
+This asks Gamescope to release client frame callbacks on every fourth display
+vblank. When the client and compositor meet those callbacks, each real frame
+plus its three generated frames aligns to four display vblanks. It is
+vendor-agnostic and does not change reconstruction quality, but it deliberately
+caps the game and therefore adds input latency when the game could otherwise
+render above 30 fps. Keep it optional rather than treating it as a general
+frame-generation default.
+
+The limiter cannot recover a missed client render or a late compositor wakeup.
+In particular, a nested test running without `CAP_SYS_NICE` may still measure
+three/five-vblank pairs or longer gaps around the intended four-vblank cadence.
+At x4, a five-vblank gap necessarily leaves one repeat because only three
+generated frames are available. Treat the limiter as a controlled pacing test,
+not as the frozen visual baseline or a guaranteed stutter fix.
 
 The original discovery run used in-situ learning. To continue training without
 touching the frozen profile, make a writable copy:

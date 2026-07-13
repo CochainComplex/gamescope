@@ -41,6 +41,7 @@
 #include "vblankmanager.hpp"
 #include "log.hpp"
 #include "Utils/Process.h"
+#include "framegen/adaptation.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
@@ -4781,11 +4782,7 @@ struct FramegenHistory_t
 	// push constants). -1 = no sample yet / default. The one-batch-in-flight
 	// guarantee makes the mapped readback race-free: it is only parsed after
 	// hasCompletedFramegen() admits the batch that wrote it.
-	float flAdaptResidEma = -1.0f;   // mean warped-luma prediction residual
-	float flAdaptNoiseEma = -1.0f;   // same, over static confident texels only
-	float flAdaptFbP75Ema = -1.0f;   // 75th percentile round-trip error (texels)
-	float flAdaptFbTolActive = -1.0f;    // -1 = use the static base tolerance
-	float flAdaptAgreeOffActive = 0.0f;  // additive agreement-window widening
+	gamescope::framegen::AdaptationState adaptation;
 	uint64_t ulAdaptStatsSeqNo = 0;      // batch whose probe wrote the readback
 	uint64_t ulAdaptConsumedSeqNo = 0;   // last readback folded into the EMAs
 	// Dataset capture (Stage C): batch whose copies filled the recorder
@@ -5144,11 +5141,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_device.framegenResetRungCosts();
 	// B4: the adaptation EMAs describe the old scene's content (noise floor,
 	// round-trip ambiguity); a new scene re-calibrates from the defaults.
-	g_framegenHistory.flAdaptResidEma = -1.0f;
-	g_framegenHistory.flAdaptNoiseEma = -1.0f;
-	g_framegenHistory.flAdaptFbP75Ema = -1.0f;
-	g_framegenHistory.flAdaptFbTolActive = -1.0f;
-	g_framegenHistory.flAdaptAgreeOffActive = 0.0f;
+	g_framegenHistory.adaptation = {};
 	g_framegenHistory.ulAdaptStatsSeqNo = 0;
 	g_framegenHistory.ulAdaptConsumedSeqNo = 0;
 	// Stage C dataset capture: a pending, never-flushed batch of tensors dies
@@ -6237,29 +6230,9 @@ static bool framegen_fbcheck_tol_pinned()
 	return s_bPinned;
 }
 
-// Field-trust window: fraction of surviving field texels that mispredicted the
-// real frame. Below Lo the field is fully trusted; above Hi the warp output is
-// entirely the safe fallback (crossfade in bidir, bounded extrapolation in the
-// forward warp).
-static constexpr float k_flFramegenTrustLo = 0.15f;
-static constexpr float k_flFramegenTrustHi = 0.45f;
-// Normalized 8x8-block luma residual that flags a surviving texel as
-// mispredicting: box-filtered wrong-content errors clear this easily,
-// resample/noise differences stay well below it.
-static constexpr float k_flFramegenAdaptBadResid = 0.10f;
-// Mean residual below which the field demonstrably predicts well — the gate
-// for loosening the FB tolerance on round-trip-ambiguous content.
-static constexpr float k_flFramegenAdaptResidLow = 0.045f;
-// Measured block-noise floor -> full-res agreement-window widening. Box
-// filtering attenuates uncorrelated pixel noise by ~sqrt(64), so the pixel-
-// space window needs a substantially larger offset than the block measure.
-static constexpr float k_flFramegenAdaptNoiseToAgree = 6.0f;
-static constexpr float k_flFramegenAdaptAgreeOffMax = 0.15f;
-static constexpr uint32_t k_uFramegenStatsCount = 96u;
-
 FramegenMotionStatsPush_t::FramegenMotionStatsPush_t( bool bClearOnly )
 	: clearOnly( bClearOnly ? 1u : 0u )
-	, badThresh( k_flFramegenAdaptBadResid )
+	, badThresh( gamescope::framegen::k_flAdaptationBadResidual )
 	, staticMvMax( 0.25f )
 	, minConfSurvive( 0.25f )
 {
@@ -6267,19 +6240,21 @@ FramegenMotionStatsPush_t::FramegenMotionStatsPush_t( bool bClearOnly )
 
 static float framegen_adapt_fbcheck_tol()
 {
-	if ( g_framegenHistory.flAdaptFbTolActive > 0.0f )
-		return g_framegenHistory.flAdaptFbTolActive;
+	if ( g_framegenHistory.adaptation.fbTolerance > 0.0f )
+		return g_framegenHistory.adaptation.fbTolerance;
 	return framegen_fbcheck_tol_base();
 }
 
 static float framegen_adapt_agree_lo()
 {
-	return k_flFramegenAgreeLo + g_framegenHistory.flAdaptAgreeOffActive;
+	return gamescope::framegen::active_agreement_lo(
+		g_framegenHistory.adaptation, k_flFramegenAgreeLo );
 }
 
 static float framegen_adapt_agree_hi()
 {
-	return k_flFramegenAgreeHi + 2.0f * g_framegenHistory.flAdaptAgreeOffActive;
+	return gamescope::framegen::active_agreement_hi(
+		g_framegenHistory.adaptation, k_flFramegenAgreeHi );
 }
 
 static float framegen_effective_fbcheck_tol( GamescopeFramegenQuality eQuality )
@@ -6317,83 +6292,43 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 		return;
 	h.ulAdaptConsumedSeqNo = h.ulAdaptStatsSeqNo;
 
-	uint32_t s[ k_uFramegenStatsCount ];
-	memcpy( s, g_framegenMotion.statsReadback->mappedData(), sizeof( s ) );
-	const uint32_t uTotal = s[ 0 ];
-	// Sanity: a resolution far past 8K at field res would be a stale/garbage
-	// readback, not a measurement.
-	if ( uTotal == 0 || uTotal > 4u * 1024u * 1024u )
+	std::array<uint32_t, gamescope::framegen::k_uAdaptationStatsCount> stats;
+	memcpy( stats.data(), g_framegenMotion.statsReadback->mappedData(), sizeof( stats ) );
+	const auto measurement = gamescope::framegen::decode_adaptation_stats( stats );
+	if ( !measurement.has_value() )
 		return;
 
-	const uint32_t uAlive = std::max( uTotal - std::min( s[ 3 ], uTotal ), 1u );
-	const float flResid = ( (float)s[ 1 ] / 1024.0f ) / (float)uTotal;
-	const float flBadFrac = (float)s[ 2 ] / (float)uAlive;
-	const float flKilledFrac = (float)s[ 3 ] / (float)uTotal;
-	const float flMvMean = ( (float)s[ 14 ] / 64.0f ) / (float)uTotal;
-	if ( s[ 88 ] != 0u )
+	if ( measurement->sceneCut != 0u )
 	{
 		vk_log.infof( "framegen: content scene cut detected (%u/9 sections, histogram distance %.2f); presenting a real endpoint",
-			s[ 89 ], (float)s[ 90 ] / 1024.0f );
-	}
-	// Noise floor only when enough static texels back it (a fully-moving frame
-	// has no static sample; keep the previous estimate).
-	const float flNoise = s[ 5 ] >= 64u ? ( (float)s[ 4 ] / 1024.0f ) / (float)s[ 5 ] : -1.0f;
-	// 75th percentile of the FB round-trip error from the 8-bin histogram
-	// (upper bin edge, 0.25-texel bins).
-	float flFbP75 = -1.0f;
-	{
-		uint32_t uCum = 0;
-		for ( uint32_t bin = 0; bin < 8; bin++ )
-		{
-			uCum += s[ 6 + bin ];
-			if ( uCum * 4 >= uTotal * 3 )
-			{
-				flFbP75 = 0.25f * (float)( bin + 1 );
-				break;
-			}
-		}
+			measurement->changedSections,
+			gamescope::framegen::scene_histogram_distance( *measurement ) );
 	}
 
 	// Slow EMA (1/8): threshold moves must be calmer than the per-frame signal,
-	// or the adaptation itself becomes a flicker source.
-	const auto fold = []( float &flEma, float flSample )
-	{
-		if ( flSample < 0.0f )
-			return;
-		flEma = flEma < 0.0f ? flSample : flEma + ( flSample - flEma ) / 8.0f;
-	};
-	fold( h.flAdaptResidEma, flResid );
-	fold( h.flAdaptNoiseEma, flNoise );
-	fold( h.flAdaptFbP75Ema, flFbP75 );
-
-	// FB tolerance: loosen ONLY on ambiguity-without-error — round trips fail
+	// or the adaptation itself becomes a flicker source. FB tolerance loosens
+	// ONLY on ambiguity-without-error — round trips fail
 	// while the field demonstrably predicts the real frame (periodic textures:
 	// fences, grilles, tiled detail, where many vectors are equally valid and
 	// the kill would reintroduce fizzle). High round-trip error WITH high
 	// residual is genuine mislocking and keeps the strict tolerance; the field
-	// trust handles it.
+	// trust handles it. Agreement widens only from a measured temporal-noise
+	// floor. The policy helper owns those arithmetic contracts; this function
+	// retains readback lifetime, completion, and logging ownership.
 	const float flTolBase = framegen_fbcheck_tol_base();
-	float flTol = -1.0f;
-	if ( !framegen_fbcheck_tol_pinned()
-		&& h.flAdaptResidEma >= 0.0f && h.flAdaptResidEma < k_flFramegenAdaptResidLow
-		&& h.flAdaptFbP75Ema > flTolBase )
-		flTol = std::min( h.flAdaptFbP75Ema * 1.5f, 2.5f );
-	h.flAdaptFbTolActive = flTol;
-
-	// Agreement window: widen by the measured temporal-noise floor so inherent
-	// frame-to-frame noise (film grain, dithering, video compression shimmer)
-	// stops mass-killing the motion term at full trust.
-	h.flAdaptAgreeOffActive = h.flAdaptNoiseEma > 0.0f
-		? std::clamp( k_flFramegenAdaptNoiseToAgree * h.flAdaptNoiseEma, 0.0f, k_flFramegenAdaptAgreeOffMax )
-		: 0.0f;
+	const bool bTolPinned = framegen_fbcheck_tol_pinned();
+	gamescope::framegen::update_adaptation_state(
+		h.adaptation, *measurement, flTolBase, bTolPinned );
 
 	static uint64_t s_uAdaptDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uAdaptDebugLogCounter ) )
 	{
 		vk_log.infof( "framegen: adapt resid=%.3f bad=%.1f%% killed=%.1f%% noise=%.4f fbP75=%.2f mv=%.1f scene=%u(%u/9 hist=%.2f) -> fbTol=%.2f agree=%.2f/%.2f",
-			flResid, flBadFrac * 100.0f, flKilledFrac * 100.0f,
-			h.flAdaptNoiseEma, h.flAdaptFbP75Ema, flMvMean,
-			s[ 88 ], s[ 89 ], (float)s[ 90 ] / 1024.0f,
+			measurement->residual, measurement->badFraction * 100.0f,
+			measurement->killedFraction * 100.0f,
+			h.adaptation.noiseEma, h.adaptation.fbP75Ema, measurement->motionMean,
+			measurement->sceneCut, measurement->changedSections,
+			gamescope::framegen::scene_histogram_distance( *measurement ),
 			framegen_adapt_fbcheck_tol(), framegen_adapt_agree_lo(), framegen_adapt_agree_hi() );
 	}
 }
@@ -6725,15 +6660,21 @@ static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t 
 	pCmdBuffer->bindTarget2( g_framegenMotion.statsAccum );
 	// Finalize the sectioned histogram once. This dispatch writes stats[88],
 	// then the field-sized pass broadcasts that verdict one read per workgroup.
-	pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>( k_flFramegenTrustLo, k_flFramegenTrustHi, true );
+	pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>(
+		gamescope::framegen::k_flAdaptationTrustLo,
+		gamescope::framegen::k_flAdaptationTrustHi, true );
 	pCmdBuffer->dispatch( 1, 1 );
-	pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>( k_flFramegenTrustLo, k_flFramegenTrustHi, false );
+	pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>(
+		gamescope::framegen::k_flAdaptationTrustLo,
+		gamescope::framegen::k_flAdaptationTrustHi, false );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 	if ( vulkan_framegen_bidir_active() && framegen_motion_field_rev() != nullptr )
 	{
 		pCmdBuffer->bindTarget( framegen_motion_field_rev() );
 		pCmdBuffer->bindTarget2( g_framegenMotion.statsAccum );
-		pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>( k_flFramegenTrustLo, k_flFramegenTrustHi, false );
+		pCmdBuffer->pushConstants<FramegenMotionStatsApplyPush_t>(
+			gamescope::framegen::k_flAdaptationTrustLo,
+			gamescope::framegen::k_flAdaptationTrustHi, false );
 		pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 	}
 	// Copy after scene finalization so the next-batch debug/CPU consumer sees
@@ -7189,14 +7130,18 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 			accumFlags.bStorage = true;
 			accumFlags.bTransferSrc = true;
 			g_framegenMotion.statsAccum = new CVulkanTexture();
-			bAllocated = g_framegenMotion.statsAccum->BInit( k_uFramegenStatsCount, 1, 1u, DRM_FORMAT_R32UI, accumFlags );
+			bAllocated = g_framegenMotion.statsAccum->BInit(
+				gamescope::framegen::k_uAdaptationStatsCount,
+				1, 1u, DRM_FORMAT_R32UI, accumFlags );
 			if ( bAllocated )
 			{
 				CVulkanTexture::createFlags readbackFlags;
 				readbackFlags.bMappable = true;
 				readbackFlags.bTransferDst = true;
 				g_framegenMotion.statsReadback = new CVulkanTexture();
-				bAllocated = g_framegenMotion.statsReadback->BInit( k_uFramegenStatsCount, 1, 1u, DRM_FORMAT_R32UI, readbackFlags );
+				bAllocated = g_framegenMotion.statsReadback->BInit(
+					gamescope::framegen::k_uAdaptationStatsCount,
+					1, 1u, DRM_FORMAT_R32UI, readbackFlags );
 			}
 		}
 		// Stage C intermediates. Failures here disable the feature, not the
