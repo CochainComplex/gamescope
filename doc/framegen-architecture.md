@@ -430,7 +430,12 @@ Two consumers, two latencies:
   `hasCompletedFramegen`). `src/framegen/adaptation.hpp` owns the stateless counter decoder, slow
   EMAs (1/8), and two derived calibrations. The **FB tolerance** loosens (up to 2.5 texels) only on
   *ambiguity-without-error* — round trips fail while measured prediction error stays low (periodic
-  textures: fences, grilles, tiling), where the kill would reintroduce fizzle; and the
+  textures: fences, grilles, tiling), where the kill would reintroduce fizzle. Entry/exit residual
+  thresholds are hysteretic, and the tolerance can rise by at most 0.125 or fall by at most 0.25
+  field texel per real frame. This is load-bearing temporal policy: the prior direct assignment
+  could jump `0.75 -> 2.5` between adjacent frames and abruptly replace most of the confidence
+  mask even though its input statistics were smoothed. The same-batch global trust remains the
+  immediate safety response; only next-batch calibration authority is slewed. The
   **agreement window** widens by the measured static-scene noise floor (film grain, dithering) so
   inherent temporal noise stops mass-killing the motion term. An explicit
   `GAMESCOPE_FRAMEGEN_FB_TOL` pins the tolerance (auto-cal keeps its hands off). The renderer still

@@ -6585,8 +6585,9 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 			gamescope::framegen::scene_histogram_distance( *measurement ) );
 	}
 
-	// Slow EMA (1/8): threshold moves must be calmer than the per-frame signal,
-	// or the adaptation itself becomes a flicker source. FB tolerance loosens
+	// Slow EMA (1/8), hysteretic mode selection, and bounded tolerance slew:
+	// threshold moves must be calmer than the per-frame signal, or the
+	// adaptation itself becomes a flicker source. FB tolerance loosens
 	// ONLY on ambiguity-without-error — round trips fail
 	// while the field demonstrably predicts the real frame (periodic textures:
 	// fences, grilles, tiled detail, where many vectors are equally valid and
@@ -6603,13 +6604,15 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 	static uint64_t s_uAdaptDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uAdaptDebugLogCounter ) )
 	{
-		vk_log.infof( "framegen: adapt resid=%.3f bad=%.1f%% killed=%.1f%% noise=%.4f fbP75=%.2f mv=%.1f scene=%u(%u/9 hist=%.2f) -> fbTol=%.2f agree=%.2f/%.2f",
+		vk_log.infof( "framegen: adapt resid=%.3f bad=%.1f%% killed=%.1f%% noise=%.4f fbP75=%.2f mv=%.1f scene=%u(%u/9 hist=%.2f) -> fbTol=%.2f relax=%s agree=%.2f/%.2f",
 			measurement->residual, measurement->badFraction * 100.0f,
 			measurement->killedFraction * 100.0f,
 			h.adaptation.noiseEma, h.adaptation.fbP75Ema, measurement->motionMean,
 			measurement->sceneCut, measurement->changedSections,
 			gamescope::framegen::scene_histogram_distance( *measurement ),
-			framegen_adapt_fbcheck_tol(), framegen_adapt_agree_lo(), framegen_adapt_agree_hi() );
+			framegen_adapt_fbcheck_tol(),
+			h.adaptation.fbRelaxationActive ? "on" : "off",
+			framegen_adapt_agree_lo(), framegen_adapt_agree_hi() );
 	}
 }
 

@@ -379,13 +379,44 @@ static void test_adaptation_policy()
 	ambiguous.fbP75 = 2.0f;
 	AdaptationState adaptive;
 	update_adaptation_state( adaptive, ambiguous, 0.75f, false );
-	CHECK_NEAR( adaptive.fbTolerance, 2.5f, 1e-7f );
+	CHECK( adaptive.fbRelaxationActive );
+	CHECK_NEAR( adaptive.fbTolerance, 0.75f + k_flAdaptationToleranceRisePerFrame, 1e-7f );
 	CHECK( adaptive.noiseEma == -1.0f );
 	CHECK( adaptive.agreementOffset == 0.0f );
+	for ( uint32_t i = 1u; i < 14u; i++ )
+		update_adaptation_state( adaptive, ambiguous, 0.75f, false );
+	CHECK_NEAR( adaptive.fbTolerance, 2.5f, 1e-7f );
+
+	// A residual crossing the exit threshold revokes relaxed authority
+	// immediately, but the visible confidence boundary returns at a bounded
+	// rate instead of changing by several field texels in one frame.
+	adaptive.residualEma = k_flAdaptationResidualRelaxExit + 0.01f;
+	update_adaptation_state( adaptive, ambiguous, 0.75f, false );
+	CHECK( !adaptive.fbRelaxationActive );
+	CHECK_NEAR( adaptive.fbTolerance,
+		2.5f - k_flAdaptationToleranceFallPerFrame, 1e-7f );
+
+	// Residuals between the enter and exit thresholds retain the prior mode;
+	// this is the hysteresis that prevents adjacent-frame toggling.
+	AdaptationState hysteresis;
+	hysteresis.residualEma = 0.047f;
+	hysteresis.fbP75Ema = 2.0f;
+	hysteresis.fbTolerance = 1.0f;
+	hysteresis.fbRelaxationActive = true;
+	AdaptationMeasurement middle = ambiguous;
+	middle.residual = 0.047f;
+	update_adaptation_state( hysteresis, middle, 0.75f, false );
+	CHECK( hysteresis.fbRelaxationActive );
+	hysteresis.fbRelaxationActive = false;
+	hysteresis.fbTolerance = -1.0f;
+	update_adaptation_state( hysteresis, middle, 0.75f, false );
+	CHECK( !hysteresis.fbRelaxationActive );
+	CHECK( hysteresis.fbTolerance == -1.0f );
 
 	AdaptationState pinned;
 	update_adaptation_state( pinned, ambiguous, 0.75f, true );
 	CHECK( pinned.fbTolerance == -1.0f );
+	CHECK( !pinned.fbRelaxationActive );
 
 	stats = {};
 	stats[ 0 ] = 100u;

@@ -237,8 +237,9 @@ along with these hardening/quality passes:
   particle chaos — fade smoothly to the safe fallback and recover just as
   smoothly), and auto-calibrates the consistency tolerance and agreement
   window to the content on the CPU one batch later (loosening the round-trip
-  kill only where ambiguity is measurably harmless, widening the agreement
-  window by the measured temporal-noise floor).
+  kill only where ambiguity is measurably harmless, with hysteretic entry/exit
+  and bounded per-frame tolerance slew; widening the agreement window by the
+  measured temporal-noise floor).
 - **Content scene-cut rejection** (part of adaptation at high and above) — four-bin luminance
   histograms over nine screen regions distinguish a hard content cut from coherent motion, while
   prediction residual and failed-field coverage provide independent confirmation. The verdict is

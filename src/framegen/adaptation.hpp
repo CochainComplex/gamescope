@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -19,7 +20,18 @@ inline constexpr uint32_t k_uAdaptationMaxTotal = 4u * 1024u * 1024u;
 inline constexpr float k_flAdaptationTrustLo = 0.15f;
 inline constexpr float k_flAdaptationTrustHi = 0.45f;
 inline constexpr float k_flAdaptationBadResidual = 0.10f;
-inline constexpr float k_flAdaptationResidualLow = 0.045f;
+// Enter and leave FB-tolerance relaxation through different residual
+// thresholds. The old single threshold could alternate the tolerance between
+// 0.75 and 2.5 field texels on adjacent real frames, visibly changing the
+// confidence mask even though every input statistic was already smoothed.
+inline constexpr float k_flAdaptationResidualRelaxEnter = 0.040f;
+inline constexpr float k_flAdaptationResidualRelaxExit = 0.055f;
+// Raising tolerance grants motion vectors more authority, so do it more
+// cautiously than revoking that authority. These are field texels per real
+// frame; at the 1/8-resolution estimator they bound the confidence-boundary
+// motion to one and two output pixels respectively per observation.
+inline constexpr float k_flAdaptationToleranceRisePerFrame = 0.125f;
+inline constexpr float k_flAdaptationToleranceFallPerFrame = 0.250f;
 inline constexpr float k_flAdaptationNoiseToAgreement = 6.0f;
 inline constexpr float k_flAdaptationAgreementOffsetMax = 0.15f;
 
@@ -44,6 +56,7 @@ struct AdaptationState
 	float fbP75Ema = -1.0f;
 	// Negative means that the static/manual base tolerance remains authoritative.
 	float fbTolerance = -1.0f;
+	bool fbRelaxationActive = false;
 	float agreementOffset = 0.0f;
 };
 
@@ -125,15 +138,39 @@ inline void update_adaptation_state( AdaptationState &state,
 	fold_adaptation_ema( state.noiseEma, measurement.noise );
 	fold_adaptation_ema( state.fbP75Ema, measurement.fbP75 );
 
-	float tolerance = -1.0f;
-	if ( !tolerancePinned
-		&& state.residualEma >= 0.0f
-		&& state.residualEma < k_flAdaptationResidualLow
-		&& state.fbP75Ema > baseTolerance )
+	if ( tolerancePinned )
 	{
-		tolerance = std::min( state.fbP75Ema * 1.5f, 2.5f );
+		state.fbTolerance = -1.0f;
+		state.fbRelaxationActive = false;
 	}
-	state.fbTolerance = tolerance;
+	else
+	{
+		const bool hasRelaxationEvidence = state.residualEma >= 0.0f
+			&& state.fbP75Ema > baseTolerance;
+		if ( state.fbRelaxationActive )
+		{
+			state.fbRelaxationActive = hasRelaxationEvidence
+				&& state.residualEma < k_flAdaptationResidualRelaxExit;
+		}
+		else
+		{
+			state.fbRelaxationActive = hasRelaxationEvidence
+				&& state.residualEma <= k_flAdaptationResidualRelaxEnter;
+		}
+
+		const float targetTolerance = state.fbRelaxationActive
+			? std::min( state.fbP75Ema * 1.5f, 2.5f )
+			: baseTolerance;
+		const float currentTolerance = state.fbTolerance >= 0.0f
+			? state.fbTolerance : baseTolerance;
+		const float delta = std::clamp( targetTolerance - currentTolerance,
+			-k_flAdaptationToleranceFallPerFrame,
+			k_flAdaptationToleranceRisePerFrame );
+		const float nextTolerance = currentTolerance + delta;
+		state.fbTolerance = !state.fbRelaxationActive
+			&& std::abs( nextTolerance - baseTolerance ) <= 1e-6f
+			? -1.0f : nextTolerance;
+	}
 
 	state.agreementOffset = state.noiseEma > 0.0f
 		? std::clamp( k_flAdaptationNoiseToAgreement * state.noiseEma,
