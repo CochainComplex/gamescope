@@ -3,6 +3,7 @@
 #include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
+#include "framegen/scheduling.hpp"
 #include "framegen/settings.hpp"
 #include "framegen/temporal.hpp"
 
@@ -295,6 +296,106 @@ static void test_temporal_policy()
 	CHECK( forward_strength_raw( 2.0f, 0.5f ) > 1.5f );
 }
 
+static void test_scheduling_policy()
+{
+	using namespace gamescope::framegen;
+
+	constexpr uint64_t interval = 10'000'000u;
+	CHECK( !leaves_empty_vblank( 20'000'000u, 0u, interval ) );
+	CHECK( !leaves_empty_vblank( 24'999'999u, 10'000'000u, interval ) );
+	CHECK( leaves_empty_vblank( 25'000'000u, 10'000'000u, interval ) );
+
+	for ( uint32_t confidence = 0u;
+		confidence <= k_uCadenceConfidenceRequired; confidence++ )
+	{
+		CHECK( update_cadence_confidence( confidence, true )
+			== std::min( k_uCadenceConfidenceRequired,
+				confidence + k_uCadenceConfidenceGain ) );
+		CHECK( update_cadence_confidence( confidence, false )
+			== ( confidence > k_uCadenceConfidenceLeak
+				? confidence - k_uCadenceConfidenceLeak : 0u ) );
+		CHECK( reactive_generation_ready( true, confidence )
+			== ( confidence >= k_uCadenceConfidenceRequired ) );
+		CHECK( !reactive_generation_ready( false, confidence ) );
+	}
+
+	CHECK( measured_gap_vblanks( 4'999'999u, interval ) == 1u );
+	CHECK( measured_gap_vblanks( 14'999'999u, interval ) == 1u );
+	CHECK( measured_gap_vblanks( 15'000'000u, interval ) == 2u );
+	CHECK( measured_gap_vblanks( 25'000'000u, interval ) == 3u );
+
+	for ( uint32_t gap = 1u; gap <= 8u; gap++ )
+	{
+		for ( uint32_t multiplier = 2u; multiplier <= 4u; multiplier++ )
+		{
+			for ( const bool expandToMultiplier : { false, true } )
+			{
+				const uint32_t expectedGap = expandToMultiplier
+					? std::max( gap, multiplier ) : gap;
+				CHECK( expanded_gap_vblanks(
+					gap, multiplier, expandToMultiplier ) == expectedGap );
+			}
+
+			const uint32_t expectedGenerated = gap > 1u
+				? std::min( gap - 1u, multiplier - 1u ) : 0u;
+			CHECK( generated_slots_for_gap( gap, multiplier, true )
+				== expectedGenerated );
+			CHECK( generated_slots_for_gap( gap, multiplier, false )
+				== std::min( expectedGenerated, 1u ) );
+			CHECK( ladder_generated_count( gap - 1u, multiplier, false )
+				== expectedGenerated );
+			CHECK( ladder_generated_count( gap - 1u, multiplier, true ) == 1u );
+		}
+	}
+
+	CHECK( !jit_interval_eligible( 10'999'999u, interval ) );
+	CHECK( jit_interval_eligible( 11'000'000u, interval ) );
+	CHECK( !vrr_hybrid_interval_eligible( 21'999'999u, interval ) );
+	CHECK( vrr_hybrid_interval_eligible( 22'000'000u, interval ) );
+
+	const DeadlineLadderState initial = { 0u, 0u };
+	DeadlineLadderEvaluation evaluation = evaluate_deadline_ladder(
+		initial, 7u, 8'500'000u, k_uDeadlineMinSamples, interval );
+	CHECK( !evaluation.tryDegrade );
+	CHECK( evaluation.state.degradeSteps == 0u );
+	CHECK( evaluation.state.holdFrames == 0u );
+	evaluation = evaluate_deadline_ladder(
+		initial, 7u, 8'500'001u, k_uDeadlineMinSamples, interval );
+	CHECK( evaluation.tryDegrade );
+
+	for ( uint32_t samples = 0u; samples < k_uDeadlineMinSamples; samples++ )
+		CHECK( !evaluate_deadline_ladder(
+			initial, 7u, interval, samples, interval ).tryDegrade );
+	CHECK( !evaluate_deadline_ladder(
+		initial, 0u, interval, k_uDeadlineMinSamples, interval ).tryDegrade );
+	CHECK( !evaluate_deadline_ladder(
+		initial, 7u, 0u, k_uDeadlineMinSamples, interval ).tryDegrade );
+	CHECK( !evaluate_deadline_ladder(
+		{ 7u, 0u }, 7u, interval, k_uDeadlineMinSamples, interval ).tryDegrade );
+
+	evaluation = evaluate_deadline_ladder(
+		{ 2u, 3u }, 7u, interval, k_uDeadlineMinSamples, interval );
+	CHECK( !evaluation.tryDegrade );
+	CHECK( evaluation.state.degradeSteps == 2u );
+	CHECK( evaluation.state.holdFrames == 2u );
+	DeadlineLadderState committed = commit_deadline_degradation( evaluation.state );
+	CHECK( committed.degradeSteps == 3u );
+	CHECK( committed.holdFrames == k_uDeadlineHoldFrames );
+
+	const EffectiveConfig motionHigh = {
+		GamescopeFramegenMode::Motion, 4u, GamescopeFramegenQuality::High };
+	const EffectiveConfig motionMedium = {
+		GamescopeFramegenMode::Motion, 4u, GamescopeFramegenQuality::Medium };
+	const EffectiveConfig extrapolate4 = {
+		GamescopeFramegenMode::Extrapolate, 4u, GamescopeFramegenQuality::Low };
+	const EffectiveConfig extrapolate3 = {
+		GamescopeFramegenMode::Extrapolate, 3u, GamescopeFramegenQuality::Low };
+	CHECK( degradation_reduces_work( motionHigh, motionMedium, 3u, 3u ) );
+	CHECK( degradation_reduces_work( motionMedium, extrapolate4, 3u, 3u ) );
+	CHECK( degradation_reduces_work( extrapolate4, extrapolate3, 3u, 2u ) );
+	CHECK( !degradation_reduces_work( extrapolate4, extrapolate3, 1u, 1u ) );
+}
+
 static void test_dispatch_policy()
 {
 	using gamescope::framegen::select_dispatch_policy;
@@ -380,6 +481,7 @@ int main()
 	test_net_profile_contract();
 	test_numeric_settings_contract();
 	test_temporal_policy();
+	test_scheduling_policy();
 	test_dispatch_policy();
 	test_push_constant_encoding();
 	return g_bPassed ? 0 : 1;

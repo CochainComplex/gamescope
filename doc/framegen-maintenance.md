@@ -12,7 +12,7 @@ symbols below.
 |---|---|---|
 | CLI and environment | `src/main.cpp` | parsing, validation, debug controls |
 | Framegen types and quality policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/quality vocabulary and pure degradation-ladder resolution |
-| Temporal and dispatch policy | `src/framegen/temporal.hpp`, `src/framegen/dispatch_policy.hpp` | pure phase/cadence math and capability-to-strategy selection |
+| Temporal, scheduling, and dispatch policy | `src/framegen/temporal.hpp`, `src/framegen/scheduling.hpp`, `src/framegen/dispatch_policy.hpp` | pure phase math, cadence/deadline planning, and capability-to-strategy selection |
 | Numeric and setting contracts | `src/framegen/numeric.hpp`, `src/framegen/settings.hpp` | fast-math-safe fp32 classification and strict scalar/path parsing |
 | Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp`, `src/framegen/net_profile.hpp` | CPU/GLSL ABI, tensor layout, and GSFR validation/migration |
 | Vulkan scheduling and algorithms | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch recording, and ML execution |
@@ -27,7 +27,10 @@ Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
 
 The `src/framegen` policy and contract headers are deliberately stateless and
-header-only: they add no link boundary to command recording. `device.cpp` is a
+header-only: they add no link boundary to command recording. In particular,
+`scheduling.hpp` owns deterministic cadence confidence, gap/slot planning,
+keep-up thresholds, and deadline-ladder transitions; it does not own clocks,
+timestamp queries, history, or the decision to submit. `device.cpp` is a
 narrow exception for `CVulkanDevice` queue/timestamp methods; the class remains
 the sole owner of that state. Keep mutable algorithm resources, history, and
 dispatch ordering together until they can move behind one explicit owner with a
@@ -82,6 +85,10 @@ ownership bugs.
   renderer owns timestamp provenance, validity gates, scene history, and the
   decision to submit. Do not move a guard into pure math unless every caller
   preserves the same early-exit and fallback behavior.
+- `src/framegen/scheduling.hpp` has the same boundary for cadence admission and
+  deadline degradation. The renderer supplies monotonic timestamps, measured
+  GPU cost/sample identity, queue capability, and mutable ladder state. A helper
+  result must not acquire resources, record commands, wait, or select a flip.
 - Causal slot `phase` lies after the newest real frame. The shader coefficient is
   derived from that phase and `--framegen-strength`, then bounded by the forward
   cap. Bidirectional `phase` lies in `[0, 1]` between checked real endpoints and

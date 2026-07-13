@@ -10,8 +10,9 @@ and the implementation are authoritative when a proposal describes an older shap
 
 ## 0. Scope and the one organizing fact
 
-`src/rendervulkan.cpp` owns scheduling, resource lifetime, motion preparation,
-generation, and online learning. `src/framegen/device.cpp` contains the
+`src/rendervulkan.cpp` owns scheduling state, resource lifetime, motion preparation,
+generation, and online learning. Stateless cadence/deadline planning lives in
+`src/framegen/scheduling.hpp` and is inlined into that owner. `src/framegen/device.cpp` contains the
 `CVulkanDevice` framegen queue, completion, command-buffer retirement, and GPU
 timestamp methods without owning separate state. The `cs_framegen_*.comp`
 shaders are the algorithmic surface. `src/steamcompmgr.cpp` is the present
@@ -833,7 +834,7 @@ cache hit.
 | **03** | dGPU optical-flow donor — offload motion estimation to the render GPU's `VK_NV_optical_flow` OFA, ship a small flow field over PCIe | **Aspirational** (longest horizon). Zero OFA symbols; needs a second Vulkan device gamescope has never had; cross-vendor timeline interop rated unreliable. Motion mode is the shipped fallback. |
 | **04** | Timestamp-driven adaptive degradation | **IMPLEMENTED** (`a75bfbe`) but **divergent** from the proposal — shipped is *monotonic* (down-only, re-probe on scene change), rungs are motion-quality/mode/multiplier notches (not a pyramid table), 85% deadline (not 0.6 budget), 2D per-(rung,gen-count) 7/8-EMA (not one global EWMA), three-sample cold-start guard, fixed 4-frame cooldown, modular `timestampValidBits` wrap handling, and no tuning flags. `VK_EXT_calibrated_timestamps` is unused. |
 | **05** | Tile classification + `vkCmdDispatchIndirect` + SDMA static fill — generate only over moving tiles, fill static tiles on the transfer engine | **Aspirational** (deferred). No transfer-only queue discovery / classify shader exists; the doc admits it depends on transfer-queue discovery that isn't there yet. |
-| **06** | JIT phase — plan one slot per vblank against the KMS pageflip clock with a slew-limited frametime EMA, instead of baking phases from a single-interval gap guess; adds the "skip when keeping up" guard | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_JIT=1`, dedicated queue only). `framegen_jit_submit` / `vulkan_framegen_jit_tick` (`rendervulkan.cpp`), EMA `FramegenHistory_t::ulFrametimeEmaNs`, keep-up guard `k_uFramegenJitKeepUpPercent=110`. Tested with GravityMark (~21% fewer generation passes for identical present coverage); phase-accuracy/smoothness benefit still needs native DRM + human A/B. |
+| **06** | JIT phase — plan one slot per vblank against the KMS pageflip clock with a slew-limited frametime EMA, instead of baking phases from a single-interval gap guess; adds the "skip when keeping up" guard | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_JIT=1`, dedicated queue only). `framegen_jit_submit` / `vulkan_framegen_jit_tick` (`rendervulkan.cpp`), EMA `FramegenHistory_t::ulFrametimeEmaNs`, keep-up guard `k_uJitKeepUpPercent=110` (`framegen/scheduling.hpp`). Tested with GravityMark (~21% fewer generation passes for identical present coverage); phase-accuracy/smoothness benefit still needs native DRM + human A/B. |
 | **07** | Frames-only SOTA alignment and validation | **BOUNDED IMPLEMENTATIONS COMPLETE FOR E1, E2, B, A, D.** E2 now captures exact full-resolution held-out colour with paired candidates; optional LPIPS is available, while DISTS/FvVDP remain external evaluation work. The confidence-only bidir ML authority boundary remains the production contract. |
 
 ---
@@ -844,8 +845,8 @@ cache hit.
   `bCanSpeculate` still ignores `bLeavesEmptyVblank`, so it generates a full batch **every
   real frame even when the game hits refresh** — a framegen pass of wasted bandwidth per vblank on the
   weak card, worst with Motion. The flagged "skip when comfortably keeping up" to-do (`1b949f0`) is now
-  **implemented in the two opt-in prototypes**: #06 JIT (`k_uFramegenJitKeepUpPercent=110`)
-  and #01 VRR hybrid (`k_uFramegenHybridKeepUpPercent=220`) skip the slot when the frametime
+  **implemented in the two opt-in prototypes**: #06 JIT (`k_uJitKeepUpPercent=110`)
+  and #01 VRR hybrid (`k_uVrrHybridKeepUpPercent=220`) skip the slot when the frametime
   EMA says the game is keeping up. The classic path (neither toggle set) still has no guard.
 - **NVIDIA direct-pair not implemented.** The vendor override only swaps the single-slot extrapolate;
   `extrapolatePair` stays on LDS, so NVIDIA x3/x4 batches still pay the apron and lose the ~30–37% win.

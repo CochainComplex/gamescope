@@ -56,6 +56,31 @@ Reservoir and shading remain enabled for the complete Extreme configuration,
 although their causal passes are not scheduled while bidirectional mode is
 active.
 
+### Optional cadence-locked variant
+
+At 120 Hz, x4 can fully populate the display only while the real-frame cadence
+stays at or above 30 fps. A workload that changes from a short interval to five
+or more vblanks when camera motion begins cannot be covered retroactively by
+bidirectional generation: it has already drained the slots planned from the
+previous interval, and x4 can insert at most three new frames. The result is an
+honest repeat on the newest real frame, often perceived as a brief onset
+stutter.
+
+For a smoothness-first 120 Hz test, add this option before
+`--experimental-framegen`:
+
+```bash
+  --framerate-limit 30 \
+```
+
+This aligns each real frame plus its three generated frames to four display
+vblanks. It is vendor-agnostic and does not change reconstruction quality, but
+it deliberately caps the game and therefore adds input latency when the game
+could otherwise render above 30 fps. Keep it optional rather than treating it
+as a general frame-generation default. A game that falls below 30 fps still
+needs repeats because x4 cannot produce enough distinct display frames for
+120 Hz.
+
 The original discovery run used in-situ learning. To continue training without
 touching the frozen profile, make a writable copy:
 

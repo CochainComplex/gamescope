@@ -172,7 +172,7 @@ What this fixes and what it doesn't:
 | # | Risk | Mitigation |
 |---|------|------------|
 | 1 | EMA mis-converges on bimodal frametimes (e.g. 60/30 alternation) | slew clamp bounds each step to 12.5%; worst case phase error equals today's single-sample error; re-seeds on scene change |
-| 2 | Keep-up guard misjudges a jittery ~58 fps game and leaves single-vblank holes | repeat-slot tick fills from the second vblank; threshold (`k_uFramegenJitKeepUpPercent = 110`) is a named constant to tune with `--framegen-debug` slot logs |
+| 2 | Keep-up guard misjudges a jittery ~58 fps game and leaves single-vblank holes | repeat-slot tick fills from the second vblank; threshold (`k_uJitKeepUpPercent = 110` in `framegen/scheduling.hpp`) is a named constant to tune with `--framegen-debug` slot logs |
 | 3 | `GetLastVBlank` staleness after missed flips skews the target by one vblank | `GetNextVBlank`'s catch-up loop self-corrects next tick; supersede/discard bound the damage to one misplaced slot |
 | 4 | Per-slot motion estimation cost at deep stall fills | forward cap bounds fills per stall (~2 at default strength); future: cache the motion field per (previousReal, currentReal) pair |
 | 5 | Double-submit races between trigger sites | all three sites run on the steamcompmgr thread and `framegen_jit_submit` refuses when `pending` is non-empty or the previous batch is in flight |

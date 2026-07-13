@@ -46,6 +46,7 @@
 #include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
+#include "framegen/scheduling.hpp"
 #include "framegen/settings.hpp"
 #include "framegen/temporal.hpp"
 
@@ -4802,50 +4803,11 @@ struct FramegenHistory_t
 static FramegenHistory_t g_framegenHistory;
 static bool g_bLoggedFramegenConfig = false;
 static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = 250'000'000ull;
-// Hysteresis for the fallback/shared-queue pacing gate. Real heavy-load frame
-// pacing is often noisy: a game can leave empty vblanks overall while still
-// occasionally landing a real frame just under the threshold. Treat this as a
-// leaky confidence score instead of demanding a long run of consecutive slow
-// frames. On a dedicated framegen queue we go further and generate
-// speculatively; the output is disposable if a real frame arrives in time.
-static constexpr uint32_t k_uFramegenStableFramesRequired = 4;
-static constexpr uint32_t k_uFramegenStableFramesGain = 2;
-// Drain per non-generatable frame. Keep this lower than the gain so one jittered
-// interval does not erase several valid empty-vblank opportunities.
-static constexpr uint32_t k_uFramegenStableFramesLeak = 1;
-
-// Deadline for the degradation ladder (#04): when a rung's measured GPU cost
-// exceeds this fraction of the vblank interval, shed a rung. The margin below
-// 100% is proactive headroom against per-batch jitter, so a batch whose mean sits
-// here rarely spikes past the true vblank and drops its generated frame.
-static constexpr uint64_t k_uFramegenDeadlinePercent = 85; // > this % of a vblank interval -> degrade
-// Do not make the ladder's irreversible scene-local quality decision from a
-// cold first sample. Three completed batches establish a minimally useful EMA
-// while still reacting within a few real frames to a genuinely over-budget tier.
-static constexpr uint32_t k_uFramegenDeadlineMinSamples = 3;
-// Frames to hold after a ladder step before stepping again, so the new rung's real
-// cost folds into the measurement first (the readback lags by ~1 batch). Without
-// it the loop would step again on the not-yet-updated rung cost and over-degrade.
-static constexpr uint32_t k_uFramegenDegradeHoldFrames = 4;
 // Dedicated-queue idle refill may extrapolate beyond the originally expected
 // next real frame if the game stalls. Cap the forward step so a long stall does
 // not run prediction unbounded; after this point additional refills converge
 // toward the capped prediction instead of accelerating away from real content.
 static constexpr float k_flFramegenMaxForwardStrength = 1.5f;
-// JIT display-clock pacing (#06): don't speculate a slot at real-frame record
-// time when the measured cadence says the game is keeping up with refresh —
-// the next vblank will carry a real frame and the prediction would only be
-// discarded. Below this threshold (EMA < 1.10x the vblank interval) the
-// reactive repeat-slot tick is the sole fill path, so a genuine stall is still
-// covered from its second vblank onward.
-static constexpr uint64_t k_uFramegenJitKeepUpPercent = 110;
-// VRR hybrid (#01): only place a mid-interval flip when both halves of the
-// split interval are at least one panel min-refresh cycle (EMA >= ~2.2x). Any
-// tighter and the second flip pushes the present rate past the panel ceiling —
-// the panel's minimum flip spacing could then make the NEXT real frame wait,
-// which is the one latency sin this mode exists to avoid. The extra 10% over
-// 2 cycles is jitter margin for early real frames.
-static constexpr uint64_t k_uFramegenHybridKeepUpPercent = 220;
 
 static bool framegen_refill_idle();
 static bool framegen_jit_submit( uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps );
@@ -8872,8 +8834,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// real frame and discard the prediction when a real frame wins the vblank.
 	// That spends the second GPU's slack to cover sudden missed slots without
 	// adding real-frame latency.
-	const bool bLeavesEmptyVblank = ulPrevRealFrameTimeNs != 0
-		&& now - ulPrevRealFrameTimeNs >= ( ulVblankIntervalNs * 3 ) / 2;
+	const bool bLeavesEmptyVblank = gamescope::framegen::leaves_empty_vblank(
+		now, ulPrevRealFrameTimeNs, ulVblankIntervalNs );
 	const bool bGpuHasHeadroom = g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo );
 	const bool bGeneratable = bLeavesEmptyVblank && bGpuHasHeadroom;
 	const bool bCanSpeculate = g_device.hasFramegenQueue() && bGpuHasHeadroom && ulPrevRealFrameTimeNs != 0;
@@ -8906,18 +8868,10 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		return;
 	}
 
-	// Leaky-bucket hysteresis (see above). Only score once we have a real gap to
-	// judge (ulPrevRealFrameTimeNs != 0); the priming frame above never reaches here.
-	if ( bGeneratable )
-	{
-		g_framegenHistory.nStableFrames = std::min( k_uFramegenStableFramesRequired,
-			g_framegenHistory.nStableFrames + k_uFramegenStableFramesGain );
-	}
-	else
-	{
-		g_framegenHistory.nStableFrames = g_framegenHistory.nStableFrames > k_uFramegenStableFramesLeak
-			? g_framegenHistory.nStableFrames - k_uFramegenStableFramesLeak : 0;
-	}
+	// Leaky-bucket hysteresis is stateless policy in scheduling.hpp. Only score
+	// once we have a real gap to judge; the priming frame never reaches here.
+	g_framegenHistory.nStableFrames = gamescope::framegen::update_cadence_confidence(
+		g_framegenHistory.nStableFrames, bGeneratable );
 
 	// Max degradation rungs for the startup config (0 for extrapolate/blend x2).
 	// Needed here for the dormant log; the ladder itself is evaluated further down,
@@ -8925,7 +8879,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// and never on an idle/dormant frame.
 	const uint32_t nMaxDegradeSteps = framegen_max_degrade_steps();
 
-	const bool bReactiveReady = bGeneratable && g_framegenHistory.nStableFrames >= k_uFramegenStableFramesRequired;
+	const bool bReactiveReady = gamescope::framegen::reactive_generation_ready(
+		bGeneratable, g_framegenHistory.nStableFrames );
 	const bool bShouldGenerate = bCanSpeculate || bReactiveReady;
 
 	if ( !bShouldGenerate )
@@ -8935,7 +8890,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		{
 			const char *pszState = !bGpuHasHeadroom ? "busy" : ( bGeneratable ? "stabilizing" : "dormant" );
 			vk_log.infof( "framegen: %s %u/%u degrade=%u/%u", pszState,
-				g_framegenHistory.nStableFrames, k_uFramegenStableFramesRequired,
+				g_framegenHistory.nStableFrames, gamescope::framegen::k_uCadenceConfidenceRequired,
 				g_framegenHistory.nDegradeSteps, nMaxDegradeSteps );
 		}
 		return;
@@ -8949,8 +8904,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// slots even when the last interval was fast. If a real frame arrives, the
 	// pending prediction is discarded before it can add latency; if it misses,
 	// AMD already has work queued for the empty vblank.
-	const uint32_t nMeasuredGapVblanks = std::max( 1u,
-		(uint32_t)( ( now - ulPrevRealFrameTimeNs + ulVblankIntervalNs / 2 ) / ulVblankIntervalNs ) );
+	const uint32_t nMeasuredGapVblanks = gamescope::framegen::measured_gap_vblanks(
+		now - ulPrevRealFrameTimeNs, ulVblankIntervalNs );
 
 	// Deadline-driven degradation (#04): shed one quality rung whenever the CURRENT
 	// config's measured GPU cost (see framegenGarbageCollect) overruns the vblank
@@ -8968,9 +8923,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// measurement is available the current rung's cost is 0 and the ladder stays at
 	// full quality, leaving the existing reactive discard as the only safety net.
 	const FramegenEffective_t curEffForLadder = framegen_effective_config( g_framegenHistory.nDegradeSteps );
-	const uint32_t nLadderGapVblanks = bCanSpeculate
-		? std::max( nMeasuredGapVblanks, std::max( 2u, curEffForLadder.multiplier ) )
-		: nMeasuredGapVblanks;
+	const uint32_t nLadderGapVblanks = gamescope::framegen::expanded_gap_vblanks(
+		nMeasuredGapVblanks, curEffForLadder.multiplier, bCanSpeculate );
 	const uint32_t nGapSlots = nLadderGapVblanks > 1 ? nLadderGapVblanks - 1 : 0;
 	// JIT pacing and the VRR hybrid always submit one-slot batches, so their
 	// rung costs are keyed by count 1 and only the mode rung
@@ -8980,41 +8934,33 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	const bool bVrrHybrid = vulkan_framegen_vrr_hybrid_active();
 	const bool bJitPacing = !bVrrHybrid && framegen_jit_enabled();
 	const bool bSingleSlotPacing = bJitPacing || bVrrHybrid;
-	const uint32_t nCurGenForLadder = bSingleSlotPacing
-		? 1u
-		: std::min( nGapSlots, std::max( 1u, curEffForLadder.multiplier - 1u ) );
+	const uint32_t nCurGenForLadder = gamescope::framegen::ladder_generated_count(
+		nGapSlots, curEffForLadder.multiplier, bSingleSlotPacing );
 	const uint64_t ulCurRungCostNs = g_device.framegenRungCostNs( g_framegenHistory.nDegradeSteps, nCurGenForLadder );
 	const uint32_t uCurRungSamples = g_device.framegenRungSampleCount( g_framegenHistory.nDegradeSteps, nCurGenForLadder );
-	if ( nMaxDegradeSteps > 0 && ulCurRungCostNs != 0
-		&& uCurRungSamples >= k_uFramegenDeadlineMinSamples
-		&& g_framegenHistory.nDegradeSteps < nMaxDegradeSteps )
+	gamescope::framegen::DeadlineLadderEvaluation ladderEvaluation =
+		gamescope::framegen::evaluate_deadline_ladder(
+			{ g_framegenHistory.nDegradeSteps, g_framegenHistory.nDegradeHold },
+			nMaxDegradeSteps, ulCurRungCostNs, uCurRungSamples, ulVblankIntervalNs );
+	if ( ladderEvaluation.state.holdFrames != g_framegenHistory.nDegradeHold )
+		g_framegenHistory.nDegradeHold = ladderEvaluation.state.holdFrames;
+	if ( ladderEvaluation.tryDegrade )
 	{
-		const uint64_t ulDeadlineNs = ( ulVblankIntervalNs * k_uFramegenDeadlinePercent ) / 100;
-		if ( g_framegenHistory.nDegradeHold > 0 )
+		// Over budget at the current rung. Only take the step if it actually
+		// reduces work at THIS gap: dropping a motion tier or motion->extrapolate
+		// always lowers per-frame cost, but a pure multiplier notch only helps when the gap
+		// lets it generate fewer frames. Otherwise stepping would cost quality
+		// (a coarser cadence / fewer inserted frames) for zero GPU saving.
+		const FramegenEffective_t nextEff = framegen_effective_config( g_framegenHistory.nDegradeSteps + 1 );
+		const uint32_t nNextGen = gamescope::framegen::ladder_generated_count(
+			nGapSlots, nextEff.multiplier, bSingleSlotPacing );
+		if ( gamescope::framegen::degradation_reduces_work(
+			curEffForLadder, nextEff, nCurGenForLadder, nNextGen ) )
 		{
-			// Cooldown after a step: keep generating (so the new rung's cost gets
-			// measured) but hold off on another step until that fresh sample folds
-			// in, otherwise we'd act on a not-yet-updated rung cost and overshoot.
-			g_framegenHistory.nDegradeHold--;
-		}
-		else if ( ulCurRungCostNs > ulDeadlineNs )
-		{
-			// Over budget at the current rung. Only take the step if it actually
-			// reduces work at THIS gap: dropping a motion tier or motion->extrapolate
-			// always lowers per-frame cost, but a pure multiplier notch only helps when the gap
-			// lets it generate fewer frames. Otherwise stepping would cost quality
-			// (a coarser cadence / fewer inserted frames) for zero GPU saving.
-			const FramegenEffective_t nextEff = framegen_effective_config( g_framegenHistory.nDegradeSteps + 1 );
-			const uint32_t nNextGen = bSingleSlotPacing
-				? 1u
-				: std::min( nGapSlots, std::max( 1u, nextEff.multiplier - 1u ) );
-			if ( nextEff.mode != curEffForLadder.mode
-				|| nextEff.quality != curEffForLadder.quality
-				|| nNextGen < nCurGenForLadder )
-			{
-				g_framegenHistory.nDegradeSteps++;
-				g_framegenHistory.nDegradeHold = k_uFramegenDegradeHoldFrames;
-			}
+			ladderEvaluation.state = gamescope::framegen::commit_deadline_degradation(
+				ladderEvaluation.state );
+			g_framegenHistory.nDegradeSteps = ladderEvaluation.state.degradeSteps;
+			g_framegenHistory.nDegradeHold = ladderEvaluation.state.holdFrames;
 		}
 	}
 
@@ -9025,11 +8971,12 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// frame is placed at the content midpoint of the measured interval by a
 	// timer-armed flip (steamcompmgr owns the timer and reads the offset via
 	// vulkan_framegen_vrr_hybrid_mid_offset_ns). Keep-up guard: skip when the
-	// interval is too short to split — see k_uFramegenHybridKeepUpPercent.
+	// interval is too short to split; scheduling.hpp owns the threshold.
 	if ( bVrrHybrid )
 	{
 		g_framegenHistory.pending.clear();
-		if ( g_framegenHistory.ulFrametimeEmaNs * 100 >= ulVblankIntervalNs * k_uFramegenHybridKeepUpPercent )
+		if ( gamescope::framegen::vrr_hybrid_interval_eligible(
+			g_framegenHistory.ulFrametimeEmaNs, ulVblankIntervalNs ) )
 		{
 			framegen_vrr_hybrid_submit( ulCompositeSeqNo, nMaxDegradeSteps );
 		}
@@ -9054,7 +9001,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	if ( bJitPacing )
 	{
 		g_framegenHistory.pending.clear();
-		if ( g_framegenHistory.ulFrametimeEmaNs * 100 >= ulVblankIntervalNs * k_uFramegenJitKeepUpPercent )
+		if ( gamescope::framegen::jit_interval_eligible(
+			g_framegenHistory.ulFrametimeEmaNs, ulVblankIntervalNs ) )
 		{
 			framegen_jit_submit( ulCompositeSeqNo, nMaxDegradeSteps );
 		}
@@ -9080,19 +9028,16 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// latency instead of being discarded. The measured (just-completed)
 	// interval is also exactly the span its phases interpolate.
 	const bool bBidir = vulkan_framegen_bidir_active();
-	const uint32_t nGapVblanks = ( bCanSpeculate && !bBidir )
-		? std::max( nMeasuredGapVblanks, std::max( 2u, eff.multiplier ) )
-		: nMeasuredGapVblanks;
-	const uint32_t nSlotCeiling = std::max( 1u, eff.multiplier - 1u );
-	uint32_t nGenerate = nGapVblanks > 1 ? std::min( nGapVblanks - 1, nSlotCeiling ) : 0;
+	const uint32_t nGapVblanks = gamescope::framegen::expanded_gap_vblanks(
+		nMeasuredGapVblanks, eff.multiplier, bCanSpeculate && !bBidir );
+	uint32_t nGenerate = gamescope::framegen::generated_slots_for_gap(
+		nGapVblanks, eff.multiplier, g_device.hasFramegenQueue() );
 
 	// Without a dedicated framegen queue the batch is submitted to the same
 	// in-order queue as the next composite, so it sits in front of it. Cap the
 	// single-queue path to one generated frame to bound that head-of-line work —
 	// the proven x2-prototype behaviour — rather than amplifying it under x3/x4.
-	if ( !g_device.hasFramegenQueue() )
-		nGenerate = std::min( nGenerate, 1u );
-
+	// generated_slots_for_gap applies that cap while forming nGenerate above.
 	if ( nGenerate == 0 )
 		return;
 

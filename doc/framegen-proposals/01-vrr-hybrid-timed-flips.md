@@ -30,7 +30,7 @@ resolved several of this document's open questions and changed some details:
   spacing could then delay that real frame. Stalls are left to panel LFC.
 - **Keep-up guard replaces `cv_framegen_mid_min_budget_ms`:** generate only
   when `EMA >= 2.2 × panel min-refresh cycle`
-  (`k_uFramegenHybridKeepUpPercent = 220`) so both halves of the split
+  (`k_uVrrHybridKeepUpPercent = 220` in `framegen/scheduling.hpp`) so both halves of the split
   interval respect the panel's minimum flip spacing with ~10% jitter margin.
 - **`force_repaint()` is suppressed for hybrid submissions** — a detail the
   draft missed: under VRR every wake "can vblank", so the classic
