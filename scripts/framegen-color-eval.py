@@ -4,9 +4,10 @@
 GAMESCOPE_FRAMEGEN_RECORD_COLOR records real triplets A/B/C while presenting
 all three normally. The framegen GPU predicts B from A and C at B's measured
 phase, never presents those predictions, and writes paired occlusion strengths
-0/0.5/1 beside the exact real B in one GSCF file. This provides genuine
-full-colour ground truth without relying on a repeatable second run or
-pretending an endpoint is an intermediate frame.
+0/0.5/1, or paired endpoint-trace strengths selected at capture time, beside
+the exact real B in one GSCF file. This provides genuine full-colour ground
+truth without relying on a repeatable second run or pretending an endpoint is
+an intermediate frame.
 
 Higher PSNR/SSIM and lower MAE/bad/edge/residual-change are better. Core metrics
 grade the captured output code values; EOTF metadata is reported but no guessed
@@ -31,8 +32,13 @@ import numpy as np
 
 
 MAGIC = 0x46435347  # 'GSCF'
-VERSION = 2
+VERSION = 3
+SUPPORTED_VERSIONS = (1, 2, VERSION)
 HEADER = struct.Struct("<12I8Q4f")
+CANDIDATE_KINDS = {
+    0: "occlusion",
+    1: "endpoint-trace",
+}
 
 
 def fourcc(text):
@@ -117,8 +123,8 @@ def load_sample(path):
     meta = values[12:20]
     phase = values[20]
     magic, version, width, height, drm_format, bpp, eotf, flags, planes = header[:9]
-    if magic != MAGIC or version not in (1, VERSION):
-        raise ValueError(f"not a supported GSCF v1/v{VERSION} capture")
+    if magic != MAGIC or version not in SUPPORTED_VERSIONS:
+        raise ValueError("not a supported GSCF v1/v2/v3 capture")
     expected_planes = 2 if version == 1 else 4
     expected_flags = 1 if version == 1 else 3
     if (flags & expected_flags) != expected_flags or planes != expected_planes:
@@ -132,12 +138,20 @@ def load_sample(path):
     timestamp_phase = (meta[5] - meta[4]) / (meta[6] - meta[4])
     if not math.isclose(phase, timestamp_phase, rel_tol=1e-5, abs_tol=1e-6):
         raise ValueError("capture phase disagrees with its timestamps")
-    if version == VERSION:
+    if version >= 2:
         strengths = values[21:24]
         if (not all(math.isfinite(value) and 0.0 <= value <= 1.0
                     for value in strengths)
                 or not strengths[0] < strengths[1] < strengths[2]):
             raise ValueError("capture has invalid paired candidate strengths")
+    if version == 1:
+        candidate_kind = None
+    elif version == 2:
+        candidate_kind = "occlusion"
+    else:
+        candidate_kind = CANDIDATE_KINDS.get(header[9])
+        if candidate_kind is None:
+            raise ValueError(f"capture has unknown paired candidate kind {header[9]}")
     plane_bytes = width * height * bpp
     expected = HEADER.size + planes * plane_bytes
     if len(raw) != expected:
@@ -166,6 +180,7 @@ def load_sample(path):
         "anchor_ns": meta[4],
         "reference_ns": meta[5],
         "endpoint_ns": meta[6],
+        "candidate_kind": candidate_kind,
         "candidates": candidates,
         "reference": reference,
     }
@@ -291,6 +306,10 @@ def format_row(name, metrics):
             f"nonfinite={metrics['nonfinite%']:.4f}%")
 
 
+def candidate_label(kind, strength):
+    return "configured" if strength is None else f"{kind}={strength:g}"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -319,6 +338,10 @@ def main():
     if any([candidate[0] for candidate in sample["candidates"]] != candidate_strengths
            for sample in samples):
         sys.exit("capture mixes candidate layouts")
+    candidate_kinds = {sample["candidate_kind"] for sample in samples}
+    if len(candidate_kinds) != 1:
+        sys.exit("capture mixes candidate sweep kinds")
+    candidate_kind = next(iter(candidate_kinds))
     rows_by_candidate = []
     for candidate_index in range(len(candidate_strengths)):
         rows_by_candidate.append([
@@ -327,7 +350,7 @@ def main():
     if args.per_frame:
         for sample_index, sample in enumerate(samples):
             for candidate_index, strength in enumerate(candidate_strengths):
-                label = "configured" if strength is None else f"occlusion={strength:g}"
+                label = candidate_label(candidate_kind, strength)
                 row = rows_by_candidate[candidate_index][sample_index]
                 print(f"{sample['path'].name} phase={sample['phase']:.4f} {label} "
                       + format_row("", row).lstrip(": "))
@@ -341,7 +364,7 @@ def main():
         rows = rows_by_candidate[candidate_index]
         summary = {key: float(np.mean([row[key] for row in rows])) for key in rows[0]}
         summary["sample_mae_sigma"] = float(np.std([row["mae"] for row in rows]))
-        label = "configured" if strength is None else f"occlusion={strength:g}"
+        label = candidate_label(candidate_kind, strength)
         print(format_row(label, summary))
         residual_change, transitions = temporal_residual_change(samples, candidate_index)
         residual_text = "n/a" if residual_change is None else f"{residual_change:.6f}"
@@ -359,7 +382,7 @@ def main():
         for candidate_index, strength in enumerate(candidate_strengths):
             scores = lpips_scores(samples, candidate_index)
             if scores is not None:
-                label = "configured" if strength is None else f"occlusion={strength:g}"
+                label = candidate_label(candidate_kind, strength)
                 print(f"{label}: lpips={np.mean(scores):.6f} "
                       f"sample_sigma={np.std(scores):.6f}")
 

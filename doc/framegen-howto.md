@@ -26,7 +26,7 @@ export FRAMEGEN_BEST_PROFILE="$HOME/.cache/gamescope-fg-gravitymark-best-dc58b2d
 
 test -r "$FRAMEGEN_BEST_PROFILE" # this must succeed before continuing
 unset GAMESCOPE_FRAMEGEN_NET_ONLINE GAMESCOPE_FRAMEGEN_NET_PROFILE \
-  GAMESCOPE_FRAMEGEN_RECORD_COLOR
+  GAMESCOPE_FRAMEGEN_RECORD_COLOR GAMESCOPE_FRAMEGEN_BIDIR_TRACE
 
 GAMESCOPE_BUILD_DIR=build-perf \
 GAMESCOPE_FRAMEGEN_BIDIR=1 \
@@ -307,6 +307,18 @@ it lets a clearly surviving checked side retain slightly more authority instead
 of dissolving into the unwarped crossfade. It changes neither motion fields nor
 queue/flip timing, and defaults to `0` because the measured spatial gain is small
 and still needs broad live validation.
+
+`GAMESCOPE_FRAMEGEN_BIDIR_TRACE=0.5` is an Extreme-only quality candidate for
+fast camera motion. It takes one additional, symmetric fixed-point sample of
+each endpoint field and accepts it only when the two paths close, both endpoint
+confidences support it, and neither path leaves the image. Across three
+12-frame held-out GravityMark sets with deliberate camera movement, `0.5` won
+26/36 exact pairs and improved pooled MAE/SSIM/edge error. A same-binary Radeon
+890M timestamp test measured `0.571 ms` for the 1440p XB30 baseline pipeline and
+`0.583 ms` for the separately specialized trace pipeline. Trace `0` compiles
+the optional work out. It does not alter estimation, learning, queues, phases,
+or flips. Keep it separate from the frozen baseline until it has broader live
+validation.
 
 ### d) Base-layer — fixes blurry menus / HUD
 ```bash

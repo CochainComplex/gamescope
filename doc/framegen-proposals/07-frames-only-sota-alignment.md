@@ -3,7 +3,8 @@
 Status: **design map / gap analysis**; Gaps E1/E2, B, bounded frames-only A, and a
 bounded frames-only form of D implemented (`scripts/framegen-net-eval.py`, the
 B4 GPU scene-cut guard, the E2 paired full-colour probe/evaluator, the Extreme
-disocclusion reservoir, the causal shading-persistence head, and the conservative bidir ML authority boundary). Maps
+disocclusion reservoir, the causal shading-persistence head, the conservative bidir ML authority boundary,
+and an experimental symmetric endpoint-grid correction). Maps
 [`../research-framegen.md`](../research-framegen.md) onto the shipped pipeline and
 proposals #01–#06, then sketches the genuine gaps that are worth building.
 
@@ -59,10 +60,11 @@ existing captures. This splits Gap E honestly:
 - **E2 — implemented** (`GAMESCOPE_FRAMEGEN_RECORD_COLOR`,
   `scripts/framegen-color-eval.py`). Three real frames A/B/C present normally;
   B is retained as exact ground truth but omitted from the estimator. One shared
-  A/C motion field renders B at its measured phase with paired one-sided
-  occlusion strengths 0/0.5/1 in a single GPU batch. The three invisible
-  predictions plus exact full-resolution B form GSCF v2; no prediction reaches
-  the present FIFO and online weight updates are disabled during the probe.
+  A/C motion field renders B at its measured phase with a paired 0/0.5/1
+  occlusion or endpoint-trace sweep in a single GPU batch. The three invisible
+  predictions plus exact full-resolution B form GSCF v3, which records the
+  candidate kind; the evaluator remains compatible with v1/v2. No prediction
+  reaches the present FIFO and online weight updates are disabled during the probe.
   The numpy core reports colour MAE/bad/PSNR, luma SSIM, edge error, paired wins,
   and temporal residual change; optional torch/LPIPS fails gracefully when
   unavailable. Core metrics grade captured code values and report EOTF without
@@ -188,6 +190,33 @@ The conservative follow-up is `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS` (default
 only blends generated phases part-way from `k/gap` toward uniform multiplier
 spacing. This is an A/B control, not a claimed quality default; any promotion
 requires the live result to retain baseline sharpness and responsiveness.
+
+### Experimental implementation — symmetric endpoint-grid correction
+
+The two checked fields are endpoint-anchored, but the inexpensive bidirectional
+warp samples them on the intermediate output grid. For non-translational screen
+motion this is only the first fixed-point approximation. Extreme can opt into
+one extra symmetric step with `GAMESCOPE_FRAMEGEN_BIDIR_TRACE=0…1`:
+
+`x1 = p + (1-t) F(x1)`, `x0 = p + t R(x0)`.
+
+The shader first forms provisional endpoint coordinates, resamples both complete
+checked fields, and accepts the correction only when both coordinates are
+inside the field, both checked confidences support it, and `F(x1)+R(x0)` closes
+within a motion-scaled tolerance. Flow and confidence move together because
+both are endpoint-anchored; no net manufactures authority. The trace path is a
+separate specialization of the B3 pipeline, so trace `0` compiles out its extra
+samples and registers. This uses two low-resolution field samples per output
+pixel, no extra image/pass, no CPU work, and no estimator, ML, phase, queue, or
+flip changes. It is Extreme-only; cheaper tiers remain unchanged.
+
+Across three 12-frame held-out GravityMark sets with user-driven camera motion,
+strength `0.5` improved 26/36 exact pairs. Pooled MAE changed
+`0.145880→0.145183`, SSIM `0.42542→0.42735`, and edge error
+`1.12068→1.11562`. A same-binary Radeon 890M Vulkan timestamp sweep measured
+the 1440p XB30 baseline/trace pipelines at `0.571/0.583 ms`. The default remains
+zero until live validation across more scenes confirms that the spatial gain
+does not trade into temporal shimmer.
 
 ### Gap D — Color-domain shading correction · bounded frames-only form implemented
 Non-geometric motion — lagging shadows, reflections, specular — is

@@ -296,6 +296,17 @@ static void test_numeric_settings_contract()
 	CHECK( !parse_uint32_setting( "-1", false ).has_value() );
 	CHECK( !parse_uint32_setting( "12suffix", false ).has_value() );
 	CHECK( parse_uint32_setting( "12", false ).value_or( 0u ) == 12u );
+
+	static_assert( static_cast<uint32_t>( FramegenColorProbeSweep::Occlusion ) == 0u );
+	static_assert( static_cast<uint32_t>( FramegenColorProbeSweep::EndpointTrace ) == 1u );
+	CHECK( !parse_color_probe_sweep_setting( nullptr ).has_value() );
+	CHECK( !parse_color_probe_sweep_setting( "" ).has_value() );
+	CHECK( !parse_color_probe_sweep_setting( "TRACE" ).has_value() );
+	CHECK( parse_color_probe_sweep_setting( "occlusion" ) == FramegenColorProbeSweep::Occlusion );
+	CHECK( parse_color_probe_sweep_setting( "trace" ) == FramegenColorProbeSweep::EndpointTrace );
+	CHECK( parse_color_probe_sweep_setting( "endpoint-trace" ) == FramegenColorProbeSweep::EndpointTrace );
+	CHECK( std::string_view{ color_probe_sweep_name( FramegenColorProbeSweep::Occlusion ) } == "occlusion" );
+	CHECK( std::string_view{ color_probe_sweep_name( FramegenColorProbeSweep::EndpointTrace ) } == "endpoint-trace" );
 }
 
 static void test_adaptation_policy()
@@ -618,6 +629,12 @@ static void test_dispatch_policy()
 
 static void test_push_constant_encoding()
 {
+	const FramegenMotionBidirPush_t bidir(
+		0.25f, 8.0f, 0.12f, 0.45f, 0.5f, 1.0f );
+	CHECK( bidir.phase == 0.25f );
+	CHECK( bidir.oneSidedStrength == 0.5f );
+	CHECK( bidir.endpointTraceStrength == 1.0f );
+
 	const FramegenMotionAccelPush_t accel(
 		1.25f, 0.08f, 0.40f, 4.0f, 0.12f, 0.45f, 0.5f,
 		true, false, true, false, 0.75f, 0.25f );

@@ -5,6 +5,10 @@
 
 #include "descriptor_set.h"
 
+// Pipeline-specialized rather than a runtime-only branch so the established
+// B3 pipeline carries none of the trace path's sampling/register cost.
+layout(constant_id = 6) const bool c_endpointTrace = false;
+
 // Bidirectional interpolation warp. Unlike the forward warp
 // (cs_framegen_motion_warp.comp), the output frame sits BETWEEN the two real
 // frames: both are warped toward the slot's temporal phase and blended by
@@ -36,9 +40,12 @@ uniform motion_bidir_t {
     // phase-weighted validity, 1 restores a bounded amount of the confidently
     // surviving gather. Both-valid and both-invalid pixels are unaffected.
     float u_oneSidedStrength;
+    // Endpoint fields are not defined on the intermediate output grid. One
+    // bounded fixed-point step samples each field at its provisional endpoint
+    // and accepts the correction only when the two traced paths round-trip.
+    float u_endpointTraceStrength;
     float u_pad0;
     float u_pad1;
-    float u_pad2;
 };
 
 // s_samplers[0] = previousReal, [1] = currentReal,
@@ -64,6 +71,52 @@ void main() {
             : texture(s_samplers[1], uv));
         return;
     }
+
+    if (c_endpointTrace) {
+        vec2 fieldToUv = vec2(u_lowResScale) / vec2(outSize);
+        // F is anchored on the current endpoint x1 and R on the previous
+        // endpoint x0. For intermediate output p, their exact constant-path
+        // coordinates satisfy
+        //   x1 = p + (1-t) F(x1),  x0 = p + t R(x0).
+        // The established warp uses F(p)/R(p), the first Picard iterate. One
+        // additional sample removes that grid error for pans, rotations and
+        // zooms without adding another image or pass.
+        vec2 curGuess = uv + fwdField.rg * fieldToUv * (1.0f - t);
+        vec2 prevGuess = uv + revField.rg * fieldToUv * t;
+        vec4 tracedFwd = texture(s_samplers[2], curGuess);
+        vec4 tracedRev = texture(s_samplers[3], prevGuess);
+
+        // The correction has independent geometric evidence: endpoint flows
+        // on one physical trajectory are opposites. Reject a boundary-layer
+        // jump or an off-screen clamp instead of letting fixed-point iteration
+        // amplify it. The tolerance mirrors the FB pass' motion-scaled model.
+        vec2 closure = tracedFwd.rg + tracedRev.rg;
+        float closureError = abs(closure.x) + abs(closure.y);
+        float motion = abs(tracedFwd.x) + abs(tracedFwd.y)
+            + abs(tracedRev.x) + abs(tracedRev.y);
+        float closureTol = 0.75f + 0.05f * motion;
+        float closureTrust = 1.0f
+            - smoothstep(closureTol, 2.0f * closureTol, closureError);
+        float tracedConfidence = min(clamp(tracedFwd.b, 0.0f, 1.0f),
+                                     clamp(tracedRev.b, 0.0f, 1.0f));
+        vec2 halfTexel = 0.5f / vec2(textureSize(s_samplers[2], 0));
+        float inBounds = all(greaterThanEqual(curGuess, halfTexel))
+                && all(lessThanEqual(curGuess, vec2(1.0f) - halfTexel))
+                && all(greaterThanEqual(prevGuess, halfTexel))
+                && all(lessThanEqual(prevGuess, vec2(1.0f) - halfTexel))
+            ? 1.0f : 0.0f;
+        float traceTrust = u_endpointTraceStrength * inBounds
+            * closureTrust * smoothstep(0.20f, 0.60f, tracedConfidence);
+
+        // Move each complete checked field to its endpoint grid. Its confidence
+        // may differ from the value at p, but it is the existing FB/B4/ML
+        // verdict at that endpoint, not authority inferred by this pass. Both
+        // directions must be confident and close the same trajectory.
+        fwdField = mix(fwdField, tracedFwd, traceTrust);
+        revField = mix(revField, tracedRev, traceTrust);
+    }
+
+    // Keep the established operation order exact when tracing is disabled.
     vec2 mvUvF = fwdField.rg * u_lowResScale / vec2(outSize);
     vec2 mvUvR = revField.rg * u_lowResScale / vec2(outSize);
     float confF = clamp(fwdField.b, 0.0f, 1.0f);

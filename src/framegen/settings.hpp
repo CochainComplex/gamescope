@@ -7,9 +7,40 @@
 #include <cstdlib>
 #include <limits>
 #include <optional>
+#include <string_view>
 
 namespace gamescope::framegen
 {
+
+enum class FramegenColorProbeSweep : uint32_t
+{
+	Occlusion = 0,
+	EndpointTrace = 1,
+};
+
+[[nodiscard]] inline std::optional<FramegenColorProbeSweep>
+parse_color_probe_sweep_setting( const char *value )
+{
+	if ( value == nullptr || *value == '\0' )
+		return std::nullopt;
+
+	const std::string_view setting{ value };
+	if ( setting == "occlusion" )
+		return FramegenColorProbeSweep::Occlusion;
+	if ( setting == "trace" || setting == "endpoint-trace" )
+		return FramegenColorProbeSweep::EndpointTrace;
+	return std::nullopt;
+}
+
+[[nodiscard]] inline const char *color_probe_sweep_name( FramegenColorProbeSweep sweep )
+{
+	switch ( sweep )
+	{
+		case FramegenColorProbeSweep::Occlusion: return "occlusion";
+		case FramegenColorProbeSweep::EndpointTrace: return "endpoint-trace";
+	}
+	return "unknown";
+}
 
 [[nodiscard]] inline const char *non_empty_setting( const char *value )
 {

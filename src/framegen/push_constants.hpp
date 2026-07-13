@@ -150,12 +150,15 @@ struct FramegenMotionBidirPush_t
 	float agreeLo;
 	float agreeHi;
 	float oneSidedStrength;
-	float pad0, pad1, pad2;
+	float endpointTraceStrength;
+	float pad0, pad1;
 
 	explicit FramegenMotionBidirPush_t( float flPhase, float flScale,
-		float flAgreeLo, float flAgreeHi, float flOneSidedStrength )
+		float flAgreeLo, float flAgreeHi, float flOneSidedStrength,
+		float flEndpointTraceStrength )
 		: phase( flPhase ), lowResScale( flScale ), agreeLo( flAgreeLo ), agreeHi( flAgreeHi )
-		, oneSidedStrength( flOneSidedStrength ), pad0( 0.0f ), pad1( 0.0f ), pad2( 0.0f )
+		, oneSidedStrength( flOneSidedStrength ), endpointTraceStrength( flEndpointTraceStrength )
+		, pad0( 0.0f ), pad1( 0.0f )
 	{
 	}
 };
@@ -322,6 +325,7 @@ FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, lowResScale, 4 );
 FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, agreeLo, 8 );
 FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, agreeHi, 12 );
 FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, oneSidedStrength, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, endpointTraceStrength, 20 );
 
 FRAMEGEN_PUSH_SIZE( FramegenMotionStatsPush_t, 16 );
 FRAMEGEN_PUSH_PROPERTIES( FramegenMotionStatsPush_t );

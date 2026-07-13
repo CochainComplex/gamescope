@@ -1269,6 +1269,7 @@ bool CVulkanDevice::createShaders()
 	SHADER(FRAMEGEN_MOTION_WARP, cs_framegen_motion_warp);
 	SHADER(FRAMEGEN_MOTION_WARP_ACCEL, cs_framegen_motion_warp_accel);
 	SHADER(FRAMEGEN_MOTION_BIDIR, cs_framegen_motion_bidir);
+	SHADER(FRAMEGEN_MOTION_BIDIR_TRACE, cs_framegen_motion_bidir);
 	SHADER(FRAMEGEN_MOTION_STATS, cs_framegen_motion_stats);
 	SHADER(FRAMEGEN_MOTION_STATS_APPLY, cs_framegen_motion_stats_apply);
 	SHADER(FRAMEGEN_MOTION_NET, cs_framegen_motion_net);
@@ -1491,7 +1492,9 @@ VkSampler CVulkanDevice::sampler( SamplerState key )
 
 VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable)
 {
-	const std::array<VkSpecializationMapEntry, 7> specializationEntries = {{
+	// Keep these IDs aligned with descriptor_set.h and the framegen shaders.
+	// Slot 6 is the bidir trace variant; ITM remains slot 7.
+	const std::array<VkSpecializationMapEntry, 8> specializationEntries = {{
 		{
 			.constantID = 0,
 			.offset     = sizeof(uint32_t) * 0,
@@ -1529,6 +1532,11 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 			.offset     = sizeof(uint32_t) * 6,
 			.size       = sizeof(uint32_t)
 		},
+		{
+			.constantID = 7,
+			.offset     = sizeof(uint32_t) * 7,
+			.size       = sizeof(uint32_t)
+		},
 	}};
 
 	struct {
@@ -1538,6 +1546,7 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		uint32_t blur_layer_count;
 		uint32_t colorspace_mask;
 		uint32_t output_eotf;
+		uint32_t endpoint_trace;
 		uint32_t itm_enable;
 	} specializationData = {
 		.layerCount   = layerCount,
@@ -1546,6 +1555,7 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		.blur_layer_count = blur_layer_count,
 		.colorspace_mask = colorspace_mask,
 		.output_eotf = output_eotf,
+		.endpoint_trace = type == SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE,
 		.itm_enable = itm_enable,
 	};
 
@@ -1634,6 +1644,7 @@ void CVulkanDevice::compileFramegenPipelines()
 		SHADER_TYPE_FRAMEGEN_MOTION_WARP,
 		SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL,
 		SHADER_TYPE_FRAMEGEN_MOTION_BIDIR,
+		SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE,
 		SHADER_TYPE_FRAMEGEN_MOTION_STATS,
 		SHADER_TYPE_FRAMEGEN_MOTION_STATS_APPLY,
 		SHADER_TYPE_FRAMEGEN_MOTION_NET,
@@ -4703,6 +4714,8 @@ static constexpr uint32_t k_uFramegenMotionDownscale = 8;
 static constexpr uint32_t k_uFramegenColorProbeCandidates = 3;
 static constexpr float k_flFramegenColorProbeStrengths[ k_uFramegenColorProbeCandidates ] = { 0.0f, 0.5f, 1.0f };
 
+using gamescope::framegen::FramegenColorProbeSweep;
+
 struct FramegenColorProbeResources_t
 {
 	gamescope::OwningRc<CVulkanTexture> generatedReadback[ k_uFramegenColorProbeCandidates ];
@@ -4729,6 +4742,7 @@ struct FramegenColorProbeResources_t
 	uint64_t pendingReferenceTimeNs = 0;
 	uint64_t pendingEndpointTimeNs = 0;
 	float pendingPhase = 0.0f;
+	FramegenColorProbeSweep pendingSweep = FramegenColorProbeSweep::Occlusion;
 };
 static FramegenColorProbeResources_t g_framegenColorProbe;
 static uint32_t g_uFramegenColorRecordCount = 0;
@@ -4938,7 +4952,7 @@ static uint32_t framegen_color_record_uint( const char *pszName, uint32_t uDefau
 
 static uint32_t framegen_color_record_max()
 {
-	// GSCF v2 stores three generated candidates plus the exact reference. Eight
+	// GSCF v2/v3 stores three generated candidates plus the exact reference. Eight
 	// 1440p XB30 samples are already about 500 MiB (about 1 GiB at 4K), so keep
 	// the safe default deliberately small; explicit experiments may raise it.
 	static const uint32_t s_uMax = framegen_color_record_uint(
@@ -4987,6 +5001,22 @@ static float framegen_color_record_phase_tolerance()
 		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 1.0f;
 	}();
 	return s_flTolerance;
+}
+
+static FramegenColorProbeSweep framegen_color_record_sweep()
+{
+	static const FramegenColorProbeSweep s_eSweep = []()
+	{
+		const char *pszSweep = gamescope::framegen::non_empty_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_RECORD_COLOR_SWEEP" ) );
+		if ( pszSweep == nullptr )
+			return FramegenColorProbeSweep::Occlusion;
+		if ( const auto parsed = gamescope::framegen::parse_color_probe_sweep_setting( pszSweep ) )
+			return *parsed;
+		vk_log.errorf( "framegen: unknown GAMESCOPE_FRAMEGEN_RECORD_COLOR_SWEEP='%s'; using occlusion", pszSweep );
+		return FramegenColorProbeSweep::Occlusion;
+	}();
+	return s_eSweep;
 }
 
 // JIT phase (#06): plan one slot at a time against the display clock instead of
@@ -5123,6 +5153,25 @@ static float framegen_bidir_one_sided_strength()
 	{
 		const auto value = gamescope::framegen::parse_finite_float_setting(
 			getenv( "GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION" ) );
+		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 0.0f;
+	}();
+	return s_flStrength;
+}
+
+// Extreme-only intermediate-grid correction. Endpoint motion fields are
+// defined on their respective real-frame grids, so sampling them directly at
+// an intermediate output coordinate is only the first fixed-point iterate.
+// This opt-in strength selects a separately specialized, symmetric,
+// closure-checked warp. Lower tiers retain the established pipeline.
+static float framegen_bidir_endpoint_trace_strength( GamescopeFramegenQuality eQuality )
+{
+	if ( eQuality != GamescopeFramegenQuality::Extreme )
+		return 0.0f;
+
+	static const float s_flStrength = []()
+	{
+		const auto value = gamescope::framegen::parse_finite_float_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_BIDIR_TRACE" ) );
 		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 0.0f;
 	}();
 	return s_flStrength;
@@ -6631,9 +6680,10 @@ static bool framegen_color_probe_prepare( uint32_t width, uint32_t height, uint3
 	return true;
 }
 
-// E2 CPU half. GSCF v2 stores the three paired full-resolution candidates and
-// their exact real reference. Rows are tightly repacked from the linear Vulkan
-// images; the evaluator interprets the recorded DRM fourcc and output EOTF.
+// E2 CPU half. GSCF v3 stores the three paired full-resolution candidates, the
+// swept parameter, and their exact real reference. Rows are tightly repacked
+// from the linear Vulkan images; the evaluator interprets the recorded DRM
+// fourcc and output EOTF. The unchanged header size preserves v1/v2 parsing.
 static void framegen_color_probe_consume()
 {
 	FramegenColorProbeResources_t &c = g_framegenColorProbe;
@@ -6657,9 +6707,10 @@ static void framegen_color_probe_consume()
 	}
 
 	const uint32_t uHeader[ 12 ] = {
-		0x46435347u /* 'GSCF' */, 2u,
+		0x46435347u /* 'GSCF' */, 3u,
 		c.width, c.height, c.drmFormat, c.bytesPerPixel, (uint32_t)c.eotf,
-		3u /* flags: exact reference + paired candidates */, 4u /* planes */, 0u, 0u, 0u,
+		3u /* flags: exact reference + paired candidates */, 4u /* planes */,
+		(uint32_t)c.pendingSweep, 0u, 0u,
 	};
 	const uint64_t uMetadata[ 8 ] = {
 		c.pendingSeqNo, c.pendingAnchorId, c.pendingReferenceId, c.pendingEndpointId,
@@ -6725,8 +6776,9 @@ static void framegen_color_probe_consume()
 	g_framegenHistory.genReadReference = nullptr;
 	g_framegenHistory.genReadSeqNo = 0;
 	if ( g_uFramegenColorRecordCount == 0 )
-		vk_log.infof( "framegen: full-colour held-out capture writing %ux%u paired-candidate GSCF samples to '%s'",
-			c.width, c.height, framegen_color_record_dir() );
+		vk_log.infof( "framegen: full-colour held-out capture writing %ux%u paired %s GSCF samples to '%s'",
+			c.width, c.height, gamescope::framegen::color_probe_sweep_name( c.pendingSweep ),
+			framegen_color_record_dir() );
 	g_uFramegenColorRecordCount++;
 	if ( g_uFramegenColorRecordCount >= framegen_color_record_max() )
 		framegen_color_probe_release( "sample cap reached" );
@@ -7611,11 +7663,19 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 // field) and blend by confidence x phase proximity; pixels neither direction
 // can vouch for degrade to a phase-correct crossfade inside the shader.
 static void framegen_bidir_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::Rc<CVulkanTexture> &pTarget,
-	float flPhase, GamescopeFramegenQuality eQuality, float flOneSidedOverride = -1.0f )
+	float flPhase, GamescopeFramegenQuality eQuality, float flOneSidedOverride = -1.0f,
+	float flEndpointTraceOverride = -1.0f )
 {
 	const uint32_t pg = 8;
+	const float flEndpointTraceStrength = eQuality == GamescopeFramegenQuality::Extreme
+		? ( flEndpointTraceOverride >= 0.0f
+			? std::clamp( flEndpointTraceOverride, 0.0f, 1.0f )
+			: framegen_bidir_endpoint_trace_strength( eQuality ) )
+		: 0.0f;
 
-	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_BIDIR ) );
+	pCmdBuffer->bindPipeline( g_device.pipeline( flEndpointTraceStrength > 0.0f
+		? SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE
+		: SHADER_TYPE_FRAMEGEN_MOTION_BIDIR ) );
 	pCmdBuffer->bindTarget( pTarget );
 	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
 	pCmdBuffer->setTextureSrgb( 0, true );
@@ -7640,7 +7700,7 @@ static void framegen_bidir_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamesc
 	pCmdBuffer->pushConstants<FramegenMotionBidirPush_t>( flPhase, (float)k_uFramegenMotionDownscale,
 		bAgree ? framegen_effective_agree_lo( eQuality ) : 1e5f,
 		bAgree ? framegen_effective_agree_hi( eQuality ) : 1e6f,
-		flOneSidedStrength );
+		flOneSidedStrength, flEndpointTraceStrength );
 	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pg ), div_roundup( pTarget->height(), pg ) );
 }
 
@@ -7653,6 +7713,7 @@ struct FramegenColorProbeRequest_t
 {
 	gamescope::Rc<CVulkanTexture> reference;
 	EOTF eotf;
+	FramegenColorProbeSweep sweep;
 	uint64_t anchorId;
 	uint64_t referenceId;
 	uint64_t endpointId;
@@ -7840,9 +7901,21 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		{
 			const SlotPlan_t &slot = slots[ i ];
 			if ( bBidir )
-				framegen_bidir_warp_slot( pCmdBuffer.get(), slot.tex, std::clamp( slot.phase, 0.0f, 1.0f ), eff.quality,
-					pColorProbe != nullptr && i < k_uFramegenColorProbeCandidates
-						? k_flFramegenColorProbeStrengths[ i ] : -1.0f );
+			{
+				const bool bProbeCandidate = pColorProbe != nullptr
+					&& i < k_uFramegenColorProbeCandidates;
+				float flOneSidedOverride = -1.0f;
+				float flEndpointTraceOverride = -1.0f;
+				if ( bProbeCandidate )
+				{
+					float &flOverride = pColorProbe->sweep == FramegenColorProbeSweep::EndpointTrace
+						? flEndpointTraceOverride : flOneSidedOverride;
+					flOverride = k_flFramegenColorProbeStrengths[ i ];
+				}
+				framegen_bidir_warp_slot( pCmdBuffer.get(), slot.tex,
+					std::clamp( slot.phase, 0.0f, 1.0f ), eff.quality,
+					flOneSidedOverride, flEndpointTraceOverride );
+			}
 			else
 				framegen_warp_slot( pCmdBuffer.get(), slot.tex, slot.strength, eff.quality );
 		}
@@ -7949,6 +8022,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		c.pendingReferenceTimeNs = pColorProbe->referenceTimeNs;
 		c.pendingEndpointTimeNs = pColorProbe->endpointTimeNs;
 		c.pendingPhase = slots[ 0 ].phase;
+		c.pendingSweep = pColorProbe->sweep;
 	}
 
 	// Pin this batch's input slots until it finishes reading them, so a later
@@ -8452,9 +8526,16 @@ void vulkan_framegen_benchmark()
 			if ( vulkan_framegen_bidir_active() )
 			{
 				double msBidirWarp = timePass( [&]( CVulkanCmdBuffer *cmd ) {
-					framegen_bidir_warp_slot( cmd, pOut, 0.5f, g_eFramegenQuality );
+					framegen_bidir_warp_slot( cmd, pOut, 0.5f, g_eFramegenQuality, -1.0f, 0.0f );
 				} );
 				printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion bidir warp (per gen)", msBidirWarp );
+				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme )
+				{
+					double msBidirTrace = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+						framegen_bidir_warp_slot( cmd, pOut, 0.5f, g_eFramegenQuality, -1.0f, 1.0f );
+					} );
+					printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion bidir trace (per gen)", msBidirTrace );
+				}
 			}
 		}
 		else
@@ -8478,8 +8559,8 @@ void vulkan_framegen_benchmark()
 // Gap E2 held-out capture. Real frames still scan out normally. For each A/B/C
 // sequence (consecutive by default, configurable offset/span), B is retained as
 // ground truth but deliberately omitted from motion history; three invisible
-// slots are generated at B's measured temporal phase from A/C with paired
-// occlusion strengths, copied beside B, and never enter the pending queue.
+// slots are generated at B's measured temporal phase from A/C with a paired
+// parameter sweep, copied beside B, and never enter the pending queue.
 static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRealFrame,
 	const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo )
 {
@@ -8625,6 +8706,7 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 	const FramegenColorProbeRequest_t probe = {
 		.reference = pReference,
 		.eotf = pFrameInfo->outputEncodingEOTF,
+		.sweep = framegen_color_record_sweep(),
 		.anchorId = uAnchorId,
 		.referenceId = uReferenceId,
 		.endpointId = uFrameId,
@@ -8682,6 +8764,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				if ( framegen_bidir_one_sided_strength() > 0.0f )
 					vk_log.infof( "framegen: experimental bidir one-sided occlusion authority %.2f — strongly asymmetric checked fields retain more of the surviving warped side without changing both-valid or both-killed fallback",
 						framegen_bidir_one_sided_strength() );
+				if ( framegen_bidir_endpoint_trace_strength( g_eFramegenQuality ) > 0.0f )
+					vk_log.infof( "framegen: experimental bidir endpoint trace %.2f — one symmetric closure-gated fixed-point correction; queue and flip timing are unchanged",
+						framegen_bidir_endpoint_trace_strength( g_eFramegenQuality ) );
 			}
 			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Low )
 				vk_log.infof( "framegen: low quality — forward matcher + constant-velocity warp only" );
@@ -8731,9 +8816,11 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			{
 				if ( framegen_color_probe_requested() )
 				{
-					vk_log.infof( "framegen: full-colour held-out validation active (E2) — A/B/C sequences offset=%u span=%u phaseTolerance=%.3f produce paired invisible B predictions (occlusion 0/0.5/1) on the dedicated queue; generated frames never present; synchronous GSCF writes can perturb capture cadence; up to %u samples write to '%s'",
+					vk_log.infof( "framegen: full-colour held-out validation active (E2) — A/B/C sequences offset=%u span=%u phaseTolerance=%.3f produce paired invisible B predictions (%s 0/0.5/1) on the dedicated queue; generated frames never present; synchronous GSCF writes can perturb capture cadence; up to %u samples write to '%s'",
 						framegen_color_record_offset(), framegen_color_record_span(),
-						framegen_color_record_phase_tolerance(), framegen_color_record_max(), framegen_color_record_dir() );
+						framegen_color_record_phase_tolerance(),
+						gamescope::framegen::color_probe_sweep_name( framegen_color_record_sweep() ),
+						framegen_color_record_max(), framegen_color_record_dir() );
 				}
 				else
 					vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_RECORD_COLOR ignored (requires motion+bidir, dedicated framegen queue, and base-layer mode off)" );

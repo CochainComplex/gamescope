@@ -82,8 +82,10 @@ untested, so enable one at a time.
 | `GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW=1` | Restore experimental endpoint-trained flow correction/confidence raises in bidir for A/B only. Default off because it produced heavy intermediate-frame artifacts in live x4 testing. |
 | `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS=0…1` | Experimental low-latency bidir cadence A/B. Blends generated phases from the sharp/snappy `k/gap` baseline toward uniform multiplier spacing without changing flip timing. Default `0`; full display-grid pacing was rejected as blurrier, more edge-torn, and less responsive. |
 | `GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0…1` | Experimental one-sided occlusion authority. When one checked direction is strong and the other is clearly rejected, smoothly retains more of the surviving warped side instead of phase-diluting it into the unwarped crossfade. Both-valid/both-killed pixels and queue timing are unchanged; default `0`. |
-| `GAMESCOPE_FRAMEGEN_RECORD_COLOR=<dir>` | E2 held-out full-colour validation. Requires motion+bidir, the dedicated queue, and base-layer mode off. Presents real A/B/C normally, hides B from estimation, and records paired invisible B candidates at occlusion strengths 0/0.5/1 beside exact B. Generated candidates never scan out. |
-| `GAMESCOPE_FRAMEGEN_RECORD_COLOR_MAX` / `_SKIP` | E2 sample cap (default `8`) / real-frame warm-up skip (default `0`). A 1440p XB30 v2 sample is about 62 MiB; synchronous file writes perturb capture cadence, so this mode is not a pacing test. |
+| `GAMESCOPE_FRAMEGEN_BIDIR_TRACE=0…1` | Experimental Extreme-only endpoint-grid correction. Performs one symmetric fixed-point resample and accepts it only with checked confidence, forward/reverse closure, and in-bounds endpoints. A nonzero value selects a specialized pipeline; trace `0` compiles out the extra work. Adds no pass/resource or scheduling state; lower tiers stay on the baseline path. Default `0`; use `0.5` for the measured A/B candidate. |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR=<dir>` | E2 held-out full-colour validation. Requires motion+bidir, the dedicated queue, and base-layer mode off. Presents real A/B/C normally, hides B from estimation, and records three paired invisible B candidates beside exact B. Generated candidates never scan out. |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR_SWEEP=occlusion\|trace` | Select the paired `0/0.5/1` parameter. Default `occlusion`; `trace` holds configured occlusion fixed and sweeps endpoint tracing. GSCF v3 records the kind; the evaluator still reads v1/v2. |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR_MAX` / `_SKIP` | E2 sample cap (default `8`) / real-frame warm-up skip (default `0`). A 1440p XB30 v3 sample is about 62 MiB; synchronous file writes perturb capture cadence, so this mode is not a pacing test. |
 | `GAMESCOPE_FRAMEGEN_RECORD_COLOR_SPAN` / `_OFFSET` | E2 endpoint spacing (default `2`, clamped `2..16`) and hidden-reference position (default `1`, must be `< span`). The measured timestamp ratio is authoritative because uneven cadence can move it away from `OFFSET/SPAN`. |
 | `GAMESCOPE_FRAMEGEN_RECORD_COLOR_PHASE_TOLERANCE` | Optional E2 acceptance window around `OFFSET/SPAN` (default `1`, effectively disabled). Use `SPAN=6 OFFSET=1 PHASE_TOLERANCE=0.05` to retain only measured phases within `1/6 +/- 0.05`. |
 
@@ -138,7 +140,7 @@ mkdir -p /tmp/fg-color
 GAMESCOPE_FRAMEGEN_BIDIR=1 \
 GAMESCOPE_FRAMEGEN_RECORD_COLOR=/tmp/fg-color \
 GAMESCOPE_FRAMEGEN_RECORD_COLOR_MAX=8 \
-GAMESCOPE_FRAMEGEN_RECORD_COLOR_SKIP=80 \
+GAMESCOPE_FRAMEGEN_RECORD_COLOR_SKIP=100 \
 gamescope --experimental-framegen --framegen-mode motion …
 scripts/framegen-color-eval.py --data /tmp/fg-color --per-frame
 ```
@@ -149,9 +151,17 @@ identical source frames, timing, model state, and exact full-resolution B. The
 numpy-only evaluator reports normalized colour MAE, bad pixels, PSNR, luma SSIM,
 edge error, paired wins, and screen-space temporal residual change; `--lpips`
 adds LPIPS when torch/lpips are installed. Core metrics operate on captured code
-values; EOTF is reported, not guessed into a display transform. GSCF writes are synchronous after GPU
-completion and can make the displayed real-only cadence chunky. Judge live
-smoothness only in a separate run without `_RECORD_COLOR`.
+values; EOTF is reported, not guessed into a display transform. GSCF writes are
+synchronous after GPU completion and can make the displayed real-only cadence
+chunky. The generated candidates are invisible: the window shows real frames
+only, even while the camera is moved. Judge live smoothness only in a separate
+run without `_RECORD_COLOR`.
+
+Set `GAMESCOPE_FRAMEGEN_RECORD_COLOR_SWEEP=trace` to hold the configured
+occlusion strength fixed and compare endpoint-trace strengths `0`, `0.5`, and
+`1` instead. GSCF v3 stores the candidate kind, so the evaluator cannot report
+a trace capture as an occlusion sweep. Existing GSCF v1/v2 captures remain
+readable.
 
 The default `SPAN=2 OFFSET=1` captures the measured phase of consecutive A/B/C
 frames. Low-source-rate x4 also uses early phases such as `1/6`; target those
