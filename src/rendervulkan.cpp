@@ -42,6 +42,7 @@
 #include "log.hpp"
 #include "Utils/Process.h"
 #include "framegen/adaptation.hpp"
+#include "framegen/atomic_file.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
@@ -4091,7 +4092,7 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t wi
 }
 
 static uint32_t s_frameId = 0;
-static void framegen_color_probe_consume();
+static __attribute__((noinline)) void framegen_color_probe_consume();
 
 void vulkan_garbage_collect( void )
 {
@@ -5174,7 +5175,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.currentReal = nullptr;
 }
 
-static void framegen_net_profile_consume();
+static __attribute__((noinline)) void framegen_net_profile_consume();
 static void framegen_net_profile_flush();
 
 void vulkan_framegen_reset( const char *reason )
@@ -5869,6 +5870,10 @@ static constexpr uint32_t k_uFramegenNetProfileInterval = 1024; // steps between
 // state re-init — increases monotonically for the whole process, so the save
 // cadence and the "anything unsaved?" checks survive resets.
 static std::vector<float> g_framegenNetLiveWeights;
+// Ping-pong with the live snapshot after validation. Online learning therefore
+// allocates at most two 18.6 kB vectors instead of allocating and freeing one
+// on every completed real-frame training step.
+static std::vector<float> g_framegenNetReadbackWeights;
 static uint64_t g_ulFramegenNetProgress = 0;                     // trained steps, all-time
 static uint64_t g_ulFramegenNetLiveProgress = 0;                 // progress at the cached readback
 static std::atomic<uint64_t> g_ulFramegenNetSavedProgress = { 0 }; // progress at the last successful write
@@ -6352,7 +6357,10 @@ static void framegen_record_release( const char *pszReason )
 	vk_log.infof( "framegen: dataset capture stopped (%s), readbacks released", pszReason );
 }
 
-static void framegen_record_consume()
+// Capture I/O is deliberately out of line: this function is polled by the
+// Vulkan batch recorder, and inlining its cold path bloats the production
+// command-recording footprint even when no GSFD capture is configured.
+static __attribute__((noinline)) void framegen_record_consume()
 {
 	FramegenHistory_t &h = g_framegenHistory;
 	if ( h.ulNetRecordSeqNo == 0 || h.ulNetRecordSeqNo == h.ulNetRecordConsumedSeqNo
@@ -6364,17 +6372,18 @@ static void framegen_record_consume()
 	if ( g_uFramegenRecordCount >= framegen_record_max() )
 		return; // belt-and-braces: copies stop and readbacks are freed at the cap
 
-	// Temp file + rename: the trainer globs *.bin, so a sample torn by a crash
-	// or a full disk (this rig runs near-full!) is never picked up as data.
-	char szPath[ 1008 ];
-	char szTmp[ 1024 ];
-	if ( (size_t)snprintf( szPath, sizeof( szPath ), "%s/fg_%06u.bin", framegen_record_dir(), g_uFramegenRecordCount ) >= sizeof( szPath )
-		|| (size_t)snprintf( szTmp, sizeof( szTmp ), "%s.tmp", szPath ) >= sizeof( szTmp ) )
-		return;
-	FILE *pFile = fopen( szTmp, "wb" );
-	if ( pFile == nullptr )
+	// The trainer globs *.bin, so only publish a sample after every tightly
+	// packed plane has reached a unique same-directory staging file.
+	char szName[ 32 ];
+	snprintf( szName, sizeof( szName ), "fg_%06u.bin", g_uFramegenRecordCount );
+	std::string path = framegen_record_dir();
+	path += '/';
+	path += szName;
+	gamescope::framegen::AtomicOutputFile output( path );
+	if ( !output.is_open() )
 	{
-		vk_log.errorf( "framegen: dataset capture can't write '%s' (%s)", szTmp, strerror( errno ) );
+		vk_log.errorf( "framegen: dataset capture can't write '%s' (%s)",
+			path.c_str(), strerror( output.error() ) );
 		g_uFramegenRecordCount = ~0u; // trip every future count gate
 		framegen_record_release( "write failure" );
 		return;
@@ -6390,32 +6399,34 @@ static void framegen_record_consume()
 		uLumaBpp, 8u /* field bpp */, 1u /* flags: has reverse field */, 0u,
 	};
 	const uint64_t ulSeq = h.ulNetRecordConsumedSeqNo;
-	bool bOk = fwrite( uHeader, sizeof( uHeader ), 1, pFile ) == 1
-		&& fwrite( &ulSeq, sizeof( ulSeq ), 1, pFile ) == 1;
+	bool bOk = output.write( uHeader, sizeof( uHeader ) )
+		&& output.write( &ulSeq, sizeof( ulSeq ) );
 
 	const auto writePlane = [&]( CVulkanTexture *pTex, uint32_t uBytesPerRow )
 	{
+		if ( pTex == nullptr || pTex->rowPitch() < uBytesPerRow
+			|| pTex->width() != g_framegenMotion.width
+			|| pTex->height() != g_framegenMotion.height )
+			return false;
 		const uint8_t *pData = pTex->mappedData();
 		if ( pData == nullptr )
 			return false;
 		for ( uint32_t y = 0; bOk && y < pTex->height(); y++ )
-			bOk = fwrite( pData + (size_t)y * pTex->rowPitch(), 1, uBytesPerRow, pFile ) == uBytesPerRow;
+			bOk = output.write( pData + (size_t)y * pTex->rowPitch(), uBytesPerRow );
 		return bOk;
 	};
 	bOk = bOk && writePlane( g_framegenMotion.recLumaPrev.get(), g_framegenMotion.width * uLumaBpp )
 		&& writePlane( g_framegenMotion.recLumaCur.get(), g_framegenMotion.width * uLumaBpp )
 		&& writePlane( g_framegenMotion.recField.get(), g_framegenMotion.width * 8u )
 		&& writePlane( g_framegenMotion.recFieldRev.get(), g_framegenMotion.width * 8u );
-	// fclose is part of the write: the buffered tail is where a full disk
-	// actually fails, and an unchecked one reports a short file as success.
-	bOk = ( fclose( pFile ) == 0 ) && bOk;
-	if ( bOk && rename( szTmp, szPath ) != 0 )
-		bOk = false;
+	if ( bOk )
+		bOk = output.commit();
 
 	if ( !bOk )
 	{
-		unlink( szTmp );
-		vk_log.errorf( "framegen: dataset capture write failed at '%s' (%s)", szPath, strerror( errno ) );
+		const int error = output.error() != 0 ? output.error() : EIO;
+		vk_log.errorf( "framegen: dataset capture write failed at '%s' (%s)",
+			path.c_str(), strerror( error ) );
 		g_uFramegenRecordCount = ~0u;
 		framegen_record_release( "write failure" );
 		return;
@@ -6520,21 +6531,16 @@ static void framegen_color_probe_consume()
 		|| !g_device.hasCompletedFramegen( c.pendingSeqNo ) )
 		return;
 
-	char szPath[ 1008 ];
-	char szTmp[ 1024 ];
-	if ( (size_t)snprintf( szPath, sizeof( szPath ), "%s/color_%06u.gscf",
-			framegen_color_record_dir(), g_uFramegenColorRecordCount ) >= sizeof( szPath )
-		|| (size_t)snprintf( szTmp, sizeof( szTmp ), "%s.tmp", szPath ) >= sizeof( szTmp ) )
+	char szName[ 32 ];
+	snprintf( szName, sizeof( szName ), "color_%06u.gscf", g_uFramegenColorRecordCount );
+	std::string path = framegen_color_record_dir();
+	path += '/';
+	path += szName;
+	gamescope::framegen::AtomicOutputFile output( path );
+	if ( !output.is_open() )
 	{
-		g_uFramegenColorRecordCount = ~0u;
-		framegen_color_probe_release( "path too long" );
-		return;
-	}
-
-	FILE *pFile = fopen( szTmp, "wb" );
-	if ( pFile == nullptr )
-	{
-		vk_log.errorf( "framegen: full-colour capture can't write '%s' (%s)", szTmp, strerror( errno ) );
+		vk_log.errorf( "framegen: full-colour capture can't write '%s' (%s)",
+			path.c_str(), strerror( output.error() ) );
 		g_uFramegenColorRecordCount = ~0u;
 		framegen_color_probe_release( "write failure" );
 		return;
@@ -6555,32 +6561,35 @@ static void framegen_color_probe_consume()
 		k_flFramegenColorProbeStrengths[ 1 ],
 		k_flFramegenColorProbeStrengths[ 2 ],
 	};
-	bool bOk = fwrite( uHeader, sizeof( uHeader ), 1, pFile ) == 1
-		&& fwrite( uMetadata, sizeof( uMetadata ), 1, pFile ) == 1
-		&& fwrite( flMetadata, sizeof( flMetadata ), 1, pFile ) == 1;
+	bool bOk = output.write( uHeader, sizeof( uHeader ) )
+		&& output.write( uMetadata, sizeof( uMetadata ) )
+		&& output.write( flMetadata, sizeof( flMetadata ) );
 
 	const auto writePlane = [&]( CVulkanTexture *pTex )
 	{
-		const uint8_t *pData = pTex->mappedData();
 		const uint32_t uBytesPerRow = c.width * c.bytesPerPixel;
-		if ( pData == nullptr || pTex->rowPitch() < uBytesPerRow )
+		if ( pTex == nullptr || pTex->rowPitch() < uBytesPerRow
+			|| pTex->width() != c.width || pTex->height() != c.height )
+			return false;
+		const uint8_t *pData = pTex->mappedData();
+		if ( pData == nullptr )
 			return false;
 		for ( uint32_t y = 0; bOk && y < c.height; y++ )
-			bOk = fwrite( pData + (size_t)y * pTex->rowPitch(), 1, uBytesPerRow, pFile ) == uBytesPerRow;
+			bOk = output.write( pData + (size_t)y * pTex->rowPitch(), uBytesPerRow );
 		return bOk;
 	};
 	// Plane order is generated strength 0/0.5/1, then exact real reference.
 	for ( const auto &pReadback : c.generatedReadback )
 		bOk = bOk && writePlane( pReadback.get() );
 	bOk = bOk && writePlane( c.referenceReadback.get() );
-	bOk = ( fclose( pFile ) == 0 ) && bOk;
-	if ( bOk && rename( szTmp, szPath ) != 0 )
-		bOk = false;
+	if ( bOk )
+		bOk = output.commit();
 
 	if ( !bOk )
 	{
-		unlink( szTmp );
-		vk_log.errorf( "framegen: full-colour capture write failed at '%s' (%s)", szPath, strerror( errno ) );
+		const int error = output.error() != 0 ? output.error() : EIO;
+		vk_log.errorf( "framegen: full-colour capture write failed at '%s' (%s)",
+			path.c_str(), strerror( error ) );
 		g_uFramegenColorRecordCount = ~0u;
 		framegen_color_probe_release( "write failure" );
 		return;
@@ -6876,7 +6885,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	pCmdBuffer->pushConstants<FramegenMotionNetOptPush_t>( framegen_net_online_lr(), k_flFramegenNetEmaAlpha, k_flFramegenNetDecay, m.uNetTrainStep );
 	pCmdBuffer->dispatch( uOptGroups, 1 );
 
-	// Snapshot the served weights every trained step (a 24 KB copy): the
+		// Snapshot the served weights every trained step (an 18.6 kB copy): the
 	// mapped readback feeds the CPU-side health check and keeps the profile
 	// flush at most one batch stale — the old every-1024-steps copy meant a
 	// short session (or one that reset before the boundary) persisted nothing.
@@ -6888,58 +6897,46 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	return false;
 }
 
-// The actual file write: temp file + rename, so a crash, a kill or a full
-// disk mid-write can never tear an existing good profile — the file at the
-// final path is always a complete, validated-format snapshot or absent. Every
-// fwrite AND the fclose are checked (the buffered tail is where ENOSPC bites).
+// The actual file write uses a unique same-directory staging file, so a process
+// crash, a kill, a full disk, or another Gamescope process saving the same
+// profile can never expose a partial snapshot. AtomicOutputFile checks buffered
+// close before publishing with rename.
 // Runs on an owned worker for periodic checkpoints — file I/O on the render
 // thread is a frametime spike — and synchronously for the exit/reset flush.
 static void framegen_net_profile_write_file( std::vector<float> weights, uint64_t ulProgress, bool bFromWorker )
 {
 	const char *pszPath = framegen_net_profile_path();
 	static std::atomic<bool> s_bLoggedFail = { false };
-	const auto fail = [&]( const char *pszWhat )
+	const auto fail = [&]( const char *pszWhat, int error )
 	{
 		if ( !s_bLoggedFail.exchange( true ) )
-			vk_log.errorf( "framegen: net profile %s '%s' failed (%s); keeping the previous file", pszWhat, pszPath, strerror( errno ) );
+			vk_log.errorf( "framegen: net profile %s '%s' failed (%s); keeping the previous file", pszWhat, pszPath, strerror( error ) );
 	};
 	if ( !gamescope::framegen::validate_and_migrate_net_profile_weights(
 		k_uFramegenNetVersion, weights ) )
 	{
-		errno = EINVAL;
-		fail( "validation for" );
+		fail( "validation for", EINVAL );
 		if ( bFromWorker )
 			g_bFramegenNetWriteInFlight = false;
 		return;
 	}
 
-	char szTmp[ 1024 ];
-	if ( (size_t)snprintf( szTmp, sizeof( szTmp ), "%s.tmp", pszPath ) >= sizeof( szTmp ) )
+	gamescope::framegen::AtomicOutputFile output( pszPath );
+	if ( !output.is_open() )
 	{
-		errno = ENAMETOOLONG;
-		fail( "temporary path for" );
-		if ( bFromWorker )
-			g_bFramegenNetWriteInFlight = false;
-		return;
-	}
-	FILE *pFile = fopen( szTmp, "wb" );
-	if ( pFile == nullptr )
-	{
-		fail( "open of" );
+		fail( "open of", output.error() );
 		if ( bFromWorker )
 			g_bFramegenNetWriteInFlight = false;
 		return;
 	}
 	constexpr auto metadata = gamescope::framegen::net_profile_metadata();
-	bool bOk = fwrite( metadata.data(), sizeof( uint32_t ), metadata.size(), pFile ) == metadata.size();
-	bOk = bOk && fwrite( weights.data(), sizeof( float ), weights.size(), pFile ) == weights.size();
-	bOk = ( fclose( pFile ) == 0 ) && bOk;
-	if ( bOk && rename( szTmp, pszPath ) != 0 )
-		bOk = false;
+	bool bOk = output.write( metadata.data(), metadata.size() * sizeof( uint32_t ) )
+		&& output.write( weights.data(), weights.size() * sizeof( float ) );
+	if ( bOk )
+		bOk = output.commit();
 	if ( !bOk )
 	{
-		unlink( szTmp );
-		fail( "write to" );
+		fail( "write to", output.error() != 0 ? output.error() : EIO );
 	}
 	else
 	{
@@ -6972,7 +6969,7 @@ static void framegen_net_profile_flush()
 }
 
 // Weights readback, CPU half: same completion gate as every other readback.
-// Every trained batch carries a served-weights copy (24 KB), so this cache is
+// Every trained batch carries a served-weights copy (18.6 kB), so this cache is
 // never more than one batch stale. It doubles as the training health check:
 // a non-finite weight anywhere means the optimizer diverged, and neither the
 // decay (NaN - prior = NaN) nor Adam can recover it — so re-seed the state
@@ -6989,16 +6986,16 @@ static void framegen_net_profile_consume()
 	h.ulNetProfileConsumedSeqNo = h.ulNetProfileSeqNo;
 
 	const uint8_t *pData = g_framegenMotion.netProfileReadback->mappedData();
-	std::vector<float> weights( k_uFramegenNetFloats );
+	g_framegenNetReadbackWeights.resize( k_uFramegenNetFloats );
 	for ( uint32_t y = 0; y < k_uFramegenNetTexH; y++ )
 	{
 		const uint32_t uRowFloats = std::min( k_uFramegenNetTexW, k_uFramegenNetFloats - y * k_uFramegenNetTexW );
-		memcpy( weights.data() + (size_t)y * k_uFramegenNetTexW,
+		memcpy( g_framegenNetReadbackWeights.data() + (size_t)y * k_uFramegenNetTexW,
 			pData + (size_t)y * g_framegenMotion.netProfileReadback->rowPitch(), uRowFloats * sizeof( float ) );
 	}
 	for ( uint32_t i = 0; i < k_uFramegenNetFloats; i++ )
 	{
-		if ( !gamescope::framegen::is_finite_binary32( weights[ i ] ) )
+		if ( !gamescope::framegen::is_finite_binary32( g_framegenNetReadbackWeights[ i ] ) )
 		{
 			vk_log.errorf( "framegen: net weights went non-finite at step %u — reinitializing from the prior (consider a lower GAMESCOPE_FRAMEGEN_NET_LR)", g_framegenMotion.uNetTrainStep );
 			// framegen_record_net runs before the optimizer-init dispatch in the
@@ -7009,7 +7006,10 @@ static void framegen_net_profile_consume()
 			return;
 		}
 	}
-	g_framegenNetLiveWeights = std::move( weights );
+	// Publish only after the full snapshot passes the health check. Swapping keeps
+	// the preceding live allocation as next frame's scratch storage, so a bad
+	// candidate cannot poison persistence and steady-state readback allocates none.
+	g_framegenNetLiveWeights.swap( g_framegenNetReadbackWeights );
 	g_ulFramegenNetLiveProgress = g_ulFramegenNetProgress;
 
 	// First healthy readback ever: arm the exit flush (only online-learning

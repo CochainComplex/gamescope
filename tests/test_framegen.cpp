@@ -1,4 +1,5 @@
 #include "framegen/adaptation.hpp"
+#include "framegen/atomic_file.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
@@ -13,7 +14,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
+#include <string>
 #include <string_view>
 
 using gamescope::framegen::EffectiveConfig;
@@ -181,6 +187,80 @@ static void test_net_profile_contract()
 	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetVersion + 1u, weights ) );
 	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetShadingVersion,
 		std::span<float>( weights.data(), weights.size() - 1u ) ) );
+}
+
+static std::string read_test_file( const std::string &path )
+{
+	std::ifstream input( path, std::ios::binary );
+	return std::string( std::istreambuf_iterator<char>( input ),
+		std::istreambuf_iterator<char>() );
+}
+
+static void test_atomic_output_file()
+{
+	using gamescope::framegen::AtomicOutputFile;
+
+	char directoryTemplate[] = "/tmp/gamescope-framegen-atomic-XXXXXX";
+	const char *directory = mkdtemp( directoryTemplate );
+	CHECK( directory != nullptr );
+	if ( directory == nullptr )
+		return;
+
+	const std::string path = std::string( directory ) + "/profile.bin";
+	const std::string original = "complete-profile";
+	{
+		AtomicOutputFile output( path );
+		CHECK( output.is_open() );
+		CHECK( output.error() == 0 );
+		CHECK( output.write( original.data(), 9u ) );
+		CHECK( output.write( original.data() + 9u, original.size() - 9u ) );
+		CHECK( output.commit() );
+	}
+	CHECK( read_test_file( path ) == original );
+
+	// Destroying an uncommitted writer must not truncate or replace the good file.
+	{
+		AtomicOutputFile abandoned( path );
+		CHECK( abandoned.is_open() );
+		constexpr std::string_view partial = "partial";
+		CHECK( abandoned.write( partial.data(), partial.size() ) );
+	}
+	CHECK( read_test_file( path ) == original );
+
+	// Same destination, distinct staging files. Either commit is complete, and
+	// the later atomic rename wins without either writer touching the other's data.
+	{
+		AtomicOutputFile first( path );
+		AtomicOutputFile second( path );
+		CHECK( first.is_open() );
+		CHECK( second.is_open() );
+		constexpr std::string_view firstData = "first-complete";
+		constexpr std::string_view secondData = "second-complete";
+		CHECK( first.write( firstData.data(), firstData.size() ) );
+		CHECK( second.write( secondData.data(), secondData.size() ) );
+		CHECK( first.commit() );
+		CHECK( read_test_file( path ) == firstData );
+		CHECK( second.commit() );
+		CHECK( read_test_file( path ) == secondData );
+	}
+
+	AtomicOutputFile missingParent( std::string( directory ) + "/missing/output.bin" );
+	CHECK( !missingParent.is_open() );
+	CHECK( missingParent.error() != 0 );
+	AtomicOutputFile emptyPath( "" );
+	CHECK( !emptyPath.is_open() );
+	CHECK( emptyPath.error() != 0 );
+
+	size_t entries = 0;
+	for ( const auto &entry : std::filesystem::directory_iterator( directory ) )
+	{
+		(void)entry;
+		entries++;
+	}
+	CHECK( entries == 1u );
+	std::error_code error;
+	std::filesystem::remove_all( directory, error );
+	CHECK( !error );
 }
 
 static void test_numeric_settings_contract()
@@ -568,6 +648,7 @@ int main()
 	test_learned_net_layout();
 	test_names();
 	test_net_profile_contract();
+	test_atomic_output_file();
 	test_numeric_settings_contract();
 	test_adaptation_policy();
 	test_temporal_policy();

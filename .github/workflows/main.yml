@@ -34,7 +34,8 @@ jobs:
             python3 -m py_compile scripts/framegen-net-train.py \
               scripts/framegen-net-eval.py scripts/framegen-color-eval.py
           c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
-            tests/test_framegen.cpp -o /tmp/gamescope-framegen-contracts
+            tests/test_framegen.cpp src/framegen/atomic_file.cpp \
+            -o /tmp/gamescope-framegen-contracts
           /tmp/gamescope-framegen-contracts
           if git grep -nE '/home/[[:alnum:]_.-]+/' -- \
             README.md doc/framegen-architecture.md doc/framegen-howto.md \

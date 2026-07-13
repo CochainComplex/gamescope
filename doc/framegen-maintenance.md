@@ -16,13 +16,14 @@ symbols below.
 | Self-supervised adaptation policy | `src/framegen/adaptation.hpp` | B4 counter decoding, EMA state, and next-batch threshold derivation |
 | Numeric and setting contracts | `src/framegen/numeric.hpp`, `src/framegen/settings.hpp` | fast-math-safe fp32 classification and strict scalar/path parsing |
 | Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp`, `src/framegen/net_profile.hpp` | CPU/GLSL ABI, tensor layout, and GSFR validation/migration |
+| Atomic capture/profile output | `src/framegen/atomic_file.hpp`, `src/framegen/atomic_file.cpp` | unique same-directory staging, checked buffered close, cleanup, and atomic rename |
 | Vulkan scheduling and algorithms | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch recording, and ML execution |
 | Queue and timestamp execution | `src/framegen/device.cpp`, `src/rendervulkan.hpp` | framegen submission, completion, command-buffer retirement, and GPU-time accounting |
 | Presentation choice | `src/steamcompmgr.cpp` | real/generated/repeat arbitration and timed flips |
 | Backend present | `src/Backends/DRMBackend.cpp`, `src/Backends/WaylandBackend.cpp` | final generated-frame substitution |
 | Algorithms | `src/shaders/cs_framegen_*.comp` | extrapolation, motion estimation, validation, warp, ML |
 | Offline ML tools | `scripts/framegen-net-*.py` | GSFD parsing, training, GSFR evaluation |
-| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, adaptation, dispatch, ABI encoding, net layout, and GSFR compatibility matrices |
+| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, adaptation, dispatch, ABI encoding, net layout, GSFR compatibility, and atomic-output contracts |
 
 Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
@@ -207,10 +208,25 @@ reinitialized from the finite prior.
 
 Profile I/O stays off the compositor hot path. Checkpoints use the owned writer
 thread and atomic replace; reset/exit joins it before the final flush. The
-renderer owns file lifetime, logging, and worker synchronization, while
-`net_profile.hpp` owns only the stateless serialized-format checks. During
-testing, point `GAMESCOPE_FRAMEGEN_NET_PROFILE` at a disposable copy. Never use
-a known-good profile as the writable test destination.
+renderer owns profile state, logging, and worker synchronization;
+`net_profile.hpp` owns the stateless serialized-format checks; and
+`AtomicOutputFile` owns only the output transaction. It creates a unique staging
+file beside the destination, checks every write and the buffered close, then
+renames. Destruction before commit removes the staging file and preserves the
+old destination. Concurrent instances can race over which complete snapshot is
+newest, but cannot share or corrupt a partial staging file. GSFD/GSCF capture
+uses the same primitive and remains a measurement-only synchronous path. Keep
+the three disk/readback consumers explicitly out of line: they are polled from
+`framegen_submit_planned`, and GCC otherwise folds cold string and file machinery
+into the Vulkan command recorder even when capture is disabled.
+
+The per-step served-weight readback uses two reusable vectors. GPU data is copied
+into the scratch vector, every value is checked with the fast-math-safe finite
+test, and only then are scratch and live snapshots swapped. Do not overwrite the
+live vector in place: the last healthy snapshot is both the reset warm start and
+the only data eligible for persistence after optimizer divergence. During tests,
+point `GAMESCOPE_FRAMEGEN_NET_PROFILE` at a disposable copy. Never use a known-good
+profile as the writable test destination.
 
 ## Validation by change class
 
@@ -225,10 +241,12 @@ PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
   python3 -m py_compile scripts/framegen-net-train.py \
     scripts/framegen-net-eval.py scripts/framegen-color-eval.py
 c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
-  tests/test_framegen.cpp -o /tmp/gamescope-framegen-contracts
+  tests/test_framegen.cpp src/framegen/atomic_file.cpp \
+  -o /tmp/gamescope-framegen-contracts
 /tmp/gamescope-framegen-contracts
 c++ -std=c++20 -O3 -ffast-math -Wall -Wextra -Werror -Isrc \
-  tests/test_framegen.cpp -o /tmp/gamescope-framegen-contracts-fastmath
+  tests/test_framegen.cpp src/framegen/atomic_file.cpp \
+  -o /tmp/gamescope-framegen-contracts-fastmath
 /tmp/gamescope-framegen-contracts-fastmath
 git diff --check
 ```
