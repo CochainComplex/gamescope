@@ -18,7 +18,7 @@ struct EffectiveConfig
 // Count the degradation rungs below a startup quality ceiling. Motion sheds
 // quality first, then falls back to extrapolation; multiplier reductions are
 // last. There is deliberately no disabled rung, so GPU timing never starves.
-constexpr uint32_t max_degrade_steps( GamescopeFramegenMode mode,
+[[nodiscard]] constexpr uint32_t max_degrade_steps( GamescopeFramegenMode mode,
 	GamescopeFramegenQuality quality, int multiplier )
 {
 	const uint32_t nMotionRungs = mode == GamescopeFramegenMode::Motion
@@ -30,7 +30,7 @@ constexpr uint32_t max_degrade_steps( GamescopeFramegenMode mode,
 
 // Resolve one rung without touching global state. Keeping this constexpr makes
 // the renderer call site zero-cost while allowing exhaustive CPU-only tests.
-constexpr EffectiveConfig effective_config( GamescopeFramegenMode mode,
+[[nodiscard]] constexpr EffectiveConfig effective_config( GamescopeFramegenMode mode,
 	GamescopeFramegenQuality quality, int multiplier, uint32_t nDegradeSteps )
 {
 	EffectiveConfig config = {

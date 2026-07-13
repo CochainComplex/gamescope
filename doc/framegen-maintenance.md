@@ -11,14 +11,15 @@ symbols below.
 | Area | Primary source | Ownership |
 |---|---|---|
 | CLI and environment | `src/main.cpp` | parsing, validation, debug controls |
-| Framegen types and policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/quality vocabulary and pure degradation-ladder resolution |
+| Framegen types and quality policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/quality vocabulary and pure degradation-ladder resolution |
+| Temporal and dispatch policy | `src/framegen/temporal.hpp`, `src/framegen/dispatch_policy.hpp` | pure phase/cadence math and capability-to-strategy selection |
 | Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp` | CPU/GLSL ABI and serialized/GPU tensor layout |
 | Vulkan execution | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch, queues, timestamps, ML execution |
 | Presentation choice | `src/steamcompmgr.cpp` | real/generated/repeat arbitration and timed flips |
 | Backend present | `src/Backends/DRMBackend.cpp`, `src/Backends/WaylandBackend.cpp` | final generated-frame substitution |
 | Algorithms | `src/shaders/cs_framegen_*.comp` | extrapolation, motion estimation, validation, warp, ML |
 | Offline ML tools | `scripts/framegen-net-*.py` | GSFD parsing, training, GSFR evaluation |
-| Contract tests | `tests/test_framegen.cpp` | exhaustive pure-policy, ABI encoding, and net-layout checks |
+| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, dispatch, ABI encoding, and net-layout matrices |
 
 Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
@@ -73,6 +74,10 @@ ownership bugs.
   is normalized by `currentDt / historyDt`; the irregular-sample quadratic term
   uses `currentDt / (currentDt + historyDt)`. Missing timestamps or an excessive
   interval ratio disables acceleration instead of guessing.
+- `src/framegen/temporal.hpp` owns only those arithmetic transformations. The
+  renderer owns timestamp provenance, validity gates, scene history, and the
+  decision to submit. Do not move a guard into pure math unless every caller
+  preserves the same early-exit and fallback behavior.
 - Causal slot `phase` lies after the newest real frame. The shader coefficient is
   derived from that phase and `--framegen-strength`, then bounded by the forward
   cap. Bidirectional `phase` lies in `[0, 1]` between checked real endpoints and
@@ -120,6 +125,13 @@ Other duplicated ABI constants require the same treatment:
   readback paths.
 - `k_uFramegenDescriptorSets` must cover the maximum dispatch count of one legal
   batch. Its current value is 30; it does not permit a second batch in flight.
+
+`src/framegen/dispatch_policy.hpp` maps observed capability booleans and PCI
+vendor ID to an immutable strategy. Vulkan format probing, `ShaderType` mapping,
+format-keyed caching, and debug reporting stay in `framegen_dispatch_for_format`.
+Unknown vendors use the capability-derived fp16/LDS path. A new hardware
+override requires matched microbenchmark evidence and must keep output math
+equivalent to the generic variant.
 
 ## Resource and cache identity
 

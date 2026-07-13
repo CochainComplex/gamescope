@@ -41,9 +41,11 @@
 #include "vblankmanager.hpp"
 #include "log.hpp"
 #include "Utils/Process.h"
+#include "framegen/dispatch_policy.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
+#include "framegen/temporal.hpp"
 
 #include "cs_composite_blit.h"
 #include "cs_composite_blur.h"
@@ -6381,17 +6383,30 @@ static const FramegenDispatch_t &framegen_dispatch_for_format( uint32_t drmForma
 	FramegenDispatch_t dispatch;
 	dispatch.drmFormat = drmFormat;
 
-	// fp16 is used on capable hardware except for float (scRGB) targets; see
-	// framegen_is_float_drm_format.
-	dispatch.useFp16 = g_device.supportsShaderFloat16() && !framegen_is_float_drm_format( drmFormat );
-	dispatch.extrapolate = dispatch.useFp16 ? SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16 : SHADER_TYPE_FRAMEGEN_EXTRAPOLATE;
-	dispatch.extrapolatePair = dispatch.useFp16 ? SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR_FP16 : SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR;
+	const bool bSupportsShaderFloat16 = g_device.supportsShaderFloat16();
+	const bool bFloatOutput = framegen_is_float_drm_format( drmFormat );
+	const bool bR16FLumaSupported = framegen_format_supports_sampled_storage( DRM_FORMAT_R16F );
+	const bool bMotionSupported = framegen_format_supports_sampled_storage( DRM_FORMAT_ABGR16161616F );
+	VkPhysicalDeviceProperties physProps = {};
+	g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &physProps );
+	const gamescope::framegen::DispatchPolicy policy = gamescope::framegen::select_dispatch_policy(
+		bSupportsShaderFloat16, bFloatOutput,
+		bR16FLumaSupported, bMotionSupported, physProps.vendorID );
 
-	dispatch.useR16FLuma = framegen_format_supports_sampled_storage( DRM_FORMAT_R16F );
+	dispatch.useFp16 = policy.useFp16;
+	dispatch.extrapolate = policy.preferDirectExtrapolate
+		? SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT
+		: ( policy.useFp16 ? SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16 : SHADER_TYPE_FRAMEGEN_EXTRAPOLATE );
+	// The direct-pair path has not been benchmark-qualified, so x3/x4 retains
+	// the independently selected LDS variant and precision.
+	dispatch.extrapolatePair = policy.pairUseFp16
+		? SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR_FP16 : SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR;
+
+	dispatch.useR16FLuma = policy.useR16FLuma;
 	dispatch.motionLumaFormat = dispatch.useR16FLuma ? DRM_FORMAT_R16F : DRM_FORMAT_ABGR16161616F;
 	dispatch.motionLumaPair = dispatch.useR16FLuma ? SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR : SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA;
 	dispatch.motionPyramidPair = dispatch.useR16FLuma ? SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID : SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID_RGBA;
-	dispatch.motionSupported = framegen_format_supports_sampled_storage( DRM_FORMAT_ABGR16161616F );
+	dispatch.motionSupported = policy.motionSupported;
 
 	// LDS-vs-direct extrapolation is a memory-strategy choice that capability bits
 	// cannot express: it turns on the GPU's texture-cache effectiveness, not on a
@@ -6405,17 +6420,6 @@ static const FramegenDispatch_t &framegen_dispatch_for_format( uint32_t drmForma
 	// that part with the framegen microbench. This is the one selection that a
 	// narrow vendor check earns — decided once here and cached, so no per-dispatch
 	// cost. Extend the predicate as parts are measured.
-	VkPhysicalDeviceProperties physProps = {};
-	g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &physProps );
-	const bool bPreferDirectExtrapolate = ( physProps.vendorID == 0x10DE ); // NVIDIA, measured
-	if ( bPreferDirectExtrapolate )
-	{
-		dispatch.useFp16 = false;
-		dispatch.extrapolate = SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT;
-		// The paired extrapolation shader (x3/x4 only) is left on its LDS variant
-		// until the direct-pair path is measured.
-	}
-
 	g_framegenDispatch = dispatch;
 	if ( g_bFramegenDebug )
 	{
@@ -7123,15 +7127,14 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 
 static bool framegen_motion_history_valid( GamescopeFramegenQuality eQuality )
 {
-	const uint64_t ulCurrentIntervalNs = g_framegenHistory.currentPresentTimeNs > g_framegenHistory.previousPresentTimeNs
-		? g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs : 0;
+	const uint64_t ulCurrentIntervalNs = gamescope::framegen::present_interval_ns(
+		g_framegenHistory.currentPresentTimeNs, g_framegenHistory.previousPresentTimeNs );
 	const uint64_t ulHistoryIntervalNs = g_framegenMotion.uMotionHistoryIntervalNs;
 	// A violent cadence transition is a poor second-derivative sample even after
 	// time normalization. Fall back to constant velocity for that one interval;
 	// the newly stored field immediately re-primes the next batch.
-	const bool bComparableIntervals = ulCurrentIntervalNs != 0 && ulHistoryIntervalNs != 0
-		&& ulCurrentIntervalNs <= ulHistoryIntervalNs * 4u
-		&& ulHistoryIntervalNs <= ulCurrentIntervalNs * 4u;
+	const bool bComparableIntervals = gamescope::framegen::motion_intervals_comparable(
+		ulCurrentIntervalNs, ulHistoryIntervalNs );
 	return eQuality >= GamescopeFramegenQuality::Ultra
 		&& g_framegenMotion.mvFieldHistory != nullptr
 		&& g_framegenMotion.uMotionHistoryFrameId != 0
@@ -7144,16 +7147,17 @@ static float framegen_motion_history_time_scale()
 	if ( !framegen_motion_history_valid( GamescopeFramegenQuality::Ultra ) )
 		return 1.0f;
 	const uint64_t ulCurrentIntervalNs = g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs;
-	return (float)( (double)ulCurrentIntervalNs / (double)g_framegenMotion.uMotionHistoryIntervalNs );
+	return gamescope::framegen::motion_history_time_scale(
+		ulCurrentIntervalNs, g_framegenMotion.uMotionHistoryIntervalNs );
 }
 
 static float framegen_motion_accel_time_factor()
 {
 	if ( !framegen_motion_history_valid( GamescopeFramegenQuality::Ultra ) )
 		return 0.5f;
-	const double flCurrent = (double)( g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs );
-	const double flHistory = (double)g_framegenMotion.uMotionHistoryIntervalNs;
-	return (float)( flCurrent / ( flCurrent + flHistory ) );
+	const uint64_t ulCurrentIntervalNs = g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs;
+	return gamescope::framegen::motion_acceleration_time_factor(
+		ulCurrentIntervalNs, g_framegenMotion.uMotionHistoryIntervalNs );
 }
 
 static int framegen_luma_reservoir_read_index()
@@ -7923,12 +7927,7 @@ static void framegen_bidir_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamesc
 // One planned generated frame: its temporal phase (fraction of a real-frame
 // interval past the current real frame), the shader forward coefficient
 // derived from it, and the interval-relative slot index for refill bookkeeping.
-struct FramegenSlotRequest_t
-{
-	float phase;
-	float strength;
-	uint32_t slotIndex;
-};
+using FramegenSlotRequest_t = gamescope::framegen::SlotRequest;
 
 struct FramegenColorProbeRequest_t
 {
@@ -8288,17 +8287,13 @@ static bool framegen_submit_batch( uint32_t nFirstSlot, uint32_t nGapVblanks, ui
 	for ( uint32_t i = 0; i < nGenerate; i++ )
 	{
 		const uint32_t k = nFirstSlot + i;
-		const float flGapPhase = (float)k / (float)nGapVblanks;
-		const float flUniformPhase = (float)( i + 1u ) / (float)( nGenerate + 1u );
-		const float phase = flBidirPhaseBias > 0.0f
-			? flGapPhase + ( flUniformPhase - flGapPhase ) * flBidirPhaseBias
-			: flGapPhase;
 		// Effective forward coefficient: temporal placement scaled by the user
 		// strength (0.5 is neutral, reproducing the classic x2 half-way step).
 		// Idle refill can move past the originally expected next-real slot when
 		// the game stalls, but never lets prediction run away unbounded.
-		const float flStrength = std::clamp( phase * ( g_flFramegenStrength / 0.5f ), 0.0f, k_flFramegenMaxForwardStrength );
-		requests.push_back( { phase, flStrength, k } );
+		requests.push_back( gamescope::framegen::classic_slot_request(
+			k, i, nGapVblanks, nGenerate, flBidirPhaseBias,
+			g_flFramegenStrength, k_flFramegenMaxForwardStrength ) );
 	}
 
 	return framegen_submit_planned( requests.data(), (uint32_t)requests.size(), nGapVblanks, eff, ulCompositeSeqNo, nMaxDegradeSteps, bClearPending );
@@ -8345,23 +8340,25 @@ static bool framegen_jit_submit( uint64_t ulCompositeSeqNo, uint32_t nMaxDegrade
 	if ( ulTargetVblankNs <= g_framegenHistory.ulCurrentRealVblankNs )
 		return false;
 
-	const float flPhase = (float)( (double)( ulTargetVblankNs - g_framegenHistory.ulCurrentRealVblankNs )
-		/ (double)g_framegenHistory.ulFrametimeEmaNs );
-	const float flStrengthRaw = flPhase * ( g_flFramegenStrength / 0.5f );
+	const uint64_t ulTargetDeltaNs = ulTargetVblankNs - g_framegenHistory.ulCurrentRealVblankNs;
+	const gamescope::framegen::TimedPrediction prediction = gamescope::framegen::timed_prediction(
+		ulTargetDeltaNs, g_framegenHistory.ulFrametimeEmaNs, g_flFramegenStrength );
 	// Past the forward cap every further slot would be the same capped
 	// prediction — a repeat we'd pay full generation bandwidth for. Stop; the
 	// display repeats the last scanned-out frame until real content returns.
-	if ( flStrengthRaw > k_flFramegenMaxForwardStrength )
+	if ( prediction.rawStrength > k_flFramegenMaxForwardStrength )
 		return false;
-	const float flStrength = std::clamp( flStrengthRaw, 0.0f, k_flFramegenMaxForwardStrength );
+	const float flPhase = prediction.phase;
+	const float flStrength = gamescope::framegen::clamp_forward_strength(
+		prediction.rawStrength, k_flFramegenMaxForwardStrength );
 
 	// Interval-relative slot index / gap equivalents, for bookkeeping and logs
 	// only: a JIT tick re-measures the display clock rather than continuing a
 	// slot ladder, so these never feed a later phase computation.
-	const uint32_t nSlotIndex = std::max( 1u,
-		(uint32_t)( ( ulTargetVblankNs - g_framegenHistory.ulCurrentRealVblankNs + ulVblankIntervalNs / 2 ) / ulVblankIntervalNs ) );
-	const uint32_t nGapVblanks = std::max( nSlotIndex + 1, std::max( 2u,
-		(uint32_t)( ( g_framegenHistory.ulFrametimeEmaNs + ulVblankIntervalNs / 2 ) / ulVblankIntervalNs ) ) );
+	const gamescope::framegen::JitBookkeeping bookkeeping = gamescope::framegen::jit_bookkeeping(
+		ulTargetDeltaNs, g_framegenHistory.ulFrametimeEmaNs, ulVblankIntervalNs );
+	const uint32_t nSlotIndex = bookkeeping.slotIndex;
+	const uint32_t nGapVblanks = bookkeeping.gapVblanks;
 
 	static uint64_t s_uJitDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uJitDebugLogCounter ) )
@@ -8402,11 +8399,13 @@ static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMax
 	const uint64_t ulVblankIntervalNs = nFramegenRefreshMhz > 0 ? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
 
 	const float flPhase = 0.5f;
-	const float flStrength = std::clamp( flPhase * ( g_flFramegenStrength / 0.5f ), 0.0f, k_flFramegenMaxForwardStrength );
+	const float flStrength = gamescope::framegen::clamp_forward_strength(
+		gamescope::framegen::forward_strength_raw( flPhase, g_flFramegenStrength ),
+		k_flFramegenMaxForwardStrength );
 	// Interval-relative gap equivalent, for logs and rung keying only — no
 	// phase is ever derived from it in this mode.
-	const uint32_t nGapVblanks = std::max( 2u,
-		(uint32_t)( ( g_framegenHistory.ulFrametimeEmaNs + ulVblankIntervalNs / 2 ) / ulVblankIntervalNs ) );
+	const uint32_t nGapVblanks = gamescope::framegen::interval_gap_vblanks(
+		g_framegenHistory.ulFrametimeEmaNs, ulVblankIntervalNs );
 
 	static uint64_t s_uHybridDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uHybridDebugLogCounter ) )

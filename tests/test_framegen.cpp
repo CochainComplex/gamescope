@@ -1,9 +1,12 @@
+#include "framegen/dispatch_policy.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
+#include "framegen/temporal.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 
@@ -24,6 +27,8 @@ static void check( bool bCondition, const char *pszExpression, int nLine )
 }
 
 #define CHECK( expression ) check( static_cast<bool>( expression ), #expression, __LINE__ )
+#define CHECK_NEAR( actual, expected, tolerance ) \
+	CHECK( std::fabs( ( actual ) - ( expected ) ) <= ( tolerance ) )
 
 static void test_degradation_policy()
 {
@@ -83,6 +88,136 @@ static void test_learned_net_layout()
 	CHECK( k_uFramegenNetTexH == 3u );
 }
 
+static void test_temporal_policy()
+{
+	using namespace gamescope::framegen;
+
+	CHECK( present_interval_ns( 20u, 8u ) == 12u );
+	CHECK( present_interval_ns( 8u, 20u ) == 0u );
+	CHECK( present_interval_ns( 8u, 8u ) == 0u );
+	CHECK( !motion_intervals_comparable( 0u, 1u ) );
+	CHECK( motion_intervals_comparable( 4u, 1u ) );
+	CHECK( motion_intervals_comparable( 1u, 4u ) );
+	CHECK( !motion_intervals_comparable( 5u, 1u ) );
+	CHECK( !motion_intervals_comparable( 1u, 5u ) );
+	CHECK( motion_history_time_scale( 20u, 10u ) == 2.0f );
+	CHECK_NEAR( motion_acceleration_time_factor( 20u, 10u ), 2.0f / 3.0f, 1e-6f );
+
+	const SlotRequest measured = classic_slot_request(
+		1u, 0u, 4u, 2u, 0.0f, 0.5f, 1.5f );
+	CHECK( measured.phase == 0.25f );
+	CHECK( measured.strength == 0.25f );
+	CHECK( measured.slotIndex == 1u );
+
+	const SlotRequest uniform = classic_slot_request(
+		1u, 0u, 4u, 2u, 1.0f, 0.5f, 1.5f );
+	CHECK_NEAR( uniform.phase, 1.0f / 3.0f, 1e-6f );
+	const SlotRequest halfway = classic_slot_request(
+		1u, 0u, 4u, 2u, 0.5f, 0.5f, 1.5f );
+	CHECK_NEAR( halfway.phase, ( 0.25f + 1.0f / 3.0f ) * 0.5f, 1e-6f );
+
+	const SlotRequest capped = classic_slot_request(
+		2u, 0u, 2u, 1u, 0.0f, 1.0f, 1.5f );
+	CHECK( capped.phase == 1.0f );
+	CHECK( capped.strength == 1.5f );
+
+	constexpr std::array biases = { 0.0f, 0.5f, 1.0f };
+	constexpr std::array strengths = { 0.25f, 0.5f, 1.0f };
+	for ( uint32_t generatedCount = 1u; generatedCount <= 3u; generatedCount++ )
+	{
+		for ( uint32_t gap = generatedCount + 1u; gap <= 8u; gap++ )
+		{
+			for ( uint32_t i = 0u; i < generatedCount; i++ )
+			{
+				const uint32_t slot = i + 1u;
+				const float gapPhase = static_cast<float>( slot ) / static_cast<float>( gap );
+				const float uniformPhase = static_cast<float>( i + 1u )
+					/ static_cast<float>( generatedCount + 1u );
+				for ( const float bias : biases )
+				{
+					const float expectedPhase = bias > 0.0f
+						? gapPhase + ( uniformPhase - gapPhase ) * bias : gapPhase;
+					for ( const float strength : strengths )
+					{
+						const SlotRequest request = classic_slot_request(
+							slot, i, gap, generatedCount, bias, strength, 1.5f );
+						CHECK_NEAR( request.phase, expectedPhase, 1e-7f );
+						CHECK_NEAR( request.strength,
+							std::clamp( expectedPhase * ( strength / 0.5f ), 0.0f, 1.5f ), 1e-7f );
+						CHECK( request.slotIndex == slot );
+					}
+				}
+			}
+		}
+	}
+
+	const TimedPrediction prediction = timed_prediction(
+		10'000'000u, 20'000'000u, 0.5f );
+	CHECK( prediction.phase == 0.5f );
+	CHECK( prediction.rawStrength == 0.5f );
+	const JitBookkeeping regular = jit_bookkeeping(
+		10'000'000u, 20'000'000u, 10'000'000u );
+	CHECK( regular.slotIndex == 1u );
+	CHECK( regular.gapVblanks == 2u );
+	const JitBookkeeping late = jit_bookkeeping(
+		26'000'000u, 20'000'000u, 10'000'000u );
+	CHECK( late.slotIndex == 3u );
+	CHECK( late.gapVblanks == 4u );
+	CHECK( interval_gap_vblanks( 25'000'000u, 10'000'000u ) == 3u );
+	CHECK( forward_strength_raw( 2.0f, 0.5f ) > 1.5f );
+}
+
+static void test_dispatch_policy()
+{
+	using gamescope::framegen::select_dispatch_policy;
+	constexpr std::array<uint32_t, 3> vendors = { 0u, 0x1002u, 0x10deu };
+
+	for ( uint32_t mask = 0u; mask < 16u; mask++ )
+	{
+		const bool supportsFp16 = ( mask & 1u ) != 0u;
+		const bool floatOutput = ( mask & 2u ) != 0u;
+		const bool supportsR16F = ( mask & 4u ) != 0u;
+		const bool supportsRGBA16F = ( mask & 8u ) != 0u;
+		for ( const uint32_t vendor : vendors )
+		{
+			const auto policy = select_dispatch_policy( supportsFp16, floatOutput,
+				supportsR16F, supportsRGBA16F, vendor );
+			const bool baseFp16 = supportsFp16 && !floatOutput;
+			const bool direct = vendor == 0x10deu;
+			CHECK( policy.useFp16 == ( baseFp16 && !direct ) );
+			CHECK( policy.pairUseFp16 == baseFp16 );
+			CHECK( policy.useR16FLuma == supportsR16F );
+			CHECK( policy.motionSupported == supportsRGBA16F );
+			CHECK( policy.preferDirectExtrapolate == direct );
+		}
+	}
+
+	const auto genericInt = select_dispatch_policy( true, false, true, true, 0x1002u );
+	CHECK( genericInt.useFp16 );
+	CHECK( genericInt.pairUseFp16 );
+	CHECK( genericInt.useR16FLuma );
+	CHECK( genericInt.motionSupported );
+	CHECK( !genericInt.preferDirectExtrapolate );
+
+	const auto genericFloat = select_dispatch_policy( true, true, false, true, 0x8086u );
+	CHECK( !genericFloat.useFp16 );
+	CHECK( !genericFloat.pairUseFp16 );
+	CHECK( !genericFloat.useR16FLuma );
+	CHECK( genericFloat.motionSupported );
+	CHECK( !genericFloat.preferDirectExtrapolate );
+
+	const auto nvidiaInt = select_dispatch_policy( true, false, true, true, 0x10deu );
+	CHECK( !nvidiaInt.useFp16 );
+	CHECK( nvidiaInt.pairUseFp16 );
+	CHECK( nvidiaInt.preferDirectExtrapolate );
+
+	const auto nvidiaNoFp16 = select_dispatch_policy( false, false, true, false, 0x10deu );
+	CHECK( !nvidiaNoFp16.useFp16 );
+	CHECK( !nvidiaNoFp16.pairUseFp16 );
+	CHECK( !nvidiaNoFp16.motionSupported );
+	CHECK( nvidiaNoFp16.preferDirectExtrapolate );
+}
+
 static void test_push_constant_encoding()
 {
 	const FramegenMotionAccelPush_t accel(
@@ -113,8 +248,11 @@ int main()
 {
 	test_degradation_policy();
 	test_learned_net_layout();
+	test_temporal_policy();
+	test_dispatch_policy();
 	test_push_constant_encoding();
 	return g_bPassed ? 0 : 1;
 }
 
+#undef CHECK_NEAR
 #undef CHECK

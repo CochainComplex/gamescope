@@ -138,6 +138,9 @@ g_nOutputRefresh` → `ulVblankIntervalNs = 1e12 / mHz`, which must equal
 *parent monitor's* refresh while slots are still placed on `g_nNestedRefresh`'s cadence — deriving
 the interval from `g_nOutputRefresh` there desyncs phase/strength and was the temporal wobble. On
 DRM the two are equal (no-op).
+Pure interval, phase, strength, JIT-rounding, and VRR equivalent-gap arithmetic
+lives in `src/framegen/temporal.hpp`; clock acquisition and all admission gates
+remain in `rendervulkan.cpp`.
 
 ---
 
@@ -256,6 +259,8 @@ current real-frame interval `h0` and preceding interval `h1`, the shader evaluat
 `s·F + 0.5·s·(s+1)·A` when the intervals match. The same ratio normalizes the causal shading-trend
 training target. Missing timestamps or an interval ratio beyond 4:1 disables the second derivative
 for one interval and falls back to constant velocity; the freshly stored field re-primes the next.
+The CPU-side interval comparability, `h0/h1`, and `h0/(h0+h1)` calculations are
+centralized in `src/framegen/temporal.hpp` and contract-tested at the 4:1 boundary.
 
 Acceleration has four structural guards: both fields must retain confidence; a 0.05-field-texel
 dead zone removes sub-pel estimator noise; acceleration fades out when large relative to observed
@@ -772,11 +777,12 @@ no-LDS `direct` shader wins on large-L2 / Infinity-Cache parts where the neighbo
 cache hit.
 
 - **Dispatch selection** `framegen_dispatch_for_format` — single-slot **format-keyed
-  cache**, computed once per drmFormat: `useFp16 = supportsShaderFloat16 && !isFloatFormat`;
+  cache**, computed once per drmFormat. Its pure capability mapping lives in
+  `src/framegen/dispatch_policy.hpp`: `useFp16 = supportsShaderFloat16 && !isFloatFormat`;
   `useR16FLuma` picks the luma format + `MOTION_LUMA_PAIR` vs `_RGBA`; `motionSupported = ABGR16161616F
   sampled+storage`. **Measured vendor override:** `vendorID==0x10DE` currently forces
-  `useFp16=false` and `extrapolate=DIRECT` — but **deliberately leaves `extrapolatePair` on LDS** (no
-  measured direct-pair shader yet).
+  `useFp16=false` and `extrapolate=DIRECT` — but **deliberately leaves `extrapolatePair` on its
+  independently capability-selected LDS precision** (no measured direct-pair shader yet).
 - **Microbenchmark** `vulkan_framegen_benchmark` — times the real production helpers over
   a 3-res × 2-format sweep {1080p/1440p/2160p} × {ABGR2101010 int, ABGR16161616F float}, `nIters=200`,
   own 2-query pool, `waitIdle`-serialized; marks the production-selected variant with `(*)` and,
