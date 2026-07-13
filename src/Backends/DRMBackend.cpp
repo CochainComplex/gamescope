@@ -3617,7 +3617,8 @@ namespace gamescope
 			// both modes.
 			if ( gamescope::Rc<CVulkanTexture> pGeneratedFrame = vulkan_framegen_consume_generated_frame( pFrameInfo ) )
 			{
-				if ( g_bFramegenDebug )
+				static uint64_t s_uGeneratedPresentDebugLogCounter = 0;
+				if ( FramegenDebugShouldLog( s_uGeneratedPresentDebugLogCounter ) )
 					drm_log.infof( "framegen: DRM presenting generated frame" );
 
 				FrameInfo_t generatedFrameInfo = {};

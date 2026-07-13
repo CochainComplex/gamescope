@@ -4244,11 +4244,13 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t wi
 }
 
 static uint32_t s_frameId = 0;
+static void framegen_color_probe_consume();
 
 void vulkan_garbage_collect( void )
 {
 	g_device.garbageCollect();
 	g_device.framegenGarbageCollect();
+	framegen_color_probe_consume();
 }
 
 static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace )
@@ -4800,9 +4802,12 @@ struct FramegenMotionBidirPush_t
 	float lowResScale;
 	float agreeLo;
 	float agreeHi;
+	float oneSidedStrength;
+	float pad0, pad1, pad2;
 
-	explicit FramegenMotionBidirPush_t( float flPhase, float flScale, float flAgreeLo, float flAgreeHi )
+	explicit FramegenMotionBidirPush_t( float flPhase, float flScale, float flAgreeLo, float flAgreeHi, float flOneSidedStrength )
 		: phase( flPhase ), lowResScale( flScale ), agreeLo( flAgreeLo ), agreeHi( flAgreeHi )
+		, oneSidedStrength( flOneSidedStrength ), pad0( 0.0f ), pad1( 0.0f ), pad2( 0.0f )
 	{
 	}
 };
@@ -5001,6 +5006,45 @@ struct FramegenMotionResources_t
 static FramegenMotionResources_t g_framegenMotion;
 static constexpr uint32_t k_uFramegenMotionDownscale = 8;
 
+// Full-colour held-out validation (Gap E2). In capture mode, endpoint frames
+// A/C and one exact intermediate reference B are retained; B is hidden from the
+// estimator, and three paired predictions of B from A/C are copied beside exact
+// B into host-visible images. The default offset/span is the consecutive A/B/C
+// triplet; configurable spacing covers the lower phases used by slow x4 input.
+// Predictions are never queued for presentation.
+static constexpr uint32_t k_uFramegenColorProbeCandidates = 3;
+static constexpr float k_flFramegenColorProbeStrengths[ k_uFramegenColorProbeCandidates ] = { 0.0f, 0.5f, 1.0f };
+
+struct FramegenColorProbeResources_t
+{
+	gamescope::OwningRc<CVulkanTexture> generatedReadback[ k_uFramegenColorProbeCandidates ];
+	gamescope::OwningRc<CVulkanTexture> referenceReadback;
+	gamescope::Rc<CVulkanTexture> anchor;
+	gamescope::Rc<CVulkanTexture> reference;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	uint32_t drmFormat = DRM_FORMAT_INVALID;
+	uint32_t bytesPerPixel = 0;
+	EOTF eotf = EOTF_Gamma22;
+	uint64_t nextRealId = 0;
+	uint64_t anchorId = 0;
+	uint64_t referenceId = 0;
+	uint64_t anchorTimeNs = 0;
+	uint64_t referenceTimeNs = 0;
+	uint64_t lastRealTimeNs = 0;
+
+	uint64_t pendingSeqNo = 0;
+	uint64_t pendingAnchorId = 0;
+	uint64_t pendingReferenceId = 0;
+	uint64_t pendingEndpointId = 0;
+	uint64_t pendingAnchorTimeNs = 0;
+	uint64_t pendingReferenceTimeNs = 0;
+	uint64_t pendingEndpointTimeNs = 0;
+	float pendingPhase = 0.0f;
+};
+static FramegenColorProbeResources_t g_framegenColorProbe;
+static uint32_t g_uFramegenColorRecordCount = 0;
+
 // Framegen shader dispatch is capability-based first: Vulkan tells us whether
 // float16 arithmetic is legal and whether R16F works as a sampled+storage image.
 // The one exception is the LDS-vs-direct extrapolation shader, which turns on
@@ -5051,6 +5095,7 @@ struct FramegenHistory_t
 	// delay a real frame); we just avoid reusing the slot until the read is done.
 	gamescope::Rc<CVulkanTexture> genReadA;
 	gamescope::Rc<CVulkanTexture> genReadB;
+	gamescope::Rc<CVulkanTexture> genReadReference;
 	uint64_t genReadSeqNo = 0;
 
 	// Generated frames waiting for their empty vblanks, presented front-first,
@@ -5225,6 +5270,90 @@ static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMax
 static bool framegen_format_supports_sampled_storage( uint32_t drmFormat );
 static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, const struct FrameInfo_t *pPresentFrameInfo );
 
+static const char *framegen_color_record_dir()
+{
+	static const char *s_pszDir = []() -> const char *
+	{
+		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RECORD_COLOR" );
+		return ( pszEnv != nullptr && *pszEnv != '\0' ) ? pszEnv : nullptr;
+	}();
+	return s_pszDir;
+}
+
+static uint32_t framegen_color_record_uint( const char *pszName, uint32_t uDefault, bool bAllowZero )
+{
+	const char *pszValue = getenv( pszName );
+	if ( pszValue == nullptr || *pszValue == '\0' )
+		return uDefault;
+
+	errno = 0;
+	char *pEnd = nullptr;
+	const unsigned long long ullValue = strtoull( pszValue, &pEnd, 10 );
+	if ( errno != 0 || pEnd == pszValue || *pEnd != '\0' || ullValue > UINT32_MAX
+		|| ( !bAllowZero && ullValue == 0 ) )
+	{
+		return uDefault;
+	}
+	return (uint32_t)ullValue;
+}
+
+static uint32_t framegen_color_record_max()
+{
+	// GSCF v2 stores three generated candidates plus the exact reference. Eight
+	// 1440p XB30 samples are already about 500 MiB (about 1 GiB at 4K), so keep
+	// the safe default deliberately small; explicit experiments may raise it.
+	static const uint32_t s_uMax = framegen_color_record_uint(
+		"GAMESCOPE_FRAMEGEN_RECORD_COLOR_MAX", 8u, false );
+	return s_uMax;
+}
+
+static uint32_t framegen_color_record_skip()
+{
+	static const uint32_t s_uSkip = framegen_color_record_uint(
+		"GAMESCOPE_FRAMEGEN_RECORD_COLOR_SKIP", 0u, true );
+	return s_uSkip;
+}
+
+static uint32_t framegen_color_record_span()
+{
+	// A span of N retains A and one exact reference until endpoint C arrives N
+	// real frames later. Two output-ring pins leave three rotating composite
+	// targets, so longer validation spans need no larger production ring.
+	static const uint32_t s_uSpan = std::clamp( framegen_color_record_uint(
+		"GAMESCOPE_FRAMEGEN_RECORD_COLOR_SPAN", 2u, false ), 2u, 16u );
+	return s_uSpan;
+}
+
+static uint32_t framegen_color_record_offset()
+{
+	static const uint32_t s_uOffset = []()
+	{
+		const uint32_t uSpan = framegen_color_record_span();
+		const uint32_t uOffset = framegen_color_record_uint(
+			"GAMESCOPE_FRAMEGEN_RECORD_COLOR_OFFSET", 1u, false );
+		return uOffset < uSpan ? uOffset : 1u;
+	}();
+	return s_uOffset;
+}
+
+static float framegen_color_record_phase_tolerance()
+{
+	// Frame-count spacing does not imply timestamp spacing when the source
+	// cadence jitters. Leave broad, measured-phase capture as the default, but
+	// let targeted sweeps reject intervals outside OFFSET/SPAN +/- tolerance.
+	static const float s_flTolerance = []()
+	{
+		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RECORD_COLOR_PHASE_TOLERANCE" );
+		if ( pszEnv == nullptr || *pszEnv == '\0' )
+			return 1.0f;
+		char *pEnd = nullptr;
+		const float fl = strtof( pszEnv, &pEnd );
+		return pEnd != pszEnv && *pEnd == '\0' && std::isfinite( fl )
+			? std::clamp( fl, 0.0f, 1.0f ) : 1.0f;
+	}();
+	return s_flTolerance;
+}
+
 // JIT phase (#06): plan one slot at a time against the display clock instead of
 // baking a k/gap batch from a single-interval guess. Requires the dedicated
 // framegen queue — the per-vblank submit cadence must never sit in front of a
@@ -5351,6 +5480,27 @@ static float framegen_bidir_phase_bias()
 	return s_flBias;
 }
 
+// Experimental occlusion-side authority for bidirectional interpolation. The
+// baseline warp already normalizes a one-sided field to the surviving gather,
+// but its final validity is phase-weighted and therefore dissolves much of that
+// valid gather back into the unwarped crossfade. This knob restores a bounded,
+// phase-aware amount of the surviving side only when the opposite direction is
+// clearly rejected. Zero leaves the established shader path exactly unchanged.
+static float framegen_bidir_one_sided_strength()
+{
+	static const float s_flStrength = []()
+	{
+		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION" );
+		if ( pszEnv == nullptr || *pszEnv == '\0' )
+			return 0.0f;
+		char *pEnd = nullptr;
+		const float fl = strtof( pszEnv, &pEnd );
+		return pEnd != pszEnv && *pEnd == '\0' && std::isfinite( fl )
+			? std::clamp( fl, 0.0f, 1.0f ) : 0.0f;
+	}();
+	return s_flStrength;
+}
+
 bool vulkan_framegen_bidir_active()
 {
 	return framegen_bidir_enabled()
@@ -5358,6 +5508,21 @@ bool vulkan_framegen_bidir_active()
 		&& !framegen_jit_enabled()
 		&& !vulkan_framegen_vrr_hybrid_requested()
 		&& !g_framegenHistory.bBaseLayer;
+}
+
+static bool framegen_color_probe_requested()
+{
+	return framegen_color_record_dir() != nullptr
+		&& g_device.hasFramegenQueue()
+		&& vulkan_framegen_bidir_active()
+		&& !framegen_base_layer_enabled()
+		&& !g_framegenHistory.bBaseLayer;
+}
+
+static bool framegen_color_probe_active()
+{
+	return framegen_color_probe_requested()
+		&& g_uFramegenColorRecordCount < framegen_color_record_max();
 }
 
 bool vulkan_framegen_is_enabled()
@@ -5507,6 +5672,13 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenMotion.uMotionHistoryFrameId = 0;
 	g_framegenMotion.uLumaReservoirFrameId[0] = 0;
 	g_framegenMotion.uLumaReservoirFrameId[1] = 0;
+	g_framegenColorProbe.anchor = nullptr;
+	g_framegenColorProbe.reference = nullptr;
+	g_framegenColorProbe.anchorId = 0;
+	g_framegenColorProbe.referenceId = 0;
+	g_framegenColorProbe.anchorTimeNs = 0;
+	g_framegenColorProbe.referenceTimeNs = 0;
+	g_framegenColorProbe.lastRealTimeNs = 0;
 	g_framegenHistory.pLastBaseTexture = nullptr;
 	// Release the retained output-ring slots so a ring rebuild is never blocked
 	// by history holding a reference to an old image, and so the next real frame
@@ -5526,6 +5698,7 @@ void vulkan_framegen_reset( const char *reason )
 	// health-checked served weights remain cached process-wide and seed the new
 	// state, so resize/format resets do not throw away in-session adaptation.
 	framegen_net_profile_flush();
+	framegen_color_probe_consume();
 
 	g_framegenHistory = {};
 	// The per-rung costs live on g_device and survive the history reset; forget
@@ -5536,6 +5709,7 @@ void vulkan_framegen_reset( const char *reason )
 	g_output.framegenOutputImages.clear();
 	g_output.framegenPresentImages.clear();
 	g_framegenMotion = {};
+	g_framegenColorProbe = {};
 }
 
 bool vulkan_framegen_has_pending_generated_frame()
@@ -5767,6 +5941,9 @@ static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> 
 	CVulkanTexture::createFlags createFlags;
 	createFlags.bFlippable = true;
 	createFlags.bStorage = true;
+	// An incompatible/ignored capture request must not alter production image
+	// usage or modifier selection. Only the active E2 path copies these images.
+	createFlags.bTransferSrc = framegen_color_probe_requested();
 	createFlags.bOutputImage = true;
 
 	*ppTexture = new CVulkanTexture();
@@ -6820,6 +6997,192 @@ static void framegen_record_consume()
 		framegen_record_release( "sample cap reached" );
 }
 
+static void framegen_color_probe_release( const char *pszReason )
+{
+	for ( auto &pReadback : g_framegenColorProbe.generatedReadback )
+		pReadback = nullptr;
+	g_framegenColorProbe.referenceReadback = nullptr;
+	g_framegenColorProbe.anchor = nullptr;
+	g_framegenColorProbe.reference = nullptr;
+	g_framegenColorProbe.lastRealTimeNs = 0;
+	g_framegenColorProbe.pendingSeqNo = 0;
+	g_framegenHistory.previousReal = nullptr;
+	g_framegenHistory.currentReal = nullptr;
+	g_framegenHistory.genReadA = nullptr;
+	g_framegenHistory.genReadB = nullptr;
+	g_framegenHistory.genReadReference = nullptr;
+	g_framegenHistory.genReadSeqNo = 0;
+	vk_log.infof( "framegen: full-colour held-out capture stopped (%s), readbacks released", pszReason );
+}
+
+static bool framegen_color_probe_prepare( uint32_t width, uint32_t height, uint32_t drmFormat, EOTF eotf )
+{
+	FramegenColorProbeResources_t &c = g_framegenColorProbe;
+	if ( c.referenceReadback != nullptr && c.width == width && c.height == height
+		&& c.drmFormat == drmFormat && c.eotf == eotf )
+	{
+		bool bComplete = true;
+		for ( const auto &pReadback : c.generatedReadback )
+			bComplete = bComplete && pReadback != nullptr;
+		if ( bComplete )
+			return true;
+	}
+
+	// A format transition cannot destroy staging images still owned by a GPU
+	// copy. The probe simply skips this triplet and retries after completion.
+	if ( c.pendingSeqNo != 0 && !g_device.hasCompletedFramegen( c.pendingSeqNo ) )
+		return false;
+
+	for ( auto &pReadback : c.generatedReadback )
+		pReadback = nullptr;
+	c.referenceReadback = nullptr;
+	c.width = width;
+	c.height = height;
+	c.drmFormat = drmFormat;
+	c.bytesPerPixel = DRMFormatGetBPP( drmFormat );
+	c.eotf = eotf;
+	const bool bSupportedFormat = drmFormat == DRM_FORMAT_ARGB8888
+		|| drmFormat == DRM_FORMAT_XRGB8888
+		|| drmFormat == DRM_FORMAT_ABGR8888
+		|| drmFormat == DRM_FORMAT_XBGR8888
+		|| drmFormat == DRM_FORMAT_ARGB2101010
+		|| drmFormat == DRM_FORMAT_XRGB2101010
+		|| drmFormat == DRM_FORMAT_ABGR2101010
+		|| drmFormat == DRM_FORMAT_XBGR2101010
+		|| drmFormat == DRM_FORMAT_ABGR16161616
+		|| drmFormat == DRM_FORMAT_XBGR16161616
+		|| drmFormat == DRM_FORMAT_ABGR16161616F
+		|| drmFormat == DRM_FORMAT_XBGR16161616F
+		|| drmFormat == DRM_FORMAT_ABGR32323232F;
+	if ( !bSupportedFormat || c.bytesPerPixel == 0 )
+		return false;
+
+	const auto makeReadback = [=]( gamescope::OwningRc<CVulkanTexture> *ppTex )
+	{
+		CVulkanTexture::createFlags flags;
+		flags.bMappable = true;
+		flags.bTransferDst = true;
+		*ppTex = new CVulkanTexture();
+		return ( *ppTex )->BInit( width, height, 1u, drmFormat, flags )
+			&& ( *ppTex )->mappedData() != nullptr;
+	};
+
+	bool bAllocated = true;
+	for ( auto &pReadback : c.generatedReadback )
+		bAllocated = bAllocated && makeReadback( &pReadback );
+	if ( !bAllocated || !makeReadback( &c.referenceReadback ) )
+	{
+		for ( auto &pReadback : c.generatedReadback )
+			pReadback = nullptr;
+		c.referenceReadback = nullptr;
+		return false;
+	}
+	return true;
+}
+
+// E2 CPU half. GSCF v2 stores the three paired full-resolution candidates and
+// their exact real reference. Rows are tightly repacked from the linear Vulkan
+// images; the evaluator interprets the recorded DRM fourcc and output EOTF.
+static void framegen_color_probe_consume()
+{
+	FramegenColorProbeResources_t &c = g_framegenColorProbe;
+	if ( c.pendingSeqNo == 0 || c.generatedReadback[ 0 ] == nullptr || c.referenceReadback == nullptr
+		|| !g_device.hasCompletedFramegen( c.pendingSeqNo ) )
+		return;
+
+	char szPath[ 1008 ];
+	char szTmp[ 1024 ];
+	if ( (size_t)snprintf( szPath, sizeof( szPath ), "%s/color_%06u.gscf",
+			framegen_color_record_dir(), g_uFramegenColorRecordCount ) >= sizeof( szPath )
+		|| (size_t)snprintf( szTmp, sizeof( szTmp ), "%s.tmp", szPath ) >= sizeof( szTmp ) )
+	{
+		g_uFramegenColorRecordCount = ~0u;
+		framegen_color_probe_release( "path too long" );
+		return;
+	}
+
+	FILE *pFile = fopen( szTmp, "wb" );
+	if ( pFile == nullptr )
+	{
+		vk_log.errorf( "framegen: full-colour capture can't write '%s' (%s)", szTmp, strerror( errno ) );
+		g_uFramegenColorRecordCount = ~0u;
+		framegen_color_probe_release( "write failure" );
+		return;
+	}
+
+	const uint32_t uHeader[ 12 ] = {
+		0x46435347u /* 'GSCF' */, 2u,
+		c.width, c.height, c.drmFormat, c.bytesPerPixel, (uint32_t)c.eotf,
+		3u /* flags: exact reference + paired candidates */, 4u /* planes */, 0u, 0u, 0u,
+	};
+	const uint64_t uMetadata[ 8 ] = {
+		c.pendingSeqNo, c.pendingAnchorId, c.pendingReferenceId, c.pendingEndpointId,
+		c.pendingAnchorTimeNs, c.pendingReferenceTimeNs, c.pendingEndpointTimeNs, 0u,
+	};
+	const float flMetadata[ 4 ] = {
+		c.pendingPhase,
+		k_flFramegenColorProbeStrengths[ 0 ],
+		k_flFramegenColorProbeStrengths[ 1 ],
+		k_flFramegenColorProbeStrengths[ 2 ],
+	};
+	bool bOk = fwrite( uHeader, sizeof( uHeader ), 1, pFile ) == 1
+		&& fwrite( uMetadata, sizeof( uMetadata ), 1, pFile ) == 1
+		&& fwrite( flMetadata, sizeof( flMetadata ), 1, pFile ) == 1;
+
+	const auto writePlane = [&]( CVulkanTexture *pTex )
+	{
+		const uint8_t *pData = pTex->mappedData();
+		const uint32_t uBytesPerRow = c.width * c.bytesPerPixel;
+		if ( pData == nullptr || pTex->rowPitch() < uBytesPerRow )
+			return false;
+		for ( uint32_t y = 0; bOk && y < c.height; y++ )
+			bOk = fwrite( pData + (size_t)y * pTex->rowPitch(), 1, uBytesPerRow, pFile ) == uBytesPerRow;
+		return bOk;
+	};
+	// Plane order is generated strength 0/0.5/1, then exact real reference.
+	for ( const auto &pReadback : c.generatedReadback )
+		bOk = bOk && writePlane( pReadback.get() );
+	bOk = bOk && writePlane( c.referenceReadback.get() );
+	bOk = ( fclose( pFile ) == 0 ) && bOk;
+	if ( bOk && rename( szTmp, szPath ) != 0 )
+		bOk = false;
+
+	if ( !bOk )
+	{
+		unlink( szTmp );
+		vk_log.errorf( "framegen: full-colour capture write failed at '%s' (%s)", szPath, strerror( errno ) );
+		g_uFramegenColorRecordCount = ~0u;
+		framegen_color_probe_release( "write failure" );
+		return;
+	}
+
+	c.pendingSeqNo = 0;
+	// The synchronous file write above can take multiple display intervals.
+	// Never reuse an anchor/reference timestamp captured before that stall: doing
+	// so silently moves a requested 1/6 probe toward the midpoint. The GPU batch
+	// is complete here, so every read/input pin can be released and the next real
+	// frame starts a fresh, uncontaminated held-out sequence.
+	c.anchor = nullptr;
+	c.reference = nullptr;
+	c.anchorId = 0;
+	c.referenceId = 0;
+	c.anchorTimeNs = 0;
+	c.referenceTimeNs = 0;
+	c.lastRealTimeNs = 0;
+	g_framegenHistory.previousReal = nullptr;
+	g_framegenHistory.currentReal = nullptr;
+	g_framegenHistory.genReadA = nullptr;
+	g_framegenHistory.genReadB = nullptr;
+	g_framegenHistory.genReadReference = nullptr;
+	g_framegenHistory.genReadSeqNo = 0;
+	if ( g_uFramegenColorRecordCount == 0 )
+		vk_log.infof( "framegen: full-colour held-out capture writing %ux%u paired-candidate GSCF samples to '%s'",
+			c.width, c.height, framegen_color_record_dir() );
+	g_uFramegenColorRecordCount++;
+	if ( g_uFramegenColorRecordCount >= framegen_color_record_max() )
+		framegen_color_probe_release( "sample cap reached" );
+}
+
 // Common sampler binding for the motion passes' non-sRGB intermediates (luma
 // levels and motion fields).
 static void framegen_motion_bind_sampler( CVulkanCmdBuffer *pCmdBuffer, uint32_t nSlot, gamescope::Rc<CVulkanTexture> pTexture, bool bNearest )
@@ -7654,7 +8017,7 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 // field) and blend by confidence x phase proximity; pixels neither direction
 // can vouch for degrade to a phase-correct crossfade inside the shader.
 static void framegen_bidir_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::Rc<CVulkanTexture> &pTarget,
-	float flPhase, GamescopeFramegenQuality eQuality )
+	float flPhase, GamescopeFramegenQuality eQuality, float flOneSidedOverride = -1.0f )
 {
 	const uint32_t pg = 8;
 
@@ -7677,9 +8040,13 @@ static void framegen_bidir_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamesc
 	pCmdBuffer->setSamplerUnnormalized( 3, false );
 	pCmdBuffer->setSamplerNearest( 3, false );
 	const bool bAgree = framegen_agreement_enabled( eQuality );
+	const float flOneSidedStrength = flOneSidedOverride >= 0.0f
+		? std::clamp( flOneSidedOverride, 0.0f, 1.0f )
+		: framegen_bidir_one_sided_strength();
 	pCmdBuffer->pushConstants<FramegenMotionBidirPush_t>( flPhase, (float)k_uFramegenMotionDownscale,
 		bAgree ? framegen_effective_agree_lo( eQuality ) : 1e5f,
-		bAgree ? framegen_effective_agree_hi( eQuality ) : 1e6f );
+		bAgree ? framegen_effective_agree_hi( eQuality ) : 1e6f,
+		flOneSidedStrength );
 	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pg ), div_roundup( pTarget->height(), pg ) );
 }
 
@@ -7693,7 +8060,19 @@ struct FramegenSlotRequest_t
 	uint32_t slotIndex;
 };
 
-static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending )
+struct FramegenColorProbeRequest_t
+{
+	gamescope::Rc<CVulkanTexture> reference;
+	EOTF eotf;
+	uint64_t anchorId;
+	uint64_t referenceId;
+	uint64_t endpointId;
+	uint64_t anchorTimeNs;
+	uint64_t referenceTimeNs;
+	uint64_t endpointTimeNs;
+};
+
+static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr )
 {
 	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0 )
 		return false;
@@ -7704,6 +8083,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// Stage C dataset capture: flush the previous batch's training tensors
 	// under the same completion gate.
 	framegen_record_consume();
+	framegen_color_probe_consume();
 	// C2 online learning: persist the last profile snapshot, if one completed.
 	framegen_net_profile_consume();
 
@@ -7728,6 +8108,12 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 
 	if ( slots.empty() )
 		return false;
+	if ( pColorProbe != nullptr
+		&& ( slots.size() != k_uFramegenColorProbeCandidates
+			|| pColorProbe->reference == nullptr
+			|| !framegen_color_probe_prepare( slots[ 0 ].tex->width(), slots[ 0 ].tex->height(),
+				slots[ 0 ].tex->drmFormat(), pColorProbe->eotf ) ) )
+		return false;
 
 	// Record the whole interval's generation into ONE command buffer submitted
 	// once: the shared motion intermediates are serialized by the per-command-
@@ -7748,6 +8134,11 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	const bool bMotion = eff.mode == GamescopeFramegenMode::Motion
 		&& dispatch.motionSupported
 		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(), g_framegenHistory.currentReal->height(), dispatch, eff.quality );
+	// Held-out E2 samples grade the actual motion path, not its allocation or
+	// capability fallback. A failed motion setup drops the sample and leaves all
+	// real-frame presentation untouched.
+	if ( pColorProbe != nullptr && !bMotion )
+		return false;
 
 	const bool bBidir = vulkan_framegen_bidir_active();
 
@@ -7777,17 +8168,21 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// before Adam sees it. Same-batch inference still used the pre-step weights;
 	// the optimizer publishes only for the next batch. When adaptation is
 	// explicitly disabled, training retains its previous unguarded behavior.
-	const bool bNetStateReadback = g_framegenMotion.bNetActive && framegen_net_online_enabled()
+	const bool bNetStateReadback = pColorProbe == nullptr
+		&& g_framegenMotion.bNetActive && framegen_net_online_enabled()
 		&& framegen_record_net_train( pCmdBuffer.get(), eff.quality, bAdaptProbe );
 	if ( bMotion )
 	{
 		// Each warp reads the shared motion field(s) and history; keep per-slot.
 		// Bidir slots interpolate at their exact phase (no user-strength scaling
 		// — the phase IS the temporal placement between the two real frames).
-		for ( const SlotPlan_t &slot : slots )
+		for ( size_t i = 0; i < slots.size(); i++ )
 		{
+			const SlotPlan_t &slot = slots[ i ];
 			if ( bBidir )
-				framegen_bidir_warp_slot( pCmdBuffer.get(), slot.tex, std::clamp( slot.phase, 0.0f, 1.0f ), eff.quality );
+				framegen_bidir_warp_slot( pCmdBuffer.get(), slot.tex, std::clamp( slot.phase, 0.0f, 1.0f ), eff.quality,
+					pColorProbe != nullptr && i < k_uFramegenColorProbeCandidates
+						? k_flFramegenColorProbeStrengths[ i ] : -1.0f );
 			else
 				framegen_warp_slot( pCmdBuffer.get(), slot.tex, slot.strength, eff.quality );
 		}
@@ -7858,12 +8253,23 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	}
 
 	g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
+	if ( pColorProbe != nullptr )
+	{
+		// Readback copies deliberately sit after the end timestamp: E2 measures
+		// algorithm cost, not capture-tool traffic. The submission completion still
+		// covers the copies, so mapped memory is never consumed early.
+		for ( uint32_t i = 0; i < k_uFramegenColorProbeCandidates; i++ )
+			pCmdBuffer->copyImage( slots[ i ].tex, g_framegenColorProbe.generatedReadback[ i ] );
+		pCmdBuffer->copyImage( pColorProbe->reference, g_framegenColorProbe.referenceReadback );
+	}
 	// Attribute this batch's measured cost to the rung and generated-count it ran
 	// at; batch cost scales with slot count, especially x3/x4 extrapolate pairs.
 	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, (uint32_t)slots.size() );
 
 	for ( const SlotPlan_t &slot : slots )
 	{
+		if ( pColorProbe != nullptr )
+			break;
 		FramegenHistory_t::PendingGenerated_t entry;
 		entry.tex = slot.tex;
 		entry.seqNo = ulSeqNo;
@@ -7881,14 +8287,28 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		g_framegenHistory.ulNetRecordSeqNo = ulSeqNo;
 	if ( bNetStateReadback )
 		g_framegenHistory.ulNetProfileSeqNo = ulSeqNo;
+	if ( pColorProbe != nullptr )
+	{
+		FramegenColorProbeResources_t &c = g_framegenColorProbe;
+		c.pendingSeqNo = ulSeqNo;
+		c.pendingAnchorId = pColorProbe->anchorId;
+		c.pendingReferenceId = pColorProbe->referenceId;
+		c.pendingEndpointId = pColorProbe->endpointId;
+		c.pendingAnchorTimeNs = pColorProbe->anchorTimeNs;
+		c.pendingReferenceTimeNs = pColorProbe->referenceTimeNs;
+		c.pendingEndpointTimeNs = pColorProbe->endpointTimeNs;
+		c.pendingPhase = slots[ 0 ].phase;
+	}
 
 	// Pin this batch's input slots until it finishes reading them, so a later
 	// composite can't reuse a slot the framegen queue is still sampling even
 	// after history is invalidated. The oversubscription guard admits only one
 	// batch at a time, so these always match the current (previousReal,
-	// currentReal) while incomplete — at most two slots are ever pinned.
+	// currentReal) while incomplete. E2 additionally pins its exact held-out
+	// reference, for a maximum of three slots only in capture mode.
 	g_framegenHistory.genReadA = g_framegenHistory.previousReal;
 	g_framegenHistory.genReadB = g_framegenHistory.currentReal;
+	g_framegenHistory.genReadReference = pColorProbe != nullptr ? pColorProbe->reference : nullptr;
 	g_framegenHistory.genReadSeqNo = ulSeqNo;
 
 	const uint32_t nGeneratedCount = (uint32_t)slots.size();
@@ -7896,7 +8316,8 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	static uint64_t s_uGeneratedDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uGeneratedDebugLogCounter ) )
 	{
-		vk_log.infof( "framegen: generated %u frame(s) for real id=%" PRIu64 " gapVblanks=%u mode=%s/%s(x%u) degrade=%u/%u gpu=%.2fms queue family %u",
+		vk_log.infof( "framegen: %s %u frame(s) for real id=%" PRIu64 " gapVblanks=%u mode=%s/%s(x%u) degrade=%u/%u gpu=%.2fms queue family %u",
+			pColorProbe != nullptr ? "captured held-out" : "generated",
 			nGeneratedCount,
 			g_framegenHistory.currentFrameId,
 			nGapVblanks,
@@ -7914,7 +8335,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// a repaint here would present the prediction on the very next wake —
 	// immediately after the real frame — collapsing the midpoint spacing to
 	// ~zero. The timer wake is the (only) present trigger in that mode.
-	if ( !vulkan_framegen_vrr_hybrid_active() )
+	if ( pColorProbe == nullptr && !vulkan_framegen_vrr_hybrid_active() )
 		force_repaint();
 	return true;
 }
@@ -8390,6 +8811,175 @@ void vulkan_framegen_benchmark()
 	printf( "\n" );
 }
 
+// Gap E2 held-out capture. Real frames still scan out normally. For each A/B/C
+// sequence (consecutive by default, configurable offset/span), B is retained as
+// ground truth but deliberately omitted from motion history; three invisible
+// slots are generated at B's measured temporal phase from A/C with paired
+// occlusion strengths, copied beside B, and never enter the pending queue.
+static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRealFrame,
+	const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo )
+{
+	if ( framegen_color_record_dir() == nullptr )
+		return false;
+	if ( !framegen_color_probe_requested() )
+		return false;
+
+	framegen_color_probe_consume();
+	if ( !framegen_color_probe_active() )
+		return true;
+
+	if ( !framegen_ensure_resources( pRealFrame->width(), pRealFrame->height(), pRealFrame->drmFormat(), false ) )
+		return true;
+
+	FramegenColorProbeResources_t &c = g_framegenColorProbe;
+	const uint64_t uFrameId = ++c.nextRealId;
+	const uint64_t ulNowNs = get_time_in_nanos();
+	if ( uFrameId <= framegen_color_record_skip() )
+	{
+		c.anchor = nullptr;
+		c.reference = nullptr;
+		c.lastRealTimeNs = 0;
+		g_framegenHistory.previousReal = nullptr;
+		g_framegenHistory.currentReal = nullptr;
+		return true;
+	}
+
+	const auto reseed = [&]()
+	{
+		c.anchor = pRealFrame;
+		c.reference = nullptr;
+		c.anchorId = uFrameId;
+		c.referenceId = 0;
+		c.anchorTimeNs = ulNowNs;
+		c.referenceTimeNs = 0;
+		c.lastRealTimeNs = ulNowNs;
+		c.eotf = pFrameInfo->outputEncodingEOTF;
+		g_framegenHistory.previousReal = nullptr;
+		g_framegenHistory.currentReal = pRealFrame;
+		g_framegenHistory.previousFrameId = 0;
+		g_framegenHistory.currentFrameId = uFrameId;
+	};
+
+	if ( c.anchor == nullptr )
+	{
+		reseed();
+		return true;
+	}
+
+	const bool bSequenceMismatch = c.anchor->width() != pRealFrame->width()
+		|| c.anchor->height() != pRealFrame->height()
+		|| c.anchor->drmFormat() != pRealFrame->drmFormat()
+		|| c.eotf != pFrameInfo->outputEncodingEOTF
+		|| ulNowNs <= c.lastRealTimeNs
+		|| ulNowNs - c.lastRealTimeNs > k_ulFramegenMaxRealFrameGapNs;
+	if ( bSequenceMismatch )
+	{
+		reseed();
+		return true;
+	}
+
+	// Never queue a second capture behind an unfinished one. Skipping this real
+	// frame starts a fresh held-out sequence; the submitted command owns its old
+	// inputs/readbacks, while genReadA/B/reference keep the output-ring slots
+	// immutable until completion.
+	if ( c.pendingSeqNo != 0 && !g_device.hasCompletedFramegen( c.pendingSeqNo ) )
+	{
+		reseed();
+		return true;
+	}
+
+	const uint64_t uSequenceOffset = uFrameId - c.anchorId;
+	const uint32_t uReferenceOffset = framegen_color_record_offset();
+	const uint32_t uEndpointOffset = framegen_color_record_span();
+
+	if ( c.reference == nullptr )
+	{
+		if ( uSequenceOffset < uReferenceOffset )
+		{
+			c.lastRealTimeNs = ulNowNs;
+			return true;
+		}
+		if ( uSequenceOffset != uReferenceOffset )
+		{
+			reseed();
+			return true;
+		}
+		c.reference = pRealFrame;
+		c.referenceId = uFrameId;
+		c.referenceTimeNs = ulNowNs;
+		c.lastRealTimeNs = ulNowNs;
+		return true;
+	}
+
+	if ( uSequenceOffset < uEndpointOffset )
+	{
+		c.lastRealTimeNs = ulNowNs;
+		return true;
+	}
+	if ( uSequenceOffset != uEndpointOffset )
+	{
+		reseed();
+		return true;
+	}
+
+	const uint64_t ulSpanNs = ulNowNs - c.anchorTimeNs;
+	const float flPhase = (float)( c.referenceTimeNs - c.anchorTimeNs ) / (float)ulSpanNs;
+	const float flTargetPhase = (float)uReferenceOffset / (float)uEndpointOffset;
+	if ( !std::isfinite( flPhase ) || flPhase <= 0.05f || flPhase >= 0.95f
+		|| std::abs( flPhase - flTargetPhase ) > framegen_color_record_phase_tolerance() )
+	{
+		reseed();
+		return true;
+	}
+
+	gamescope::Rc<CVulkanTexture> pAnchor = c.anchor;
+	gamescope::Rc<CVulkanTexture> pReference = c.reference;
+	const uint64_t uAnchorId = c.anchorId;
+	const uint64_t uReferenceId = c.referenceId;
+	const uint64_t ulAnchorTimeNs = c.anchorTimeNs;
+	const uint64_t ulReferenceTimeNs = c.referenceTimeNs;
+
+	g_framegenHistory.pending.clear();
+	g_framegenHistory.previousReal = pAnchor;
+	g_framegenHistory.currentReal = pRealFrame;
+	g_framegenHistory.previousFrameId = uAnchorId;
+	g_framegenHistory.currentFrameId = uFrameId;
+	g_framegenHistory.previousPresentTimeNs = ulAnchorTimeNs;
+	g_framegenHistory.currentPresentTimeNs = ulNowNs;
+	g_framegenHistory.lastCompositeSeqNo = ulCompositeSeqNo;
+	g_framegenHistory.nLastGeneratedSlot = 0;
+	g_framegenHistory.nLastGenerationGapVblanks = 0;
+
+	const FramegenEffective_t eff = {
+		.mode = GamescopeFramegenMode::Motion,
+		.multiplier = 4u,
+		.quality = g_eFramegenQuality,
+	};
+	FramegenSlotRequest_t slots[ k_uFramegenColorProbeCandidates ];
+	for ( uint32_t i = 0; i < k_uFramegenColorProbeCandidates; i++ )
+		slots[ i ] = { .phase = flPhase, .strength = flPhase, .slotIndex = i + 1u };
+	const FramegenColorProbeRequest_t probe = {
+		.reference = pReference,
+		.eotf = pFrameInfo->outputEncodingEOTF,
+		.anchorId = uAnchorId,
+		.referenceId = uReferenceId,
+		.endpointId = uFrameId,
+		.anchorTimeNs = ulAnchorTimeNs,
+		.referenceTimeNs = ulReferenceTimeNs,
+		.endpointTimeNs = ulNowNs,
+	};
+	const bool bSubmitted = framegen_submit_planned( slots, k_uFramegenColorProbeCandidates, 2u, eff,
+		ulCompositeSeqNo, framegen_max_degrade_steps(), false, &probe );
+	if ( !bSubmitted && g_bFramegenDebug )
+		vk_log.infof( "framegen: held-out colour probe dropped (motion/capture resources unavailable)" );
+
+	// C is a provisional next anchor. In-flight sampling is protected by
+	// genReadA/B/reference; after the synchronous file write, consume() clears
+	// this timestamp so storage latency cannot contaminate the next interval.
+	reseed();
+	return true;
+}
+
 static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo )
 {
 	if ( !vulkan_framegen_is_enabled() || !pRealFrame || !pFrameInfo )
@@ -8424,6 +9014,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				if ( framegen_bidir_phase_bias() > 0.0f )
 					vk_log.infof( "framegen: experimental bidir phase bias %.2f — low-latency queue timing preserved; generated phases move partially from k/gap toward uniform multiplier spacing",
 						framegen_bidir_phase_bias() );
+				if ( framegen_bidir_one_sided_strength() > 0.0f )
+					vk_log.infof( "framegen: experimental bidir one-sided occlusion authority %.2f — strongly asymmetric checked fields retain more of the surviving warped side without changing both-valid or both-killed fallback",
+						framegen_bidir_one_sided_strength() );
 			}
 			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Low )
 				vk_log.infof( "framegen: low quality — forward matcher + constant-velocity warp only" );
@@ -8469,6 +9062,17 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			}
 			if ( framegen_record_dir() != nullptr )
 				vk_log.infof( "framegen: dataset capture requested — writing up to %u field-res training samples to '%s'", framegen_record_max(), framegen_record_dir() );
+			if ( framegen_color_record_dir() != nullptr )
+			{
+				if ( framegen_color_probe_requested() )
+				{
+					vk_log.infof( "framegen: full-colour held-out validation active (E2) — A/B/C sequences offset=%u span=%u phaseTolerance=%.3f produce paired invisible B predictions (occlusion 0/0.5/1) on the dedicated queue; generated frames never present; synchronous GSCF writes can perturb capture cadence; up to %u samples write to '%s'",
+						framegen_color_record_offset(), framegen_color_record_span(),
+						framegen_color_record_phase_tolerance(), framegen_color_record_max(), framegen_color_record_dir() );
+				}
+				else
+					vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_RECORD_COLOR ignored (requires motion+bidir, dedicated framegen queue, and base-layer mode off)" );
+			}
 		}
 		g_bLoggedFramegenConfig = true;
 	}
@@ -8488,6 +9092,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		return;
 	}
 	g_framegenHistory.pLastBaseTexture = pBaseTexture;
+	if ( framegen_record_color_probe_real( pRealFrame, pFrameInfo, ulCompositeSeqNo ) )
+		return;
 
 	// #02 dispatcher: decide per recorded frame whether the base-layer path
 	// applies. History then tracks the pre-upscale game buffer instead of the
@@ -8842,33 +9448,45 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	if ( bBidir )
 	{
 		// The interpolations lead INTO this real frame on the delayed timeline;
-		// nothing pending is stale (older entries precede these chronologically),
-		// so the queue is appended to, never cleared. If the game outran the
-		// one-flip-per-vblank drain (a mis-measured gap), shed the oldest
-		// interpolations — never a queued real frame — before adding more.
+		// queued REAL entries must stay ordered, but an interpolation becomes a
+		// latency liability once the game outruns the one-flip-per-vblank drain.
+		// Reserve room for this batch AND its real endpoint before appending: the
+		// old check ran against the pre-append size, so a nominal cap of 10 could
+		// repeatedly reach 14 with an x4 batch. Shed oldest predictions first,
+		// never real frames; if real backlog alone consumes the budget, admit fewer
+		// new interpolations and let the timeline catch up.
 		const size_t uMaxPending = (size_t)( 2u * ( eff.multiplier + 1u ) );
-		if ( g_framegenHistory.pending.size() > uMaxPending )
+		const uint32_t nRequested = nGenerate;
+		const size_t uDesiredOldMax = uMaxPending > (size_t)nGenerate + 1u
+			? uMaxPending - (size_t)nGenerate - 1u : 0u;
+		size_t uShed = 0;
+		for ( auto it = g_framegenHistory.pending.begin();
+			g_framegenHistory.pending.size() > uDesiredOldMax && it != g_framegenHistory.pending.end(); )
 		{
-			size_t uShed = 0;
-			for ( auto it = g_framegenHistory.pending.begin();
-				g_framegenHistory.pending.size() > uMaxPending && it != g_framegenHistory.pending.end(); )
+			if ( !it->bReal )
 			{
-				if ( !it->bReal )
-				{
-					it = g_framegenHistory.pending.erase( it );
-					uShed++;
-				}
-				else
-				{
-					++it;
-				}
+				it = g_framegenHistory.pending.erase( it );
+				uShed++;
 			}
-			static uint64_t s_uOverflowDebugLogCounter = 0;
-			if ( uShed > 0 && FramegenDebugShouldLog( s_uOverflowDebugLogCounter ) )
-				vk_log.infof( "framegen: bidir queue overflow, shed %zu interpolation(s)", uShed );
+			else
+			{
+				++it;
+			}
+		}
+		const size_t uReservedForReal = g_framegenHistory.pending.size() < uMaxPending
+			? 1u : 0u;
+		const size_t uAvailableGenerated = uMaxPending - std::min( uMaxPending,
+			g_framegenHistory.pending.size() + uReservedForReal );
+		nGenerate = std::min<uint32_t>( nGenerate, (uint32_t)uAvailableGenerated );
+		static uint64_t s_uOverflowDebugLogCounter = 0;
+		if ( ( uShed > 0 || nGenerate != nRequested ) && FramegenDebugShouldLog( s_uOverflowDebugLogCounter ) )
+		{
+			vk_log.infof( "framegen: bidir queue pressure pending=%zu/%zu shed=%zu admitted=%u/%u",
+				g_framegenHistory.pending.size(), uMaxPending, uShed, nGenerate, nRequested );
 		}
 
-		framegen_submit_batch( 1, nGapVblanks, nGenerate, eff, ulCompositeSeqNo, nMaxDegradeSteps, false );
+		if ( nGenerate > 0 )
+			framegen_submit_batch( 1, nGapVblanks, nGenerate, eff, ulCompositeSeqNo, nMaxDegradeSteps, false );
 
 		// Queue the real frame itself behind its interpolations. Its composite
 		// rides the realtime queue (seqNo 0 on the framegen timeline = always
@@ -9206,15 +9824,20 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		// A slot an in-flight batch is still sampling (genReadA/genReadB) is
 		// pinned the same way until that batch signals genReadSeqNo, covering the
 		// window where history has been invalidated but the read is still running.
-		// At most two slots are pinned in a >=5 ring, so a free slot always
-		// exists; the bound guards against spinning if that ever changed. When
-		// framegen is off every pointer is null and this is the old advance.
+		// Normal generation pins at most two slots. The opt-in E2 held-out probe
+		// temporarily pins A/B/C, still leaving two slots in the five-image ring;
+		// the bound guards against spinning if that ever changes. When framegen is
+		// off every pointer is null and this is the old advance.
 		const CVulkanTexture *pCur = g_framegenHistory.currentReal.get();
 		const CVulkanTexture *pPrev = g_framegenHistory.previousReal.get();
 		const bool bGenReadInFlight = g_framegenHistory.genReadSeqNo != 0
 			&& !g_device.hasCompletedFramegen( g_framegenHistory.genReadSeqNo );
 		const CVulkanTexture *pReadA = bGenReadInFlight ? g_framegenHistory.genReadA.get() : nullptr;
 		const CVulkanTexture *pReadB = bGenReadInFlight ? g_framegenHistory.genReadB.get() : nullptr;
+		const CVulkanTexture *pReadReference = bGenReadInFlight ? g_framegenHistory.genReadReference.get() : nullptr;
+		// E2's held-out middle frame must also stay immutable while it waits for
+		// the third real frame that closes the A/B/C probe interval.
+		const CVulkanTexture *pProbeReference = g_framegenColorProbe.reference.get();
 		// Bidir (B3): a real frame queued for a delayed flip references a ring
 		// slot too; recompositing into it before it scans out would tear the
 		// frame the user is about to see. In steady state it aliases
@@ -9229,10 +9852,11 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			}
 			return false;
 		};
-		for ( uint32_t i = 0; ( pCur || pPrev || pReadA || pReadB || !g_framegenHistory.pending.empty() ) && i < nRing; i++ )
+		for ( uint32_t i = 0; ( pCur || pPrev || pReadA || pReadB || pReadReference || pProbeReference || !g_framegenHistory.pending.empty() ) && i < nRing; i++ )
 		{
 			const CVulkanTexture *pSlot = g_output.outputImages[ nNext ].get();
-			if ( pSlot != pCur && pSlot != pPrev && pSlot != pReadA && pSlot != pReadB && !fnPinnedByQueuedReal( pSlot ) )
+			if ( pSlot != pCur && pSlot != pPrev && pSlot != pReadA && pSlot != pReadB
+				&& pSlot != pReadReference && pSlot != pProbeReference && !fnPinnedByQueuedReal( pSlot ) )
 				break;
 			nNext = ( nNext + 1 ) % nRing;
 		}

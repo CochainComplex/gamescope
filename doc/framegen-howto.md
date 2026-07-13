@@ -199,6 +199,11 @@ not run in this mode; bidirectional interpolation uses two checked endpoint
 fields instead. `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS=0.25` is an experimental
 compromise for low-source-rate A/B: it slightly evens generated phase spacing
 without adding flip latency. The default `0` is the established sharp/snappy path.
+`GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0.5` is a separate experimental edge A/B:
+it lets a clearly surviving checked side retain slightly more authority instead
+of dissolving into the unwarped crossfade. It changes neither motion fields nor
+queue/flip timing, and defaults to `0` because the measured spatial gain is small
+and still needs broad live validation.
 
 ### d) Base-layer — fixes blurry menus / HUD
 ```bash

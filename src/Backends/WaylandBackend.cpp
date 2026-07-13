@@ -1103,7 +1103,8 @@ namespace gamescope
             // a scanout-ready output-sized image in both modes.
             if ( gamescope::Rc<CVulkanTexture> pGeneratedFrame = vulkan_framegen_consume_generated_frame( pFrameInfo ) )
             {
-                if ( g_bFramegenDebug )
+                static uint64_t s_uGeneratedPresentDebugLogCounter = 0;
+                if ( FramegenDebugShouldLog( s_uGeneratedPresentDebugLogCounter ) )
                     xdg_log.infof( "framegen: Wayland presenting generated frame" );
 
                 FrameInfo_t::Layer_t compositeLayer{};

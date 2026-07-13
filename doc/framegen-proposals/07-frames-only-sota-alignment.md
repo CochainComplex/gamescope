@@ -1,9 +1,9 @@
 # 07 — Frames-only SOTA alignment: what we have, what's missing
 
-Status: **design map / gap analysis**; Gaps E1, B, bounded frames-only A, and a
+Status: **design map / gap analysis**; Gaps E1/E2, B, bounded frames-only A, and a
 bounded frames-only form of D implemented (`scripts/framegen-net-eval.py`, the
-B4 GPU scene-cut guard, the Extreme disocclusion reservoir, the causal
-shading-persistence head, and the conservative bidir ML authority boundary). Maps
+B4 GPU scene-cut guard, the E2 paired full-colour probe/evaluator, the Extreme
+disocclusion reservoir, the causal shading-persistence head, and the conservative bidir ML authority boundary). Maps
 [`../research-framegen.md`](../research-framegen.md) onto the shipped pipeline and
 proposals #01–#06, then sketches the genuine gaps that are worth building.
 
@@ -56,13 +56,29 @@ existing captures. This splits Gap E honestly:
   reuses the trainer's verified GSFD parser and net so the two never drift; a
   zero-head blob reproduces the neutral metrics exactly (its correctness oracle).
   numpy-only, CPU, zero runtime cost, no HDR/ladder impact.
-- **E2 — follow-up (needs a small capture extension).** True colour-domain
-  LPIPS/DISTS/FvVDP require dumping generated + ground-truth **full-res colour**
-  pairs (a new `RECORD` mode in `rendervulkan.cpp`). The evaluator would then
-  grow an optional metric path (torch/LPIPS if importable, graceful otherwise).
+- **E2 — implemented** (`GAMESCOPE_FRAMEGEN_RECORD_COLOR`,
+  `scripts/framegen-color-eval.py`). Three real frames A/B/C present normally;
+  B is retained as exact ground truth but omitted from the estimator. One shared
+  A/C motion field renders B at its measured phase with paired one-sided
+  occlusion strengths 0/0.5/1 in a single GPU batch. The three invisible
+  predictions plus exact full-resolution B form GSCF v2; no prediction reaches
+  the present FIFO and online weight updates are disabled during the probe.
+  The numpy core reports colour MAE/bad/PSNR, luma SSIM, edge error, paired wins,
+  and temporal residual change; optional torch/LPIPS fails gracefully when
+  unavailable. Core metrics grade captured code values and report EOTF without
+  inventing a display transform. DISTS/FvVDP remain external metric additions, not capture gaps.
+  Readback copies sit after the algorithm timestamp. Synchronous host writes can
+  perturb real-only capture cadence, so E2 is explicitly not a pacing benchmark.
+  Configurable endpoint span/reference offset preserve the same three-slot pin
+  proof while covering early live phases. Frame count is not a timestamp
+  guarantee under uneven source cadence, so every sample records and renders at
+  its measured phase; `SPAN=6 OFFSET=1 PHASE_TOLERANCE=0.05` restricts a targeted
+  sweep to `1/6 +/- 0.05` instead of extrapolating a midpoint result to the
+  low-source-rate x4 regime. Each synchronous write resets the logical sequence
+  before capture resumes, preventing storage latency from skewing the next span.
 
-E1 already **unblocks measuring** the other gaps structurally; E2 is what lets us
-grade the final colour frame the way the literature does.
+E1 grades estimator structure; E2 now grades the final colour frame against a
+real hidden intermediate without relying on non-repeatable cross-run captures.
 
 ### Gap B — Content-based scene-cut detection · implemented
 The B4 probe now accumulates four-bin luminance histograms for both real frames
@@ -129,8 +145,8 @@ was removed. A single global translation is not a reliable substitute for
 local motion under parallax, rotation, acceleration, particles, disocclusion,
 or independently moving layers, and applying the same prior to forward and
 reverse matching can correlate errors that the FB check is meant to reject.
-Do not reintroduce this path without E2 full-color temporal metrics and an
-independent validation signal that cannot reinforce the proposal it grades.
+Do not reintroduce this path unless paired E2 full-colour results improve and an
+independent validation signal cannot reinforce the proposal it grades.
 
 ### Corrected contract — bidirectional ML is a confidence veto
 The learned flow head had the same validation circularity in a subtler form.
@@ -200,8 +216,9 @@ both supervision and correction for isolated A/B.
 
 This is deliberately below a full SCN: no output-resolution feature network,
 no invented color, and no claim that it can handle arbitrary view-dependent
-effects. E2 full-color capture and LPIPS/DISTS/FvVDP remain required to tune and
-validate the final color result perceptually. The bounded form preserves the
+effects. E2 full-colour capture is now present; LPIPS can be run optionally,
+while DISTS/FvVDP and broader content coverage remain required before promoting
+the shading correction. The bounded form preserves the
 split-net cost model and degradation safety while providing a causal mechanism
 for persistent lighting/color trends.
 
@@ -239,9 +256,10 @@ for persistent lighting/color trends.
 
 ## Recommended order
 
-`E → B → A → D`. **E1, B, bounded frames-only A, and bounded frames-only D are
-done**; E2 (colour-frame capture) is the next measurement step, while a full
-feature-domain SCN remains the long-horizon ceiling. #03 stays a baseline.
+`E → B → A → D`. **E1/E2, B, bounded frames-only A, and bounded frames-only D
+are done**; broad E2 corpus capture plus external DISTS/FvVDP grading is the next
+measurement step, while a full feature-domain SCN remains the long-horizon
+ceiling. #03 stays a baseline.
 
 ## Cross-check provenance (2026-07-11)
 

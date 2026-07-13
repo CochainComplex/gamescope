@@ -32,6 +32,13 @@ uniform motion_bidir_t {
     // crossfade fallback instead.
     float u_agreeLo;
     float u_agreeHi;
+    // Opt-in correction for a clear occlusion side: 0 is the exact established
+    // phase-weighted validity, 1 restores a bounded amount of the confidently
+    // surviving gather. Both-valid and both-invalid pixels are unaffected.
+    float u_oneSidedStrength;
+    float u_pad0;
+    float u_pad1;
+    float u_pad2;
 };
 
 // s_samplers[0] = previousReal, [1] = currentReal,
@@ -102,6 +109,24 @@ void main() {
 
     float validity = clamp(wSum, 0.0f, 1.0f)
         * (1.0f - mixedness * smoothstep(u_agreeLo, u_agreeHi, disagree / max(1.0f, mx)));
+
+    if (u_oneSidedStrength > 0.0f) {
+        float strongConf = max(confF, confR);
+        float weakConf = min(confF, confR);
+        // Continuous authority gate: no hard tile boundary, no global-camera
+        // assumption, and no confidence manufacture when neither field is good.
+        float oneSided = smoothstep(0.45f, 0.75f, strongConf)
+            * (1.0f - smoothstep(0.08f, 0.25f, weakConf));
+
+        // sqrt keeps endpoint continuity (support is still zero at the endpoint
+        // that cannot contain this side) while reducing the mid-interval return
+        // to the unwarped crossfade. This avoids revealing a disocclusion at full
+        // strength for the whole interval, which would trade smear for popping.
+        float sidePhase = confF >= confR ? t : (1.0f - t);
+        float oneSidedValidity = strongConf * sqrt(max(sidePhase, 0.0f));
+        float boostedValidity = max(validity, oneSidedValidity);
+        validity = mix(validity, boostedValidity, u_oneSidedStrength * oneSided);
+    }
 
     imageStore(dst, coord, mix(crossfade, warped, validity));
 }

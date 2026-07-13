@@ -40,6 +40,10 @@ _gamescope_env_prepend LD_LIBRARY_PATH "$GAMESCOPE_LOCAL_PREFIX/lib"
 _gamescope_env_prepend LD_LIBRARY_PATH "$GAMESCOPE_LOCAL_PREFIX/lib/x86_64-linux-gnu"
 
 _gamescope_env_prepend PATH "$_gamescope_env_build/src"
+_gamescope_env_prepend PATH "$GAMESCOPE_LOCAL_PREFIX/bin"
+_gamescope_env_prepend PKG_CONFIG_PATH "$GAMESCOPE_LOCAL_PREFIX/lib/pkgconfig"
+_gamescope_env_prepend PKG_CONFIG_PATH "$GAMESCOPE_LOCAL_PREFIX/lib/x86_64-linux-gnu/pkgconfig"
+_gamescope_env_prepend CMAKE_PREFIX_PATH "$GAMESCOPE_LOCAL_PREFIX"
 export GAMESCOPE_SCRIPT_PATH="$GAMESCOPE_REPO/scripts"
 
 # Let ad-hoc Vulkan clients find the local gamescope WSI layer JSON as well.
