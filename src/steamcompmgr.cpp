@@ -2055,6 +2055,7 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 	if (layer->colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB)
 		layer->ctm = s_scRGB709To2020Matrix;
 	layer->tex = commit->vulkanTex;
+	layer->acquireReadyTimeNs = commit->present_time;
 
 	layer->filter = base.filter;
 	layer->eAlphaBlendingMode = base.eAlphaBlendingMode;
@@ -2124,6 +2125,7 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 	layer->filter = ( flags & PaintWindowFlag::NoFilter ) ? GamescopeUpscaleFilter::LINEAR : g_upscaleFilter;
 
 	layer->tex = lastCommit->GetTexture( layer->filter, g_upscaleScaler, layer->colorspace );
+	layer->acquireReadyTimeNs = lastCommit->present_time;
 
 	if ( flags & PaintWindowFlag::NoScale )
 	{
@@ -8320,7 +8322,7 @@ static gamescope::CTimerFunction g_FPSLimitVRRTimer{ []
 
 // VRR hybrid (#01): one-shot absolute timer for the mid-interval generated
 // flip. Armed after a real frame's flip completes, for (KMS flip timestamp +
-// phase * frametime EMA) — timerfd and the pageflip events share
+// phase * predicted source cadence) — timerfd and the pageflip events share
 // CLOCK_MONOTONIC, so the spacing is display ground truth end to end. The
 // callback runs on this thread inside PollEvents (no atomics needed); the
 // deadline flag persists until acted on, so a fire that finds a flip still in
@@ -9291,9 +9293,10 @@ steamcompmgr_main(int argc, char **argv)
 			// JIT display-clock pacing (#06): this vblank is going to a
 			// hardware repeat while framegen is active — no real content and
 			// nothing pending (a stall, a too-slow discard, or a mispredicted
-			// keep-up). Ask the JIT planner to fill from the next vblank, so a
-			// hole never exceeds one vblank. No-op unless GAMESCOPE_FRAMEGEN_JIT
-			// is set and a dedicated framegen queue exists.
+			// keep-up). Ask the JIT planner for the earliest slot that can still be
+			// prepared. A GPU overrun or the bounded forward-prediction cap may
+			// still require more than one honest repeat. No-op unless
+			// GAMESCOPE_FRAMEGEN_JIT is set and a dedicated framegen queue exists.
 			if ( vblank && !bShouldPaint && vulkan_framegen_is_enabled() )
 				vulkan_framegen_jit_tick();
 

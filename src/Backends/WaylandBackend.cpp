@@ -499,7 +499,10 @@ namespace gamescope
         CWaylandBackend *m_pBackend = nullptr;
         wl_buffer *m_pHostBuffer = nullptr;
         wlr_buffer *m_pClientBuffer = nullptr;
-        uint32_t m_uCompositorUseCount = 0;
+        // wl_buffer.release is a transition back to reusable storage, not a
+        // completion token for one particular attach. Reattaching an unchanged
+        // busy buffer must therefore keep one aggregate lifetime pin.
+        bool m_bCompositorAcquired = false;
     };
     const wl_buffer_listener CWaylandFb::s_BufferListener =
     {
@@ -942,24 +945,30 @@ namespace gamescope
 
     void CWaylandFb::OnCompositorAcquire()
     {
-        // A compositor may have several same-surface commits using the same
-        // wl_buffer in flight and emits one release for each use. Keep the
-        // backing storage alive until every committed attach has been released.
-        assert( m_uCompositorUseCount != UINT32_MAX );
-        ++m_uCompositorUseCount;
-        IncRef();
+        // The core protocol defines release as "no longer used by the
+        // compositor". Several commits may reattach the same unchanged buffer
+        // before that event, but they do not create independently reusable
+        // lifetimes. One public ref keeps both this object and its DMA-BUF
+        // backing alive until the aggregate release transition.
+        if ( !m_bCompositorAcquired )
+        {
+            m_bCompositorAcquired = true;
+            IncRef();
+        }
     }
 
     void CWaylandFb::OnCompositorRelease()
     {
-        if ( m_uCompositorUseCount == 0 )
+        if ( !m_bCompositorAcquired )
         {
-            xdg_log.errorf( "Compositor released a buffer without an outstanding use." );
+            // A redundant callback has no lifetime ref left to drop. Keep it
+            // non-destructive and retain a diagnostic for backend auditing.
+            xdg_log.debugf( "Compositor released an already reusable buffer." );
             return;
         }
 
         // DecRef may destroy this object, so update all member state first.
-        --m_uCompositorUseCount;
+        m_bCompositorAcquired = false;
         DecRef();
     }
 

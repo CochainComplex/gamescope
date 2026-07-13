@@ -23,16 +23,17 @@ symbols below.
 | Backend present | `src/Backends/DRMBackend.cpp`, `src/Backends/WaylandBackend.cpp` | final generated-frame substitution |
 | Algorithms | `src/shaders/cs_framegen_*.comp` | extrapolation, motion estimation, validation, warp, ML |
 | Offline ML tools | `scripts/framegen-net-*.py` | GSFD parsing, training, GSFR evaluation |
-| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, adaptation, dispatch, ABI encoding, net layout, GSFR compatibility, and atomic-output contracts |
+| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, cadence/deadline admission, adaptation, dispatch, ABI encoding, net layout, GSFR compatibility, and atomic-output contracts |
 
 Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
 
 The `src/framegen` policy and contract headers are deliberately stateless and
 header-only: they add no link boundary to command recording. In particular,
-`scheduling.hpp` owns deterministic cadence confidence, gap/slot planning,
+`scheduling.hpp` owns deterministic cadence confidence, the bounded online
+source-cadence filter, fixed-slot deadline admission, gap/slot planning,
 keep-up thresholds, and deadline-ladder transitions; it does not own clocks,
-timestamp queries, history, or the decision to submit. `device.cpp` is a
+timestamp provenance, history, or the decision to submit. `device.cpp` is a
 narrow exception for `CVulkanDevice` queue/timestamp methods; the class remains
 the sole owner of that state. `adaptation.hpp` similarly owns only deterministic
 counter decoding and threshold math. `rendervulkan.cpp` retains the mapped-memory
@@ -64,10 +65,14 @@ or ownership bugs.
    `genReadA`/`genReadB` pins. Supporting concurrent batches requires explicit
    per-submission ownership for all four; increasing a ring size alone is not a
    correctness fix.
-6. **Output images are acquired by ownership, not guessed age.** A generated or
-   late-composite target is writable only when `CVulkanTexture::IsInUse()` is
-   false. Pool pressure shortens or skips a batch; it never rewrites a pending or
-   scanned-out image.
+6. **Output images are acquired by ownership, not guessed age.** Real composite,
+   generated, and late-composite targets are writable only when
+   `CVulkanTexture::IsInUse()` is false. Completed cross-queue read pins are
+   released before real-target acquisition. Real pressure first runs one
+   non-blocking backend event-progress pass, then invalidates speculative
+   history and retries; persistent pressure skips safely. This extra poll is
+   exceptional-path only. Generated pool pressure shortens or skips a batch.
+   No path rewrites a pending or scanned-out image.
 7. **Every framegen submission is covered by reset lifetime.** Update
    `lastFramegenWorkSeqNo` for work that retains framegen textures, including
    descriptor-free copies. Reset must retire that sequence before releasing the
@@ -75,6 +80,9 @@ or ownership bugs.
 8. **Classic fixed-slot mode suppresses VRR and tearing.** VRR hybrid is an
    explicit, dedicated-queue-only timing regime. Do not let a shader-quality
    change implicitly select a present mode.
+9. **JIT prediction is admission-only.** It may spend idle presentation-GPU work
+   on a disposable backup or skip that work. It must not delay a real frame,
+   wait for a generated frame, or override real/generated/repeat arbitration.
 
 ## Temporal and algorithm contracts
 
@@ -94,6 +102,10 @@ or ownership bugs.
   deadline degradation. The renderer supplies monotonic timestamps, measured
   GPU cost/sample identity, queue capability, and mutable ladder state. A helper
   result must not acquire resources, record commands, wait, or select a flip.
+- Acquire-ready cadence and composite-time fallback are distinct timestamp
+  provenances. Reset the predictor when provenance changes, timestamps stop
+  increasing, or the scene gap expires. Never mix display-quantized and
+  pre-vblank intervals in one learned state.
 - Causal slot `phase` lies after the newest real frame. The shader coefficient is
   derived from that phase and `--framegen-strength`, then bounded by the forward
   cap. Bidirectional `phase` lies in `[0, 1]` between checked real endpoints and
@@ -165,10 +177,22 @@ equivalent to the generic variant.
 
 ## Resource and cache identity
 
-`previousReal` and `currentReal` retain output-ring images by reference. Ring
-advance must continue to skip history and in-flight generation reads. The
-generated output pool is disjoint from that ring and remains sized from the user
-multiplier, not the current degraded multiplier.
+`previousReal` and `currentReal` retain output-ring images by reference. Real
+target selection must continue to use `CVulkanTexture::IsInUse()` so logical
+history, unfinished generation reads, and backend scanout ownership share one
+correctness check. `genReadA/B` must be released as soon as `genReadSeqNo`
+completes, but never before. The generated output pool is disjoint from that
+ring. Both pool capacities are sized from the requested multiplier, not the
+current degraded multiplier: generated output uses `2·multiplier`, while the
+real composite ring uses 8/10/12 slots at x2/x3/x4 to absorb the deeper host
+queue caused by higher presentation cadence. These are capacity estimates;
+`IsInUse()` is still the safety condition if a backend retains more.
+
+On nested Wayland, `wl_buffer.release` is an aggregate transition to reusable
+storage. A repeated attach while the same buffer is still compositor-owned must
+not add another lifetime reference: one acquire transition is paired with the
+one release transition. Do not replace this with per-commit counting unless a
+different protocol supplies explicit per-use completion tokens.
 
 The finalized motion field is reusable only when all identity keys match:
 

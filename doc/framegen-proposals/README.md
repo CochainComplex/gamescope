@@ -62,7 +62,7 @@ on top of it.
 | `GAMESCOPE_FRAMEGEN_NET_LR` / `GAMESCOPE_FRAMEGEN_NET_EVERY` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Learning rate (default `3e-4`) / train every *N*th real frame (default `1` — raise on weak present GPUs). |
 | `GAMESCOPE_FRAMEGEN_RECORD=<dir>` | `--framegen-mode motion` | Capture training tensors (one `GSFD` file per real frame, ≈1.2 MB at 1440p) into `<dir>`; bidir is not required. |
 | `GAMESCOPE_FRAMEGEN_RECORD_MAX` | `GAMESCOPE_FRAMEGEN_RECORD` set | Cap on captured frames (default `1000`). |
-| `GAMESCOPE_FRAMEGEN_JIT=1` | **dedicated framegen queue**; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #06 JIT display-clock pacing (a no-op without the dedicated queue). |
+| `GAMESCOPE_FRAMEGEN_JIT=1` | **dedicated framegen queue**; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #06 causal fixed-cadence JIT: predict the next acquire-ready time, generate a disposable one-slot backup only when it may miss the exact compositor wake deadline, and let a real frame preempt it (a no-op without the dedicated queue). |
 | `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` | **dedicated queue + connector actually in VRR**; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #01 VRR hybrid — real frames present VRR-style, the generated frame flips mid-interval on a timer (falls back to fixed-refresh **live** when VRR isn't active). |
 | `GAMESCOPE_FRAMEGEN_BASE=1` | any mode; per-frame scene check; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #02 base-layer generation — generate pre-upscale, late-composite fresh overlays/cursor (falls back to output-space **per frame** on unsupported scenes). |
 
@@ -178,7 +178,8 @@ Frame generation itself (enabled with `--experimental-framegen`) is in the tree,
 along with these hardening/quality passes:
 
 - **Zero-copy history** — the last two composited output images are retained by
-  reference instead of copied (the output ring grows to 5 while framegen is on).
+  reference instead of copied (the ownership-aware output ring grows to 8/10/12
+  slots at x2/x3/x4 while framegen is on).
 - **fp16 + LDS-tiled extrapolate shader** — the forward-extrapolation shader
   runs in packed fp16 on capable hardware and caches the current-frame tile in
   shared memory (falls back to fp32 for scRGB/float targets).
@@ -310,9 +311,11 @@ build on top of that foundation.
    discovery that does not exist yet, so it is documented rather than built.)
 6. [JIT phase: display-clock pacing for generated frames](06-jit-phase-display-clock.md)
    — stop baking slot phases from a single-interval gap guess; plan one slot at a
-   time, one vblank ahead, with its phase measured against the KMS pageflip clock
-   and a slew-limited frametime EMA. Fixes the phase-vs-vblank sawtooth in the
-   marginal 40–59 fps regime and adds the missing "skip when keeping up" guard.
+   time against the KMS pageflip clock. A deterministic online alpha-beta filter
+   learns pre-vblank acquire-ready cadence, trend, and late error, then admits a
+   disposable generated backup only when the next real frame may miss the exact
+   compositor wake deadline. The resulting generated ratio varies with available
+   real frames while real-over-generated arbitration remains exact.
    **Prototype implemented** (`GAMESCOPE_FRAMEGEN_JIT=1`, dedicated queue only).
 7. [Frames-only SOTA alignment: what we have, what's missing](07-frames-only-sota-alignment.md)
    — maps the [frame-generation research survey](../research-framegen.md) onto

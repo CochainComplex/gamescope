@@ -15,6 +15,19 @@ struct EffectiveConfig
 	GamescopeFramegenQuality quality;
 };
 
+// The compositor output ring also carries zero-copy real-frame history. A
+// higher generated cadence can leave more distinct buffers queued in a nested
+// compositor before its aggregate release events catch up, so reserve two
+// backend-lifetime slots per requested multiplier in addition to four slots
+// for history and real composite progress. Ownership checks, not this capacity
+// estimate, remain the correctness boundary.
+[[nodiscard]] constexpr uint32_t output_ring_size_for_multiplier( int multiplier )
+{
+	const uint32_t boundedMultiplier = static_cast<uint32_t>(
+		std::clamp( multiplier, 2, 4 ) );
+	return 4u + 2u * boundedMultiplier;
+}
+
 // Count the degradation rungs below a startup quality ceiling. Motion sheds
 // quality first, then falls back to extrapolation; multiplier reductions are
 // last. There is deliberately no disabled rung, so GPU timing never starves.

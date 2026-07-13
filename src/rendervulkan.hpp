@@ -296,6 +296,11 @@ struct FrameInfo_t
 	struct Layer_t
 	{
 		gamescope::Rc<CVulkanTexture> tex;
+		// CLOCK_MONOTONIC time at which this client buffer's acquire fence
+		// became ready. Framegen uses the base layer's value only as a causal
+		// source-cadence observation; it is never forwarded as presentation
+		// feedback and generated layers leave it at zero.
+		uint64_t acquireReadyTimeNs = 0;
 		int zpos;
 
 		vec2_t offset;
@@ -465,7 +470,7 @@ void vulkan_framegen_jit_tick();
 bool vulkan_framegen_vrr_hybrid_requested();
 bool vulkan_framegen_vrr_hybrid_active();
 // Nanoseconds after the real frame's KMS flip timestamp at which the pending
-// generated frame should be flipped (phase * frametime EMA); 0 when there is
+// generated frame should be flipped (phase * predicted source cadence); 0 when there is
 // nothing to schedule. steamcompmgr arms the mid-interval timer with this.
 uint64_t vulkan_framegen_vrr_hybrid_mid_offset_ns();
 

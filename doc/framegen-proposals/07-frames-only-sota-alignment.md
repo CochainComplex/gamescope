@@ -112,9 +112,9 @@ background buffer and world-space projection depend. We have neither, so our
 version is necessarily coarser.
 
 The implemented frames-only form deliberately does **not** retain another
-output-ring image: that would increase the pin set and break the five-slot ring's
-"always one free composite target" proof while a dedicated-queue batch is still
-reading. Instead, two internally owned 1/8-resolution luma images retain the
+output-ring image: that would increase the pin set and reduce ownership
+headroom while a dedicated-queue batch is still reading. Instead, two
+internally owned 1/8-resolution luma images retain the
 two-interval-old evidence needed by both the current batch and same-interval JIT
 refills. Each image carries a real-frame ID; skipped estimates, invalidations,
 scene cuts, and non-consecutive history cannot consume it.

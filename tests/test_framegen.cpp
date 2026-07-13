@@ -44,6 +44,12 @@ static void check( bool bCondition, const char *pszExpression, int nLine )
 
 static void test_degradation_policy()
 {
+	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 1 ) == 8u );
+	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 2 ) == 8u );
+	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 3 ) == 10u );
+	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 4 ) == 12u );
+	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 5 ) == 12u );
+
 	constexpr std::array modes = {
 		GamescopeFramegenMode::Extrapolate,
 		GamescopeFramegenMode::Blend,
@@ -481,6 +487,50 @@ static void test_scheduling_policy()
 	using namespace gamescope::framegen;
 
 	constexpr uint64_t interval = 10'000'000u;
+	CadencePredictorState cadence;
+	CHECK( predicted_cadence_interval_ns( cadence ) == 0u );
+	CHECK( fixed_cadence_admission( 100'000'000u, cadence,
+		100'100'000u, 111'000'000u, interval ).generateBackup );
+
+	for ( uint32_t i = 0u; i < k_uCadencePredictorMinSamples; i++ )
+		cadence = update_cadence_predictor( cadence, interval );
+	CHECK( cadence.samples == k_uCadencePredictorMinSamples );
+	CHECK( cadence.intervalNs == interval );
+	CHECK( cadence.trendNs == 0 );
+	CHECK( cadence.lateErrorNs == 0u );
+	CHECK( predicted_cadence_interval_ns( cadence ) == interval );
+
+	const FixedCadenceAdmission early = fixed_cadence_admission(
+		100'000'000u, cadence, 100'100'000u, 111'000'000u, interval );
+	CHECK( !early.generateBackup );
+	CHECK( early.trained );
+	CHECK( !early.predictionOverdue );
+	CHECK( early.predictedReadyNs == 110'000'000u );
+	CHECK( early.safetyMarginNs == interval / k_uCadenceArrivalGuardDivisor );
+	CHECK( early.deadlineHeadroomNs
+		== 1'000'000u - interval / k_uCadenceArrivalGuardDivisor );
+	const FixedCadenceAdmission tight = fixed_cadence_admission(
+		100'000'000u, cadence, 100'100'000u, 110'200'000u, interval );
+	CHECK( tight.generateBackup );
+	CHECK( tight.deadlineHeadroomNs == 0u );
+	const FixedCadenceAdmission overdue = fixed_cadence_admission(
+		100'000'000u, cadence, 110'400'000u, 120'000'000u, interval );
+	CHECK( overdue.generateBackup );
+	CHECK( overdue.trained );
+	CHECK( overdue.predictionOverdue );
+	CHECK( overdue.deadlineHeadroomNs > 0u );
+
+	const CadencePredictorState lateCadence = update_cadence_predictor(
+		cadence, 14'000'000u );
+	CHECK( lateCadence.intervalNs == 10'500'000u );
+	CHECK( lateCadence.trendNs == 62'500 );
+	CHECK( lateCadence.lateErrorNs == 4'000'000u );
+	CHECK( predicted_cadence_interval_ns( lateCadence ) == 10'562'500u );
+	CHECK( fixed_cadence_admission( 100'000'000u, lateCadence,
+		100'100'000u, 114'800'000u, interval ).generateBackup );
+	CHECK( update_cadence_predictor( cadence, 0u ).intervalNs == cadence.intervalNs );
+	CHECK( saturating_add_ns( UINT64_MAX - 1u, 2u ) == UINT64_MAX );
+
 	CHECK( !leaves_empty_vblank( 20'000'000u, 0u, interval ) );
 	CHECK( !leaves_empty_vblank( 24'999'999u, 10'000'000u, interval ) );
 	CHECK( leaves_empty_vblank( 25'000'000u, 10'000'000u, interval ) );

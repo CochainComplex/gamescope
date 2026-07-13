@@ -25,8 +25,10 @@ export GRAVITYMARK_DIR=/path/to/GravityMark/bin
 export FRAMEGEN_BEST_PROFILE="$HOME/.cache/gamescope-fg-gravitymark-best-dc58b2d5.bin"
 
 test -r "$FRAMEGEN_BEST_PROFILE" # this must succeed before continuing
-unset GAMESCOPE_FRAMEGEN_NET_ONLINE GAMESCOPE_FRAMEGEN_NET_PROFILE \
-  GAMESCOPE_FRAMEGEN_RECORD_COLOR GAMESCOPE_FRAMEGEN_BIDIR_TRACE
+unset GAMESCOPE_FRAMEGEN_JIT GAMESCOPE_FRAMEGEN_VRR_HYBRID \
+  GAMESCOPE_FRAMEGEN_BASE GAMESCOPE_FRAMEGEN_NET_ONLINE \
+  GAMESCOPE_FRAMEGEN_NET_PROFILE GAMESCOPE_FRAMEGEN_RECORD_COLOR \
+  GAMESCOPE_FRAMEGEN_BIDIR_TRACE
 
 GAMESCOPE_BUILD_DIR=build-perf \
 GAMESCOPE_FRAMEGEN_BIDIR=1 \
@@ -87,6 +89,66 @@ three/five-vblank pairs or longer gaps around the intended four-vblank cadence.
 At x4, a five-vblank gap necessarily leaves one repeat because only three
 generated frames are available. Treat the limiter as a controlled pacing test,
 not as the frozen visual baseline or a guaranteed stutter fix.
+
+### Optional causal fixed-cadence JIT variant
+
+`GAMESCOPE_FRAMEGEN_JIT=1` implements the fixed-display idea without delaying a
+real frame. For each refresh slot, it uses the renderer buffer's acquire-ready
+timestamps to learn cadence, bounded trend, and recent late error. It generates
+one disposable forward-predicted backup only when the next real frame is not
+confidently due before the compositor's exact wake deadline. At presentation,
+the order remains real frame, ready generated frame, then hardware repeat.
+
+This is intentionally separate from the preferred bidirectional x4 baseline:
+JIT is causal and low latency; bidirectional mode waits for the next real frame
+and usually has better endpoint evidence. Do not enable both.
+
+The startup log must contain `causal fixed-cadence JIT active`. If it instead
+reports bidirectional interpolation, or reports that bidirectional mode was
+ignored, the shell still contains a conflicting pacing toggle and the run is
+not a JIT comparison.
+
+Using the variables defined by the preferred baseline command above:
+
+```bash
+unset GAMESCOPE_FRAMEGEN_BIDIR GAMESCOPE_FRAMEGEN_VRR_HYBRID \
+  GAMESCOPE_FRAMEGEN_BASE GAMESCOPE_FRAMEGEN_NET_ONLINE \
+  GAMESCOPE_FRAMEGEN_NET_PROFILE GAMESCOPE_FRAMEGEN_RECORD_COLOR
+
+GAMESCOPE_BUILD_DIR=build-perf \
+GAMESCOPE_FRAMEGEN_JIT=1 \
+GAMESCOPE_FRAMEGEN_NET="$FRAMEGEN_BEST_PROFILE" \
+GAMESCOPE_FRAMEGEN_RESERVOIR=1 \
+GAMESCOPE_FRAMEGEN_SHADING=1 \
+GAMESCOPE_FRAMEGEN_DEBUG_EVERY=60 \
+./env-gamescope-local.sh \
+gamescope --expose-wayland --backend wayland \
+  --prefer-vk-device "$PRESENT_DEV" \
+  -W 2560 -H 1440 -r 120 \
+  --experimental-framegen \
+  --framegen-mode motion \
+  --framegen-multiplier 4 \
+  --framegen-quality extreme \
+  --framegen-strength 0.5 \
+  --framegen-debug \
+  -- env -C "$GRAVITYMARK_DIR" MESA_VK_DEVICE_SELECT="$RENDER_DEV" \
+    ./GravityMark.x64 -vk -temporal 0 -benchmark 0 -fps 1 \
+    -asteroids 1000000 -width 2560 -height 1440 -vsync 0
+```
+
+The timing predictor adapts in memory whenever JIT is active; it has no profile
+file and adds no Vulkan dispatch. This is independent of C2 image-model
+training. To continue in-situ image-model learning, use the writable working
+profile procedure below. In JIT mode the multiplier sizes the existing output
+capacity and policy, but it does not force three generated frames per real: the
+effective multiplier follows available display slots and stops at the forward
+prediction cap.
+
+For a short scheduling trace, temporarily set
+`GAMESCOPE_FRAMEGEN_DEBUG_EVERY=1`. Restore `60` for visual judgment so logging
+does not become the source of CPU jitter. Nested Wayland validates execution
+and dual-GPU import; native DRM is required to judge KMS phase accuracy, input
+latency, VRR interaction, and final scanout pacing.
 
 The original discovery run used in-situ learning. To continue training without
 touching the frozen profile, make a writable copy:

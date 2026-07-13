@@ -10,10 +10,10 @@ The prototype was built on top of proposal 06's display-clock machinery, which
 resolved several of this document's open questions and changed some details:
 
 - **Interval source (open question 1): resolved.** The mid offset is
-  `0.5 × frametime EMA` using #06's slew-limited estimator
-  (`FramegenHistory_t::ulFrametimeEmaNs`), not a new rolling estimate in
-  `page_flip_handler`. Under VRR the estimator's samples are even cleaner than
-  under fixed refresh, because composite times are no longer vblank-quantized.
+  `0.5 × predicted source cadence` using #06's bounded online alpha-beta filter
+  (`FramegenHistory_t::cadence`), not a new rolling estimate in
+  `page_flip_handler`. Acquire-fence completion normally supplies the observation
+  before display quantization; composite time is a provenance-isolated fallback.
 - **Anchor: the real flip's KMS timestamp, not commit time.** The timer arm is
   deferred until the real frame's flip completes
   (`CurrentPresentsInFlight()==0`), then armed at
@@ -29,7 +29,7 @@ resolved several of this document's open questions and changed some details:
   exactly where the next real frame is expected, and the panel's minimum flip
   spacing could then delay that real frame. Stalls are left to panel LFC.
 - **Keep-up guard replaces `cv_framegen_mid_min_budget_ms`:** generate only
-  when `EMA >= 2.2 × panel min-refresh cycle`
+  when predicted cadence is at least `2.2 × panel min-refresh cycle`
   (`k_uVrrHybridKeepUpPercent = 220` in `framegen/scheduling.hpp`) so both halves of the split
   interval respect the panel's minimum flip spacing with ~10% jitter margin.
 - **`force_repaint()` is suppressed for hybrid submissions** — a detail the
@@ -407,10 +407,10 @@ any real content. The real flip's code path is unchanged from framegen-off VRR.
 
 ## Open questions
 
-1. **Interval source under VRR.** The vblank estimator's VRR branch
-   (`src/vblankmanager.cpp:157-177`) intentionally does not model a real cadence. Is a short rolling
-   average of real-flip deltas in `page_flip_handler` accurate enough, or do we need a dedicated
-   real-frame-interval estimator (EMA + spike clamp like the non-VRR redzone logic at `:127-145`)?
+1. **Interval source under VRR: resolved.** The vblank estimator's VRR branch
+   intentionally does not model source cadence. The prototype uses #06's
+   provenance-aware acquire-ready alpha-beta filter; see the implementation
+   notes above.
 2. **Should the midpoint be dynamic per phase?** If the game's frame time is bimodal (e.g. 60/72
    alternating), a fixed 0.5 fraction can place the generated flip poorly. Worth a phase-aware
    fraction?
