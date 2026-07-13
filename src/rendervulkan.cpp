@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cstddef>
 #include <thread>
 #include <dlfcn.h>
 #include "vulkan_include.h"
@@ -4950,6 +4951,107 @@ struct FramegenMotionNetOptPush_t
 	}
 };
 
+// These structs are copied verbatim into GLSL push-constant blocks. Keep their
+// byte layout explicit: changing a member order in C++ without making the same
+// shader change otherwise compiles cleanly and silently feeds the wrong values
+// to every dispatch using that block.
+#define FRAMEGEN_PUSH_SIZE( type, size ) \
+	static_assert( sizeof( type ) == size, #type " size must match its GLSL push-constant block" )
+#define FRAMEGEN_PUSH_MEMBER( type, member, offset ) \
+	static_assert( offsetof( type, member ) == offset, #type "::" #member " must match its GLSL push-constant block" )
+
+FRAMEGEN_PUSH_SIZE( FramegenPushData_t, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenPushData_t, strength, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenPushData_t, suppressLo, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenPushData_t, suppressHi, 8 );
+
+FRAMEGEN_PUSH_SIZE( FramegenPairPushData_t, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenPairPushData_t, strength0, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenPairPushData_t, strength1, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenPairPushData_t, suppressLo, 8 );
+FRAMEGEN_PUSH_MEMBER( FramegenPairPushData_t, suppressHi, 12 );
+
+FRAMEGEN_PUSH_SIZE( FramegenBlendPushData_t, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenBlendPushData_t, phase, 0 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionMatchPush_t, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionMatchPush_t, searchRadius, 0 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionWarpPush_t, 24 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, strength, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, suppressLo, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, suppressHi, 8 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, lowResScale, 12 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, agreeLo, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, agreeHi, 20 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionAccelPush_t, 52 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, strength, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, suppressLo, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, suppressHi, 8 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, lowResScale, 12 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, agreeLo, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, agreeHi, 20 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, accelMax, 24 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, historyValid, 28 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, guidedReconstruction, 32 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, reservoirValid, 36 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, shadingValid, 40 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, historyFlowScale, 44 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, accelTimeFactor, 48 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionRefinePush_t, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionRefinePush_t, finalLevel, 0 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionFBCheckPush_t, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionFBCheckPush_t, tolBase, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionFBCheckPush_t, tolSlope, 4 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionBidirPush_t, 32 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, phase, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, lowResScale, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, agreeLo, 8 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, agreeHi, 12 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, oneSidedStrength, 16 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionStatsPush_t, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsPush_t, clearOnly, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsPush_t, badThresh, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsPush_t, staticMvMax, 8 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsPush_t, minConfSurvive, 12 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionStatsApplyPush_t, 32 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, trustLo, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, trustHi, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneHistSection, 8 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneHistGlobal, 12 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneResid, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneUnreliable, 20 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneMinSections, 24 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, detectOnly, 28 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionNetPush_t, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetPush_t, mode, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetPush_t, flowScale, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetPush_t, confidenceRaiseScale, 8 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetPush_t, shadingScale, 12 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionNetTrainPush_t, 20 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, seed, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, sliceBase, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, mode, 8 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, flags, 12 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, historyTimeScale, 16 );
+
+FRAMEGEN_PUSH_SIZE( FramegenMotionNetOptPush_t, 16 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetOptPush_t, lr, 0 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetOptPush_t, emaAlpha, 4 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetOptPush_t, decay, 8 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionNetOptPush_t, step, 12 );
+
+#undef FRAMEGEN_PUSH_MEMBER
+#undef FRAMEGEN_PUSH_SIZE
+
 // Motion-estimation intermediates (low-resolution luma pyramids and the motion
 // field). Allocated lazily by the motion dispatch, released on framegen reset.
 // The matcher runs coarse-to-fine over three pyramid levels: full search only
@@ -6379,8 +6481,38 @@ static const char *framegen_net_weights_path()
 // must fail validation rather than run with silently mismatched channels.
 static constexpr uint32_t k_uFramegenNetMagic = 0x52465347u; // 'GSFR'
 static constexpr uint32_t k_uFramegenNetVersion = 3u;
-static constexpr uint32_t k_uFramegenNetLayerDims[ 3 ][ 2 ] = { { 12u, 16u }, { 16u, 16u }, { 16u, 4u } };
-static constexpr uint32_t k_uFramegenNetFloats = 4644;
+static constexpr uint32_t k_uFramegenNetLayerCount = 3u;
+static constexpr uint32_t k_uFramegenNetKernelWidth = 3u;
+static constexpr uint32_t k_uFramegenNetKernelElements =
+	k_uFramegenNetKernelWidth * k_uFramegenNetKernelWidth;
+static constexpr uint32_t k_uFramegenNetLayerDims[ k_uFramegenNetLayerCount ][ 2 ] =
+	{ { 12u, 16u }, { 16u, 16u }, { 16u, 4u } };
+static constexpr uint32_t k_uFramegenNetLayer1Weights =
+	k_uFramegenNetLayerDims[ 0 ][ 0 ] * k_uFramegenNetLayerDims[ 0 ][ 1 ] * k_uFramegenNetKernelElements;
+static constexpr uint32_t k_uFramegenNetLayer2Offset =
+	k_uFramegenNetLayer1Weights + k_uFramegenNetLayerDims[ 0 ][ 1 ];
+static constexpr uint32_t k_uFramegenNetLayer2Weights =
+	k_uFramegenNetLayerDims[ 1 ][ 0 ] * k_uFramegenNetLayerDims[ 1 ][ 1 ] * k_uFramegenNetKernelElements;
+static constexpr uint32_t k_uFramegenNetLayer3Offset =
+	k_uFramegenNetLayer2Offset + k_uFramegenNetLayer2Weights + k_uFramegenNetLayerDims[ 1 ][ 1 ];
+static constexpr uint32_t k_uFramegenNetLayer3WeightsPerOutput =
+	k_uFramegenNetLayerDims[ 2 ][ 0 ] * k_uFramegenNetKernelElements;
+static constexpr uint32_t k_uFramegenNetLayer3BiasOffset =
+	k_uFramegenNetLayer3Offset + k_uFramegenNetLayer3WeightsPerOutput * k_uFramegenNetLayerDims[ 2 ][ 1 ];
+static constexpr uint32_t k_uFramegenNetFloats =
+	k_uFramegenNetLayer3BiasOffset + k_uFramegenNetLayerDims[ 2 ][ 1 ];
+static constexpr uint32_t k_uFramegenNetShadingOutput = 3u;
+static constexpr uint32_t k_uFramegenNetShadingWeightBegin =
+	k_uFramegenNetLayer3Offset + k_uFramegenNetShadingOutput * k_uFramegenNetLayer3WeightsPerOutput;
+static constexpr uint32_t k_uFramegenNetShadingBias =
+	k_uFramegenNetLayer3BiasOffset + k_uFramegenNetShadingOutput;
+static_assert( k_uFramegenNetShadingOutput < k_uFramegenNetLayerDims[ 2 ][ 1 ],
+	"framegen shading output must exist in the final net layer" );
+static_assert( k_uFramegenNetLayer2Offset == 1744u
+	&& k_uFramegenNetLayer3Offset == 4064u
+	&& k_uFramegenNetLayer3BiasOffset == 4640u,
+	"framegen net offsets must match the inference and training shaders" );
+static_assert( k_uFramegenNetFloats == 4644u, "framegen net shape must match the inference/training shaders and GSFR tools" );
 static constexpr uint32_t k_uFramegenNetTexW = 2048; // shader indexes (idx & 2047, idx >> 11)
 static constexpr uint32_t k_uFramegenNetTexH = ( k_uFramegenNetFloats + k_uFramegenNetTexW - 1 ) / k_uFramegenNetTexW;
 
@@ -6487,14 +6619,14 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 	bool bOk = fread( uHeader, sizeof( uHeader ), 1, pFile ) == 1
 		&& uHeader[ 0 ] == k_uFramegenNetMagic
 		&& uHeader[ 1 ] >= 1u && uHeader[ 1 ] <= k_uFramegenNetVersion
-		&& uHeader[ 2 ] == 3u;
-	for ( uint32_t l = 0; bOk && l < 3; l++ )
+		&& uHeader[ 2 ] == k_uFramegenNetLayerCount;
+	for ( uint32_t l = 0; bOk && l < k_uFramegenNetLayerCount; l++ )
 	{
 		uint32_t uDims[ 3 ] = {};
 		bOk = fread( uDims, sizeof( uDims ), 1, pFile ) == 1
 			&& uDims[ 0 ] == k_uFramegenNetLayerDims[ l ][ 0 ]
 			&& uDims[ 1 ] == k_uFramegenNetLayerDims[ l ][ 1 ]
-			&& uDims[ 2 ] == 3u;
+			&& uDims[ 2 ] == k_uFramegenNetKernelWidth;
 	}
 	if ( bOk )
 	{
@@ -6506,8 +6638,9 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 		{
 			// V1/V2 never defined output channel four. Do not trust arbitrary
 			// finite bytes from a third-party blob as a color-correction gate.
-			std::fill( weights.begin() + 4496u, weights.begin() + 4640u, 0.0f );
-			weights[ 4643u ] = 0.0f;
+			std::fill( weights.begin() + k_uFramegenNetShadingWeightBegin,
+				weights.begin() + k_uFramegenNetLayer3BiasOffset, 0.0f );
+			weights[ k_uFramegenNetShadingBias ] = 0.0f;
 		}
 	}
 	fclose( pFile );
@@ -6556,9 +6689,10 @@ static const std::vector<float> &framegen_net_weights()
 			std::mt19937 rng( 7u );
 			std::normal_distribution<float> dist1( 0.0f, std::sqrt( 2.0f / 108.0f ) );
 			std::normal_distribution<float> dist2( 0.0f, std::sqrt( 2.0f / 144.0f ) );
-			for ( uint32_t i = 0; i < 1728; i++ )
+			for ( uint32_t i = 0; i < k_uFramegenNetLayer1Weights; i++ )
 				weights[ i ] = dist1( rng );
-			for ( uint32_t i = 1744; i < 4048; i++ )
+			for ( uint32_t i = k_uFramegenNetLayer2Offset;
+				i < k_uFramegenNetLayer2Offset + k_uFramegenNetLayer2Weights; i++ )
 				weights[ i ] = dist2( rng );
 			vk_log.infof( "framegen: net starting from a neutral prior (no blob/profile); online learning will shape it" );
 		}
@@ -7585,11 +7719,17 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 			g_bFramegenNetWriteInFlight = false;
 		return;
 	}
-	const uint32_t uHeader[ 3 ] = { k_uFramegenNetMagic, k_uFramegenNetVersion, 3u };
+	const uint32_t uHeader[ 3 ] = {
+		k_uFramegenNetMagic, k_uFramegenNetVersion, k_uFramegenNetLayerCount,
+	};
 	bool bOk = fwrite( uHeader, sizeof( uHeader ), 1, pFile ) == 1;
-	for ( uint32_t l = 0; bOk && l < 3; l++ )
+	for ( uint32_t l = 0; bOk && l < k_uFramegenNetLayerCount; l++ )
 	{
-		const uint32_t uDims[ 3 ] = { k_uFramegenNetLayerDims[ l ][ 0 ], k_uFramegenNetLayerDims[ l ][ 1 ], 3u };
+		const uint32_t uDims[ 3 ] = {
+			k_uFramegenNetLayerDims[ l ][ 0 ],
+			k_uFramegenNetLayerDims[ l ][ 1 ],
+			k_uFramegenNetKernelWidth,
+		};
 		bOk = fwrite( uDims, sizeof( uDims ), 1, pFile ) == 1;
 	}
 	bOk = bOk && fwrite( weights.data(), sizeof( float ), weights.size(), pFile ) == weights.size();

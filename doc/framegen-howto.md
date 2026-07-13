@@ -4,10 +4,9 @@ A plain-language guide to using gamescope's frame generation: what it does, how
 to set up the two graphics cards, ready-to-paste commands for each mode, and an
 honest list of what doesn't work yet.
 
-> **Heads-up:** this is **experimental** and lives in this local build only (it
-> is not in normal/upstream gamescope). Expect rough edges. Nothing here can
-> damage your hardware, but games may show visual glitches or occasionally crash
-> — just close and retry with a simpler mode.
+> **Heads-up:** this is **experimental** and specific to this fork (it is not in
+> upstream gamescope). Expect visual glitches and occasional crashes; retry with
+> a lower quality tier or simpler mode when a workload is unstable.
 
 ---
 
@@ -68,25 +67,26 @@ frame-generation setting instead.
 gamescope always draws to whichever card the display cable is physically
 plugged into.
 
-- **On a laptop** this is already sorted — the built-in screen is wired to one
-  GPU (on this machine, the AMD one), so you don't have to do anything.
+- **On a laptop** the built-in screen is normally wired to one GPU. Use that as
+  the present device; the firmware wiring, not the vendor name, decides it.
 - **On a desktop with two cards**, plug the monitor cable into the **weaker /
   present** card (e.g. the 5700 XT), **not** the powerful one (the 7900 XT).
   If your screen is plugged into the wrong card, frame generation can't run.
 
 ### Find your card IDs
 
-Each card has an ID like `10de:2db9` (that's `vendor:device`). List yours:
+Each card has an ID like `vendor:device`, written as four hexadecimal digits on
+each side of the colon. List yours:
 
 ```bash
 lspci -nn | grep -iE "vga|3d|display"
 ```
 
-On this machine that prints, for example:
+Example output from an NVIDIA-render / AMD-present system looks like:
 
 ```
-c5:00.0 3D controller [10de:2db9]      ← NVIDIA  (render card — runs the game)
-c6:00.0 Display controller [1002:150e] ← AMD     (present card — screen is here)
+01:00.0 3D controller [10de:1234]      ← NVIDIA  (render card — runs the game)
+05:00.0 Display controller [1002:5678] ← AMD     (present card — screen is here)
 ```
 
 `10de:…` is NVIDIA, `1002:…` is AMD, `8086:…` is Intel.
@@ -95,18 +95,20 @@ c6:00.0 Display controller [1002:150e] ← AMD     (present card — screen is h
 
 ## 3. First-time setup (once per terminal)
 
-Open a terminal in the gamescope folder and load this build's environment, then
-tell it which card is which (use **your** IDs from step 2):
+Open a terminal in this checkout and load the build environment, then tell it
+which card is which. Replace the example paths and IDs with your own:
 
 ```bash
-cd /home/awarth/Devstuff/dummy/gamescope
+cd /path/to/gamescope-gameslop
+export GAMESCOPE_BUILD_DIR=build-perf
 source ./env-gamescope-local.sh
 
-export RENDER=10de:2db9    # strong card that runs the game
-export PRESENT=1002:150e   # card your monitor is plugged into
+export RENDER_DEV=10de:1234!   # strong card that runs the game
+export PRESENT_DEV=1002:5678   # card your monitor is plugged into
 ```
 
-That's it — the commands below reuse `$RENDER` and `$PRESENT`.
+That's it — the commands below and the supplied launch scripts reuse
+`$RENDER_DEV` and `$PRESENT_DEV`.
 
 ---
 
@@ -115,19 +117,19 @@ That's it — the commands below reuse `$RENDER` and `$PRESENT`.
 Every command has the same shape:
 
 ```bash
-gamescope --prefer-vk-device "$PRESENT" -W 2560 -H 1440 -r 120 \
+gamescope --prefer-vk-device "$PRESENT_DEV" -W 2560 -H 1440 -r 120 \
   --experimental-framegen --framegen-mode motion --framegen-multiplier 2 \
-  -- env MESA_VK_DEVICE_SELECT="$RENDER" YOUR-GAME-HERE
+  -- env MESA_VK_DEVICE_SELECT="$RENDER_DEV" YOUR-GAME-HERE
 ```
 
 Reading it left to right:
 
-- `--prefer-vk-device "$PRESENT"` — do the compositing + frame generation on the present card.
+- `--prefer-vk-device "$PRESENT_DEV"` — do the compositing + frame generation on the present card.
 - `-W 2560 -H 1440 -r 120` — screen width, height, and refresh rate (match your monitor).
 - `--experimental-framegen` — **turns frame generation on** (required).
 - `--framegen-mode motion` — the algorithm (see modes below).
 - `--framegen-multiplier 2` — show 2× the frames (`3` or `4` for more).
-- everything after `--` is **your game**; `MESA_VK_DEVICE_SELECT="$RENDER"` pins the game to the strong card.
+- everything after `--` is **your game**; `MESA_VK_DEVICE_SELECT="$RENDER_DEV"` pins the game to the strong card.
 
 Replace `YOUR-GAME-HERE` with how you'd normally launch the game. For Steam
 games, put `gamescope … --` in front of the launch options, or use
@@ -138,10 +140,15 @@ games, put `gamescope … --` in front of the launch options, or use
 If you have the GravityMark benchmark, this is a known-good test:
 
 ```bash
-gamescope --prefer-vk-device "$PRESENT" -W 2560 -H 1440 -r 120 \
-  --experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-debug \
-  -- env MESA_VK_DEVICE_SELECT="$RENDER" sh -c \
-  'cd /home/awarth/Devstuff/dummy/gm-bench/GravityMark_1.89_linux/bin && exec ./GravityMark.x64 -vk -fps 1 -asteroids 200000 -width 2560 -height 1440 -vsync 0'
+export GRAVITYMARK_DIR=/path/to/GravityMark/bin
+(
+  cd "$GRAVITYMARK_DIR"
+  gamescope --prefer-vk-device "$PRESENT_DEV" -W 2560 -H 1440 -r 120 \
+    --experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-debug \
+    -- env MESA_VK_DEVICE_SELECT="$RENDER_DEV" \
+    ./GravityMark.x64 -vk -temporal 0 -benchmark 0 -fps 1 \
+      -asteroids 200000 -width 2560 -height 1440 -vsync 0
+)
 ```
 
 `--framegen-debug` makes gamescope print what it's doing — watch the terminal
@@ -188,7 +195,7 @@ set `GAMESCOPE_FRAMEGEN_RESERVOIR=0` only for live A/B attribution.
 ```
 …plus put **`GAMESCOPE_FRAMEGEN_BIDIR=1`** in front of `gamescope`:
 ```bash
-GAMESCOPE_FRAMEGEN_BIDIR=1 gamescope --prefer-vk-device "$PRESENT" …
+GAMESCOPE_FRAMEGEN_BIDIR=1 gamescope --prefer-vk-device "$PRESENT_DEV" …
 ```
 Blends *between* two real frames instead of guessing ahead — the smoothest
 result and the best with see-through effects (smoke, glass). **Trade-off: adds
@@ -207,7 +214,7 @@ and still needs broad live validation.
 
 ### d) Base-layer — fixes blurry menus / HUD
 ```bash
-GAMESCOPE_FRAMEGEN_BASE=1 gamescope --prefer-vk-device "$PRESENT" …
+GAMESCOPE_FRAMEGEN_BASE=1 gamescope --prefer-vk-device "$PRESENT_DEV" …
 ```
 Generates the game picture *before* the on-screen menus/health bars/cursor are
 added, so text and HUD stay crisp instead of smearing. Use this if your HUD
@@ -215,7 +222,7 @@ looks ghosted. (Can't be combined with bidirectional.)
 
 ### e) VRR / FreeSync / G-Sync monitors
 ```bash
-GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 gamescope --prefer-vk-device "$PRESENT" --adaptive-sync …
+GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 gamescope --prefer-vk-device "$PRESENT_DEV" --adaptive-sync …
 ```
 Keeps your monitor's adaptive-sync (FreeSync/G-Sync) working *with* frame
 generation. **Only does something on a real VRR monitor that's actually in VRR
@@ -226,7 +233,7 @@ ignores bidirectional mode.
 
 ### f) AI refiner (most experimental)
 ```bash
-GAMESCOPE_FRAMEGEN_NET_ONLINE=1 gamescope --prefer-vk-device "$PRESENT" \
+GAMESCOPE_FRAMEGEN_NET_ONLINE=1 gamescope --prefer-vk-device "$PRESENT_DEV" \
   --experimental-framegen --framegen-mode motion --framegen-quality extreme …
 ```
 A tiny neural net cleans up the motion and **learns your game as you play**.
@@ -343,4 +350,6 @@ Add `--framegen-debug` and watch the terminal:
 *For the full list of flags and environment toggles (including developer
 options), see [`framegen-proposals/README.md`](framegen-proposals/README.md).
 For how it works under the hood, see
-[`framegen-architecture.md`](framegen-architecture.md).*
+[`framegen-architecture.md`](framegen-architecture.md). Maintainers should also
+read [`framegen-maintenance.md`](framegen-maintenance.md) before changing the
+shader, queue, cache, learning, or presentation contracts.*

@@ -229,7 +229,8 @@ case.
 
 ## Integration points in gamescope
 
-All line numbers are current-tree anchors, not exact after edits.
+Source-line anchors below are retained from the original proposal and are not
+expected to match the current implementation; use the named symbols instead.
 
 1. **`CVulkanDevice` (`src/rendervulkan.hpp:778`)** — add members:
    `VkQueryPool m_framegenTsPool`, `double m_timestampPeriod`,
@@ -378,30 +379,26 @@ encodes this as the rung thresholds.
 
 ## Interaction with VRR / HDR / anti-lag / tearing
 
-- **VRR:** framegen already forces adaptive sync off while active —
-  `frameInfo.allowVRR = cv_adaptive_sync && !vulkan_framegen_is_enabled()`
-  (`src/steamcompmgr.cpp:2570`), and generated presents set
-  `allowVRR = false` (`src/Backends/DRMBackend.cpp:3619`). The ladder does **not**
-  re-enable VRR; the budget is always computed against the fixed
-  `g_nOutputRefresh` interval. Rung transitions do not change present timing, so
-  they cannot perturb the fixed-refresh cadence framegen relies on.
+- **VRR:** classic and JIT framegen use fixed display slots and suppress adaptive
+  sync. The separate opt-in VRR-hybrid prototype carries the real present's VRR
+  state into its timer-driven generated flip. The ladder does not select either
+  timing regime; it only lowers work inside the active regime.
 
 - **HDR:** the budget/estimator are colorspace-agnostic — they measure
   wall-clock-equivalent GPU duration. HDR (fp16/PQ) history textures are larger
   and thus *more expensive* to generate over, which the EWMA captures
   automatically: on HDR content the loop will naturally sit a rung lower for the
-  same GPU. The existing EOTF-change history invalidation (line 4450) still
-  fires; a rung is preserved across it (cost characteristics do not reset just
-  because history did).
+  same GPU. An EOTF change invalidates history and resets the scene-local rung
+  measurements, so the new format is measured from its configured ceiling
+  instead of inheriting timings from a different texture representation.
 
 - **Anti-lag / Reflex:** untouched. Generated frames still emit **no** Wayland
   commits and **no** client `frame_done`/presentation feedback (constraint 2);
   the ladder only changes *which* generation shader runs and *whether* it runs.
   It never introduces a client-visible event. Measurement is passive.
 
-- **Tearing:** framegen suppresses async/tearing flips while active (log at
-  line 4425). Generated presents go through the normal (non-async) commit. The
-  ladder does not alter this.
+- **Tearing:** framegen suppresses async/tearing flips while active. Generated
+  presents go through the normal non-async commit. The ladder does not alter this.
 
 ---
 
@@ -410,15 +407,15 @@ encodes this as the rung thresholds.
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | Driver reports `timestampValidBits == 0` on the compute queue | Estimator unusable | Detect at init; disable ladder, fall back to today's reactive logic. Log once. |
-| Reading a query for a generation that hasn't completed | Stall if `WAIT_BIT` set | Never set `VK_QUERY_RESULT_WAIT_BIT`; read the **prior** slot; treat `VK_NOT_READY` as a down-signal. |
-| Timestamp measures duration, not slack-to-vblank | Rung too optimistic near deadline | Conservative budget fraction (0.6) + optional `calibrated_timestamps` for true monotonic slack. |
-| Query pool not reset before reuse | UB / garbage results | `CmdResetQueryPool` at top of every generation cmdbuf for the slot about to be written; double-buffer so we never reset a slot still being read. |
-| EWMA lag after a scene-complexity spike | One overrun before adapting | Asymmetric hysteresis: instant single-step *down* on `VK_NOT_READY` or on `EWMA > budget`; the late-skip net (line 4310) still catches the stray miss. |
-| Rung flapping around a boundary | Microstutter | Up-transitions require `nRungUpCredits` sustained-headroom frames; down is immediate. Mirrors existing `k_uFramegenStableFramesRequired` philosophy. |
-| Query pool leaked across resize/format change | VkQueryPool leak | Destroy in `vulkan_framegen_reset` (line 4282); recreate in `framegen_ensure_resources` (line 4373) alongside textures. |
-| Motion-mode per-stage stamps inflate query count | Pool sizing | Size pool for worst case (`k_uTimestampsPerGen` = 4) × 2 slots; extrapolate only writes 2, leaves rest reset-but-unwritten (skipped in read). |
-| `calibrated_timestamps` drift between recalibrations | Slack miscomputed | Recalibrate ~1 Hz; add `maxDeviation` to safety margin; feature is opt-in anyway. |
-| Ladder promotes to x4 on a GPU that then gets a background load spike | Multiple wasted generations | Per-slot budget check for x3/x4 (`N×per_gen ≤ N×slot_budget`) with margin; down-step drops the multiplier first (rungs 5→4→3). |
+| Reading a query for a generation that has not completed | Accidental compositor stall | Never set `VK_QUERY_RESULT_WAIT_BIT`; consume an association only after its owning timeline reaches the submission sequence. |
+| Timestamp measures duration, not slack-to-vblank | Rung too optimistic near deadline | Use the implemented 85% interval deadline and retain reactive not-ready discard as the final guard. |
+| Query pair not reset before reuse | Undefined or stale results | The depth-4 process-lifetime pool resets exactly the selected pair in the generation command buffer before its opening timestamp. The one-batch-in-flight gate prevents live reuse. |
+| EWMA lag after a workload spike | One overrun before adapting | Use a 7/8 EMA with a three-sample warm-up; the present path still drops a late result rather than waiting. |
+| Rung flapping around a boundary | Microstutter | The implemented ladder is down-only within a scene and resets only on scene/history invalidation. |
+| Query pool tied to resize/format resources | Lifetime bugs or unnecessary churn | Keep the query pool at device/process lifetime. Resize and format resets clear scene associations and costs but do not destroy or recreate the pool. |
+| Motion-mode per-stage stamps inflate query count | Pool sizing | The implementation records only one opening and closing timestamp per full batch; attribution is by `(rung, generated-count)`. |
+| `calibrated_timestamps` drift between recalibrations | Slack miscomputed | The implemented policy does not use calibrated timestamps; it compares queue-family GPU duration to the conservative interval budget. |
+| A background load spike invalidates the selected rung | Wasted generation or a repeated scanout | Monotonic quality reduction plus the non-blocking late-discard path bounds the effect; quality is re-probed only after scene invalidation. |
 
 ---
 

@@ -19,11 +19,29 @@ jobs:
             libxtst libxkbcommon libdrm libinput wayland-protocols benchmark \
             xorg-xwayland pipewire cmake \
             libavif libheif aom rav1e libdecor libxdamage \
-            luajit \
+            luajit python shellcheck \
             catch2 gcovr
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+      - name: Check framegen maintenance tooling
+        run: |
+          bash -n env-gamescope-local.sh test-framegen.sh \
+            scripts/framegen-launch-common.sh watch-framegen.sh run-framegen-native.sh
+          shellcheck -x env-gamescope-local.sh test-framegen.sh \
+            scripts/framegen-launch-common.sh watch-framegen.sh run-framegen-native.sh
+          PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
+            python3 -m py_compile scripts/framegen-net-train.py \
+              scripts/framegen-net-eval.py scripts/framegen-color-eval.py
+          if git grep -nE '/home/[[:alnum:]_.-]+/' -- \
+            README.md doc/framegen-architecture.md doc/framegen-howto.md \
+            doc/framegen-maintenance.md doc/framegen-proposals \
+            env-gamescope-local.sh test-framegen.sh watch-framegen.sh \
+            run-framegen-native.sh scripts/framegen-\*.py \
+            scripts/framegen-launch-common.sh; then
+            echo 'Machine-specific home path found in a published framegen file.' >&2
+            exit 1
+          fi
       - name: Build with gcc
         run: |
           export CC=gcc CXX=g++

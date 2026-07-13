@@ -1,48 +1,65 @@
 #!/usr/bin/env bash
-# Watch compositor-side FRAME GENERATION live (nested inside your GNOME session).
-#
-# Dual-GPU split (the target topology):
-#   * the CLIENT renders on the NVIDIA card (RENDER_DEV)
-#   * gamescope does compositing + frame generation + present on the AMD card
-#     (PRESENT_DEV) via a cross-GPU dma-buf share.
-# vkmark's GPU-heavy "desktop" scene stands in for a GPU-bound game so real frames
-# arrive slower than the display and framegen has real gaps to fill.
-#
-# NOTE: nested inside GNOME the PACING is parent-jittered — good for *seeing*
-# generation happen, but the true smoothness test is run-framegen-native.sh (DRM).
-#
-# Usage:  ./watch-framegen.sh [mode] [multiplier] [windows] [WxH] [refresh]
-#   mode        motion | extrapolate | blend        (default motion)
-#   multiplier  2 | 3 | 4                            (default 3)
-#   windows     vkmark desktop load; more = lower base fps.
-#               On the fast NVIDIA card you need a lot: ~1000@4K -> ~40fps,
-#               ~1500@4K -> ~27fps. (default 1000)
-#   WxH         render size                          (default 3840x2160)
-#   refresh     gamescope vblank rate                (default 120)
-#
-# Env:  RENDER_DEV (default 10de:2db9 NVIDIA)  PRESENT_DEV (default 1002:150e AMD)
-#       APP=...  override the client command (a real game, GravityMark, etc.)
-#
-# Watch for smooth motion in the moving windows, and the log line:
-#   framegen: generated N frame(s) ... mode=motion(xM) ... gpu=X.XXms
-set -u
-cd /home/awarth/Devstuff/dummy/gamescope || exit 1
+# Watch compositor-side frame generation in a nested desktop window.
+set -euo pipefail
 
-source "$PWD/env-gamescope-local.sh"
+usage()
+{
+	cat <<'EOF'
+Usage:
+  RENDER_DEV=vendor:device! PRESENT_DEV=vendor:device \
+    ./watch-framegen.sh [mode] [multiplier] [windows] [WxH] [refresh] [-- client [args...]]
 
-RENDER_DEV=${RENDER_DEV:-10de:2db9}     # client renders here (NVIDIA)
-PRESENT_DEV=${PRESENT_DEV:-1002:150e}   # framegen + present here (AMD)
-mode=${1:-motion}; mult=${2:-3}; wins=${3:-1000}; res=${4:-3840x2160}; rhz=${5:-120}
-W=${res%x*}; H=${res#*x}
-APP=${APP:-vkmark --size $res -b desktop:windows=${wins}:duration=600}
+Arguments:
+  mode        motion | extrapolate | blend  (default: motion)
+  multiplier  2 | 3 | 4                     (default: 3)
+  windows     vkmark desktop workload       (default: 1000)
+  WxH         render/output size             (default: 3840x2160)
+  refresh     nested target refresh          (default: 120)
 
-echo "# NESTED  framegen: mode=$mode x$mult  render=$RENDER_DEV  present=$PRESENT_DEV"
-echo "# ${W}x${H} @ ${rhz}Hz  client: $APP"
+The client renders on RENDER_DEV. Gamescope composites, generates, and presents
+on PRESENT_DEV. Pass a client after `--`; otherwise vkmark is used. APP remains
+available for compatibility, but cannot preserve complex shell quoting.
 
-# gamescope on the AMD present card; the client is pinned to NVIDIA via a
-# per-process env so it doesn't override gamescope's --prefer-vk-device.
-gamescope --expose-wayland --backend wayland --prefer-vk-device "$PRESENT_DEV" \
-  -W "$W" -H "$H" -r "$rhz" \
-  --experimental-framegen --framegen-mode "$mode" --framegen-multiplier "$mult" \
-  --framegen-strength 0.5 --framegen-debug \
-  -- env MESA_VK_DEVICE_SELECT="$RENDER_DEV" $APP
+This nested path is useful for visual and functional checks. Its cadence also
+contains the parent compositor's jitter; use run-framegen-native.sh from a text
+VT for direct DRM/KMS pacing tests.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=env-gamescope-local.sh
+source "$SCRIPT_DIR/env-gamescope-local.sh"
+# shellcheck source=scripts/framegen-launch-common.sh
+source "$SCRIPT_DIR/scripts/framegen-launch-common.sh"
+
+framegen_parse_launch_args 3 1000 3840x2160 120 "$@"
+mode="$FRAMEGEN_MODE"
+multiplier="$FRAMEGEN_MULTIPLIER"
+windows="$FRAMEGEN_WINDOWS"
+resolution="$FRAMEGEN_RESOLUTION"
+refresh="$FRAMEGEN_REFRESH"
+app_args=( "${FRAMEGEN_APP_ARGS[@]}" )
+
+framegen_require_device_ids
+framegen_validate_launch_args "$mode" "$multiplier" "$windows" "$resolution" "$refresh"
+framegen_resolve_gamescope_binary
+framegen_build_app_command "$resolution" "$windows" "${app_args[@]}"
+framegen_format_command
+
+printf '# NESTED framegen: mode=%s x%s render=%s present=%s\n' \
+	"$mode" "$multiplier" "$RENDER_DEV" "$PRESENT_DEV"
+printf '# %sx%s @ %s Hz; client: %s\n' \
+	"$FRAMEGEN_WIDTH" "$FRAMEGEN_HEIGHT" "$refresh" "$FRAMEGEN_APP_DISPLAY"
+
+"$FRAMEGEN_GAMESCOPE_BIN" \
+	--expose-wayland --backend wayland --prefer-vk-device "$PRESENT_DEV" \
+	-W "$FRAMEGEN_WIDTH" -H "$FRAMEGEN_HEIGHT" -r "$refresh" \
+	--experimental-framegen --framegen-mode "$mode" \
+	--framegen-multiplier "$multiplier" --framegen-strength 0.5 \
+	--framegen-debug -- \
+	env MESA_VK_DEVICE_SELECT="$RENDER_DEV" "${FRAMEGEN_APP_CMD[@]}"

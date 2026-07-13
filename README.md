@@ -57,6 +57,7 @@ It's **experimental**. Expect shimmer on fine detail, ghost trails on fast motio
 - 🕹️ **[How-To guide](doc/framegen-howto.md)** — plain-language setup: the two-card split, how to wire the display, copy-paste commands per mode, and current limits.
 - 🎛️ **[Engineer's reference](doc/framegen-proposals/README.md)** — every flag and toggle, how the shipped pipeline works, and the design-proposal roadmap.
 - 🔧 **[Architecture](doc/framegen-architecture.md)** — how it works under the hood, end to end.
+- 🧰 **[Maintainer guide](doc/framegen-maintenance.md)** — contracts that must survive refactors and the publication/validation checklist.
 - 📚 **[Research survey](doc/research-framegen.md)** — the frames-only state of the art this pipeline is measured against (primary-source cross-checked).
 
 > The build target and binary are still `gamescope` (drop-in compatible with existing scripts, Steam launch options, and packaging); "gamescope-gameslop" is the fork's identity, not a rename of the executable.
@@ -139,9 +140,11 @@ Reflex and anti-lag, and never produce fake presentation feedback.
 
 This is a prototype. Keep the following in mind:
 
-* **Generated frames only display on empty vblanks.** Real content always takes
-  priority: a generated frame is dropped, never presented, if a new game frame
-  *or* an overlay/notification update is ready for the same vblank. On a
+* **Causal generated frames only display in slots without newer real content.**
+  A causal candidate is dropped if a new game frame needs that display slot;
+  overlay-only updates are either boundedly deferred or late-composited in base
+  mode. Bidirectional mode is the explicit exception: its interpolations and
+  real endpoints form one delayed, content-ordered queue. On a
   dedicated framegen queue, gamescope also prepares speculative generated
   candidates after usable real frames so sudden missed vblanks already have
   work in flight on the second GPU. If a slow game exhausts that first batch,
@@ -154,17 +157,19 @@ This is a prototype. Keep the following in mind:
   near an integer fraction of refresh (for example `-r 72` on a 144 Hz display).
 * **It forces the composite path** (implies `--force-composite`), so direct
   scan-out is disabled while it is active. This costs a little latency and power
-  versus a plain direct-scan-out frame. **Adaptive sync (VRR) and tearing flips
-  are suppressed while framegen is active** — framegen fills fixed vblank
-  slots, which is fundamentally at odds with both. If you prefer VRR at your
-  game's native frame rate (lower latency, no artifacts) over doubled motion
-  clarity, run without `--experimental-framegen`.
-* **Timing / latency.** The real frame is always presented immediately — frame
-  generation adds no extra latency to the frames the game actually rendered. All
+  versus a plain direct-scan-out frame. The default fixed-slot path suppresses
+  adaptive sync (VRR), and all framegen paths suppress tearing flips. The opt-in
+  `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` prototype is the VRR exception: on a
+  dedicated framegen queue with an actively VRR-capable connector it schedules
+  one generated flip inside the measured interval. If you prefer native VRR
+  with no generated artifacts, run without `--experimental-framegen`.
+* **Timing / latency.** In causal modes the real frame is presented immediately;
+  bidirectional mode deliberately delays it by one real-frame interval so its
+  interpolations can precede it. All
   framegen GPU work (history copy + generation) is submitted in a separate
   command buffer *after* the real frame's composite, so the real frame's page
   flip never waits on it. When the compositor's GPU exposes a second compute
-  queue (most AMD/RADV hardware does), all generation runs on a **dedicated
+  queue, all generation runs on a **dedicated
   queue** with its own timeline, so a slow generation can never sit in front of
   the next composite on the realtime queue — the composite is protected in
   hardware, not just by scheduling. (Set `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE=1` to
@@ -229,8 +234,8 @@ lspci -nn | grep -Ei 'vga|3d|display'
 vulkaninfo --summary
 ```
 
-For example, an `lspci` line ending in `[1002:150e]` is written as
-`1002:150e`, and a line ending in `[10de:2db9]` is written as `10de:2db9`.
+For example, an `lspci` line ending in `[1002:5678]` is written as
+`1002:5678`, and a line ending in `[10de:1234]` is written as `10de:1234`.
 Pass the compositor GPU to gamescope with `--prefer-vk-device vendor:device`.
 For the game process after the `--` separator, use
 `MESA_VK_DEVICE_SELECT='vendor:device!'` to request only that Vulkan device.
@@ -238,36 +243,44 @@ On NVIDIA Optimus systems, the child process may also need
 `__NV_PRIME_RENDER_OFFLOAD=1 __VK_LAYER_NV_optimus=NVIDIA_only`.
 
 ```sh
-# Dual-GPU: composite on the AMD iGPU (1002:150e), render vkcube on the NVIDIA
-# dGPU (10de:2db9), upscale 1440p -> 2160p with FSR, x2 frame generation.
+# Replace these example IDs with values reported by lspci on your system.
+PRESENT_DEV=1002:5678
+RENDER_DEV=10de:1234!
+
+# Dual-GPU: composite on the present GPU, render vkcube on the render GPU,
+# upscale 1440p -> 2160p with FSR, and use x2 frame generation.
 gamescope \
-    --prefer-vk-device 1002:150e \
+    --prefer-vk-device "$PRESENT_DEV" \
     --experimental-framegen \
     -w 2560 -h 1440 -W 3840 -H 2160 \
     -F fsr -f -- \
-    env MESA_VK_DEVICE_SELECT='10de:2db9!' vkcube
+    env MESA_VK_DEVICE_SELECT="$RENDER_DEV" vkcube
 
 # Same, with the low-latency default made explicit and diagnostics enabled.
 # --debug-dual-gpu-route logs GPU/buffer/frame-path routing; --framegen-debug
 # logs framegen history, dispatch, and present cadence.
 gamescope \
     --debug-dual-gpu-route \
-    --prefer-vk-device 1002:150e \
+    --prefer-vk-device "$PRESENT_DEV" \
     --experimental-framegen --framegen-mode extrapolate --framegen-debug \
     -w 2560 -h 1440 -W 3840 -H 2160 \
     -F fsr -f -- \
-    env MESA_VK_DEVICE_SELECT='10de:2db9!' vkcube
+    env MESA_VK_DEVICE_SELECT="$RENDER_DEV" vkcube
 ```
 
-### Local dual-GPU test commands
+### Dual-GPU test commands
 
-These are the exact style of commands used for the current NVIDIA-render /
-AMD-framegen test machine. Replace the PCI IDs for other systems.
+Export the render and present IDs once, using the values for your system:
+
+```sh
+export RENDER_DEV=10de:1234!
+export PRESENT_DEV=1002:5678
+```
 
 Common framegen settings used in the tests:
 
 ```sh
---prefer-vk-device 1002:150e          # gamescope/compositor/framegen on AMD
+--prefer-vk-device "$PRESENT_DEV"     # gamescope/compositor/framegen device
 --experimental-framegen
 --framegen-mode motion                # motion-compensated generation
 --framegen-multiplier 3               # x3 target cadence
@@ -289,7 +302,7 @@ the `--` separator:
 ```sh
 GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
 gamescope \
-    --prefer-vk-device 1002:150e \
+    --prefer-vk-device "$PRESENT_DEV" \
     -W 2560 -H 1440 -r 120 \
     --expose-wayland \
     --experimental-framegen \
@@ -297,7 +310,7 @@ gamescope \
     --framegen-multiplier 3 \
     --framegen-strength 0.5 \
     --framegen-debug -- \
-    env MESA_VK_DEVICE_SELECT='10de:2db9!' vkmark --size 2560x1440
+    env MESA_VK_DEVICE_SELECT="$RENDER_DEV" vkmark --size 2560x1440
 ```
 
 SuperTuxKart 1.4 is an OpenGL client here, so `MESA_VK_DEVICE_SELECT` does not
@@ -307,7 +320,7 @@ variables for the child process instead:
 ```sh
 GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
 gamescope \
-    --prefer-vk-device 1002:150e \
+    --prefer-vk-device "$PRESENT_DEV" \
     -W 2560 -H 1440 -r 120 \
     --expose-wayland \
     --experimental-framegen \
@@ -336,7 +349,7 @@ Before trusting an OpenGL game, verify the split with a quick probe:
 
 ```sh
 GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
-gamescope --prefer-vk-device 1002:150e -W 1280 -H 720 -r 120 \
+gamescope --prefer-vk-device "$PRESENT_DEV" -W 1280 -H 720 -r 120 \
     --expose-wayland -- \
     env IRR_DEVICE_TYPE=x11 \
         __NV_PRIME_RENDER_OFFLOAD=1 \
@@ -344,7 +357,7 @@ gamescope --prefer-vk-device 1002:150e -W 1280 -H 720 -r 120 \
         glxinfo -B
 ```
 
-The gamescope log should say it selected the AMD device, while `glxinfo` or
+The gamescope log should report `$PRESENT_DEV`, while `glxinfo` or
 SuperTuxKart should report the NVIDIA OpenGL renderer. Nested runs like the
 commands above validate routing and shader execution, but native scanout pacing
 still needs a real DRM session from a text VT, for example through
@@ -367,7 +380,7 @@ See `gamescope --help` for a full list of options.
 * `-S stretch`: use stretch scaling, the game will fill the window. (e.g. 4:3 to 16:9)
 * `-b`: create a border-less window.
 * `-f`: create a full-screen window.
-* `--experimental-framegen`: enable experimental compositor-side frame generation (x2–x4). Implies `--force-composite`; disables adaptive sync and tearing while active. See [Experimental frame generation](#experimental-frame-generation).
+* `--experimental-framegen`: enable experimental compositor-side frame generation (x2–x4). Implies `--force-composite`; the default fixed-slot path disables adaptive sync, and tearing remains disabled. `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` is the opt-in VRR exception. See [Experimental frame generation](#experimental-frame-generation).
 * `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency), `motion` (motion-compensated, higher quality/cost) or `blend` (debug).
 * `--framegen-quality`: motion quality/cost ceiling: `low`, `medium`, `high` (default), `ultra`, or `extreme`. Lower tiers skip whole passes; `ultra` adds causal temporal acceleration and `extreme` adds full-resolution color-guided motion reconstruction, a bounded three-frame disocclusion resolver (`GAMESCOPE_FRAMEGEN_RESERVOIR=0`), and with ML a causal shading-persistence correction (`GAMESCOPE_FRAMEGEN_SHADING=0`).
 * `--framegen-strength`: forward-extrapolation step for `extrapolate`/`motion` modes, `0.0`–`1.0` (default `0.5`). Lower values reduce ghosting.

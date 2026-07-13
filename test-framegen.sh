@@ -3,11 +3,12 @@
 # test-framegen.sh — drive gamescope compositor-side frame generation for testing.
 #
 # Usage:
-#   ./test-framegen.sh gpus                             List GPUs and their vendor:device ids.
-#   ./test-framegen.sh bench [gpu]                      GPU-only shader microbenchmark (no display).
-#   ./test-framegen.sh run   [gpu] [mode] [res] [app]   Nested end-to-end run + cadence summary.
+#   ./test-framegen.sh gpus                            List GPUs and their vendor:device IDs.
+#   ./test-framegen.sh bench [gpu]                     GPU-only shader microbenchmark (no display).
+#   ./test-framegen.sh run [gpu] [mode] [res] [-- app args]
+#                                                       Nested run + cadence summary.
 #
-#   gpu  : nvidia | amd | <vendor:device hex>   (default: nvidia)   e.g. 1002:150e
+#   gpu  : auto | nvidia | amd | intel | <vendor:device>   (default: auto)
 #   mode : extrapolate | motion | blend         (default: extrapolate)
 #   res  : 1080 | 1440 | 2160                    (default: 1080)
 #   app  : command to run inside gamescope       (default: vkcube)
@@ -21,44 +22,47 @@
 #
 # Examples:
 #   ./test-framegen.sh bench amd
-#   ./test-framegen.sh run nvidia motion 1440
-#   DURATION=12 ./test-framegen.sh run 1002:150e extrapolate 1080 vkgears
+#   ./test-framegen.sh run auto motion 1440
+#   DURATION=12 ./test-framegen.sh run 1002:1234 extrapolate 1080 -- vkgears
 #
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# This checkout is linked against the manually built Wayland/Pixman stack.
-# Keep every benchmark/run on that ABI; invoking the binary directly against
-# distro libraries can fail at load time or, worse, mix incompatible symbols.
-export GAMESCOPE_BUILD_DIR="${GAMESCOPE_BUILD_DIR:-build-perf}"
+# Always use the checkout's environment wrapper. It supplies locally compiled
+# dependencies when GAMESCOPE_LOCAL_PREFIX is set and keeps the selected build's
+# WSI layer ahead of system paths.
+export GAMESCOPE_BUILD_DIR="${GAMESCOPE_BUILD_DIR:-build}"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/env-gamescope-local.sh"
 
-# Locate the gamescope binary (prefer the perf build).
-BIN=""
-for cand in "$SCRIPT_DIR/$GAMESCOPE_BUILD_DIR/src/gamescope" "$SCRIPT_DIR/build-perf/src/gamescope" "$SCRIPT_DIR/build/src/gamescope"; do
-    [[ -x "$cand" ]] && { BIN="$cand"; break; }
-done
-if [[ -z "$BIN" ]]; then
-    echo "error: gamescope binary not found. Build it first (ninja -C build-perf src/gamescope)." >&2
-    exit 1
-fi
+# Use exactly the requested local build. Falling through to a system binary or a
+# different build tree makes benchmark and cadence comparisons meaningless.
+BIN="${GAMESCOPE_BIN:-$SCRIPT_DIR/$GAMESCOPE_BUILD_DIR/src/gamescope}"
+
+require_binary() {
+    if [[ ! -x "$BIN" ]]; then
+        echo "error: gamescope binary not found at '$BIN'." >&2
+        echo "       Set GAMESCOPE_BUILD_DIR or GAMESCOPE_BIN, then build it with ninja." >&2
+        return 1
+    fi
+}
 
 # Map a friendly GPU name to a vendor:device id via lspci. On a dual-AMD box
 # (both vendor 1002) pass the explicit id instead — see 'gpus'.
 resolve_gpu() {
-    local gpu="${1:-nvidia}" id=""
+    local gpu="${1:-auto}" id=""
     case "$gpu" in
-        nvidia) id=$(lspci -nn | grep -iE 'vga|3d controller|display controller' | grep -oiE '10de:[0-9a-f]{4}' | head -1) ;;
-        amd)    id=$(lspci -nn | grep -iE 'vga|3d controller|display controller' | grep -oiE '1002:[0-9a-f]{4}' | head -1) ;;
-        intel)  id=$(lspci -nn | grep -iE 'vga|3d controller|display controller' | grep -oiE '8086:[0-9a-f]{4}' | head -1) ;;
-        [0-9a-fA-F]*:[0-9a-fA-F]*) id="$gpu" ;;
-        *) echo "error: unknown gpu '$gpu' (use nvidia|amd|intel|<vendor:device>)" >&2; exit 1 ;;
+        auto)   id=$(lspci -nn | grep -iE 'vga|3d controller|display controller' | grep -oiE '[0-9a-f]{4}:[0-9a-f]{4}' | head -1 || true) ;;
+        nvidia) id=$(lspci -nn | grep -iE 'vga|3d controller|display controller' | grep -oiE '10de:[0-9a-f]{4}' | head -1 || true) ;;
+        amd)    id=$(lspci -nn | grep -iE 'vga|3d controller|display controller' | grep -oiE '1002:[0-9a-f]{4}' | head -1 || true) ;;
+        intel)  id=$(lspci -nn | grep -iE 'vga|3d controller|display controller' | grep -oiE '8086:[0-9a-f]{4}' | head -1 || true) ;;
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) id="${gpu,,}" ;;
+        *) echo "error: unknown gpu '$gpu' (use auto|nvidia|amd|intel|<vendor:device>)" >&2; return 1 ;;
     esac
     if [[ -z "$id" ]]; then
         echo "error: no GPU matching '$gpu' found (try './test-framegen.sh gpus')" >&2
-        exit 1
+        return 1
     fi
     echo "$id"
 }
@@ -74,20 +78,21 @@ res_to_dims() {
 
 cmd_gpus() {
     echo "GPUs (lspci):"
-    lspci -nn | grep -iE 'vga|3d controller|display controller' | sed 's/^/  /'
+    lspci -nn | grep -iE 'vga|3d controller|display controller' | sed 's/^/  /' || true
     echo
     echo "Vulkan devices:"
     if command -v vulkaninfo >/dev/null 2>&1; then
-        vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|driverName|deviceType' | sed 's/^/  /'
+        vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|driverName|deviceType' | sed 's/^/  /' || true
     else
         echo "  (vulkaninfo not installed)"
     fi
     echo
-    echo "Pass a vendor:device id (e.g. 1002:150e) as the [gpu] arg to pin a specific card."
+    echo "Pass a vendor:device ID as the [gpu] argument to pin a specific card."
 }
 
 cmd_bench() {
-    local id quality="${QUALITY:-high}"; id=$(resolve_gpu "${1:-nvidia}")
+    require_binary
+    local id quality="${QUALITY:-high}"; id=$(resolve_gpu "${1:-auto}")
     case "$quality" in low|medium|high|ultra|extreme) ;; *) echo "error: QUALITY must be low|medium|high|ultra|extreme" >&2; exit 1 ;; esac
     echo "# framegen GPU microbenchmark — device $id"
     echo "# quality=$quality (compare extrapolate variants and the selected motion pipeline)"
@@ -125,27 +130,46 @@ summarize() {
         echo "  RESULT: no generated frames presented."
         echo "    - Ensure the game runs BELOW the display rate (LIMIT>1); with no gap"
         echo "      there are no empty vblanks to fill."
-        echo "    - 'motion' mode needs ~8 stable frames before it activates."
+        echo "    - Shared-queue motion mode needs a short stable-cadence warm-up."
         echo "    - Full log: $log"
     fi
     echo "================================================================="
 }
 
 cmd_run() {
+    require_binary
     local id mode res app w h
     local -a app_cmd
-    id=$(resolve_gpu "${1:-nvidia}")
+    id=$(resolve_gpu "${1:-auto}")
     mode="${2:-extrapolate}"
     res="${3:-1080}"
-    app="${4:-vkcube}"
-    read -r -a app_cmd <<< "$app"
+    if [[ "${4:-}" == "--" ]]; then
+        app_cmd=( "${@:5}" )
+    elif (( $# > 3 )); then
+        app_cmd=( "${@:4}" )
+        if (( ${#app_cmd[@]} == 1 )) && [[ "${app_cmd[0]}" == *[[:space:]]* ]]; then
+            # Compatibility with the old one-string app argument.
+            read -r -a app_cmd <<< "${app_cmd[0]}"
+        fi
+    else
+        app_cmd=( vkcube )
+    fi
+    (( ${#app_cmd[@]} > 0 )) || { echo "error: app command is empty" >&2; return 1; }
+    printf -v app '%q ' "${app_cmd[@]}"
+    app="${app% }"
     read -r w h < <(res_to_dims "$res")
     local refresh="${REFRESH:-144}" limit="${LIMIT:-2}" every="${DEBUG_EVERY:-1}" quality="${QUALITY:-high}"
 
     case "$mode" in extrapolate|motion|blend) ;; *) echo "error: mode must be extrapolate|motion|blend" >&2; exit 1 ;; esac
     case "$quality" in low|medium|high|ultra|extreme) ;; *) echo "error: QUALITY must be low|medium|high|ultra|extreme" >&2; exit 1 ;; esac
-    if ! command -v "${app%% *}" >/dev/null 2>&1; then
-        echo "error: test app '${app%% *}' not found in PATH" >&2; exit 1
+    [[ "$refresh" =~ ^[1-9][0-9]*$ ]] || { echo "error: REFRESH must be a positive integer" >&2; return 1; }
+    [[ "$limit" =~ ^[1-9][0-9]*$ ]] || { echo "error: LIMIT must be a positive integer" >&2; return 1; }
+    [[ "$every" =~ ^[1-9][0-9]*$ ]] || { echo "error: DEBUG_EVERY must be a positive integer" >&2; return 1; }
+    if [[ -n "${DURATION:-}" && ! "$DURATION" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "error: DURATION must be a non-negative number of seconds" >&2; return 1
+    fi
+    if ! command -v "${app_cmd[0]}" >/dev/null 2>&1 && [[ ! -x "${app_cmd[0]}" ]]; then
+        echo "error: test app '${app_cmd[0]}' not found" >&2; exit 1
     fi
 
     local log; log="$(mktemp -t framegen-run.XXXXXX.log)"
@@ -162,13 +186,28 @@ cmd_run() {
         --framegen-debug -- "${app_cmd[@]}"
     )
 
+    local run_status
+    local -a pipeline_status
+    set +e
     if [[ -n "${DURATION:-}" ]]; then
-        GAMESCOPE_FRAMEGEN_DEBUG_EVERY="$every" timeout "$DURATION" "${cmd[@]}" 2>&1 | tee "$log" || true
+        GAMESCOPE_FRAMEGEN_DEBUG_EVERY="$every" timeout "$DURATION" "${cmd[@]}" 2>&1 | tee "$log"
+        pipeline_status=( "${PIPESTATUS[@]}" )
     else
-        GAMESCOPE_FRAMEGEN_DEBUG_EVERY="$every" "${cmd[@]}" 2>&1 | tee "$log" || true
+        GAMESCOPE_FRAMEGEN_DEBUG_EVERY="$every" "${cmd[@]}" 2>&1 | tee "$log"
+        pipeline_status=( "${PIPESTATUS[@]}" )
+    fi
+    set -e
+
+    run_status=${pipeline_status[0]}
+    if (( run_status == 0 && pipeline_status[1] != 0 )); then
+        run_status=${pipeline_status[1]}
     fi
 
     summarize "$log"
+    if [[ -n "${DURATION:-}" && "$run_status" -eq 124 ]]; then
+        return 0
+    fi
+    return "$run_status"
 }
 
 case "${1:-}" in
@@ -176,7 +215,7 @@ case "${1:-}" in
     bench) shift; cmd_bench "$@" ;;
     run)   shift; cmd_run "$@" ;;
     ""|-h|--help|help)
-        sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         ;;
     *) echo "error: unknown subcommand '$1' (use gpus|bench|run)" >&2; exit 1 ;;
 esac

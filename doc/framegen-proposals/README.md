@@ -9,6 +9,7 @@ survey:
 
 - 🕹️ [**How-To**](../framegen-howto.md) — plain-language setup: the two-card split, wiring the display, copy-paste commands per mode, current limits. **Start here to *use* it.**
 - 🔧 [**Architecture**](../framegen-architecture.md) — the deep implementation map: end-to-end dataflow, the algorithmic branches, the decision state machine, resource design, and the §3.6 prior-art table.
+- 🧰 [**Maintainer guide**](../framegen-maintenance.md) — invariants, ABI/cache/queue contracts, validation levels, and publication checks.
 - 📚 [**Research survey**](../research-framegen.md) — the frames-only state of the art this pipeline is measured against (primary-source cross-checked).
 
 **What's shipped vs. proposed.** Everything in the
