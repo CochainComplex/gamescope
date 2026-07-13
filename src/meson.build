@@ -72,8 +72,6 @@ shader_src = [
   'shaders/cs_framegen_extrapolate_fp16.comp',
   'shaders/cs_framegen_extrapolate_pair.comp',
   'shaders/cs_framegen_extrapolate_pair_fp16.comp',
-  'shaders/cs_framegen_motion_luma.comp',
-  'shaders/cs_framegen_motion_luma_rgba.comp',
   'shaders/cs_framegen_motion_luma_pair.comp',
   'shaders/cs_framegen_motion_luma_pair_rgba.comp',
   'shaders/cs_framegen_motion_pyramid.comp',

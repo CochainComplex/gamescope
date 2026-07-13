@@ -13,13 +13,13 @@ symbols below.
 | CLI and environment | `src/main.cpp` | parsing, validation, debug controls |
 | Framegen types and quality policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/quality vocabulary and pure degradation-ladder resolution |
 | Temporal and dispatch policy | `src/framegen/temporal.hpp`, `src/framegen/dispatch_policy.hpp` | pure phase/cadence math and capability-to-strategy selection |
-| Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp` | CPU/GLSL ABI and serialized/GPU tensor layout |
+| Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp`, `src/framegen/net_profile.hpp` | CPU/GLSL ABI, tensor layout, and GSFR validation/migration |
 | Vulkan execution | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch, queues, timestamps, ML execution |
 | Presentation choice | `src/steamcompmgr.cpp` | real/generated/repeat arbitration and timed flips |
 | Backend present | `src/Backends/DRMBackend.cpp`, `src/Backends/WaylandBackend.cpp` | final generated-frame substitution |
 | Algorithms | `src/shaders/cs_framegen_*.comp` | extrapolation, motion estimation, validation, warp, ML |
 | Offline ML tools | `scripts/framegen-net-*.py` | GSFD parsing, training, GSFR evaluation |
-| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, dispatch, ABI encoding, and net-layout matrices |
+| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, dispatch, ABI encoding, net layout, and GSFR compatibility matrices |
 
 Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
@@ -118,7 +118,12 @@ Other duplicated ABI constants require the same treatment:
   served-weight layout are shared by C++, inference/training/optimizer shaders,
   and the Python trainer/evaluator.
 - GSFR magic/version/layer metadata are shared by runtime profile loading and
-  the Python tools. A format change requires an explicit compatibility policy.
+  the Python tools. `src/framegen/net_profile.hpp` is the runtime source of truth
+  for metadata construction, strict validation, finite-weight checks, and the
+  v1/v2 shading-head migration. A format change requires an explicit
+  compatibility policy and matching tool updates. Serialized finite-weight
+  checks inspect IEEE-754 bits because the production C++ build uses
+  `-ffast-math`; do not replace them with `std::isfinite`.
 - GSFD and GSCF capture versions are public analysis-file formats. Reject unknown
   versions rather than partially interpreting them.
 - B4's 96-counter layout is shared by the stats, apply, training, and CPU
@@ -177,9 +182,11 @@ Adam consumes it. Non-finite served weights are rejected and the optimizer is
 reinitialized from the finite prior.
 
 Profile I/O stays off the compositor hot path. Checkpoints use the owned writer
-thread and atomic replace; reset/exit joins it before the final flush. During
-testing, point `GAMESCOPE_FRAMEGEN_NET_PROFILE` at a disposable copy. Never use a
-known-good profile as the writable test destination.
+thread and atomic replace; reset/exit joins it before the final flush. The
+renderer owns file lifetime, logging, and worker synchronization, while
+`net_profile.hpp` owns only the stateless serialized-format checks. During
+testing, point `GAMESCOPE_FRAMEGEN_NET_PROFILE` at a disposable copy. Never use
+a known-good profile as the writable test destination.
 
 ## Validation by change class
 
@@ -196,6 +203,9 @@ PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
 c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
   tests/test_framegen.cpp -o /tmp/gamescope-framegen-contracts
 /tmp/gamescope-framegen-contracts
+c++ -std=c++20 -O3 -ffast-math -Wall -Wextra -Werror -Isrc \
+  tests/test_framegen.cpp -o /tmp/gamescope-framegen-contracts-fastmath
+/tmp/gamescope-framegen-contracts-fastmath
 git diff --check
 ```
 

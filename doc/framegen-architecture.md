@@ -83,7 +83,7 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - **`IBackend::SupportsFramegen()`** in `src/backend.h` — defaults false; DRM and nested Wayland return true, and `CDeferredBackend` delegates to its child. It contains the forced-composite/present-timing cost to capable backends.
 
 ### Shader build wiring (`src/meson.build`)
-The 23 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) and registered unconditionally by the `SHADER()` macro table; `MOTION_WARP_ACCEL` serves Ultra acceleration and Extreme guided reconstruction. **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays**, so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
+The 21 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) and registered unconditionally by the `SHADER()` macro table; `MOTION_WARP_ACCEL` serves Ultra acceleration and Extreme guided reconstruction. **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays**, so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
 
 ---
 
@@ -509,8 +509,11 @@ avoids the invalid two-frame objective that would reward blindly repeating every
 the fourth output row/bias receive this loss; it cannot perturb the shared trunk or the established
 flow/confidence heads. Reverse tiles write an exact zero shading gradient. Detected scene cuts,
 disabled B4/cut detection, stale frame IDs, JIT/refill of the same real pair, missing resources,
-lower tiers, and bidir all disable the objective. GSFR v3 activates the head; v1/v2 blobs are migrated only after forcibly zeroing their
-formerly undefined fourth row and bias.
+lower tiers, and bidir all disable the objective. GSFR v3 activates the head;
+v1/v2 blobs are migrated only after forcibly zeroing their formerly undefined
+fourth row and bias. `src/framegen/net_profile.hpp` centralizes that metadata,
+finite-weight validation, and compatibility transform; the renderer retains
+atomic file replacement and worker-thread lifetime.
 
 Optimizer robustness is two-layered. The GPU rejects non-finite gradient slices, clamps each
 parameter gradient to the necessary `[-1,1]` bound implied by the offline trainer's global-norm
@@ -848,9 +851,6 @@ cache hit.
   (7900 XT / 5700 XT) are not special-cased** and run the un-benchmarked LDS+fp16 default; the direct
   shader's own header claims RDNA3's Infinity Cache benefits too — dispatcher and shader comment
   disagree on RDNA3. Extend the predicate once measured on those parts.
-- **Unused shader variants.** The `MOTION_LUMA` / `_RGBA` single-target shaders are compiled but
-  not dispatched; only the paired variants run. The single-target RGBA variant still uses a
-  single-tap downsample and must not be revived without matching the paired box-filter behavior.
 - **Wobble** — fixed in `a75bfbe` (nested-refresh clock, box luma, sub-pixel SAD, selective clamp);
   extrapolate stays structurally juddery on fast motion → prefer motion mode for pans.
 - **Translucency (vkmark "penguins")** — tested: FG *preserves* opacity (0.52 vs 0.50); the earlier

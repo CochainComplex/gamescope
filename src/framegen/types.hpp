@@ -34,3 +34,42 @@ enum class GamescopeFramegenQuality : uint32_t
 	// field at motion boundaries. This is the most expensive causal path.
 	Extreme,
 };
+
+namespace gamescope::framegen
+{
+
+[[nodiscard]] constexpr const char *mode_name( GamescopeFramegenMode mode )
+{
+	switch ( mode )
+	{
+		case GamescopeFramegenMode::Extrapolate:
+			return "extrapolate";
+		case GamescopeFramegenMode::Blend:
+			return "blend";
+		case GamescopeFramegenMode::Motion:
+			return "motion";
+		default:
+			return "unknown";
+	}
+}
+
+[[nodiscard]] constexpr const char *quality_name( GamescopeFramegenQuality quality )
+{
+	switch ( quality )
+	{
+		case GamescopeFramegenQuality::Low:
+			return "low";
+		case GamescopeFramegenQuality::Medium:
+			return "medium";
+		case GamescopeFramegenQuality::High:
+			return "high";
+		case GamescopeFramegenQuality::Ultra:
+			return "ultra";
+		case GamescopeFramegenQuality::Extreme:
+			return "extreme";
+		default:
+			return "unknown";
+	}
+}
+
+} // namespace gamescope::framegen

@@ -43,6 +43,7 @@
 #include "Utils/Process.h"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/net_layout.hpp"
+#include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
 #include "framegen/temporal.hpp"
@@ -59,8 +60,6 @@
 #include "cs_framegen_extrapolate_fp16.h"
 #include "cs_framegen_extrapolate_pair.h"
 #include "cs_framegen_extrapolate_pair_fp16.h"
-#include "cs_framegen_motion_luma.h"
-#include "cs_framegen_motion_luma_rgba.h"
 #include "cs_framegen_motion_luma_pair.h"
 #include "cs_framegen_motion_luma_pair_rgba.h"
 #include "cs_framegen_motion_pyramid.h"
@@ -1212,8 +1211,6 @@ bool CVulkanDevice::createShaders()
 		SHADER(FRAMEGEN_EXTRAPOLATE_PAIR_FP16, cs_framegen_extrapolate_pair_fp16);
 	else
 		SHADER(FRAMEGEN_EXTRAPOLATE_PAIR_FP16, cs_framegen_extrapolate_pair);
-	SHADER(FRAMEGEN_MOTION_LUMA, cs_framegen_motion_luma);
-	SHADER(FRAMEGEN_MOTION_LUMA_RGBA, cs_framegen_motion_luma_rgba);
 	SHADER(FRAMEGEN_MOTION_LUMA_PAIR, cs_framegen_motion_luma_pair);
 	SHADER(FRAMEGEN_MOTION_LUMA_PAIR_RGBA, cs_framegen_motion_luma_pair_rgba);
 	SHADER(FRAMEGEN_MOTION_PYRAMID, cs_framegen_motion_pyramid);
@@ -4667,46 +4664,6 @@ extern uint32_t g_reshade_technique_idx;
 
 ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
 
-static const char *framegen_mode_name_of( GamescopeFramegenMode eMode )
-{
-	switch ( eMode )
-	{
-		case GamescopeFramegenMode::Extrapolate:
-			return "extrapolate";
-		case GamescopeFramegenMode::Blend:
-			return "blend";
-		case GamescopeFramegenMode::Motion:
-			return "motion";
-		default:
-			return "unknown";
-	}
-}
-
-static const char *framegen_mode_name()
-{
-	return framegen_mode_name_of( g_eFramegenMode );
-}
-
-static const char *framegen_quality_name_of( GamescopeFramegenQuality eQuality )
-{
-	switch ( eQuality )
-	{
-		case GamescopeFramegenQuality::Low:
-			return "low";
-		case GamescopeFramegenQuality::Medium:
-			return "medium";
-		case GamescopeFramegenQuality::High:
-			return "high";
-		case GamescopeFramegenQuality::Ultra:
-			return "ultra";
-		case GamescopeFramegenQuality::Extreme:
-			return "extreme";
-		default:
-			return "unknown";
-	}
-}
-
-
 // Motion-estimation intermediates (low-resolution luma pyramids and the motion
 // field). Allocated lazily by the motion dispatch, released on framegen reset.
 // The matcher runs coarse-to-fine over three pyramid levels: full search only
@@ -5232,7 +5189,7 @@ bool vulkan_framegen_base_layer_active()
 // layer 0, YCbCr game buffer, ReShade active — ReShade rewrites layer 0 inside
 // vulkan_composite and would run twice and host-stall on the generated
 // composite, or a base format without storage-image support), the recorder
-// falls back LIVE to the legacy output-space path; the switch is mediated by
+// falls back LIVE to the output-space path; the switch is mediated by
 // the dims/mode-keyed history reset, so the two paths never mix within a
 // scene.
 static bool framegen_base_layer_usable( const struct FrameInfo_t *pFrameInfo )
@@ -5604,7 +5561,7 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 
 	// Base-layer mode (#02): the pending slot holds a pre-upscale BASE frame;
 	// composite it through the real pipeline with the live layer stack (fresh
-	// overlays, latest cursor) before it can be flipped. Legacy mode returns
+	// overlays, latest cursor) before it can be flipped. Output-space mode returns
 	// the scanout-ready generated output directly.
 	gamescope::Rc<CVulkanTexture> pResult = front.tex;
 	if ( g_framegenHistory.bBaseLayer )
@@ -5790,7 +5747,7 @@ static bool framegen_ensure_resources( uint32_t width, uint32_t height, uint32_t
 	if ( g_framegenHistory.width != width || g_framegenHistory.height != height
 		|| g_framegenHistory.drmFormat != drmFormat || g_framegenHistory.bBaseLayer != bBaseLayer )
 	{
-		// The mode is part of the reset key: flipping base<->legacy without a
+		// The mode is part of the reset key: flipping base<->output-space without a
 		// reset would mix owned-copy history with output-ring history and
 		// mislabel pending frames (a base-sized, non-flippable image must
 		// never reach drm_prepare directly, and vice versa).
@@ -5802,9 +5759,9 @@ static bool framegen_ensure_resources( uint32_t width, uint32_t height, uint32_t
 	}
 
 	// Generated-frame pool: 2*multiplier distinct images so the (multiplier-1)
-	// frames in flight plus any still being scanned out (legacy) or still
+	// frames in flight plus any still being scanned out (output-space) or still
 	// being read by a late composite (base mode) never alias. History
-	// (previousReal/currentReal) is NOT allocated here in legacy mode — it is
+	// (previousReal/currentReal) is NOT allocated here in output-space mode — it is
 	// retained by reference from the output ring in framegen_record_real_frame;
 	// in base mode it lives in the two owned baseHistory images below.
 	const size_t nPool = (size_t)2 * (size_t)g_nFramegenMultiplier;
@@ -5993,7 +5950,7 @@ static bool framegen_is_float_drm_format( uint32_t drmFormat )
 	// fp32 for them (see the fp16 shader's precision note). 16-bit UNORM
 	// targets need the same treatment for a different reason: fp16's 11-bit
 	// mantissa cannot represent 16-bit-deep content, so the fp16 path would
-	// band it. Unreachable in legacy output-space mode (scanout formats are
+	// band it. Unreachable in output-space mode (scanout formats are
 	// 8/10-bit), but base-layer mode (#02) generates in the CLIENT's format,
 	// and 16-bit UNORM swapchains do occur (e.g. the NVIDIA WSI path here).
 	switch ( drmFormat )
@@ -6207,33 +6164,17 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 		return false;
 	}
 
-	uint32_t uHeader[ 3 ] = {};
-	bool bOk = fread( uHeader, sizeof( uHeader ), 1, pFile ) == 1
-		&& uHeader[ 0 ] == k_uFramegenNetMagic
-		&& uHeader[ 1 ] >= 1u && uHeader[ 1 ] <= k_uFramegenNetVersion
-		&& uHeader[ 2 ] == k_uFramegenNetLayerCount;
-	for ( uint32_t l = 0; bOk && l < k_uFramegenNetLayerCount; l++ )
-	{
-		uint32_t uDims[ 3 ] = {};
-		bOk = fread( uDims, sizeof( uDims ), 1, pFile ) == 1
-			&& uDims[ 0 ] == k_uFramegenNetLayerDims[ l ][ 0 ]
-			&& uDims[ 1 ] == k_uFramegenNetLayerDims[ l ][ 1 ]
-			&& uDims[ 2 ] == k_uFramegenNetKernelWidth;
-	}
+	gamescope::framegen::NetProfileMetadata metadata = {};
+	bool bOk = fread( metadata.data(), sizeof( uint32_t ), metadata.size(), pFile ) == metadata.size();
+	const uint32_t uVersion = bOk
+		? gamescope::framegen::net_profile_metadata_version( metadata ) : 0u;
+	bOk = uVersion != 0u;
 	if ( bOk )
 	{
 		weights.resize( k_uFramegenNetFloats );
 		bOk = fread( weights.data(), sizeof( float ), weights.size(), pFile ) == weights.size();
-		for ( size_t i = 0; bOk && i < weights.size(); i++ )
-			bOk = std::isfinite( weights[ i ] );
-		if ( bOk && uHeader[ 1 ] < 3u )
-		{
-			// V1/V2 never defined output channel four. Do not trust arbitrary
-			// finite bytes from a third-party blob as a color-correction gate.
-			std::fill( weights.begin() + k_uFramegenNetShadingWeightBegin,
-				weights.begin() + k_uFramegenNetLayer3BiasOffset, 0.0f );
-			weights[ k_uFramegenNetShadingBias ] = 0.0f;
-		}
+		bOk = bOk && gamescope::framegen::validate_and_migrate_net_profile_weights(
+			uVersion, weights );
 	}
 	fclose( pFile );
 
@@ -6242,10 +6183,10 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 		weights.clear();
 		vk_log.errorf( "framegen: net weights '%s' malformed (want 3 finite fp32 conv layers 12->16->16->4, k=3)", pszPath );
 	}
-	else if ( uHeader[ 1 ] < k_uFramegenNetVersion )
+	else if ( uVersion < k_uFramegenNetVersion )
 	{
 		vk_log.infof( "framegen: net weights '%s' use legacy v%u training semantics; accepting as a bounded prior under v%u with the formerly-reserved shading head zeroed",
-			pszPath, uHeader[ 1 ], k_uFramegenNetVersion );
+			pszPath, uVersion, k_uFramegenNetVersion );
 	}
 	return bOk;
 }
@@ -7295,6 +7236,15 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 		if ( !s_bLoggedFail.exchange( true ) )
 			vk_log.errorf( "framegen: net profile %s '%s' failed (%s); keeping the previous file", pszWhat, pszPath, strerror( errno ) );
 	};
+	if ( !gamescope::framegen::validate_and_migrate_net_profile_weights(
+		k_uFramegenNetVersion, weights ) )
+	{
+		errno = EINVAL;
+		fail( "validation for" );
+		if ( bFromWorker )
+			g_bFramegenNetWriteInFlight = false;
+		return;
+	}
 
 	char szTmp[ 1024 ];
 	if ( (size_t)snprintf( szTmp, sizeof( szTmp ), "%s.tmp", pszPath ) >= sizeof( szTmp ) )
@@ -7313,19 +7263,8 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 			g_bFramegenNetWriteInFlight = false;
 		return;
 	}
-	const uint32_t uHeader[ 3 ] = {
-		k_uFramegenNetMagic, k_uFramegenNetVersion, k_uFramegenNetLayerCount,
-	};
-	bool bOk = fwrite( uHeader, sizeof( uHeader ), 1, pFile ) == 1;
-	for ( uint32_t l = 0; bOk && l < k_uFramegenNetLayerCount; l++ )
-	{
-		const uint32_t uDims[ 3 ] = {
-			k_uFramegenNetLayerDims[ l ][ 0 ],
-			k_uFramegenNetLayerDims[ l ][ 1 ],
-			k_uFramegenNetKernelWidth,
-		};
-		bOk = fwrite( uDims, sizeof( uDims ), 1, pFile ) == 1;
-	}
+	constexpr auto metadata = gamescope::framegen::net_profile_metadata();
+	bool bOk = fwrite( metadata.data(), sizeof( uint32_t ), metadata.size(), pFile ) == metadata.size();
 	bOk = bOk && fwrite( weights.data(), sizeof( float ), weights.size(), pFile ) == weights.size();
 	bOk = ( fclose( pFile ) == 0 ) && bOk;
 	if ( bOk && rename( szTmp, pszPath ) != 0 )
@@ -8252,8 +8191,8 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 			nGeneratedCount,
 			g_framegenHistory.currentFrameId,
 			nGapVblanks,
-			framegen_mode_name_of( bMotion ? GamescopeFramegenMode::Motion : eff.mode ),
-			framegen_quality_name_of( eff.quality ),
+			gamescope::framegen::mode_name( bMotion ? GamescopeFramegenMode::Motion : eff.mode ),
+			gamescope::framegen::quality_name( eff.quality ),
 			eff.multiplier,
 			g_framegenHistory.nDegradeSteps,
 			nMaxDegradeSteps,
@@ -8931,8 +8870,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	if ( !g_bLoggedFramegenConfig )
 	{
-		vk_log.infof( "framegen: enabled mode=%s quality=%s multiplier=%d%s", framegen_mode_name(),
-			framegen_quality_name_of( g_eFramegenQuality ), g_nFramegenMultiplier,
+		vk_log.infof( "framegen: enabled mode=%s quality=%s multiplier=%d%s",
+			gamescope::framegen::mode_name( g_eFramegenMode ),
+			gamescope::framegen::quality_name( g_eFramegenQuality ), g_nFramegenMultiplier,
 			g_device.hasFramegenQueue() ? " (dedicated queue)" : "" );
 		vk_log.infof( "framegen: forcing composite path" );
 		if ( vulkan_framegen_vrr_hybrid_requested() )
@@ -9177,7 +9117,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// History shift, on every kept real frame (even non-generatable ones) so
 	// the two most recent reals stay fresh and a slowdown resumes generation
 	// without a re-prime. Base mode (#02) copies the client's base buffer into
-	// an owned image on the framegen queue; legacy mode is the zero-copy
+	// an owned image on the framegen queue; output-space mode is the zero-copy
 	// shift — the previous "current" becomes "previous" and the just-composited
 	// output image becomes "current", holding references into the output ring.
 	if ( bBaseLayer )

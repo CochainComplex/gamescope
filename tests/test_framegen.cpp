@@ -1,5 +1,6 @@
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/net_layout.hpp"
+#include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
 #include "framegen/temporal.hpp"
@@ -9,6 +10,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <string_view>
 
 using gamescope::framegen::EffectiveConfig;
 using gamescope::framegen::effective_config;
@@ -86,6 +89,95 @@ static void test_learned_net_layout()
 	CHECK( k_uFramegenNetFloats == 4644u );
 	CHECK( k_uFramegenNetTexW == 2048u );
 	CHECK( k_uFramegenNetTexH == 3u );
+}
+
+static void test_names()
+{
+	using gamescope::framegen::mode_name;
+	using gamescope::framegen::quality_name;
+
+	CHECK( std::string_view( mode_name( GamescopeFramegenMode::Extrapolate ) ) == "extrapolate" );
+	CHECK( std::string_view( mode_name( GamescopeFramegenMode::Blend ) ) == "blend" );
+	CHECK( std::string_view( mode_name( GamescopeFramegenMode::Motion ) ) == "motion" );
+	CHECK( std::string_view( mode_name( static_cast<GamescopeFramegenMode>( 99u ) ) ) == "unknown" );
+	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::Low ) ) == "low" );
+	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::Medium ) ) == "medium" );
+	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::High ) ) == "high" );
+	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::Ultra ) ) == "ultra" );
+	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::Extreme ) ) == "extreme" );
+	CHECK( std::string_view( quality_name( static_cast<GamescopeFramegenQuality>( 99u ) ) ) == "unknown" );
+}
+
+static void test_net_profile_contract()
+{
+	using namespace gamescope::framegen;
+
+	constexpr NetProfileMetadata current = net_profile_metadata();
+	static_assert( current[ 0 ] == k_uFramegenNetMagic );
+	static_assert( current[ 1 ] == k_uFramegenNetVersion );
+	static_assert( current[ 2 ] == k_uFramegenNetLayerCount );
+	static_assert( current[ 3 ] == 12u && current[ 4 ] == 16u && current[ 5 ] == 3u );
+	static_assert( current[ 6 ] == 16u && current[ 7 ] == 16u && current[ 8 ] == 3u );
+	static_assert( current[ 9 ] == 16u && current[ 10 ] == 4u && current[ 11 ] == 3u );
+	CHECK( net_profile_metadata_version( current ) == k_uFramegenNetVersion );
+
+	for ( uint32_t version = k_uFramegenNetOldestVersion;
+		version <= k_uFramegenNetVersion; version++ )
+	{
+		const NetProfileMetadata metadata = net_profile_metadata( version );
+		CHECK( net_profile_metadata_version( metadata ) == version );
+	}
+
+	NetProfileMetadata malformed = current;
+	malformed[ 0 ] ^= 1u;
+	CHECK( net_profile_metadata_version( malformed ) == 0u );
+	malformed = net_profile_metadata( 0u );
+	CHECK( net_profile_metadata_version( malformed ) == 0u );
+	malformed = net_profile_metadata( k_uFramegenNetVersion + 1u );
+	CHECK( net_profile_metadata_version( malformed ) == 0u );
+	malformed = current;
+	malformed[ 2 ]++;
+	CHECK( net_profile_metadata_version( malformed ) == 0u );
+	for ( size_t word = 3u; word < malformed.size(); word++ )
+	{
+		malformed = current;
+		malformed[ word ]++;
+		CHECK( net_profile_metadata_version( malformed ) == 0u );
+	}
+	CHECK( net_profile_metadata_version(
+		std::span<const uint32_t>( current.data(), current.size() - 1u ) ) == 0u );
+
+	std::array<float, k_uFramegenNetFloats> weights = {};
+	for ( size_t i = 0; i < weights.size(); i++ )
+		weights[ i ] = static_cast<float>( i + 1u );
+	const auto original = weights;
+	CHECK( validate_and_migrate_net_profile_weights( k_uFramegenNetShadingVersion, weights ) );
+	CHECK( weights == original );
+
+	for ( const uint32_t version : { 1u, 2u } )
+	{
+		weights = original;
+		CHECK( validate_and_migrate_net_profile_weights( version, weights ) );
+		for ( size_t i = 0; i < weights.size(); i++ )
+		{
+			const bool bLegacyShadingWeight = i >= k_uFramegenNetShadingWeightBegin
+				&& i < k_uFramegenNetLayer3BiasOffset;
+			const bool bLegacyShadingBias = i == k_uFramegenNetShadingBias;
+			CHECK( weights[ i ] == ( bLegacyShadingWeight || bLegacyShadingBias
+				? 0.0f : original[ i ] ) );
+		}
+	}
+
+	weights = original;
+	weights[ 17 ] = std::numeric_limits<float>::quiet_NaN();
+	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetShadingVersion, weights ) );
+	weights = original;
+	weights[ 18 ] = std::numeric_limits<float>::infinity();
+	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetShadingVersion, weights ) );
+	CHECK( !validate_and_migrate_net_profile_weights( 0u, weights ) );
+	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetVersion + 1u, weights ) );
+	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetShadingVersion,
+		std::span<float>( weights.data(), weights.size() - 1u ) ) );
 }
 
 static void test_temporal_policy()
@@ -248,6 +340,8 @@ int main()
 {
 	test_degradation_policy();
 	test_learned_net_layout();
+	test_names();
+	test_net_profile_contract();
 	test_temporal_policy();
 	test_dispatch_policy();
 	test_push_constant_encoding();

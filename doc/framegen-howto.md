@@ -8,6 +8,70 @@ honest list of what doesn't work yet.
 > upstream gamescope). Expect visual glitches and occasional crashes; retry with
 > a lower quality tier or simpler mode when a workload is unstable.
 
+## Preferred visual baseline: GravityMark x4
+
+This is the accepted, most visually appealing GravityMark configuration from
+live testing: Motion Extreme, three generated frames per real frame,
+bidirectional presentation, strength `0.5`, and the frozen learned profile. It
+prioritizes visual smoothness and quality; bidirectional mode adds one real-frame
+interval of latency, so this is not the competitive-latency preset.
+
+Set the two PCI IDs and paths for the machine, then run:
+
+```bash
+export PRESENT_DEV=1002:5678          # GPU physically connected to the display
+export RENDER_DEV=10de:1234!          # GPU rendering GravityMark
+export GRAVITYMARK_DIR=/path/to/GravityMark/bin
+export FRAMEGEN_BEST_PROFILE="$HOME/.cache/gamescope-fg-gravitymark-best-dc58b2d5.bin"
+
+test -r "$FRAMEGEN_BEST_PROFILE" # this must succeed before continuing
+unset GAMESCOPE_FRAMEGEN_NET_ONLINE GAMESCOPE_FRAMEGEN_NET_PROFILE \
+  GAMESCOPE_FRAMEGEN_RECORD_COLOR
+
+GAMESCOPE_BUILD_DIR=build-perf \
+GAMESCOPE_FRAMEGEN_BIDIR=1 \
+GAMESCOPE_FRAMEGEN_NET="$FRAMEGEN_BEST_PROFILE" \
+GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS=0 \
+GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0 \
+GAMESCOPE_FRAMEGEN_RESERVOIR=1 \
+GAMESCOPE_FRAMEGEN_SHADING=1 \
+GAMESCOPE_FRAMEGEN_DEBUG_EVERY=60 \
+./env-gamescope-local.sh \
+gamescope --expose-wayland --backend wayland \
+  --prefer-vk-device "$PRESENT_DEV" \
+  -W 2560 -H 1440 -r 120 \
+  --experimental-framegen \
+  --framegen-mode motion \
+  --framegen-multiplier 4 \
+  --framegen-quality extreme \
+  --framegen-strength 0.5 \
+  --framegen-debug \
+  -- env -C "$GRAVITYMARK_DIR" MESA_VK_DEVICE_SELECT="$RENDER_DEV" \
+    ./GravityMark.x64 -vk -temporal 0 -benchmark 0 -fps 1 \
+    -asteroids 1000000 -width 2560 -height 1440 -vsync 0
+```
+
+The frozen command is repeatable and cannot modify the accepted profile.
+Reservoir and shading remain enabled for the complete Extreme configuration,
+although their causal passes are not scheduled while bidirectional mode is
+active.
+
+The original discovery run used in-situ learning. To continue training without
+touching the frozen profile, make a writable copy:
+
+```bash
+export FRAMEGEN_WORKING_PROFILE="$HOME/.cache/gamescope-fg-gravitymark-working.bin"
+cp -a "$FRAMEGEN_BEST_PROFILE" "$FRAMEGEN_WORKING_PROFILE"
+chmod u+w "$FRAMEGEN_WORKING_PROFILE"
+```
+
+Then remove the frozen command's `GAMESCOPE_FRAMEGEN_NET=...` line and export:
+
+```bash
+export GAMESCOPE_FRAMEGEN_NET_ONLINE=1
+export GAMESCOPE_FRAMEGEN_NET_PROFILE="$FRAMEGEN_WORKING_PROFILE"
+```
+
 ---
 
 ## 1. What frame generation actually does
