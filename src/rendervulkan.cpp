@@ -1355,11 +1355,11 @@ bool CVulkanDevice::createScratchResources()
 	}
 
 	// Best-effort timestamp query-pool ring to measure live framegen GPU time,
-	// feeding the deadline-driven degradation ladder. Only meaningful on the
-	// dedicated queue (where a batch's timestamps aren't serialized behind the
-	// composite); if the queue family can't timestamp, framegen simply runs
-	// without the measurement and the ladder stays at full quality.
-	if ( m_bHasFramegenQueue )
+	// feeding the deadline-driven degradation ladder. A dedicated queue measures
+	// isolated generation work; the shared-queue fallback measures the actual
+	// submission span, including unavoidable same-queue interference. Both are
+	// useful deadline signals. If the family cannot timestamp, framegen simply
+	// runs without measurement and the ladder stays at full quality.
 	{
 		uint32_t nQueueFamilyCount = 0;
 		vk.GetPhysicalDeviceQueueFamilyProperties( physDev(), &nQueueFamilyCount, nullptr );
@@ -1386,8 +1386,11 @@ bool CVulkanDevice::createScratchResources()
 			};
 			if ( vk.CreateQueryPool( device(), &queryPoolInfo, nullptr, &m_framegenQueryPool ) == VK_SUCCESS )
 			{
+				m_uFramegenTimestampValidBits = queueFamilyProps[ m_queueFamily ].timestampValidBits;
 				m_flFramegenTimestampPeriodNs = physProps.limits.timestampPeriod;
-				vk_log.infof( "frame generation: measuring GPU time via timestamp queries (period %.2f ns)", m_flFramegenTimestampPeriodNs );
+				vk_log.infof( "frame generation: measuring GPU time via timestamp queries (period %.2f ns, %u valid bits, %s queue)",
+					m_flFramegenTimestampPeriodNs, m_uFramegenTimestampValidBits,
+					m_bHasFramegenQueue ? "dedicated" : "shared" );
 			}
 			else
 			{
@@ -1872,10 +1875,10 @@ void CVulkanDevice::waitIdle(bool reset)
 	// and framegen pools those buffers still reference) never free GPU-in-flight
 	// resources. Not on any per-frame path.
 	if ( m_bHasFramegenQueue )
-	{
 		waitFramegen( m_framegenSeqNo );
-		framegenGarbageCollect();
-	}
+	// Dedicated buffers and either queue mode's completed timing association are
+	// now safe to recycle/consume. This is still outside every per-frame path.
+	framegenGarbageCollect();
 }
 
 bool CVulkanDevice::hasCompleted(uint64_t sequence)
@@ -1895,7 +1898,13 @@ bool CVulkanDevice::hasCompleted(uint64_t sequence)
 uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer, uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung, uint32_t nGeneratedCount )
 {
 	if ( !m_bHasFramegenQueue )
-		return submit( std::move( cmdBuffer ) );
+	{
+		const uint64_t ulSeqNo = submit( std::move( cmdBuffer ) );
+		if ( nQuerySlot >= 0 )
+			m_framegenQuerySlotBySeqNo.emplace( ulSeqNo,
+				FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount } );
+		return ulSeqNo;
+	}
 
 	CVulkanCmdBuffer *pRaw = cmdBuffer.get();
 	pRaw->end();
@@ -1904,7 +1913,12 @@ uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf
 
 	VkSemaphore waitSemaphores[1] = { m_scratchTimelineSemaphore };
 	uint64_t waitValues[1] = { ulWaitCompositeSeqNo };
-	VkPipelineStageFlags waitStages[1] = { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT };
+	// Nothing in this command buffer is independent of the just-composited real
+	// frame. Wait at the earliest execution scope so the opening TOP_OF_PIPE
+	// timestamp cannot run before the semaphore and accidentally charge
+	// composite-wait time to the framegen degradation ladder. ALL_COMMANDS also
+	// keeps future non-compute setup/copy passes inside the same dependency.
+	VkPipelineStageFlags waitStages[1] = { VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
 
 	VkSemaphore signalSemaphores[1] = { m_framegenTimeline->pVkSemaphore };
 	uint64_t signalValues[1] = { nextSeqNo };
@@ -1982,9 +1996,17 @@ void CVulkanDevice::framegenTimestampEnd( CVulkanCmdBuffer *pCmdBuffer, int nSlo
 
 void CVulkanDevice::framegenResetRungCosts()
 {
+	// A scene reset may race logically with an already-submitted batch on the
+	// dedicated queue. Its command buffer still completes and is recycled, but
+	// its timing belongs to the old scene and must not re-seed the fresh ladder.
+	m_framegenQuerySlotBySeqNo.clear();
+	m_ulFramegenLastRawGpuTimeNs = 0;
 	for ( uint32_t r = 0; r < kFramegenLadderSlots; r++ )
 		for ( uint32_t c = 0; c < kFramegenGeneratedCountSlots; c++ )
+		{
 			m_aFramegenRungCostNs[ r ][ c ] = 0;
+			m_aFramegenRungSamples[ r ][ c ] = 0;
+		}
 }
 
 void CVulkanDevice::waitFramegen( uint64_t sequence )
@@ -2004,50 +2026,66 @@ void CVulkanDevice::waitFramegen( uint64_t sequence )
 	vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
 }
 
-// Recycle framegen command buffers whose framegen-timeline seqNo has completed.
-// Framegen keeps its own pending map because it signals a separate timeline; the
-// buffers return to the shared unused pool (same command family).
+// Recycle dedicated-queue command buffers and consume timestamp queries whose
+// owning timeline has completed. Shared-queue command buffers are recycled by
+// garbageCollect(), but their framegen query associations live here too so the
+// deadline ladder behaves identically on single-queue devices.
 void CVulkanDevice::framegenGarbageCollect()
 {
-	if ( !m_bHasFramegenQueue || m_pendingFramegenCmdBufs.empty() )
+	if ( m_pendingFramegenCmdBufs.empty() && m_framegenQuerySlotBySeqNo.empty() )
 		return;
 
 	uint64_t currentSeqNo = 0;
-	vk_check( vk.GetSemaphoreCounterValue( device(), m_framegenTimeline->pVkSemaphore, &currentSeqNo ) );
+	const VkSemaphore completionTimeline = m_bHasFramegenQueue
+		? m_framegenTimeline->pVkSemaphore : m_scratchTimelineSemaphore;
+	vk_check( vk.GetSemaphoreCounterValue( device(), completionTimeline, &currentSeqNo ) );
 
-	for ( auto it = m_pendingFramegenCmdBufs.begin(); it != m_pendingFramegenCmdBufs.end(); )
+	if ( m_bHasFramegenQueue )
+	{
+		for ( auto it = m_pendingFramegenCmdBufs.begin(); it != m_pendingFramegenCmdBufs.end(); )
+		{
+			if ( it->first > currentSeqNo )
+				break; // ordered by seqNo: nothing later has completed either
+
+			it->second->reset();
+			m_unusedCmdBufs.push_back( std::move( it->second ) );
+			it = m_pendingFramegenCmdBufs.erase( it );
+		}
+	}
+
+	// A completed timeline signal makes both timestamps available. Read without
+	// WAIT_BIT so this maintenance path can never stall the compositor thread.
+	for ( auto it = m_framegenQuerySlotBySeqNo.begin(); it != m_framegenQuerySlotBySeqNo.end(); )
 	{
 		if ( it->first > currentSeqNo )
-			break; // ordered by seqNo: nothing later has completed either
+			break;
 
-		// The seqNo has completed, so any timestamps this batch wrote are ready.
-		// Read them back WITHOUT WAIT_BIT (never stall the compositor thread) and
-		// fold into the rolling GPU-time stat that drives the degradation ladder.
-		auto slotIt = m_framegenQuerySlotBySeqNo.find( it->first );
-		if ( slotIt != m_framegenQuerySlotBySeqNo.end() )
+		const uint32_t nSlot = it->second.nSlot;
+		const uint32_t nRung = it->second.nRung;
+		const uint32_t nGeneratedCount = it->second.nGeneratedCount;
+		uint64_t ts[2] = { 0, 0 };
+		const VkResult res = vk.GetQueryPoolResults( device(), m_framegenQueryPool, nSlot * 2, 2,
+			sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT );
+		const uint64_t ulTimestampMask = m_uFramegenTimestampValidBits >= 64
+			? UINT64_MAX : ( ( 1ull << m_uFramegenTimestampValidBits ) - 1ull );
+		const uint64_t ulGpuTicks = ( ts[1] - ts[0] ) & ulTimestampMask;
+		if ( res == VK_SUCCESS && ulGpuTicks != 0
+			&& nRung < kFramegenLadderSlots && nGeneratedCount < kFramegenGeneratedCountSlots )
 		{
-			const uint32_t nSlot = slotIt->second.nSlot;
-			const uint32_t nRung = slotIt->second.nRung;
-			const uint32_t nGeneratedCount = slotIt->second.nGeneratedCount;
-			uint64_t ts[2] = { 0, 0 };
-			const VkResult res = vk.GetQueryPoolResults( device(), m_framegenQueryPool, nSlot * 2, 2,
-				sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT );
-			if ( res == VK_SUCCESS && ts[1] > ts[0] && nRung < kFramegenLadderSlots && nGeneratedCount < kFramegenGeneratedCountSlots )
-			{
-				const uint64_t ulGpuNs = (uint64_t)( double( ts[1] - ts[0] ) * m_flFramegenTimestampPeriodNs );
-				m_ulFramegenLastRawGpuTimeNs = ulGpuNs;
-				// Fold into this exact batch shape with a symmetric slow EMA (7/8).
-				// A single anomalous batch must not shed quality for the whole scene,
-				// and x2-like gaps must not inherit x4-like batch timings.
-				uint64_t &ulRungCost = m_aFramegenRungCostNs[ nRung ][ nGeneratedCount ];
-				ulRungCost = ( ulRungCost == 0 ) ? ulGpuNs : ( ulRungCost * 7 + ulGpuNs ) / 8;
-			}
-			m_framegenQuerySlotBySeqNo.erase( slotIt );
+			// Timestamp values wrap at timestampValidBits, which can be less
+			// than 64 even though GetQueryPoolResults returns uint64_t values.
+			// Modular subtraction above keeps a wrap-crossing batch valid.
+			const uint64_t ulGpuNs = (uint64_t)( double( ulGpuTicks ) * m_flFramegenTimestampPeriodNs );
+			m_ulFramegenLastRawGpuTimeNs = ulGpuNs;
+			// Fold into this exact batch shape with a symmetric slow EMA (7/8).
+			// A single anomalous batch must not shed quality for the whole scene,
+			// and x2-like gaps must not inherit x4-like batch timings.
+			uint64_t &ulRungCost = m_aFramegenRungCostNs[ nRung ][ nGeneratedCount ];
+			ulRungCost = ( ulRungCost == 0 ) ? ulGpuNs : ( ulRungCost * 7 + ulGpuNs ) / 8;
+			if ( m_aFramegenRungSamples[ nRung ][ nGeneratedCount ] != UINT32_MAX )
+				m_aFramegenRungSamples[ nRung ][ nGeneratedCount ]++;
 		}
-
-		it->second->reset();
-		m_unusedCmdBufs.push_back( std::move( it->second ) );
-		it = m_pendingFramegenCmdBufs.erase( it );
+		it = m_framegenQuerySlotBySeqNo.erase( it );
 	}
 }
 
@@ -4755,17 +4793,23 @@ struct FramegenMotionAccelPush_t
 	float guidedReconstruction;
 	float reservoirValid;
 	float shadingValid;
-	float pad2;
+	// The retained field is displacement over the preceding real-frame
+	// interval, not a velocity. Normalize it to the current interval before
+	// differencing, then use the irregular-sample quadratic coefficient below.
+	float historyFlowScale;
+	float accelTimeFactor;
 
 	FramegenMotionAccelPush_t( float flStrength, float flLo, float flHi, float flScale,
 		float flAgreeLo, float flAgreeHi, float flAccelMax, bool bHistoryValid,
-		bool bGuidedReconstruction, bool bReservoirValid, bool bShadingValid )
+		bool bGuidedReconstruction, bool bReservoirValid, bool bShadingValid,
+		float flHistoryFlowScale, float flAccelTimeFactor )
 		: strength( flStrength ), suppressLo( flLo ), suppressHi( flHi ), lowResScale( flScale )
 		, agreeLo( flAgreeLo ), agreeHi( flAgreeHi ), accelMax( flAccelMax )
 		, historyValid( bHistoryValid ? 1.0f : 0.0f )
 		, guidedReconstruction( bGuidedReconstruction ? 1.0f : 0.0f )
 		, reservoirValid( bReservoirValid ? 1.0f : 0.0f )
-		, shadingValid( bShadingValid ? 1.0f : 0.0f ), pad2( 0.0f )
+		, shadingValid( bShadingValid ? 1.0f : 0.0f )
+		, historyFlowScale( flHistoryFlowScale ), accelTimeFactor( flAccelTimeFactor )
 	{
 	}
 };
@@ -4877,13 +4921,15 @@ struct FramegenMotionNetTrainPush_t
 	uint32_t sliceBase;
 	float mode;
 	uint32_t flags;
+	float historyTimeScale;
 
 	FramegenMotionNetTrainPush_t( uint32_t uSeed, uint32_t uSliceBase, bool bSceneCutGuard,
-		bool bShadingHistoryValid, bool bConservativeBidir )
+		bool bShadingHistoryValid, bool bConservativeBidir, float flHistoryTimeScale )
 		: seed( uSeed ), sliceBase( uSliceBase ), mode( 0.0f )
 		, flags( ( bSceneCutGuard ? 1u : 0u )
 			| ( bShadingHistoryValid ? 2u : 0u )
 			| ( bConservativeBidir ? 4u : 0u ) )
+		, historyTimeScale( flHistoryTimeScale )
 	{
 	}
 };
@@ -4938,6 +4984,16 @@ struct FramegenMotionResources_t
 	// rejects stale history when shared-queue admission skipped an interval.
 	gamescope::OwningRc<CVulkanTexture> mvFieldHistory;
 	uint64_t uMotionHistoryFrameId = 0;
+	uint64_t uMotionHistoryIntervalNs = 0;
+	// The finalized field for the current real-frame pair remains resident in
+	// mvField/mvFieldNet. JIT and idle refills reuse it instead of estimating,
+	// refining, probing and training on the same pair again. On the next
+	// consecutive pair it is copied to mvFieldHistory before preparation
+	// overwrites the working images.
+	uint64_t uMotionFieldFrameId = 0;
+	uint64_t uMotionFieldIntervalNs = 0;
+	GamescopeFramegenQuality eMotionFieldQuality = GamescopeFramegenQuality::Low;
+	bool bMotionFieldBidir = false;
 	// Extreme-quality frames-only disocclusion evidence. This low-resolution
 	// image contains luma from two intervals ago: a batch samples it during
 	// every warp, then refreshes it from lumaPrev after all warps complete. The
@@ -5136,6 +5192,10 @@ struct FramegenHistory_t
 	uint64_t ulFrametimeEmaNs = 0;
 	uint64_t ulCurrentRealVblankNs = 0;
 	uint64_t lastCompositeSeqNo = 0;
+	// Latest submission on the framegen execution path, including descriptor-free
+	// base-history copies. Reset paths wait for this token before releasing pools
+	// or history; lastGeneratedSeqNo remains generation-only for the headroom gate.
+	uint64_t lastFramegenWorkSeqNo = 0;
 	// Seq no (on the framegen timeline) of the most recent generation batch, for
 	// the oversubscription guard: skip new generation while the previous batch
 	// is still running rather than queue work in front of real frames.
@@ -5240,6 +5300,10 @@ static constexpr uint32_t k_uFramegenStableFramesLeak = 1;
 // 100% is proactive headroom against per-batch jitter, so a batch whose mean sits
 // here rarely spikes past the true vblank and drops its generated frame.
 static constexpr uint64_t k_uFramegenDeadlinePercent = 85; // > this % of a vblank interval -> degrade
+// Do not make the ladder's irreversible scene-local quality decision from a
+// cold first sample. Three completed batches establish a minimally useful EMA
+// while still reacting within a few real frames to a genuinely over-budget tier.
+static constexpr uint32_t k_uFramegenDeadlineMinSamples = 3;
 // Frames to hold after a ladder step before stepping again, so the new rung's real
 // cost folds into the measurement first (the readback lags by ~1 batch). Without
 // it the loop would step again on the not-yet-updated rung cost and over-degrade.
@@ -5670,6 +5734,9 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.ulNetProfileConsumedSeqNo = 0;
 	// Temporal acceleration must never cross a scene/cadence discontinuity.
 	g_framegenMotion.uMotionHistoryFrameId = 0;
+	g_framegenMotion.uMotionHistoryIntervalNs = 0;
+	g_framegenMotion.uMotionFieldFrameId = 0;
+	g_framegenMotion.uMotionFieldIntervalNs = 0;
 	g_framegenMotion.uLumaReservoirFrameId[0] = 0;
 	g_framegenMotion.uLumaReservoirFrameId[1] = 0;
 	g_framegenColorProbe.anchor = nullptr;
@@ -5687,6 +5754,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.currentReal = nullptr;
 }
 
+static void framegen_net_profile_consume();
 static void framegen_net_profile_flush();
 
 void vulkan_framegen_reset( const char *reason )
@@ -5694,9 +5762,21 @@ void vulkan_framegen_reset( const char *reason )
 	if ( g_bFramegenDebug )
 		vk_log.infof( "framegen: reset history reason=%s", reason ? reason : "unknown" );
 
+	// A base-history copy deliberately does not participate in the generation
+	// headroom gate, but it still reads/writes resources owned by this state. A
+	// live resize or base-mode transition can reach reset without a global device
+	// drain; retire the latest framegen-path submission before dropping its pools,
+	// descriptor-ring invariant, or output-ring read pins. This wait is confined
+	// to exceptional reset paths and never runs in steady-state presentation.
+	if ( g_framegenHistory.lastFramegenWorkSeqNo != 0
+		&& !g_device.hasCompletedFramegen( g_framegenHistory.lastFramegenWorkSeqNo ) )
+		g_device.waitFramegen( g_framegenHistory.lastFramegenWorkSeqNo );
+	g_device.framegenGarbageCollect();
+
 	// C2: persist unsaved learning before the state textures go away. The latest
 	// health-checked served weights remain cached process-wide and seed the new
 	// state, so resize/format resets do not throw away in-session adaptation.
+	framegen_net_profile_consume();
 	framegen_net_profile_flush();
 	framegen_color_probe_consume();
 
@@ -6095,11 +6175,29 @@ static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope:
 	if ( !framegen_ensure_present_pool() )
 		return nullptr;
 
-	const uint32_t idx = g_framegenHistory.nNextPresentIndex % (uint32_t)g_output.framegenPresentImages.size();
-	g_framegenHistory.nNextPresentIndex++;
-	gamescope::Rc<CVulkanTexture> pTarget = g_output.framegenPresentImages[ idx ];
+	// The parent compositor or KMS may retain more than a fixed number of old
+	// commits. Select by actual Vulkan/backend ownership rather than blindly
+	// cycling the three-image pool; if all targets are acquired, repeating the
+	// last scanout is preferable to compositing into a live buffer.
+	gamescope::Rc<CVulkanTexture> pTarget;
+	for ( size_t nProbe = 0; nProbe < g_output.framegenPresentImages.size(); nProbe++ )
+	{
+		const uint32_t idx = g_framegenHistory.nNextPresentIndex % (uint32_t)g_output.framegenPresentImages.size();
+		g_framegenHistory.nNextPresentIndex++;
+		CVulkanTexture *pCandidate = g_output.framegenPresentImages[ idx ].get();
+		if ( pCandidate != nullptr && !pCandidate->IsInUse() )
+		{
+			pTarget = pCandidate;
+			break;
+		}
+	}
 	if ( pTarget == nullptr )
+	{
+		static uint64_t s_uPresentPressureDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uPresentPressureDebugLogCounter ) )
+			vk_log.infof( "framegen: late-composite pool pressure pool=%zu", g_output.framegenPresentImages.size() );
 		return nullptr;
+	}
 
 	FrameInfo_t generatedFrameInfo = *pPresentFrameInfo;
 	generatedFrameInfo.layers[ 0 ].tex = pGeneratedBase;
@@ -6132,9 +6230,10 @@ static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope:
 // the copy (RAW), across command buffers. The copy uses no descriptors and no
 // timestamp slots, so it is exempt from the one-batch-in-flight machinery and
 // must NOT bump lastGeneratedSeqNo (the headroom gate would see a perpetually
-// busy queue). The client texture is only referenced by this immediately
-// submitted copy — never retained across frames — so its commit-keyed buffer
-// lifetime is respected.
+// busy queue). Its separate lastFramegenWorkSeqNo still makes reset lifetime-
+// safe. The client texture is only referenced by this immediately submitted
+// copy — never retained across frames — so its commit-keyed buffer lifetime
+// is respected.
 static bool framegen_base_record_copy( gamescope::Rc<CVulkanTexture> pBaseFrame, uint64_t ulCompositeSeqNo )
 {
 	const uint32_t nTarget = g_framegenHistory.nBaseHistoryNext & 1u;
@@ -6149,7 +6248,8 @@ static bool framegen_base_record_copy( gamescope::Rc<CVulkanTexture> pBaseFrame,
 	// its timeline point makes that readiness chain visible to this queue before
 	// it reads the same client image, and also orders the composite's image-state
 	// transitions ahead of the copy.
-	g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo, -1, 0, 0 );
+	g_framegenHistory.lastFramegenWorkSeqNo =
+		g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo, -1, 0, 0 );
 
 	g_framegenHistory.nBaseHistoryNext = nTarget ^ 1u;
 	g_framegenHistory.previousReal = g_framegenHistory.currentReal;
@@ -7299,10 +7399,37 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 
 static bool framegen_motion_history_valid( GamescopeFramegenQuality eQuality )
 {
+	const uint64_t ulCurrentIntervalNs = g_framegenHistory.currentPresentTimeNs > g_framegenHistory.previousPresentTimeNs
+		? g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs : 0;
+	const uint64_t ulHistoryIntervalNs = g_framegenMotion.uMotionHistoryIntervalNs;
+	// A violent cadence transition is a poor second-derivative sample even after
+	// time normalization. Fall back to constant velocity for that one interval;
+	// the newly stored field immediately re-primes the next batch.
+	const bool bComparableIntervals = ulCurrentIntervalNs != 0 && ulHistoryIntervalNs != 0
+		&& ulCurrentIntervalNs <= ulHistoryIntervalNs * 4u
+		&& ulHistoryIntervalNs <= ulCurrentIntervalNs * 4u;
 	return eQuality >= GamescopeFramegenQuality::Ultra
 		&& g_framegenMotion.mvFieldHistory != nullptr
 		&& g_framegenMotion.uMotionHistoryFrameId != 0
-		&& g_framegenMotion.uMotionHistoryFrameId + 1u == g_framegenHistory.currentFrameId;
+		&& g_framegenMotion.uMotionHistoryFrameId + 1u == g_framegenHistory.currentFrameId
+		&& bComparableIntervals;
+}
+
+static float framegen_motion_history_time_scale()
+{
+	if ( !framegen_motion_history_valid( GamescopeFramegenQuality::Ultra ) )
+		return 1.0f;
+	const uint64_t ulCurrentIntervalNs = g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs;
+	return (float)( (double)ulCurrentIntervalNs / (double)g_framegenMotion.uMotionHistoryIntervalNs );
+}
+
+static float framegen_motion_accel_time_factor()
+{
+	if ( !framegen_motion_history_valid( GamescopeFramegenQuality::Ultra ) )
+		return 0.5f;
+	const double flCurrent = (double)( g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs );
+	const double flHistory = (double)g_framegenMotion.uMotionHistoryIntervalNs;
+	return (float)( flCurrent / ( flCurrent + flHistory ) );
 }
 
 static int framegen_luma_reservoir_read_index()
@@ -7376,6 +7503,8 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	const gamescope::Rc<CVulkanTexture> pOlderField = bShadingHistoryValid
 		? gamescope::Rc<CVulkanTexture>( m.mvFieldHistory )
 		: gamescope::Rc<CVulkanTexture>( m.mvField );
+	const float flHistoryTimeScale = bShadingHistoryValid
+		? framegen_motion_history_time_scale() : 1.0f;
 
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET_TRAIN ) );
 	pCmdBuffer->bindTarget( m.netGradSlices );
@@ -7388,7 +7517,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	framegen_motion_bind_sampler( pCmdBuffer, 5, pOlderLuma, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 6, pOlderField, false );
 	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed, 0u,
-		bSceneCutGuard, bShadingHistoryValid, bConservativeBidir );
+		bSceneCutGuard, bShadingHistoryValid, bConservativeBidir, flHistoryTimeScale );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
 	pCmdBuffer->bindTarget( m.netGradSlices );
@@ -7404,7 +7533,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	framegen_motion_bind_sampler( pCmdBuffer, 5, m.lumaPrev, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 6, m.mvField, false );
 	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed ^ 0x55555555u, uHalf,
-		bSceneCutGuard, false, bConservativeBidir );
+		bSceneCutGuard, false, bConservativeBidir, 1.0f );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
 	bindOpt();
@@ -7583,6 +7712,13 @@ static void framegen_net_profile_consume()
 static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t width, uint32_t height,
 	const FramegenDispatch_t &dispatch, GamescopeFramegenQuality eQuality )
 {
+	// Every call below overwrites the working field. Callers which can reuse the
+	// finalized field must decide that before entering; clearing the identity
+	// here also makes benchmark/capture/setup calls unable to leave a stale
+	// production cache behind.
+	g_framegenMotion.uMotionFieldFrameId = 0;
+	g_framegenMotion.uMotionFieldIntervalNs = 0;
+
 	const uint32_t lowW = std::max( 1u, div_roundup( width, k_uFramegenMotionDownscale ) );
 	const uint32_t lowH = std::max( 1u, div_roundup( height, k_uFramegenMotionDownscale ) );
 	const uint32_t uFieldFormat = DRM_FORMAT_ABGR16161616F;
@@ -7641,6 +7777,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		if ( bAllocated && bNeedMotionHistory )
 			bAllocated = framegen_create_intermediate( &g_framegenMotion.mvFieldHistory, lowW, lowH, uFieldFormat );
 		g_framegenMotion.uMotionHistoryFrameId = 0;
+		g_framegenMotion.uMotionHistoryIntervalNs = 0;
 		// B4 stats are a high-tier resource. Lower tiers must not fail motion
 		// setup because an adaptation-only image format/allocation failed.
 		g_framegenMotion.statsAccum = nullptr;
@@ -7958,6 +8095,8 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	const bool bShadingValid = bGuided && bHistoryValid
 		&& framegen_shading_enabled( eQuality )
 		&& g_framegenMotion.bNetActive && g_framegenMotion.netShadingFocus != nullptr;
+	const float flHistoryFlowScale = bHistoryValid ? framegen_motion_history_time_scale() : 1.0f;
+	const float flAccelTimeFactor = bHistoryValid ? framegen_motion_accel_time_factor() : 0.5f;
 	// Extreme uses the accelerated shader even during the first interval: its
 	// full-resolution field reconstruction does not need temporal history.
 	const bool bAccelPipeline = bHistoryValid || bGuided;
@@ -8001,7 +8140,8 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 		pCmdBuffer->pushConstants<FramegenMotionAccelPush_t>( flStrength,
 			k_flFramegenSuppressLo, k_flFramegenSuppressHi,
 			(float)k_uFramegenMotionDownscale, flAgreeLo, flAgreeHi,
-			1.0f, bHistoryValid, bGuided, bReservoirValid, bShadingValid );
+			1.0f, bHistoryValid, bGuided, bReservoirValid, bShadingValid,
+			flHistoryFlowScale, flAccelTimeFactor );
 	}
 	else
 	{
@@ -8097,13 +8237,32 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	slots.reserve( nRequestCount );
 	for ( uint32_t i = 0; i < nRequestCount; i++ )
 	{
-		const uint32_t idx = g_framegenHistory.nNextOutputIndex % g_output.framegenOutputImages.size();
-		g_framegenHistory.nNextOutputIndex++;
-		gamescope::Rc<CVulkanTexture> pGenerated = g_output.framegenOutputImages[ idx ];
+		gamescope::Rc<CVulkanTexture> pGenerated;
+		for ( size_t nProbe = 0; nProbe < g_output.framegenOutputImages.size(); nProbe++ )
+		{
+			const uint32_t idx = g_framegenHistory.nNextOutputIndex % g_output.framegenOutputImages.size();
+			g_framegenHistory.nNextOutputIndex++;
+			CVulkanTexture *pCandidate = g_output.framegenOutputImages[ idx ].get();
+			// Public texture refs cover pending/current command-buffer use;
+			// backend-fb refs cover KMS requests and Wayland compositor acquire
+			// lifetime. IsInUse() observes both and has no guessed commit depth.
+			if ( pCandidate != nullptr && !pCandidate->IsInUse() )
+			{
+				pGenerated = pCandidate;
+				break;
+			}
+		}
 		if ( !pGenerated )
 			continue;
 
 		slots.push_back( { std::move( pGenerated ), pRequests[ i ].phase, pRequests[ i ].strength, pRequests[ i ].slotIndex } );
+	}
+	if ( slots.size() != nRequestCount )
+	{
+		static uint64_t s_uOutputPressureDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uOutputPressureDebugLogCounter ) )
+			vk_log.infof( "framegen: output-pool pressure admitted=%zu/%u pool=%zu pending=%zu",
+				slots.size(), nRequestCount, g_output.framegenOutputImages.size(), g_framegenHistory.pending.size() );
 	}
 
 	if ( slots.empty() )
@@ -8121,33 +8280,76 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// batch draws from the isolated framegen descriptor ring (see markFramegen).
 	std::unique_ptr<CVulkanCmdBuffer> pCmdBuffer = g_device.commandBuffer();
 	pCmdBuffer->markFramegen();
-	// Bracket the batch's dispatches with GPU timestamps so its cost feeds the
-	// degradation ladder next interval. No-op (returns -1) without timestamp support.
-	const int nQuerySlot = g_device.framegenTimestampBegin( pCmdBuffer.get() );
 	const FramegenDispatch_t &dispatch = framegen_dispatch_for_format( g_framegenHistory.drmFormat );
+	const bool bBidir = vulkan_framegen_bidir_active();
+	const bool bMotionRequested = eff.mode == GamescopeFramegenMode::Motion
+		&& dispatch.motionSupported;
+	// The classic/JIT/idle planners can submit several batches for one real
+	// interval. Re-estimating and re-training on that identical pair both wastes
+	// the deadline and statistically overweights slow intervals. The finalized
+	// field remains resident until any new preparation explicitly invalidates it.
+	const bool bReuseMotion = pColorProbe == nullptr
+		&& bMotionRequested
+		&& g_framegenMotion.uMotionFieldFrameId != 0
+		&& g_framegenMotion.uMotionFieldFrameId == g_framegenHistory.currentFrameId
+		&& g_framegenMotion.eMotionFieldQuality == eff.quality
+		&& g_framegenMotion.bMotionFieldBidir == bBidir
+		&& framegen_motion_field() != nullptr
+		&& ( !bBidir || framegen_motion_field_rev() != nullptr );
+	// Bracket the batch's dispatches with GPU timestamps so its cost feeds the
+	// degradation ladder next interval. Cached refills contain only per-slot
+	// warps; mixing those cheap samples into the same (rung,count) EMA would
+	// understate the cost of the next real pair's full setup batch.
+	const int nQuerySlot = bReuseMotion ? -1 : g_device.framegenTimestampBegin( pCmdBuffer.get() );
+
+	// Preserve the preceding pair's finalized displacement before preparation
+	// overwrites the working fields. The exact quality/mode and consecutive-ID
+	// gates keep estimator changes or a skipped interval from looking like
+	// physical acceleration. The copy and later history reads are ordered in
+	// this same command buffer.
+	if ( !bReuseMotion && pColorProbe == nullptr && bMotionRequested && !bBidir
+		&& eff.quality >= GamescopeFramegenQuality::Ultra )
+	{
+		const bool bHistorySourceValid = g_framegenMotion.mvFieldHistory != nullptr
+			&& g_framegenMotion.uMotionFieldFrameId != 0
+			&& g_framegenMotion.uMotionFieldFrameId + 1u == g_framegenHistory.currentFrameId
+			&& g_framegenMotion.eMotionFieldQuality == eff.quality
+			&& !g_framegenMotion.bMotionFieldBidir
+			&& framegen_motion_field() != nullptr;
+		if ( bHistorySourceValid )
+		{
+			pCmdBuffer->copyImage( framegen_motion_field(), g_framegenMotion.mvFieldHistory );
+			g_framegenMotion.uMotionHistoryFrameId = g_framegenMotion.uMotionFieldFrameId;
+			g_framegenMotion.uMotionHistoryIntervalNs = g_framegenMotion.uMotionFieldIntervalNs;
+		}
+		else
+		{
+			g_framegenMotion.uMotionHistoryFrameId = 0;
+			g_framegenMotion.uMotionHistoryIntervalNs = 0;
+		}
+	}
 
 	// Motion estimation depends only on the two real frames, so it is computed
-	// once for the batch; falls back to extrapolation for every slot if the
+	// once for the real pair; later batches reuse its finalized field. Falls
+	// back to extrapolation for every slot if the
 	// intermediates can't be allocated. The ladder's effective mode (not the base
 	// global) selects the pass, so motion can be shed under GPU pressure without
 	// disturbing vulkan_framegen_is_enabled() or the forced-composite tax.
-	const bool bMotion = eff.mode == GamescopeFramegenMode::Motion
-		&& dispatch.motionSupported
-		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(), g_framegenHistory.currentReal->height(), dispatch, eff.quality );
+	const bool bMotion = bReuseMotion || ( bMotionRequested
+		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(),
+			g_framegenHistory.currentReal->height(), dispatch, eff.quality ) );
 	// Held-out E2 samples grade the actual motion path, not its allocation or
 	// capability fallback. A failed motion setup drops the sample and leaves all
 	// real-frame presentation untouched.
 	if ( pColorProbe != nullptr && !bMotion )
 		return false;
 
-	const bool bBidir = vulkan_framegen_bidir_active();
-
 	// Stage C: with the checked fields final, capture the RAW training tensors
 	// (pre-refinement, pre-trust — what the net must learn to improve on),
 	// then refine both fields through the net. Everything downstream — the B4
 	// probe and the warps — binds the refined copies via
 	// framegen_motion_field() once the net has run.
-	const bool bNetRecord = bMotion && g_framegenMotion.recField != nullptr
+	const bool bNetRecord = bMotion && !bReuseMotion && g_framegenMotion.recField != nullptr
 		&& g_uFramegenRecordCount < framegen_record_max();
 	if ( bNetRecord )
 	{
@@ -8156,11 +8358,11 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		pCmdBuffer->copyImage( g_framegenMotion.mvField, g_framegenMotion.recField );
 		pCmdBuffer->copyImage( g_framegenMotion.mvFieldRevChk, g_framegenMotion.recFieldRev );
 	}
-	if ( bMotion && g_framegenMotion.mvFieldNet != nullptr )
+	if ( bMotion && !bReuseMotion && g_framegenMotion.mvFieldNet != nullptr )
 		framegen_record_net( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height, bBidir );
 	// B4: with the field final, record the quality probe — the warps below
 	// read its verdict in this same batch, the CPU next batch.
-	const bool bAdaptProbe = bMotion && framegen_adapt_enabled( eff.quality );
+	const bool bAdaptProbe = bMotion && !bReuseMotion && framegen_adapt_enabled( eff.quality );
 	if ( bAdaptProbe )
 		framegen_record_adapt_probe( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height );
 
@@ -8169,8 +8371,17 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// the optimizer publishes only for the next batch. When adaptation is
 	// explicitly disabled, training retains its previous unguarded behavior.
 	const bool bNetStateReadback = pColorProbe == nullptr
-		&& g_framegenMotion.bNetActive && framegen_net_online_enabled()
+		&& !bReuseMotion && g_framegenMotion.bNetActive && framegen_net_online_enabled()
 		&& framegen_record_net_train( pCmdBuffer.get(), eff.quality, bAdaptProbe );
+	if ( bMotion && !bReuseMotion && pColorProbe == nullptr )
+	{
+		g_framegenMotion.uMotionFieldFrameId = g_framegenHistory.currentFrameId;
+		g_framegenMotion.uMotionFieldIntervalNs =
+			g_framegenHistory.currentPresentTimeNs > g_framegenHistory.previousPresentTimeNs
+			? g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs : 0;
+		g_framegenMotion.eMotionFieldQuality = eff.quality;
+		g_framegenMotion.bMotionFieldBidir = bBidir;
+	}
 	if ( bMotion )
 	{
 		// Each warp reads the shared motion field(s) and history; keep per-slot.
@@ -8212,16 +8423,6 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 			framegen_bind_extrapolate( pCmdBuffer.get(), dispatch.extrapolate, slots[ i ].tex, slots[ i ].strength );
 	}
 
-	// Ultra retains the final checked/refined/trust-scaled forward field only
-	// after every slot has read the preceding one. Command-buffer barriers order
-	// the read-before-copy, and the frame-ID check in framegen_warp_slot rejects
-	// this history if a later shared-queue interval is skipped.
-	if ( bMotion && !bBidir && eff.quality >= GamescopeFramegenQuality::Ultra
-		&& g_framegenMotion.mvFieldHistory != nullptr )
-	{
-		pCmdBuffer->copyImage( framegen_motion_field(), g_framegenMotion.mvFieldHistory );
-		g_framegenMotion.uMotionHistoryFrameId = g_framegenHistory.currentFrameId;
-	}
 	// Preserve two-interval-old real-frame luma without extending the
 	// output-ring lifetime. Every warp above reads the old reservoir first;
 	// this same-command-buffer copy is ordered after those reads and publishes
@@ -8265,6 +8466,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// Attribute this batch's measured cost to the rung and generated-count it ran
 	// at; batch cost scales with slot count, especially x3/x4 extrapolate pairs.
 	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, (uint32_t)slots.size() );
+	g_framegenHistory.lastFramegenWorkSeqNo = ulSeqNo;
 
 	for ( const SlotPlan_t &slot : slots )
 	{
@@ -8316,7 +8518,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	static uint64_t s_uGeneratedDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uGeneratedDebugLogCounter ) )
 	{
-		vk_log.infof( "framegen: %s %u frame(s) for real id=%" PRIu64 " gapVblanks=%u mode=%s/%s(x%u) degrade=%u/%u gpu=%.2fms queue family %u",
+		vk_log.infof( "framegen: %s %u frame(s) for real id=%" PRIu64 " gapVblanks=%u mode=%s/%s(x%u) degrade=%u/%u gpu=%.2fms%s queue family %u",
 			pColorProbe != nullptr ? "captured held-out" : "generated",
 			nGeneratedCount,
 			g_framegenHistory.currentFrameId,
@@ -8327,6 +8529,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 			g_framegenHistory.nDegradeSteps,
 			nMaxDegradeSteps,
 			g_device.framegenLastGpuTimeNs() / 1.0e6,
+			bReuseMotion ? " (prior full batch; cached-field warp unmeasured)" : "",
 			g_device.queueFamily() );
 	}
 
@@ -8569,11 +8772,19 @@ void vulkan_framegen_benchmark()
 	VkPhysicalDeviceProperties props = {};
 	g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &props );
 	const double flTimestampPeriodNs = props.limits.timestampPeriod;
-	if ( flTimestampPeriodNs == 0.0 )
+	uint32_t uQueueFamilyCount = 0;
+	g_device.vk.GetPhysicalDeviceQueueFamilyProperties( g_device.physDev(), &uQueueFamilyCount, nullptr );
+	std::vector<VkQueueFamilyProperties> queueFamilyProps( uQueueFamilyCount );
+	g_device.vk.GetPhysicalDeviceQueueFamilyProperties( g_device.physDev(), &uQueueFamilyCount, queueFamilyProps.data() );
+	const uint32_t uTimestampValidBits = g_device.queueFamily() < uQueueFamilyCount
+		? queueFamilyProps[ g_device.queueFamily() ].timestampValidBits : 0;
+	if ( flTimestampPeriodNs == 0.0 || uTimestampValidBits == 0 )
 	{
 		fprintf( stderr, "framegen-bench: device does not support timestamp queries\n" );
 		return;
 	}
+	const uint64_t ulTimestampMask = uTimestampValidBits >= 64
+		? UINT64_MAX : ( ( 1ull << uTimestampValidBits ) - 1ull );
 
 	const VkQueryPoolCreateInfo queryPoolInfo = {
 		.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -8644,7 +8855,8 @@ void vulkan_framegen_benchmark()
 			uint64_t ts[2] = { 0, 0 };
 			g_device.vk.GetQueryPoolResults( g_device.device(), queryPool, 0, 2,
 				sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
-			dTotalNs += double( ts[1] - ts[0] ) * flTimestampPeriodNs;
+			const uint64_t ulGpuTicks = ( ts[1] - ts[0] ) & ulTimestampMask;
+			dTotalNs += double( ulGpuTicks ) * flTimestampPeriodNs;
 		}
 		return dTotalNs / double( nIters ) / 1.0e6;
 	};
@@ -8721,7 +8933,10 @@ void vulkan_framegen_benchmark()
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 				{
 					g_framegenMotion.uMotionHistoryFrameId = 2;
+					g_framegenMotion.uMotionHistoryIntervalNs = 16'666'667ull;
 					g_framegenHistory.currentFrameId = 3;
+					g_framegenHistory.previousPresentTimeNs = 16'666'667ull;
+					g_framegenHistory.currentPresentTimeNs = 33'333'334ull;
 				}
 				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme
 					&& g_framegenMotion.lumaReservoir[0] != nullptr )
@@ -9336,7 +9551,10 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		? 1u
 		: std::min( nGapSlots, std::max( 1u, curEffForLadder.multiplier - 1u ) );
 	const uint64_t ulCurRungCostNs = g_device.framegenRungCostNs( g_framegenHistory.nDegradeSteps, nCurGenForLadder );
-	if ( nMaxDegradeSteps > 0 && ulCurRungCostNs != 0 && g_framegenHistory.nDegradeSteps < nMaxDegradeSteps )
+	const uint32_t uCurRungSamples = g_device.framegenRungSampleCount( g_framegenHistory.nDegradeSteps, nCurGenForLadder );
+	if ( nMaxDegradeSteps > 0 && ulCurRungCostNs != 0
+		&& uCurRungSamples >= k_uFramegenDeadlineMinSamples
+		&& g_framegenHistory.nDegradeSteps < nMaxDegradeSteps )
 	{
 		const uint64_t ulDeadlineNs = ( ulVblankIntervalNs * k_uFramegenDeadlinePercent ) / 100;
 		if ( g_framegenHistory.nDegradeHold > 0 )

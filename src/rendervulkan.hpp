@@ -908,6 +908,11 @@ public:
 		return nRung < kFramegenLadderSlots && nGeneratedCount < kFramegenGeneratedCountSlots
 			? m_aFramegenRungCostNs[ nRung ][ nGeneratedCount ] : 0;
 	}
+	uint32_t framegenRungSampleCount( uint32_t nRung, uint32_t nGeneratedCount ) const
+	{
+		return nRung < kFramegenLadderSlots && nGeneratedCount < kFramegenGeneratedCountSlots
+			? m_aFramegenRungSamples[ nRung ][ nGeneratedCount ] : 0;
+	}
 	// Raw GPU time (ns) of the most recent framegen batch, for logging only.
 	uint64_t framegenLastGpuTimeNs() const { return m_ulFramegenLastRawGpuTimeNs; }
 	// Forget all per-rung costs (e.g. on a scene change) so the ladder re-probes
@@ -1079,20 +1084,22 @@ protected:
 	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingFramegenCmdBufs;
 
 	// Timestamp query-pool ring for live framegen GPU-time measurement. Ring depth
-	// covers the worst-case in-flight batches; created only when a dedicated
-	// framegen queue exists and its family supports timestamps. Process-lifetime,
-	// like the framegen timeline (no device destructor). All of these are touched
-	// only from the compositor thread (record + garbage-collect), same as
-	// m_pendingFramegenCmdBufs, so no additional locking is required.
+	// covers the worst-case in-flight batches; available on dedicated and shared
+	// queue paths whenever the selected family supports timestamps. Process-
+	// lifetime, like the framegen timeline (no device destructor). All of these
+	// are touched only from the compositor thread (record + garbage-collect), so
+	// no additional locking is required.
 	VkQueryPool m_framegenQueryPool = VK_NULL_HANDLE;
 	uint32_t m_uFramegenQueryRingDepth = 0;
 	uint32_t m_uFramegenQueryHead = 0;
+	uint32_t m_uFramegenTimestampValidBits = 0;
 	double m_flFramegenTimestampPeriodNs = 0.0;
 	// seqNo -> { query ring slot, ladder rung, generated count } so the readback
 	// can attribute the measured cost to the exact batch shape.
 	struct FramegenQueryAssoc_t { uint32_t nSlot; uint32_t nRung; uint32_t nGeneratedCount; };
 	std::map<uint64_t, FramegenQueryAssoc_t> m_framegenQuerySlotBySeqNo;
 	uint64_t m_aFramegenRungCostNs[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
+	uint32_t m_aFramegenRungSamples[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
 	uint64_t m_ulFramegenLastRawGpuTimeNs = 0;
 
 private:

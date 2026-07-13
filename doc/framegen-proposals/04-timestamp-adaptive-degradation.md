@@ -1,6 +1,12 @@
 # Proposal 4 — Timestamp-Driven Adaptive Degradation Ladder
 
-Status: design draft
+Status: **implemented with deliberate control-policy divergences**. The original design below is
+retained as rationale. Production uses a monotonic down-only ladder, 85% vblank budget,
+per-`(rung, generated-count)` 7/8 EMA, a three-completed-sample warm-up, and a four-frame post-step
+hold. The dedicated-queue semaphore wait covers `ALL_COMMANDS`, keeping the opening timestamp after
+the composite dependency; deltas are modular in `timestampValidBits`, so sub-64-bit counter wrap is
+valid. Single-queue devices key the same non-blocking query readback to the scratch timeline, so the
+ladder remains active there; only generation admission is deliberately more conservative.
 Scope: `src/rendervulkan.cpp` framegen core, `CVulkanDevice`/`CVulkanCmdBuffer`,
 `src/steamcompmgr.cpp` slot scheduler, `src/vblankmanager.cpp` timing source.
 Depends on: the existing experimental framegen path (`--experimental-framegen`)

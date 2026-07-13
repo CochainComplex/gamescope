@@ -111,10 +111,11 @@ The 23 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) 
    history-invalidation checks, the generate/dormant gate, multiplier adaptation, and the
    degradation-ladder step, then shifts zero-copy history `previousReal ← currentReal ←
    composited image` (`:5789-5791`).
-6. **Generation on the dedicated queue.** If generating, `framegen_submit_batch` (`:5314`) records
+6. **Generation on the framegen queue.** If generating, `framegen_submit_batch` (`:5314`) records
    the whole interval into **one** `markFramegen()` command buffer, brackets it with GPU timestamps,
-   and submits via `submitFramegen` (`:1857`), which waits the composite scratch-timeline value,
-   `QueueSubmit`s to `m_framegenQueue`, and signals `m_framegenTimeline`. `framegen_submit_batch`
+   and submits via `submitFramegen` (`:1857`). With queue index 1 it waits the composite
+   scratch-timeline value, `QueueSubmit`s to `m_framegenQueue`, and signals `m_framegenTimeline`;
+   single-queue devices submit in order on the normal scratch timeline. `framegen_submit_batch`
    appends `PendingGenerated_t` entries and pins `genReadA/B = previousReal/currentReal`,
    `genReadSeqNo = batch seqNo` (`:5417-5419`). Then `force_repaint()` (def `steamcompmgr.cpp:7171`)
    `Nudge()`s the compositor thread to run the empty-vblank iteration at all.
@@ -174,9 +175,11 @@ wide-gamut negatives; previous frame sampled at center only.
 
 ### 3.2 Motion mode detail
 
-Stages 1+2 run **once per real-frame pair** (`framegen_prepare_motion` `:5231`); stage 3 runs
-**per slot** (`framegen_warp_slot` `:5292`). Falls back to extrapolate for the whole batch if
-intermediates can't be allocated.
+Stages 1+2, learned refinement, B4 probing and online training run **once per real-frame pair**
+(`framegen_prepare_motion` `:5231`); stage 3 runs **per slot** (`framegen_warp_slot` `:5292`). The
+final field is cached by real-frame ID, quality and causal/bidir mode, so later JIT/idle batches for
+the same pair issue only their warps and cannot overweight a slow interval in online training.
+Falls back to extrapolate for the whole batch if intermediates can't be allocated.
 
 - **Stage 1 — luma pyramid** (`cs_framegen_motion_luma_pair.comp` +
   `cs_framegen_motion_pyramid.comp`): **4-tap bilinear box** to 1/8-res luma, both frames in one
@@ -241,12 +244,19 @@ worse even where matching fails.
 #### 3.2.1 Ultra causal acceleration and Extreme guided reconstruction
 
 `cs_framegen_motion_warp_accel.comp` uses a third causal interval without requiring application
-motion vectors, a vendor optical-flow block, or a future frame. After an ultra batch's warps finish,
-the final checked/refined/trust-scaled forward field is copied to `mvFieldHistory`. On the next
-consecutive estimated real-frame pair, the shader samples that older field at `uv-currentFlow`, so
-the old and current vectors describe the same moving content, then evaluates
-`A = F_current - F_old`. The future displacement is the quadratic
-`s·F + 0.5·s·(s+1)·A`.
+motion vectors, a vendor optical-flow block, or a future frame. The final
+checked/refined/trust-scaled forward field remains resident as the current pair's cached field. At
+the start of the next consecutive, same-quality causal pair it is copied to `mvFieldHistory`
+**before** preparation overwrites the working images; same-pair JIT/refills therefore retain both
+the finalized current field and the true preceding field. The shader samples that history at
+`uv-currentFlow`, so the old and current vectors describe the same moving content. The fields are interval
+**displacements**, not velocities, so cadence jitter must not become false acceleration. For the
+current real-frame interval `h0` and preceding interval `h1`, the shader evaluates
+`A = F_current - F_old·h0/h1`; the future displacement is
+`s·F_current + h0/(h0+h1)·s·(s+1)·A`. This is the exact irregular-sample quadratic and reduces to
+`s·F + 0.5·s·(s+1)·A` when the intervals match. The same ratio normalizes the causal shading-trend
+training target. Missing timestamps or an interval ratio beyond 4:1 disables the second derivative
+for one interval and falls back to constant velocity; the freshly stored field re-primes the next.
 
 Acceleration has four structural guards: both fields must retain confidence; a 0.05-field-texel
 dead zone removes sub-pel estimator noise; acceleration fades out when large relative to observed
@@ -596,7 +606,9 @@ idle/dormant stretch never moves the rung.
 - `deadline = vblankInterval · k_uFramegenDeadlinePercent(85) / 100`.
 - `ulCurRungCostNs = framegenRungCostNs(nDegradeSteps, nCurGenForLadder)` — the live-measured GPU
   cost of the current config's batch shape (per-(rung, gen-count), 7/8 EMA; §6).
-- Guard: `nMaxDegradeSteps>0 && cost!=0 && steps<max` (`:5871`).
+- Guard: `nMaxDegradeSteps>0 && cost!=0 && samples>=3 && steps<max` (`:5871`). Three completed
+  batches of that exact `(rung, generated-count)` shape keep a cold or anomalous first sample from
+  making an irreversible scene-local quality decision.
 - If `nDegradeHold>0`: decrement only (cooldown — burns down even during a dip below deadline; it is
   **wall-frames, not over-budget-frames**).
 - Else if `cost > deadline`: peek `nextEff = framegen_effective_config(steps+1)` and **step only if
@@ -695,7 +707,12 @@ lockless structures safe (§6).
   partial-overlay aliases while active (`:3915`).
 - **Generated-frame scanout pool** `framegenOutputImages`, sized **`2·g_nFramegenMultiplier`**
   (`:5051`), rolling cursor `% pool.size()`. **Strictly disjoint** from the composite ring — generated
-  frames flip directly and outlive generation.
+  frames flip directly and outlive generation. Allocation admits only a texture whose
+  `CVulkanTexture::IsInUse()` is false: public refs cover pending slots and Vulkan command-buffer
+  lifetime, while backend-fb refs cover DRM request/visible sets and Wayland compositor acquire to
+  `wl_buffer.release`. If the backend retains the whole pool, the batch is shortened (or skipped)
+  and scanout repeats; an acquired image is never rewritten. The three-image late-composite pool
+  in base-layer mode uses the same ownership test.
 - **Dedicated compute queue.** `createDevice` requests `queueCount=2` from `m_queueFamily` when
   `framegen && backend-supported && queueCount≥2 && !GAMESCOPE_FRAMEGEN_SINGLE_QUEUE` (`:709`),
   retrieves index 1 → `m_framegenQueue`. Both queues share `REALTIME` global priority (Vulkan has no
@@ -703,19 +720,36 @@ lockless structures safe (§6).
   still works. Requested only when framegen is enabled, so other sessions are unaffected.
 - **Own framegen timeline** `m_framegenTimeline` (monotonic `m_framegenSeqNo`); graceful downgrade to
   the shared queue if creation fails. Composite `waitIdle` explicitly drains it.
-- **Per-queue descriptor ring.** `m_framegenDescriptorSets` (16) vs composite `m_descriptorSets` (24)
-  → a 40-set pool; routed by `CVulkanCmdBuffer::m_bFramegen` set by `markFramegen()`. **No completion
+- **Per-queue descriptor ring.** `m_framegenDescriptorSets` (30) vs composite `m_descriptorSets` (24)
+  -> a 54-set pool; routed by `CVulkanCmdBuffer::m_bFramegen` set by `markFramegen()`. **No completion
   tracking** — a bare modulo counter, safe *only* because of the one-batch-in-flight guard.
 - **Command-buffer split.** Generation into its own `CVulkanCmdBuffer` from the shared pool, submitted
-  via `submitFramegen` (raw `vk.QueueSubmit` to `m_framegenQueue`), recycled after the framegen
-  timeline signals (`framegenGarbageCollect`).
+  via `submitFramegen`: the second-queue path uses raw `vk.QueueSubmit` plus the dedicated framegen
+  timeline, while the fallback uses normal `submit` plus the scratch timeline. Each path recycles
+  through the command buffer's owning timeline (`framegenGarbageCollect` handles the dedicated path).
+- **Finalized motion-field cache.** `uMotionFieldFrameId` identifies the checked/refined/trust-scaled
+  field still resident in `mvField`/`mvFieldNet`. Same-pair JIT and idle refills reuse it and run only
+  their warps; they do not repeat estimation, B4, net inference or online training. A new preparation,
+  held-out probe, resource rebuild or history invalidation clears the identity. The next consecutive
+  same-quality causal pair shifts it to `mvFieldHistory` before overwriting the working field.
 - **Cross-queue WAR pin.** `genReadA/B/genReadSeqNo` (`:5417`) pin history slots against ring reuse
   until `hasCompletedFramegen(genReadSeqNo)` — at most 2 slots pinned, so the ≥5 ring always has a
   free slot and the skip loop terminates.
-- **Timestamp query ring.** Depth-4, created only if `timestampValidBits>0 && timestampPeriod!=0` on
-  the dedicated queue; TOP/BOTTOM_OF_PIPE brackets; readback **without** `WAIT_BIT` folds into
-  `m_aFramegenRungCostNs[8][4]` via a 7/8 EMA keyed by **batch shape** (so x2-gaps don't inherit
-  x4-batch timings).
+- **Reset lifetime fence.** `lastFramegenWorkSeqNo` tracks every framegen-path submission, including
+  descriptor-free base-history copies that intentionally do not affect the generation headroom gate.
+  A resize, format change or base-mode transition retires that token before releasing history, pools,
+  descriptor/query state or ring pins; this wait exists only on exceptional reset paths. A completed
+  online-weight readback is consumed before the reset flush, preserving the newest in-situ step.
+- **Timestamp query ring.** Depth-4, created if `timestampValidBits>0 && timestampPeriod!=0` on the
+  selected queue family; TOP/BOTTOM_OF_PIPE brackets. The dedicated-queue composite wait is scoped to
+  `ALL_COMMANDS`, so the opening timestamp cannot execute before the semaphore and charge upstream
+  composite wait time to framegen. The single-queue fallback keys the same query associations to the
+  scratch timeline, so low-queue-count devices retain deadline adaptation. Readback **without**
+  `WAIT_BIT` performs modular subtraction in
+  the queue family's `timestampValidBits` domain, then folds into `m_aFramegenRungCostNs[8][4]` via
+  a 7/8 EMA keyed by **batch shape** (so x2-gaps don't inherit x4-batch timings). A saturating sample
+  count supplies the ladder's three-sample warm-up. Scene reset also drops outstanding
+  query-to-rung associations, so a pre-cut batch that completes late cannot seed the new scene.
 
 **The one assumption behind three lockless structures:** "at most one framegen batch in flight"
 (`bGpuHasHeadroom`) is what makes the 16-slot descriptor ring, the depth-4 timestamp ring, and the
@@ -747,11 +781,12 @@ cache hit.
   when online ML is enabled, reports inference and training separately. Empirical
   basis for the NVIDIA=direct choice. On Radeon 890M, Extreme versus Ultra warp cost measured
   0.649 vs 0.587 ms at 1440p integer and 1.517 vs 1.411 ms at 2160p integer (200 dispatch mean),
-  a 4–11% premium for the full-resolution boundary verdict. (Note: it checks only `timestampPeriod==0`, **not**
-  `timestampValidBits`, unlike the live path — weaker guard.)
-- **Live measurement → ladder** (dedicated queue only): timestamp ring → non-blocking readback in
-  `framegenGarbageCollect` → 7/8 EMA per (rung, gen-count). On the shared queue there are no
-  timestamps, so the ladder is inert and the reactive discard is the only protection.
+  a 4–11% premium for the full-resolution boundary verdict. It uses the selected queue family's
+  `timestampValidBits` and modular wrap subtraction, matching the live estimator.
+- **Live measurement → ladder** (dedicated or shared queue): timestamp ring → non-blocking readback
+  in `framegenGarbageCollect` → 7/8 EMA per (rung, gen-count). Cached-field refill warps are not mixed
+  into that EMA: it represents the next real pair's full setup batch rather than a cheap same-pair
+  continuation.
 
 ---
 
@@ -783,7 +818,7 @@ cache hit.
 | **01** | VRR hybrid — present the real frame VRR-style for the full latency win, schedule the generated frame with a timer-armed mid-interval atomic flip | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_VRR_HYBRID=1`, dedicated queue + active VRR only). The VRR-suppression gates are gone: `steamcompmgr.cpp:2574` now keeps `allowVRR` on while framegen runs iff the hybrid is requested, and `DRMBackend.cpp:3625` inherits the real frame's `allowVRR` instead of hard-coding false — so both flips carry the same VRR state and no per-frame modeset fires. Single generated frame at phase 0.5 flipped by the absolute mid-interval timer `g_FramegenMidTimer` (`steamcompmgr.cpp:8337`); planned by `framegen_vrr_hybrid_submit` (`rendervulkan.cpp:5661`). Built on #06's frametime EMA; toggle is env, not the proposed `cv_framegen_vrr_hybrid`. **Not yet validated on a VRR panel** (see the proposal's Status line). |
 | **02** | Base-layer generation + late overlay/cursor composite — generate on the pre-upscale game layer, composite UI on top (~−56% BW, no HUD ghosting) | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_BASE=1`, no dedicated-queue requirement). Generation runs on `layers[0].tex`; the present-time consume late-composites overlays/cursor over the generated base through `vulkan_composite` (`framegen_base_present_composite`, `:5350`), so UI/HUD/cursor smear is eliminated **by construction** and generated frames get the full FSR + shaper/3D-LUT pipeline. **Divergence:** the draft's "−56% BW" inverted post zero-copy-history — base mode now *adds* a base-sized history copy per real frame + one full composite per presented generated frame; the justification is the quality win, not bandwidth. Live per-frame dispatcher (`framegen_base_layer_usable`, `:4939`) falls back to output-space generation for video-underlay/YCbCr/ReShade/no-storage-format scenes. Validated nested on the dual-GPU FSR path (motion x3). |
 | **03** | dGPU optical-flow donor — offload motion estimation to the render GPU's `VK_NV_optical_flow` OFA, ship a small flow field over PCIe | **Aspirational** (longest horizon). Zero OFA symbols; needs a second Vulkan device gamescope has never had; cross-vendor timeline interop rated unreliable. Motion mode is the shipped fallback. |
-| **04** | Timestamp-driven adaptive degradation | **IMPLEMENTED** (`a75bfbe`) but **divergent** from the proposal — shipped is *monotonic* (down-only, re-probe on scene change), rungs are motion-quality/mode/multiplier notches (not a pyramid table), 85% deadline (not 0.6 budget), 2D per-(rung,gen-count) 7/8-EMA (not one global EWMA), fixed 4-frame cooldown, and no tuning flags. `VK_EXT_calibrated_timestamps` is unused. |
+| **04** | Timestamp-driven adaptive degradation | **IMPLEMENTED** (`a75bfbe`) but **divergent** from the proposal — shipped is *monotonic* (down-only, re-probe on scene change), rungs are motion-quality/mode/multiplier notches (not a pyramid table), 85% deadline (not 0.6 budget), 2D per-(rung,gen-count) 7/8-EMA (not one global EWMA), three-sample cold-start guard, fixed 4-frame cooldown, modular `timestampValidBits` wrap handling, and no tuning flags. `VK_EXT_calibrated_timestamps` is unused. |
 | **05** | Tile classification + `vkCmdDispatchIndirect` + SDMA static fill — generate only over moving tiles, fill static tiles on the transfer engine | **Aspirational** (deferred). No transfer-only queue discovery / classify shader exists; the doc admits it depends on transfer-queue discovery that isn't there yet. |
 | **06** | JIT phase — plan one slot per vblank against the KMS pageflip clock with a slew-limited frametime EMA, instead of baking phases from a single-interval gap guess; adds the "skip when keeping up" guard | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_JIT=1`, dedicated queue only). `framegen_jit_submit` / `vulkan_framegen_jit_tick` (`rendervulkan.cpp`), EMA `FramegenHistory_t::ulFrametimeEmaNs`, keep-up guard `k_uFramegenJitKeepUpPercent=110`. Tested with GravityMark (~21% fewer generation passes for identical present coverage); phase-accuracy/smoothness benefit still needs native DRM + human A/B. |
 | **07** | Frames-only SOTA alignment and validation | **BOUNDED IMPLEMENTATIONS COMPLETE FOR E1, E2, B, A, D.** E2 now captures exact full-resolution held-out colour with paired candidates; optional LPIPS is available, while DISTS/FvVDP remain external evaluation work. The confidence-only bidir ML authority boundary remains the production contract. |
@@ -805,8 +840,7 @@ cache hit.
   (7900 XT / 5700 XT) are not special-cased** and run the un-benchmarked LDS+fp16 default; the direct
   shader's own header claims RDNA3's Infinity Cache benefits too — dispatcher and shader comment
   disagree on RDNA3. Extend the predicate once measured on those parts.
-- **Dead code.** `FramegenHistory_t::previousPresentTimeNs` (`:4765`, written `:5729/:5761`, **never
-  read** — confirmed) and `previousFrameId` (`:4763`) are dead. The `MOTION_LUMA` / `_RGBA`
+- **Dead code.** `FramegenHistory_t::previousFrameId` (`:4763`) is dead. The `MOTION_LUMA` / `_RGBA`
   single-target shaders are compiled but never dispatched (only the `_PAIR` variants run); the dead
   `_rgba` variant uses a **single-tap** downsample that would reintroduce the exact aliasing wobble
   the box filter fixed if it were ever revived.
@@ -824,8 +858,8 @@ cache hit.
   Wayland generated-frame present hard-nulls planes 1..7 (overlays/cursor dropped for a generated
   slot). `force_repaint`'s load-bearing effect for the generated case is the `Nudge()` (the
   `bShouldPaint` override already handles the paint decision).
-- **Shared-queue path is intentionally hobbled** — `nGenerate` forced to 1, no timestamps, so the
-  ladder is inert and only the reactive discard protects it.
+- **Shared-queue path is intentionally conservative** — `nGenerate` is forced to 1 to bound
+  head-of-line blocking. It now retains timestamp-driven degradation as well as reactive discard.
 - **Motion is all-or-nothing under pressure** — the ladder sheds Motion before any multiplier notch,
   so `Motion-x4 → Extrapolate-x4 → x3 → x2` with no Motion-x3/x2 rung.
 - **Descriptor ring has no completion tracking** — safety rests entirely on the one-batch-in-flight

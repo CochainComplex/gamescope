@@ -46,7 +46,10 @@ uniform motion_net_train_t {
     uint  u_seed;      // per-frame tile-placement seed (derived from seqno)
     uint  u_sliceBase; // first slice row this dispatch writes
     float u_mode;      // task-conditioning input (must match inference)
-    uint  u_flags;     // bit 0: scene-cut guard, bit 1: causal shading history
+    uint  u_flags;     // bit 0: scene cut, bit 1: shading history, bit 2: conservative bidir
+    // Current real-frame interval / preceding interval. Only the causal
+    // shading-persistence target uses it; geometry stays in native units.
+    float u_historyTimeScale;
 };
 
 // The gradient slice image: one row per tile, width = parameter count.
@@ -284,7 +287,8 @@ void main() {
             vec2 olderPos = prevPos - oldField.xy;
             float lold = texture(s_samplers[5], olderPos / vec2(sz)).r;
             float scale = max(1.0f, max(abs(wg.x), max(abs(ld), abs(lold))));
-            float trend = clamp(wg.x - lold, -0.10f * scale, 0.10f * scale);
+            float trend = clamp((wg.x - lold) * u_historyTimeScale,
+                                -0.10f * scale, 0.10f * scale);
             float trendN = abs(trend) / scale;
             float focusTanh = tanh(o[3]);
             float focus = max(focusTanh, 0.0f);

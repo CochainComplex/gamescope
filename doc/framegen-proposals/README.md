@@ -177,6 +177,10 @@ along with these hardening/quality passes:
 - **Dedicated framegen queue** — generation runs on a second same-family compute
   queue with its own timeline, so it can never block the next composite on the
   realtime queue (falls back to the shared queue when unavailable).
+- **Ownership-safe generated pools** — output selection observes both Vulkan
+  command-buffer refs and backend framebuffer ownership. KMS/Wayland retention
+  shortens or skips a batch instead of letting the compute queue rewrite an
+  image still queued for scanout.
 - **Motion-compensated mode** (`--framegen-mode motion`) — a low-res luma block
   matcher produces a motion field that a warp pass reprojects along, blending
   back to extrapolation where the match is unconfident. The matcher is a
@@ -191,6 +195,9 @@ along with these hardening/quality passes:
   two-source agreement test** in the warp (the flow is projected from both
   real frames; pixels where the projections read different content fall back
   individually, so edge errors degrade cleanly instead of double-exposing).
+  Ultra/Extreme temporal acceleration normalizes retained displacement fields
+  by their measured real-frame intervals, so source-cadence jitter is not
+  interpreted as physical acceleration.
   *Prior art:* the block-matching + SAD + luma-pyramid construction is the
   classical, non-learned analog of AMD FSR 3's FidelityFX Optical Flow (GPUOpen);
   the two-source color-match arbitration mirrors FSR 3's optical-flow-vs-MV blend
@@ -235,7 +242,9 @@ along with these hardening/quality passes:
   smoothing, occlusion inpainting, confidence-vs-usefulness calibration). A
   zero-initialized head is exactly the unrefined pipeline, the corrections
   are bounded by construction, and the adaptation probe grades the refined
-  field — so a bad checkpoint is clamped in the same batch. Trained offline,
+  field — so a bad checkpoint is clamped in the same batch. JIT/idle refills
+  reuse that finalized field and weight snapshot; they do not rerun inference,
+  adaptation or training on an identical pair. Trained offline,
   self-supervised, on tensors captured with `GAMESCOPE_FRAMEGEN_RECORD`
   (`scripts/framegen-net-train.py`, numpy-only). *Prior art:* the "heuristic
   motion + lightweight correction net" template of GFFE (Wu et al., ACM TOG

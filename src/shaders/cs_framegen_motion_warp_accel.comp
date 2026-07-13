@@ -35,7 +35,12 @@ uniform motion_accel_t {
     float u_reservoirValid;
     // The net's zero-neutral causal shading-persistence focus map is valid.
     float u_shadingValid;
-    float u_pad2;
+    // Motion fields store displacement per observed real-frame interval. The
+    // preceding field is multiplied by currentDt/historyDt before it becomes a
+    // velocity comparison, otherwise cadence jitter masquerades as acceleration.
+    float u_historyFlowScale;
+    // currentDt / (currentDt + historyDt), exactly 0.5 for equal intervals.
+    float u_accelTimeFactor;
 };
 
 // s_samplers[0] = previousReal, [1] = currentReal,
@@ -122,7 +127,8 @@ vec4 coherentHistoryField(vec2 uv, vec2 currentFlow) {
             vec4 candidate = texelFetch(s_samplers[3], fieldCoord, 0);
             vec2 samplePos = vec2(fieldCoord) + vec2(0.5f);
             vec2 spatialDelta = samplePos - uv * vec2(fieldSize);
-            float score = abs(candidate.r - currentFlow.x) + abs(candidate.g - currentFlow.y)
+            vec2 normalizedFlow = candidate.rg * u_historyFlowScale;
+            float score = abs(normalizedFlow.x - currentFlow.x) + abs(normalizedFlow.y - currentFlow.y)
                 + 0.0125f * dot(spatialDelta, spatialDelta)
                 + 0.05f * (1.0f - clamp(candidate.b, 0.0f, 1.0f));
             if (score < bestScore) {
@@ -195,15 +201,16 @@ vec3 reservoirCandidate(vec2 uv, vec2 invOutSize, vec2 baselineFlow,
         if (oldField.a < -0.5f || oldConf < 0.35f)
             continue;
 
-        vec2 accel = candidate.rg - oldField.rg;
+        vec2 oldFlowNormalized = oldField.rg * u_historyFlowScale;
+        vec2 accel = candidate.rg - oldFlowNormalized;
         accel = sign(accel) * max(abs(accel) - vec2(0.05f), vec2(0.0f));
-        float speed = max(0.5f, max(length(candidate.rg), length(oldField.rg)));
+        float speed = max(0.5f, max(length(candidate.rg), length(oldFlowNormalized)));
         float accelRatio = length(accel) / speed;
         float accelTrust = candidateConf * oldConf
             * (1.0f - smoothstep(0.35f, 1.0f, accelRatio));
         accel = clamp(accel, vec2(-u_accelMax), vec2(u_accelMax));
 
-        float accelCoeff = 0.5f * u_strength * (u_strength + 1.0f);
+        float accelCoeff = u_accelTimeFactor * u_strength * (u_strength + 1.0f);
         vec2 futureFlow = candidate.rg * u_strength
             + accel * (accelCoeff * accelTrust);
         vec2 curUv = uv - futureFlow * u_lowResScale * invOutSize;
@@ -276,7 +283,8 @@ void main() {
     vec4 oldField = vec4(flow, conf, 0.0f);
     if (u_historyValid > 0.5f)
         oldField = coherentHistoryField(uv - flowUv, flow);
-    vec2 accel = flow - oldField.rg;
+    vec2 oldFlowNormalized = oldField.rg * u_historyFlowScale;
+    vec2 accel = flow - oldFlowNormalized;
 
     // Remove the sub-pel noise floor before extrapolating a second derivative.
     // Then reject acceleration that is implausibly large relative to the two
@@ -284,16 +292,17 @@ void main() {
     // field-verdict flip from becoming a multi-pixel frametime-rate wobble.
     const vec2 deadzone = vec2(0.05f);
     accel = sign(accel) * max(abs(accel) - deadzone, vec2(0.0f));
-    float speed = max(0.5f, max(length(flow), length(oldField.rg)));
+    float speed = max(0.5f, max(length(flow), length(oldFlowNormalized)));
     float accelRatio = length(accel) / speed;
     float accelTrust = conf * clamp(oldField.b, 0.0f, 1.0f)
         * (1.0f - smoothstep(0.35f, 1.0f, accelRatio));
     accel = clamp(accel, vec2(-u_accelMax), vec2(u_accelMax));
 
-    // Quadratic through the three causal positions. With s intervals beyond
-    // the newest real frame, p(s) = p(0) + s*F + s*(s+1)/2*A. At A=0 this is
-    // exactly the constant-velocity production warp.
-    float accelCoeff = 0.5f * u_strength * (u_strength + 1.0f);
+    // Quadratic through the three causal positions. For current interval h0,
+    // preceding interval h1 and normalized difference A = F0-F1*h0/h1, the
+    // future displacement is s*F0 + h0/(h0+h1)*s*(s+1)*A. Equal intervals
+    // reduce to the familiar s*F + s*(s+1)/2*A; A=0 is constant velocity.
+    float accelCoeff = u_accelTimeFactor * u_strength * (u_strength + 1.0f);
     vec2 futureFlow = flow * u_strength + accel * (accelCoeff * accelTrust * u_historyValid);
     vec2 futureUv = futureFlow * u_lowResScale * invOutSize;
     vec3 predictedMotion = texture(s_samplers[1], uv - futureUv).rgb;
