@@ -601,6 +601,8 @@ zero is bit-exact to the baseline.
 
 Evaluated **only on frames that actually generate** (after the dormant early-return), so an
 idle/dormant stretch never moves the rung.
+The stateless rung transformation lives in `src/framegen/policy.hpp`; Vulkan timing and the
+scene-local rung counter remain owned by `rendervulkan.cpp`.
 
 - `deadline = vblankInterval · k_uFramegenDeadlinePercent(85) / 100`.
 - `ulCurRungCostNs = framegenRungCostNs(nDegradeSteps, nCurGenForLadder)` — the live-measured GPU

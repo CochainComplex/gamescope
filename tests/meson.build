@@ -14,3 +14,11 @@ test_convar = executable(
 	cpp_args: gamescope_cpp_args,
 )
 test('convar', test_convar)
+
+test_framegen = executable(
+	'test_framegen',
+	['test_framegen.cpp'],
+	include_directories: [srcdir],
+	cpp_args: gamescope_cpp_args,
+)
+test('framegen', test_framegen)

@@ -33,12 +33,16 @@ jobs:
           PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
             python3 -m py_compile scripts/framegen-net-train.py \
               scripts/framegen-net-eval.py scripts/framegen-color-eval.py
+          c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
+            tests/test_framegen.cpp -o /tmp/gamescope-framegen-contracts
+          /tmp/gamescope-framegen-contracts
           if git grep -nE '/home/[[:alnum:]_.-]+/' -- \
             README.md doc/framegen-architecture.md doc/framegen-howto.md \
             doc/framegen-maintenance.md doc/framegen-proposals \
             env-gamescope-local.sh test-framegen.sh watch-framegen.sh \
             run-framegen-native.sh scripts/framegen-\*.py \
-            scripts/framegen-launch-common.sh; then
+            scripts/framegen-launch-common.sh src/framegen \
+            tests/test_framegen.cpp; then
             echo 'Machine-specific home path found in a published framegen file.' >&2
             exit 1
           fi

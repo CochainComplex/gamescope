@@ -11,14 +11,24 @@ symbols below.
 | Area | Primary source | Ownership |
 |---|---|---|
 | CLI and environment | `src/main.cpp` | parsing, validation, debug controls |
-| Vulkan execution | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch, queues, timestamps, ML |
+| Framegen types and policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/quality vocabulary and pure degradation-ladder resolution |
+| Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp` | CPU/GLSL ABI and serialized/GPU tensor layout |
+| Vulkan execution | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch, queues, timestamps, ML execution |
 | Presentation choice | `src/steamcompmgr.cpp` | real/generated/repeat arbitration and timed flips |
 | Backend present | `src/Backends/DRMBackend.cpp`, `src/Backends/WaylandBackend.cpp` | final generated-frame substitution |
 | Algorithms | `src/shaders/cs_framegen_*.comp` | extrapolation, motion estimation, validation, warp, ML |
 | Offline ML tools | `scripts/framegen-net-*.py` | GSFD parsing, training, GSFR evaluation |
+| Contract tests | `tests/test_framegen.cpp` | exhaustive pure-policy, ABI encoding, and net-layout checks |
 
 Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
+
+The `src/framegen` headers are deliberately stateless and header-only: they add
+no link boundary to command recording. Keep mutable Vulkan resources, history,
+and submission ordering together until they can move behind one explicit owner
+with a proven lifetime. Splitting tightly coupled dispatch helpers merely to
+reduce line count is not an architectural improvement and can hide ordering or
+ownership bugs.
 
 ## Non-negotiable runtime contracts
 
@@ -84,8 +94,8 @@ become wrong whenever the hot path is reorganized.
 Framegen push constants bypass the shared upload arena so dedicated-queue work
 cannot race its host allocator. The C++ structures from `FramegenPushData_t`
 through `FramegenMotionNetOptPush_t` are copied verbatim into GLSL blocks.
-`src/rendervulkan.cpp` has compile-time size and semantic-member offset assertions
-for every block.
+`src/framegen/push_constants.hpp` has compile-time size, semantic-member offset,
+standard-layout, and trivially-copyable assertions for every block.
 
 When changing a push block:
 
@@ -171,6 +181,9 @@ shellcheck -x env-gamescope-local.sh test-framegen.sh \
 PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
   python3 -m py_compile scripts/framegen-net-train.py \
     scripts/framegen-net-eval.py scripts/framegen-color-eval.py
+c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
+  tests/test_framegen.cpp -o /tmp/gamescope-framegen-contracts
+/tmp/gamescope-framegen-contracts
 git diff --check
 ```
 

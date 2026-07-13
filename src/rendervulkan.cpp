@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
-#include <cstddef>
 #include <thread>
 #include <dlfcn.h>
 #include "vulkan_include.h"
@@ -42,6 +41,9 @@
 #include "vblankmanager.hpp"
 #include "log.hpp"
 #include "Utils/Process.h"
+#include "framegen/net_layout.hpp"
+#include "framegen/policy.hpp"
+#include "framegen/push_constants.hpp"
 
 #include "cs_composite_blit.h"
 #include "cs_composite_blur.h"
@@ -4702,355 +4704,6 @@ static const char *framegen_quality_name_of( GamescopeFramegenQuality eQuality )
 	}
 }
 
-// Push constants for the extrapolate shaders. `strength` is the effective
-// per-slot forward coefficient: the CPU folds this slot's temporal placement
-// (where it lands between the two real frames) and the user --framegen-strength
-// into a single value, so the shader stays slot-agnostic.
-struct FramegenPushData_t
-{
-	float strength;
-	float suppressLo;
-	float suppressHi;
-	float pad;
-
-	explicit FramegenPushData_t( float flStrength, float flLo, float flHi )
-		: strength( flStrength )
-		, suppressLo( flLo )
-		, suppressHi( flHi )
-		, pad( 0.0f )
-	{
-	}
-};
-
-// Paired extrapolation: two slot coefficients in one dispatch, so the two 4K
-// history reads are shared instead of repeated per generated frame.
-struct FramegenPairPushData_t
-{
-	float strength0;
-	float strength1;
-	float suppressLo;
-	float suppressHi;
-
-	FramegenPairPushData_t( float flStrength0, float flStrength1, float flLo, float flHi )
-		: strength0( flStrength0 )
-		, strength1( flStrength1 )
-		, suppressLo( flLo )
-		, suppressHi( flHi )
-	{
-	}
-};
-
-// Blend mode: per-slot temporal placement as the crossfade weight, so x3/x4
-// produces distinct intermediate frames instead of identical 0.5 duplicates.
-struct FramegenBlendPushData_t
-{
-	float phase;
-	float pad0, pad1, pad2;
-
-	explicit FramegenBlendPushData_t( float flPhase )
-		: phase( flPhase ), pad0( 0.0f ), pad1( 0.0f ), pad2( 0.0f )
-	{
-	}
-};
-
-// Push constants for the motion-mode block-match and warp passes.
-struct FramegenMotionMatchPush_t
-{
-	int32_t searchRadius;
-	int32_t pad0, pad1, pad2;
-
-	explicit FramegenMotionMatchPush_t( int32_t nSearchRadius )
-		: searchRadius( nSearchRadius ), pad0( 0 ), pad1( 0 ), pad2( 0 )
-	{
-	}
-};
-
-struct FramegenMotionWarpPush_t
-{
-	float strength;
-	float suppressLo;
-	float suppressHi;
-	float lowResScale;
-	float agreeLo;
-	float agreeHi;
-
-	explicit FramegenMotionWarpPush_t( float flStrength, float flLo, float flHi, float flScale, float flAgreeLo, float flAgreeHi )
-		: strength( flStrength ), suppressLo( flLo ), suppressHi( flHi ), lowResScale( flScale )
-		, agreeLo( flAgreeLo ), agreeHi( flAgreeHi )
-	{
-	}
-};
-
-struct FramegenMotionAccelPush_t
-{
-	float strength;
-	float suppressLo;
-	float suppressHi;
-	float lowResScale;
-	float agreeLo;
-	float agreeHi;
-	float accelMax;
-	float historyValid;
-	float guidedReconstruction;
-	float reservoirValid;
-	float shadingValid;
-	// The retained field is displacement over the preceding real-frame
-	// interval, not a velocity. Normalize it to the current interval before
-	// differencing, then use the irregular-sample quadratic coefficient below.
-	float historyFlowScale;
-	float accelTimeFactor;
-
-	FramegenMotionAccelPush_t( float flStrength, float flLo, float flHi, float flScale,
-		float flAgreeLo, float flAgreeHi, float flAccelMax, bool bHistoryValid,
-		bool bGuidedReconstruction, bool bReservoirValid, bool bShadingValid,
-		float flHistoryFlowScale, float flAccelTimeFactor )
-		: strength( flStrength ), suppressLo( flLo ), suppressHi( flHi ), lowResScale( flScale )
-		, agreeLo( flAgreeLo ), agreeHi( flAgreeHi ), accelMax( flAccelMax )
-		, historyValid( bHistoryValid ? 1.0f : 0.0f )
-		, guidedReconstruction( bGuidedReconstruction ? 1.0f : 0.0f )
-		, reservoirValid( bReservoirValid ? 1.0f : 0.0f )
-		, shadingValid( bShadingValid ? 1.0f : 0.0f )
-		, historyFlowScale( flHistoryFlowScale ), accelTimeFactor( flAccelTimeFactor )
-	{
-	}
-};
-
-struct FramegenMotionRefinePush_t
-{
-	int32_t finalLevel;
-	int32_t pad0, pad1, pad2;
-
-	explicit FramegenMotionRefinePush_t( bool bFinalLevel )
-		: finalLevel( bFinalLevel ? 1 : 0 ), pad0( 0 ), pad1( 0 ), pad2( 0 )
-	{
-	}
-};
-
-struct FramegenMotionFBCheckPush_t
-{
-	float tolBase;
-	float tolSlope;
-	float pad0, pad1;
-
-	explicit FramegenMotionFBCheckPush_t( float flTolBase, float flTolSlope )
-		: tolBase( flTolBase ), tolSlope( flTolSlope ), pad0( 0.0f ), pad1( 0.0f )
-	{
-	}
-};
-
-// Bidirectional interpolation warp (B3): the slot's temporal phase within the
-// completed real-frame interval plus the same field scale / agreement window
-// the forward warp uses.
-struct FramegenMotionBidirPush_t
-{
-	float phase;
-	float lowResScale;
-	float agreeLo;
-	float agreeHi;
-	float oneSidedStrength;
-	float pad0, pad1, pad2;
-
-	explicit FramegenMotionBidirPush_t( float flPhase, float flScale, float flAgreeLo, float flAgreeHi, float flOneSidedStrength )
-		: phase( flPhase ), lowResScale( flScale ), agreeLo( flAgreeLo ), agreeHi( flAgreeHi )
-		, oneSidedStrength( flOneSidedStrength ), pad0( 0.0f ), pad1( 0.0f ), pad2( 0.0f )
-	{
-	}
-};
-
-// Self-supervised stats probe (B4): thresholds for the per-texel verdicts; see
-// cs_framegen_motion_stats.comp for the counter layout they feed.
-struct FramegenMotionStatsPush_t
-{
-	uint32_t clearOnly;
-	float badThresh;
-	float staticMvMax;
-	float minConfSurvive;
-
-	explicit FramegenMotionStatsPush_t( bool bClearOnly );
-};
-
-// The apply half: window over the measured mispredicting fraction that scales
-// the field's confidence channel (cs_framegen_motion_stats_apply.comp).
-struct FramegenMotionStatsApplyPush_t
-{
-	float trustLo;
-	float trustHi;
-	float sceneHistSection;
-	float sceneHistGlobal;
-	float sceneResid;
-	float sceneUnreliable;
-	uint32_t sceneMinSections;
-	uint32_t detectOnly;
-
-	FramegenMotionStatsApplyPush_t( float flTrustLo, float flTrustHi, bool bDetectOnly )
-		: trustLo( flTrustLo )
-		, trustHi( flTrustHi )
-		, sceneHistSection( 0.35f )
-		, sceneHistGlobal( 0.25f )
-		, sceneResid( 0.12f )
-		, sceneUnreliable( 0.55f )
-		, sceneMinSections( 7u )
-		, detectOnly( bDetectOnly ? 1u : 0u )
-	{
-	}
-};
-
-// Learned field refinement (Stage C). Bidir uses the same fixed feature
-// encoding as existing profiles, but can independently suppress geometry,
-// confidence raises and the causal shading head at the output boundary.
-struct FramegenMotionNetPush_t
-{
-	float mode;
-	float flowScale;
-	float confidenceRaiseScale;
-	float shadingScale;
-
-	FramegenMotionNetPush_t( float flMode, bool bConservativeBidir )
-		: mode( flMode )
-		, flowScale( bConservativeBidir ? 0.0f : 1.0f )
-		, confidenceRaiseScale( bConservativeBidir ? 0.0f : 1.0f )
-		, shadingScale( bConservativeBidir ? 0.0f : 1.0f )
-	{
-	}
-};
-
-// In-situ learning (C2), gradient pass: tile-placement seed and which slice
-// rows this direction's dispatch owns (cs_framegen_motion_net_train.comp).
-struct FramegenMotionNetTrainPush_t
-{
-	uint32_t seed;
-	uint32_t sliceBase;
-	float mode;
-	uint32_t flags;
-	float historyTimeScale;
-
-	FramegenMotionNetTrainPush_t( uint32_t uSeed, uint32_t uSliceBase, bool bSceneCutGuard,
-		bool bShadingHistoryValid, bool bConservativeBidir, float flHistoryTimeScale )
-		: seed( uSeed ), sliceBase( uSliceBase ), mode( 0.0f )
-		, flags( ( bSceneCutGuard ? 1u : 0u )
-			| ( bShadingHistoryValid ? 2u : 0u )
-			| ( bConservativeBidir ? 4u : 0u ) )
-		, historyTimeScale( flHistoryTimeScale )
-	{
-	}
-};
-
-// In-situ learning (C2), optimizer pass: Adam step size, served-weights EMA
-// factor, per-step relaxation toward the prior, and the 1-based step counter
-// (0 = initialize state from the prior) — cs_framegen_motion_net_opt.comp.
-struct FramegenMotionNetOptPush_t
-{
-	float lr;
-	float emaAlpha;
-	float decay;
-	uint32_t step;
-
-	FramegenMotionNetOptPush_t( float flLr, float flEmaAlpha, float flDecay, uint32_t uStep )
-		: lr( flLr ), emaAlpha( flEmaAlpha ), decay( flDecay ), step( uStep )
-	{
-	}
-};
-
-// These structs are copied verbatim into GLSL push-constant blocks. Keep their
-// byte layout explicit: changing a member order in C++ without making the same
-// shader change otherwise compiles cleanly and silently feeds the wrong values
-// to every dispatch using that block.
-#define FRAMEGEN_PUSH_SIZE( type, size ) \
-	static_assert( sizeof( type ) == size, #type " size must match its GLSL push-constant block" )
-#define FRAMEGEN_PUSH_MEMBER( type, member, offset ) \
-	static_assert( offsetof( type, member ) == offset, #type "::" #member " must match its GLSL push-constant block" )
-
-FRAMEGEN_PUSH_SIZE( FramegenPushData_t, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenPushData_t, strength, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenPushData_t, suppressLo, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenPushData_t, suppressHi, 8 );
-
-FRAMEGEN_PUSH_SIZE( FramegenPairPushData_t, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenPairPushData_t, strength0, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenPairPushData_t, strength1, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenPairPushData_t, suppressLo, 8 );
-FRAMEGEN_PUSH_MEMBER( FramegenPairPushData_t, suppressHi, 12 );
-
-FRAMEGEN_PUSH_SIZE( FramegenBlendPushData_t, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenBlendPushData_t, phase, 0 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionMatchPush_t, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionMatchPush_t, searchRadius, 0 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionWarpPush_t, 24 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, strength, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, suppressLo, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, suppressHi, 8 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, lowResScale, 12 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, agreeLo, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, agreeHi, 20 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionAccelPush_t, 52 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, strength, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, suppressLo, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, suppressHi, 8 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, lowResScale, 12 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, agreeLo, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, agreeHi, 20 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, accelMax, 24 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, historyValid, 28 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, guidedReconstruction, 32 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, reservoirValid, 36 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, shadingValid, 40 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, historyFlowScale, 44 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionAccelPush_t, accelTimeFactor, 48 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionRefinePush_t, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionRefinePush_t, finalLevel, 0 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionFBCheckPush_t, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionFBCheckPush_t, tolBase, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionFBCheckPush_t, tolSlope, 4 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionBidirPush_t, 32 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, phase, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, lowResScale, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, agreeLo, 8 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, agreeHi, 12 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionBidirPush_t, oneSidedStrength, 16 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionStatsPush_t, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsPush_t, clearOnly, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsPush_t, badThresh, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsPush_t, staticMvMax, 8 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsPush_t, minConfSurvive, 12 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionStatsApplyPush_t, 32 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, trustLo, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, trustHi, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneHistSection, 8 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneHistGlobal, 12 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneResid, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneUnreliable, 20 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, sceneMinSections, 24 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionStatsApplyPush_t, detectOnly, 28 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionNetPush_t, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetPush_t, mode, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetPush_t, flowScale, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetPush_t, confidenceRaiseScale, 8 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetPush_t, shadingScale, 12 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionNetTrainPush_t, 20 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, seed, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, sliceBase, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, mode, 8 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, flags, 12 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetTrainPush_t, historyTimeScale, 16 );
-
-FRAMEGEN_PUSH_SIZE( FramegenMotionNetOptPush_t, 16 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetOptPush_t, lr, 0 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetOptPush_t, emaAlpha, 4 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetOptPush_t, decay, 8 );
-FRAMEGEN_PUSH_MEMBER( FramegenMotionNetOptPush_t, step, 12 );
-
-#undef FRAMEGEN_PUSH_MEMBER
-#undef FRAMEGEN_PUSH_SIZE
 
 // Motion-estimation intermediates (low-resolution luma pyramids and the motion
 // field). Allocated lazily by the motion dispatch, released on framegen reset.
@@ -5713,12 +5366,7 @@ bool vulkan_framegen_is_enabled()
 // the base globals (g_eFramegenMode / g_nFramegenMultiplier): those gate the whole
 // feature (vulkan_framegen_is_enabled) and size the output pool, so the ladder only
 // ever degrades within them and reads its result through framegen_effective_config.
-struct FramegenEffective_t
-{
-	GamescopeFramegenMode mode;
-	uint32_t multiplier;
-	GamescopeFramegenQuality quality;
-};
+using FramegenEffective_t = gamescope::framegen::EffectiveConfig;
 
 // Total number of rungs available from the startup config: motion walks through
 // every lower quality tier and then to extrapolate, followed by one rung per
@@ -5730,12 +5378,8 @@ struct FramegenEffective_t
 // measurement-frozen ladder rung would.
 static uint32_t framegen_max_degrade_steps()
 {
-	// Each motion quality level is a real command-recording rung. Low still has
-	// one final step to extrapolate; Extreme therefore contributes five rungs.
-	const uint32_t nMotionRung = g_eFramegenMode == GamescopeFramegenMode::Motion
-		? (uint32_t)g_eFramegenQuality + 1u : 0u;
-	const uint32_t nMultiplierRungs = (uint32_t)std::max( 0, g_nFramegenMultiplier - 2 );
-	return nMotionRung + nMultiplierRungs;
+	return gamescope::framegen::max_degrade_steps(
+		g_eFramegenMode, g_eFramegenQuality, g_nFramegenMultiplier );
 }
 
 // Apply nDegradeSteps degradations to the startup ceiling. Motion (the priciest
@@ -5744,27 +5388,8 @@ static uint32_t framegen_max_degrade_steps()
 // the result is always a still-generating config (never dormant).
 static FramegenEffective_t framegen_effective_config( uint32_t nDegradeSteps )
 {
-	FramegenEffective_t eff = { g_eFramegenMode, (uint32_t)std::max( 2, g_nFramegenMultiplier ), g_eFramegenQuality };
-	uint32_t n = nDegradeSteps;
-
-	while ( n > 0 && eff.mode == GamescopeFramegenMode::Motion
-		&& eff.quality > GamescopeFramegenQuality::Low )
-	{
-		eff.quality = (GamescopeFramegenQuality)( (uint32_t)eff.quality - 1u );
-		n--;
-	}
-	if ( n > 0 && eff.mode == GamescopeFramegenMode::Motion )
-	{
-		eff.mode = GamescopeFramegenMode::Extrapolate;
-		n--;
-	}
-	while ( n > 0 && eff.multiplier > 2 )
-	{
-		eff.multiplier--;
-		n--;
-	}
-
-	return eff;
+	return gamescope::framegen::effective_config(
+		g_eFramegenMode, g_eFramegenQuality, g_nFramegenMultiplier, nDegradeSteps );
 }
 
 static bool framegen_output_matches( const gamescope::OwningRc<CVulkanTexture> &pTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
@@ -6479,42 +6104,7 @@ static const char *framegen_net_weights_path()
 // Older blobs keep the same tensor layout and are accepted only after that
 // unconstrained legacy row is explicitly zeroed; incompatible future layouts
 // must fail validation rather than run with silently mismatched channels.
-static constexpr uint32_t k_uFramegenNetMagic = 0x52465347u; // 'GSFR'
-static constexpr uint32_t k_uFramegenNetVersion = 3u;
-static constexpr uint32_t k_uFramegenNetLayerCount = 3u;
-static constexpr uint32_t k_uFramegenNetKernelWidth = 3u;
-static constexpr uint32_t k_uFramegenNetKernelElements =
-	k_uFramegenNetKernelWidth * k_uFramegenNetKernelWidth;
-static constexpr uint32_t k_uFramegenNetLayerDims[ k_uFramegenNetLayerCount ][ 2 ] =
-	{ { 12u, 16u }, { 16u, 16u }, { 16u, 4u } };
-static constexpr uint32_t k_uFramegenNetLayer1Weights =
-	k_uFramegenNetLayerDims[ 0 ][ 0 ] * k_uFramegenNetLayerDims[ 0 ][ 1 ] * k_uFramegenNetKernelElements;
-static constexpr uint32_t k_uFramegenNetLayer2Offset =
-	k_uFramegenNetLayer1Weights + k_uFramegenNetLayerDims[ 0 ][ 1 ];
-static constexpr uint32_t k_uFramegenNetLayer2Weights =
-	k_uFramegenNetLayerDims[ 1 ][ 0 ] * k_uFramegenNetLayerDims[ 1 ][ 1 ] * k_uFramegenNetKernelElements;
-static constexpr uint32_t k_uFramegenNetLayer3Offset =
-	k_uFramegenNetLayer2Offset + k_uFramegenNetLayer2Weights + k_uFramegenNetLayerDims[ 1 ][ 1 ];
-static constexpr uint32_t k_uFramegenNetLayer3WeightsPerOutput =
-	k_uFramegenNetLayerDims[ 2 ][ 0 ] * k_uFramegenNetKernelElements;
-static constexpr uint32_t k_uFramegenNetLayer3BiasOffset =
-	k_uFramegenNetLayer3Offset + k_uFramegenNetLayer3WeightsPerOutput * k_uFramegenNetLayerDims[ 2 ][ 1 ];
-static constexpr uint32_t k_uFramegenNetFloats =
-	k_uFramegenNetLayer3BiasOffset + k_uFramegenNetLayerDims[ 2 ][ 1 ];
-static constexpr uint32_t k_uFramegenNetShadingOutput = 3u;
-static constexpr uint32_t k_uFramegenNetShadingWeightBegin =
-	k_uFramegenNetLayer3Offset + k_uFramegenNetShadingOutput * k_uFramegenNetLayer3WeightsPerOutput;
-static constexpr uint32_t k_uFramegenNetShadingBias =
-	k_uFramegenNetLayer3BiasOffset + k_uFramegenNetShadingOutput;
-static_assert( k_uFramegenNetShadingOutput < k_uFramegenNetLayerDims[ 2 ][ 1 ],
-	"framegen shading output must exist in the final net layer" );
-static_assert( k_uFramegenNetLayer2Offset == 1744u
-	&& k_uFramegenNetLayer3Offset == 4064u
-	&& k_uFramegenNetLayer3BiasOffset == 4640u,
-	"framegen net offsets must match the inference and training shaders" );
-static_assert( k_uFramegenNetFloats == 4644u, "framegen net shape must match the inference/training shaders and GSFR tools" );
-static constexpr uint32_t k_uFramegenNetTexW = 2048; // shader indexes (idx & 2047, idx >> 11)
-static constexpr uint32_t k_uFramegenNetTexH = ( k_uFramegenNetFloats + k_uFramegenNetTexW - 1 ) / k_uFramegenNetTexW;
+// The numeric CPU contract is centralized in framegen/net_layout.hpp.
 
 // In-situ learning (C2): GAMESCOPE_FRAMEGEN_NET_ONLINE=1 keeps training the
 // refiner on the framegen GPU while it serves — every real frame is a fresh
