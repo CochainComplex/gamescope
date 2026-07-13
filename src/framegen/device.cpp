@@ -32,7 +32,7 @@ uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf
 	{
 		const uint64_t ulSeqNo = submit( std::move( cmdBuffer ) );
 		if ( nQuerySlot >= 0 )
-			m_framegenQuerySlotBySeqNo.emplace( ulSeqNo,
+			m_framegenQuerySlotBySeqNo.emplace_back( ulSeqNo,
 				FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount } );
 		return ulSeqNo;
 	}
@@ -79,12 +79,12 @@ uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf
 
 	vk_check( vk.QueueSubmit( m_framegenQueue, 1, &submitInfo, VK_NULL_HANDLE ) );
 
-	m_pendingFramegenCmdBufs.emplace( nextSeqNo, std::move( cmdBuffer ) );
+	m_pendingFramegenCmdBufs.emplace_back( nextSeqNo, std::move( cmdBuffer ) );
 	// Associate the timestamp ring slot (if any), ladder rung, and generated-count
 	// with its seqNo, so readback can attribute measured cost to the exact batch
 	// shape. A rung's cost is not stable across x2-like and x4-like gaps.
 	if ( nQuerySlot >= 0 )
-		m_framegenQuerySlotBySeqNo.emplace( nextSeqNo, FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount } );
+		m_framegenQuerySlotBySeqNo.emplace_back( nextSeqNo, FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount } );
 	return nextSeqNo;
 }
 
@@ -92,9 +92,13 @@ bool CVulkanDevice::hasCompletedFramegen( uint64_t sequence )
 {
 	if ( !m_bHasFramegenQueue )
 		return hasCompleted( sequence );
+	if ( sequence == 0
+		|| m_framegenCompletedSeqNo.load( std::memory_order_relaxed ) >= sequence )
+		return true;
 
 	uint64_t currentSeqNo = 0;
 	vk_check( vk.GetSemaphoreCounterValue( device(), m_framegenTimeline->pVkSemaphore, &currentSeqNo ) );
+	cache_timeline_completion( m_framegenCompletedSeqNo, currentSeqNo );
 	return currentSeqNo >= sequence;
 }
 
@@ -142,6 +146,12 @@ void CVulkanDevice::framegenResetRungCosts()
 
 void CVulkanDevice::waitFramegen( uint64_t sequence )
 {
+	// Sequence zero denotes a queued real frame in the bidirectional timeline.
+	// It has no framegen submission to retire, so avoid an otherwise pointless
+	// vkWaitSemaphores(value=0) on every such flip.
+	if ( sequence == 0 )
+		return;
+
 	if ( !m_bHasFramegenQueue )
 	{
 		wait( sequence, false );
@@ -155,6 +165,7 @@ void CVulkanDevice::waitFramegen( uint64_t sequence )
 		.pValues = &sequence,
 	};
 	vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
+	cache_timeline_completion( m_framegenCompletedSeqNo, sequence );
 }
 
 // Recycle dedicated-queue command buffers and consume timestamp queries whose
@@ -170,30 +181,33 @@ void CVulkanDevice::framegenGarbageCollect()
 	const VkSemaphore completionTimeline = m_bHasFramegenQueue
 		? m_framegenTimeline->pVkSemaphore : m_scratchTimelineSemaphore;
 	vk_check( vk.GetSemaphoreCounterValue( device(), completionTimeline, &currentSeqNo ) );
+	if ( m_bHasFramegenQueue )
+		cache_timeline_completion( m_framegenCompletedSeqNo, currentSeqNo );
+	else
+		cache_timeline_completion( m_submissionCompletedSeqNo, currentSeqNo );
 
 	if ( m_bHasFramegenQueue )
 	{
-		for ( auto it = m_pendingFramegenCmdBufs.begin(); it != m_pendingFramegenCmdBufs.end(); )
+		auto completedEnd = m_pendingFramegenCmdBufs.begin();
+		while ( completedEnd != m_pendingFramegenCmdBufs.end()
+			&& completedEnd->first <= currentSeqNo )
 		{
-			if ( it->first > currentSeqNo )
-				break; // ordered by seqNo: nothing later has completed either
-
-			it->second->reset();
-			m_unusedCmdBufs.push_back( std::move( it->second ) );
-			it = m_pendingFramegenCmdBufs.erase( it );
+			completedEnd->second->reset();
+			m_unusedCmdBufs.push_back( std::move( completedEnd->second ) );
+			++completedEnd;
 		}
+		m_pendingFramegenCmdBufs.erase( m_pendingFramegenCmdBufs.begin(), completedEnd );
 	}
 
 	// A completed timeline signal makes both timestamps available. Read without
 	// WAIT_BIT so this maintenance path can never stall the compositor thread.
-	for ( auto it = m_framegenQuerySlotBySeqNo.begin(); it != m_framegenQuerySlotBySeqNo.end(); )
+	auto completedQueriesEnd = m_framegenQuerySlotBySeqNo.begin();
+	while ( completedQueriesEnd != m_framegenQuerySlotBySeqNo.end()
+		&& completedQueriesEnd->first <= currentSeqNo )
 	{
-		if ( it->first > currentSeqNo )
-			break;
-
-		const uint32_t nSlot = it->second.nSlot;
-		const uint32_t nRung = it->second.nRung;
-		const uint32_t nGeneratedCount = it->second.nGeneratedCount;
+		const uint32_t nSlot = completedQueriesEnd->second.nSlot;
+		const uint32_t nRung = completedQueriesEnd->second.nRung;
+		const uint32_t nGeneratedCount = completedQueriesEnd->second.nGeneratedCount;
 		uint64_t ts[2] = { 0, 0 };
 		const VkResult res = vk.GetQueryPoolResults( device(), m_framegenQueryPool, nSlot * 2, 2,
 			sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT );
@@ -216,8 +230,9 @@ void CVulkanDevice::framegenGarbageCollect()
 			if ( m_aFramegenRungSamples[ nRung ][ nGeneratedCount ] != UINT32_MAX )
 				m_aFramegenRungSamples[ nRung ][ nGeneratedCount ]++;
 		}
-		it = m_framegenQuerySlotBySeqNo.erase( it );
+		++completedQueriesEnd;
 	}
+	m_framegenQuerySlotBySeqNo.erase( m_framegenQuerySlotBySeqNo.begin(), completedQueriesEnd );
 }
 
 #undef vk_check

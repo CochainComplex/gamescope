@@ -93,6 +93,34 @@
 extern bool g_bWasPartialComposite;
 extern bool g_bAllowDeferredBackend;
 
+namespace
+{
+
+constexpr size_t k_uInitialSubmissionCapacity = 16;
+constexpr size_t k_uInitialTrackedTextureCapacity = VKR_SAMPLER_SLOTS * 4 + VKR_TARGET_SLOTS;
+
+// Vulkan submits normally carry only the compositor timeline, plus at most one
+// explicit-sync acquire/release point. Keep that path off the allocator while
+// retaining an unbounded fallback for future multi-semaphore callers.
+template<typename T, size_t InlineCapacity>
+class InlineSubmitArray
+{
+public:
+	T *storage( size_t count )
+	{
+		if ( count <= InlineCapacity ) [[likely]]
+			return m_inline.data();
+		m_overflow = std::make_unique_for_overwrite<T[]>( count );
+		return m_overflow.get();
+	}
+
+private:
+	std::array<T, InlineCapacity> m_inline;
+	std::unique_ptr<T[]> m_overflow;
+};
+
+} // namespace
+
 static bool framegen_backend_supported()
 {
 	return GetBackend() != nullptr && GetBackend()->SupportsFramegen();
@@ -432,6 +460,17 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 		return false;
 
 	m_bInitialized = true;
+	m_unusedCmdBufs.reserve( k_uInitialSubmissionCapacity );
+	m_pendingCmdBufs.reserve( k_uInitialSubmissionCapacity );
+	m_pendingFramegenCmdBufs.reserve( k_uInitialSubmissionCapacity );
+	m_framegenQuerySlotBySeqNo.reserve( k_uInitialSubmissionCapacity );
+
+	// Frame generation is opt-in, so pay its fixed pipeline creation cost at
+	// compositor startup instead of on the first generated frame. A lazy miss in
+	// pipeline() calls vkCreateComputePipelines on the compositor thread and is a
+	// visible first-use hitch, especially for the larger ML shaders.
+	if ( vulkan_framegen_is_enabled() )
+		compileFramegenPipelines();
 
 	std::thread piplelineThread([this](){compileAllPipelines();});
 	piplelineThread.detach();
@@ -1294,6 +1333,17 @@ bool CVulkanDevice::createScratchResources()
 	}
 
 	// Make and map upload buffer
+	VkPhysicalDeviceProperties deviceProperties = {};
+	vk.GetPhysicalDeviceProperties( physDev(), &deviceProperties );
+	const VkDeviceSize uniformAlignment = std::max<VkDeviceSize>(
+		16, deviceProperties.limits.minUniformBufferOffsetAlignment );
+	if ( uniformAlignment > UINT32_MAX )
+	{
+		vk_log.errorf( "uniform-buffer offset alignment is too large: %" PRIu64,
+			(uint64_t)uniformAlignment );
+		return false;
+	}
+	m_uniformBufferOffsetAlignment = (uint32_t)uniformAlignment;
 	
 	VkBufferCreateInfo bufferCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -1544,25 +1594,6 @@ void CVulkanDevice::compileAllPipelines()
 		PipelineInfo_t{ SHADER_TYPE_RGB_TO_NV12, 1, 1, 1 },
 	};
 
-	if ( vulkan_framegen_is_enabled() )
-	{
-		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_BLEND, 1, 1, 1 } );
-		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE, 1, 1, 1 } );
-		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT, 1, 1, 1 } );
-		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR, 1, 1, 1 } );
-		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR, 1, 1, 1 } );
-		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA, 1, 1, 1 } );
-		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_MATCH, 1, 1, 1 } );
-		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_WARP, 1, 1, 1 } );
-		pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL, 1, 1, 1 } );
-
-		if ( m_bSupportsShaderFloat16 )
-		{
-			pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16, 1, 1, 1 } );
-			pipelineInfos.emplace_back( PipelineInfo_t{ SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR_FP16, 1, 1, 1 } );
-		}
-	}
-
 	for (auto& info : pipelineInfos) {
 		for (uint32_t layerCount = 1; layerCount <= info.layerCount; layerCount++) {
 			for (uint32_t ycbcrMask = 0; ycbcrMask < info.ycbcrMask; ycbcrMask++) {
@@ -1583,6 +1614,40 @@ void CVulkanDevice::compileAllPipelines()
 				}
 			}
 		}
+	}
+}
+
+void CVulkanDevice::compileFramegenPipelines()
+{
+	static constexpr ShaderType pipelines[] = {
+		SHADER_TYPE_FRAMEGEN_BLEND,
+		SHADER_TYPE_FRAMEGEN_EXTRAPOLATE,
+		SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT,
+		SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR,
+		SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR,
+		SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA,
+		SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID,
+		SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID_RGBA,
+		SHADER_TYPE_FRAMEGEN_MOTION_MATCH,
+		SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE,
+		SHADER_TYPE_FRAMEGEN_MOTION_FBCHECK,
+		SHADER_TYPE_FRAMEGEN_MOTION_WARP,
+		SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL,
+		SHADER_TYPE_FRAMEGEN_MOTION_BIDIR,
+		SHADER_TYPE_FRAMEGEN_MOTION_STATS,
+		SHADER_TYPE_FRAMEGEN_MOTION_STATS_APPLY,
+		SHADER_TYPE_FRAMEGEN_MOTION_NET,
+		SHADER_TYPE_FRAMEGEN_MOTION_NET_TRAIN,
+		SHADER_TYPE_FRAMEGEN_MOTION_NET_OPT,
+	};
+
+	for ( ShaderType type : pipelines )
+		pipeline( type );
+
+	if ( m_bSupportsShaderFloat16 )
+	{
+		pipeline( SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16 );
+		pipeline( SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR_FP16 );
 	}
 }
 
@@ -1614,7 +1679,7 @@ int32_t CVulkanDevice::findMemoryType( VkMemoryPropertyFlags properties, uint32_
 {
 	for ( uint32_t i = 0; i < m_memoryProperties.memoryTypeCount; i++ )
 	{
-		if ( ( ( 1 << i ) & requiredTypeBits ) == 0 )
+		if ( ( ( 1u << i ) & requiredTypeBits ) == 0 )
 			continue;
 		
 		if ( ( properties & m_memoryProperties.memoryTypes[ i ].propertyFlags ) != properties )
@@ -1668,36 +1733,45 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	// This is the seq no of the command buffer we are going to submit.
 	const uint64_t nextSeqNo = lastSubmissionSeqNo + 1;
 
-	std::vector<VkSemaphore> pSignalSemaphores;
-	std::vector<uint64_t> ulSignalPoints;
+	static constexpr size_t k_uInlineSubmitSemaphores = 8;
+	const auto &externalSignals = cmdBuffer->GetExternalSignals();
+	const auto &externalWaits = cmdBuffer->GetExternalDependencies();
+	const size_t signalCount = 1 + externalSignals.size();
+	const size_t waitCount = externalWaits.size();
 
-	std::vector<VkPipelineStageFlags> uWaitStageFlags;
-	std::vector<VkSemaphore> pWaitSemaphores;
-	std::vector<uint64_t> ulWaitPoints;
+	InlineSubmitArray<VkSemaphore, k_uInlineSubmitSemaphores> signalSemaphores;
+	InlineSubmitArray<uint64_t, k_uInlineSubmitSemaphores> signalPoints;
+	InlineSubmitArray<VkSemaphore, k_uInlineSubmitSemaphores> waitSemaphores;
+	InlineSubmitArray<uint64_t, k_uInlineSubmitSemaphores> waitPoints;
+	InlineSubmitArray<VkPipelineStageFlags, k_uInlineSubmitSemaphores> waitStageFlags;
+	VkSemaphore *pSignalSemaphores = signalSemaphores.storage( signalCount );
+	uint64_t *pSignalPoints = signalPoints.storage( signalCount );
+	VkSemaphore *pWaitSemaphores = waitSemaphores.storage( waitCount );
+	uint64_t *pWaitPoints = waitPoints.storage( waitCount );
+	VkPipelineStageFlags *pWaitStageFlags = waitStageFlags.storage( waitCount );
 
-	pSignalSemaphores.push_back( m_scratchTimelineSemaphore );
-	ulSignalPoints.push_back( nextSeqNo );
-
-	for ( auto &dep : cmdBuffer->GetExternalSignals() )
+	pSignalSemaphores[0] = m_scratchTimelineSemaphore;
+	pSignalPoints[0] = nextSeqNo;
+	for ( size_t i = 0; i < externalSignals.size(); i++ )
 	{
-		pSignalSemaphores.push_back( dep.pTimelineSemaphore->pVkSemaphore );
-		ulSignalPoints.push_back( dep.ulPoint );
+		pSignalSemaphores[i + 1] = externalSignals[i].pTimelineSemaphore->pVkSemaphore;
+		pSignalPoints[i + 1] = externalSignals[i].ulPoint;
 	}
 
-	for ( auto &dep : cmdBuffer->GetExternalDependencies() )
+	for ( size_t i = 0; i < externalWaits.size(); i++ )
 	{
-		pWaitSemaphores.push_back( dep.pTimelineSemaphore->pVkSemaphore );
-		ulWaitPoints.push_back( dep.ulPoint );
-		uWaitStageFlags.push_back( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT );
+		pWaitSemaphores[i] = externalWaits[i].pTimelineSemaphore->pVkSemaphore;
+		pWaitPoints[i] = externalWaits[i].ulPoint;
+		pWaitStageFlags[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 	}
 
 	VkTimelineSemaphoreSubmitInfo timelineInfo = {
 		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
 		// no need to ensure order of cmd buffer submission, we only have one queue
-		.waitSemaphoreValueCount = static_cast<uint32_t>( ulWaitPoints.size() ),
-		.pWaitSemaphoreValues = ulWaitPoints.data(),
-		.signalSemaphoreValueCount = static_cast<uint32_t>( ulSignalPoints.size() ),
-		.pSignalSemaphoreValues = ulSignalPoints.data(),
+		.waitSemaphoreValueCount = static_cast<uint32_t>( waitCount ),
+		.pWaitSemaphoreValues = pWaitPoints,
+		.signalSemaphoreValueCount = static_cast<uint32_t>( signalCount ),
+		.pSignalSemaphoreValues = pSignalPoints,
 	};
 
 	VkCommandBuffer rawCmdBuffer = cmdBuffer->rawBuffer();
@@ -1705,13 +1779,13 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	VkSubmitInfo submitInfo = {
 		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 		.pNext = &timelineInfo,
-		.waitSemaphoreCount = static_cast<uint32_t>( pWaitSemaphores.size() ),
-		.pWaitSemaphores = pWaitSemaphores.data(),
-		.pWaitDstStageMask = uWaitStageFlags.data(),
+		.waitSemaphoreCount = static_cast<uint32_t>( waitCount ),
+		.pWaitSemaphores = pWaitSemaphores,
+		.pWaitDstStageMask = pWaitStageFlags,
 		.commandBufferCount = 1,
 		.pCommandBuffers = &rawCmdBuffer,
-		.signalSemaphoreCount = static_cast<uint32_t>( pSignalSemaphores.size() ),
-		.pSignalSemaphores = pSignalSemaphores.data(),
+		.signalSemaphoreCount = static_cast<uint32_t>( signalCount ),
+		.pSignalSemaphores = pSignalSemaphores,
 	};
 
 	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, VK_NULL_HANDLE ) );
@@ -1722,7 +1796,7 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 uint64_t CVulkanDevice::submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer)
 {
 	uint64_t nextSeqNo = submitInternal(cmdBuffer.get());
-	m_pendingCmdBufs.emplace(nextSeqNo, std::move(cmdBuffer));
+	m_pendingCmdBufs.emplace_back(nextSeqNo, std::move(cmdBuffer));
 	return nextSeqNo;
 }
 
@@ -1730,6 +1804,7 @@ void CVulkanDevice::garbageCollect( void )
 {
 	uint64_t currentSeqNo;
 	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
+	cache_timeline_completion( m_submissionCompletedSeqNo, currentSeqNo );
 
 	resetCmdBuffers(currentSeqNo);
 }
@@ -1871,6 +1946,7 @@ void CVulkanDevice::wait(uint64_t sequence, bool reset)
 	} ;
 
 	vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
+	cache_timeline_completion( m_submissionCompletedSeqNo, sequence );
 
 	if (reset)
 		resetCmdBuffers(sequence);
@@ -1894,31 +1970,39 @@ void CVulkanDevice::waitIdle(bool reset)
 
 bool CVulkanDevice::hasCompleted(uint64_t sequence)
 {
+	if ( sequence == 0
+		|| m_submissionCompletedSeqNo.load( std::memory_order_relaxed ) >= sequence )
+		return true;
+
 	uint64_t currentSeqNo = 0;
 	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
+	cache_timeline_completion( m_submissionCompletedSeqNo, currentSeqNo );
 	return currentSeqNo >= sequence;
 }
 
 void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
 {
-	auto last = m_pendingCmdBufs.find(sequence);
-	if (last == m_pendingCmdBufs.end())
-		return;
-
-	for (auto it = m_pendingCmdBufs.begin(); ; it++)
+	// Submission sequence numbers are monotonic, so a contiguous vector is both
+	// cheaper and more predictable than allocating one tree node per frame.
+	// Retire every tracked command buffer covered by the observed timeline value;
+	// untracked submitInternal callers can legitimately leave gaps in the keys.
+	auto completedEnd = m_pendingCmdBufs.begin();
+	while ( completedEnd != m_pendingCmdBufs.end() && completedEnd->first <= sequence )
 	{
-		it->second->reset();
-		m_unusedCmdBufs.push_back(std::move(it->second));
-		if (it == last)
-			break;
+		completedEnd->second->reset();
+		m_unusedCmdBufs.push_back(std::move(completedEnd->second));
+		++completedEnd;
 	}
 
-	m_pendingCmdBufs.erase(m_pendingCmdBufs.begin(), ++last);
+	m_pendingCmdBufs.erase(m_pendingCmdBufs.begin(), completedEnd);
 }
 
 CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily)
 	: m_cmdBuffer(cmdBuffer), m_device(parent), m_queue(queue), m_queueFamily(queueFamily)
 {
+	m_textureRefs.reserve( k_uInitialTrackedTextureCapacity );
+	m_textureState.reserve( k_uInitialTrackedTextureCapacity );
+	m_imageBarriers.reserve( VKR_SAMPLER_SLOTS + VKR_TARGET_SLOTS );
 }
 
 CVulkanCmdBuffer::~CVulkanCmdBuffer()
@@ -2021,6 +2105,7 @@ void CVulkanCmdBuffer::clearState()
 	m_target = nullptr;
 	m_target2 = nullptr;
 	m_renderBufferOffset = 0;
+	m_renderBufferSize = 0;
 	m_useSrgb.reset();
 }
 
@@ -2029,8 +2114,9 @@ void CVulkanCmdBuffer::uploadConstants(Args&&... args)
 {
 	PushData data(std::forward<Args>(args)...);
 
-	auto [ptr, offset] = m_device->uploadBufferData(sizeof(data));
+	auto [ptr, offset] = m_device->uploadUniformBufferData(sizeof(data));
 	m_renderBufferOffset = offset;
+	m_renderBufferSize = sizeof(data);
 	memcpy(ptr, &data, sizeof(data));
 }
 
@@ -2144,7 +2230,12 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 
 	scratchDescriptor.buffer = m_device->m_uploadBuffer;
 	scratchDescriptor.offset = m_renderBufferOffset;
-	scratchDescriptor.range = VK_WHOLE_SIZE;
+	// VK_WHOLE_SIZE makes the effective UBO range extend to the end of the
+	// 8 MiB upload arena, exceeding maxUniformBufferRange on devices such as
+	// NVIDIA's 64 KiB implementation. Bind only the constants this dispatch uses.
+	// Push-constant-only framegen shaders still need a valid, non-zero descriptor
+	// because all pipelines share this descriptor-set layout.
+	scratchDescriptor.range = m_renderBufferSize != 0 ? m_renderBufferSize : 16u;
 
 	for (uint32_t i = 0; i < VKR_SAMPLER_SLOTS; i++)
 	{
@@ -2273,44 +2364,63 @@ void CVulkanCmdBuffer::copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, u
 
 void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
 {
-	auto result = m_textureState.emplace(image, TextureState());
+	auto [state, inserted] = trackTexture( image );
 	// no need to reimport if the image didn't change
-	if (!result.second)
+	if (!inserted)
 		return;
-	result.first->second.needsImport = image->externalImage();
-	result.first->second.needsExport = image->externalImage();
+	state->needsImport = image->externalImage();
+	state->needsExport = image->externalImage();
 }
 
 void CVulkanCmdBuffer::prepareDestImage(CVulkanTexture *image)
 {
-	auto result = m_textureState.emplace(image, TextureState());
+	auto [state, inserted] = trackTexture( image );
 	// no need to discard if the image is already image/in the correct layout
-	if (!result.second)
+	if (!inserted)
 		return;
-	result.first->second.discarded = true;
-	result.first->second.needsExport = image->externalImage();
-	result.first->second.needsPresentLayout = image->outputImage();
+	state->discarded = true;
+	state->needsExport = image->externalImage();
+	state->needsPresentLayout = image->outputImage();
 }
 
 void CVulkanCmdBuffer::discardImage(CVulkanTexture *image)
 {
-	auto result = m_textureState.emplace(image, TextureState());
-	if (!result.second)
+	auto [state, inserted] = trackTexture( image );
+	if (!inserted)
 		return;
-	result.first->second.discarded = true;
+	state->discarded = true;
 }
 
 void CVulkanCmdBuffer::markDirty(CVulkanTexture *image)
 {
-	auto result = m_textureState.find(image);
+	TextureState *state = findTextureState( image );
 	// image should have been prepared already
-	assert(result !=  m_textureState.end());
-	result->second.dirty = true;
+	assert(state != nullptr);
+	state->dirty = true;
+}
+
+std::pair<TextureState *, bool> CVulkanCmdBuffer::trackTexture( CVulkanTexture *image )
+{
+	if ( TextureState *state = findTextureState( image ) )
+		return { state, false };
+
+	m_textureState.push_back( TrackedTextureState{ image, TextureState{} } );
+	return { &m_textureState.back().state, true };
+}
+
+TextureState *CVulkanCmdBuffer::findTextureState( CVulkanTexture *image )
+{
+	for ( TrackedTextureState &tracked : m_textureState )
+	{
+		if ( tracked.pTexture == image )
+			return &tracked.state;
+	}
+	return nullptr;
 }
 
 void CVulkanCmdBuffer::insertBarrier(bool flush)
 {
-	std::vector<VkImageMemoryBarrier> barriers;
+	m_imageBarriers.clear();
 
 	uint32_t externalQueue = m_device->supportsModifiers() ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL_KHR;
 
@@ -2321,10 +2431,10 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		.layerCount = 1
 	};
 
-	for (auto& pair : m_textureState)
+	for ( TrackedTextureState &tracked : m_textureState )
 	{
-		CVulkanTexture *image = pair.first;
-		TextureState& state = pair.second;
+		CVulkanTexture *image = tracked.pTexture;
+		TextureState& state = tracked.state;
 		assert(!flush || !state.needsImport);
 
 		bool isExport = flush && state.needsExport;
@@ -2352,7 +2462,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 			.subresourceRange = subResRange
 		};
 
-		barriers.push_back(memoryBarrier);
+		m_imageBarriers.push_back(memoryBarrier);
 
 		state.discarded = false;
 		state.dirty = false;
@@ -2361,7 +2471,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 
 	// TODO replace VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
 	m_device->vk.CmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-									0, 0, nullptr, 0, nullptr, barriers.size(), barriers.data());
+									0, 0, nullptr, 0, nullptr, m_imageBarriers.size(), m_imageBarriers.data());
 }
 
 CVulkanDevice g_device;
