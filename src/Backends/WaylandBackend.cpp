@@ -499,7 +499,7 @@ namespace gamescope
         CWaylandBackend *m_pBackend = nullptr;
         wl_buffer *m_pHostBuffer = nullptr;
         wlr_buffer *m_pClientBuffer = nullptr;
-        bool m_bCompositorAcquired = false;
+        uint32_t m_uCompositorUseCount = 0;
     };
     const wl_buffer_listener CWaylandFb::s_BufferListener =
     {
@@ -942,29 +942,25 @@ namespace gamescope
 
     void CWaylandFb::OnCompositorAcquire()
     {
-        // If the compositor has acquired us, track that
-        // and increment the ref count.
-        if ( !m_bCompositorAcquired )
-        {
-            m_bCompositorAcquired = true;
-            IncRef();
-        }
+        // A compositor may have several same-surface commits using the same
+        // wl_buffer in flight and emits one release for each use. Keep the
+        // backing storage alive until every committed attach has been released.
+        assert( m_uCompositorUseCount != UINT32_MAX );
+        ++m_uCompositorUseCount;
+        IncRef();
     }
 
     void CWaylandFb::OnCompositorRelease()
     {
-        // Compositor has released us, decrement rc.
-        //assert( m_bCompositorAcquired );
+        if ( m_uCompositorUseCount == 0 )
+        {
+            xdg_log.errorf( "Compositor released a buffer without an outstanding use." );
+            return;
+        }
 
-        if ( m_bCompositorAcquired )
-        {
-            m_bCompositorAcquired = false;
-            DecRef();
-        }
-        else
-        {
-            xdg_log.errorf( "Compositor released us but we were not acquired. Oh no." );
-        }
+        // DecRef may destroy this object, so update all member state first.
+        --m_uCompositorUseCount;
+        DecRef();
     }
 
     void CWaylandFb::Wayland_Buffer_Release( wl_buffer *pBuffer )
