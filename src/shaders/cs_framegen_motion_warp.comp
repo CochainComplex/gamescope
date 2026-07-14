@@ -9,7 +9,7 @@
 // estimated motion field, blends toward the plain forward-extrapolation result
 // wherever the match is unconfident (so it can never be much worse than the
 // extrapolate mode), and applies the same TAA-style neighborhood rectification.
-// Writes the output image, so it reuses descriptor_set.h's rgba8 dst.
+// Writes the output image, so it reuses descriptor_set.h's formatless dst.
 layout(
   local_size_x = 8,
   local_size_y = 8,

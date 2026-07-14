@@ -83,6 +83,14 @@ or ownership bugs.
 9. **JIT prediction is admission-only.** It may spend idle presentation-GPU work
    on a disposable backup or skip that work. It must not delay a real frame,
    wait for a generated frame, or override real/generated/repeat arbitration.
+10. **Storage-image formats match their views.** Generic output shaders use
+   formatless write-only storage images and require the enabled Vulkan
+   `shaderStorageImageWriteWithoutFormat` feature. This is what permits the same
+   output path to bind RGBA/BGRA 8-bit, RGB10A2, 16-bit UNORM, and floating-point
+   views without lying in SPIR-V. Explicitly formatted intermediate shaders must
+   continue to match their concrete image views. R16F luma additionally requires
+   enabled `shaderStorageImageExtendedFormats`; devices without it use the
+   existing RGBA16F luma fallback.
 
 ## Temporal and algorithm contracts
 
@@ -166,7 +174,9 @@ Other duplicated ABI constants require the same treatment:
   the image width, counter interpretation, EMA, and derived thresholds. A shader
   layout change requires matching decoder and boundary-test changes.
 - `k_uFramegenDescriptorSets` must cover the maximum dispatch count of one legal
-  batch. Its current value is 30; it does not permit a second batch in flight.
+  batch. The current worst case is 25 and the ring has 30 entries. Recording
+  counts framegen dispatches and fails before a descriptor can wrap within one
+  batch; this capacity does not permit a second batch in flight.
 
 `src/framegen/dispatch_policy.hpp` maps observed capability booleans and PCI
 vendor ID to an immutable strategy. Vulkan format probing, `ShaderType` mapping,
@@ -207,10 +217,13 @@ history invalidation, resource rebuild, held-out color probing, or any operation
 that overwrites the working field. Acceleration history additionally requires a
 consecutive preceding pair and matching interval metadata.
 
-The timestamp query pool has device/process lifetime. Each batch resets and uses
-one pair from its depth-4 ring. Scene invalidation clears query-to-rung
-associations and costs so a late pre-cut result cannot seed the new scene; resize
-or format changes do not recreate the pool.
+The timestamp query pool has device/process lifetime. Each batch selects one
+unowned pair from its depth-4 ring; a slot is not reset until its previous
+query-to-sequence association has been consumed. A temporarily full association
+ring skips that optional timing sample instead of overwriting unread data. Scene
+invalidation clears associations and costs so a late pre-cut result cannot seed
+the new scene; the one-batch completion gate still orders any discarded old query
+before a new reset. Resize or format changes do not recreate the pool.
 
 ## In-situ learning
 

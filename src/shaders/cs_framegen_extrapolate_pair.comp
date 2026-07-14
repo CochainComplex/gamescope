@@ -9,11 +9,12 @@
 // cs_framegen_extrapolate.comp, but one dispatch writes TWO generated frames.
 // Every slot of an interval reads the same two real frames, so fusing a pair
 // halves the dominant cost — the two full-resolution history reads — for the
-// x3/x4 multipliers. Declares its own rgba8 targets: binding 1 is the shared
-// dst slot, binding 2 the second storage-image slot (dst_chroma's slot, unused
-// by non-YCbCr targets).
-layout(binding = 1, rgba8) writeonly uniform image2D dst0;
-layout(binding = 2, rgba8) writeonly uniform image2D dst1;
+// x3/x4 multipliers. Declares its own formatless targets because output images
+// can be 8/10/16-bit or floating point: binding 1 is the shared dst slot,
+// binding 2 the second storage-image slot (dst_chroma's slot, unused by
+// non-YCbCr targets).
+layout(binding = 1) writeonly uniform image2D dst0;
+layout(binding = 2) writeonly uniform image2D dst1;
 layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 
 layout(

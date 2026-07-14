@@ -715,30 +715,43 @@ bool set_mura_scale(float new_scale)
 	return diff;
 }
 
+template<size_t N>
+static bool load_color_lut_override( const char *path, uint16_t ( &destination )[ N ], const char *name )
+{
+	FILE *file = fopen( path, "rb" );
+	if ( file == nullptr )
+		return false;
+	defer( fclose( file ) );
+
+	if ( fseek( file, 0, SEEK_END ) != 0 )
+		return false;
+	const long fileSize = ftell( file );
+	if ( fileSize < 0 || static_cast<unsigned long>( fileSize ) != sizeof( destination ) )
+	{
+		xwm_log.warnf( "%s LUT override has invalid size %ld (expected %zu bytes)",
+			name, fileSize, sizeof( destination ) );
+		return false;
+	}
+	if ( fseek( file, 0, SEEK_SET ) != 0 )
+		return false;
+
+	if ( fread( destination, sizeof( destination ), 1, file ) != 1 )
+	{
+		xwm_log.warnf( "failed to read %s LUT override", name );
+		return false;
+	}
+
+	return true;
+}
+
 bool set_color_3dlut_override(const char *path)
 {
 	int nLutIndex = EOTF_Gamma22;
 	g_ColorMgmt.pending.externalDirtyCtr++;
 	g_ColorMgmtLutsOverride[nLutIndex].bHasLut3D = false;
 
-	FILE *f = fopen(path, "rb");
-	if (!f) {
-		return true;
-	}
-	defer( fclose(f) );
-
-	fseek(f, 0, SEEK_END);
-	long fsize = ftell(f);
-	fseek(f, 0, SEEK_SET);
-
-	size_t elems = fsize / sizeof(uint16_t);
-
-	if (elems == 0) {
-		return true;
-	}
-
-	fread(g_ColorMgmtLutsOverride[nLutIndex].lut3d, elems, sizeof(uint16_t), f);
-	g_ColorMgmtLutsOverride[nLutIndex].bHasLut3D = true;
+	g_ColorMgmtLutsOverride[nLutIndex].bHasLut3D = load_color_lut_override(
+		path, g_ColorMgmtLutsOverride[nLutIndex].lut3d, "3D" );
 
 	return true;
 }
@@ -749,24 +762,8 @@ bool set_color_shaperlut_override(const char *path)
 	g_ColorMgmt.pending.externalDirtyCtr++;
 	g_ColorMgmtLutsOverride[nLutIndex].bHasLut1D = false;
 
-	FILE *f = fopen(path, "rb");
-	if (!f) {
-		return true;
-	}
-	defer( fclose(f) );
-
-	fseek(f, 0, SEEK_END);
-	long fsize = ftell(f);
-	fseek(f, 0, SEEK_SET);
-
-	size_t elems = fsize / sizeof(uint16_t);
-
-	if (elems == 0) {
-		return true;
-	}
-
-	fread(g_ColorMgmtLutsOverride[nLutIndex].lut1d, elems, sizeof(uint16_t), f);
-	g_ColorMgmtLutsOverride[nLutIndex].bHasLut1D = true;
+	g_ColorMgmtLutsOverride[nLutIndex].bHasLut1D = load_color_lut_override(
+		path, g_ColorMgmtLutsOverride[nLutIndex].lut1d, "shaper" );
 
 	return true;
 }
@@ -1494,19 +1491,6 @@ get_window_last_done_commit_peek( steamcompmgr_win_t *w )
 	return w->commit_queue[ lastCommit ].get();
 }
 
-static int64_t
-window_last_done_commit_id( steamcompmgr_win_t *w )
-{
-	if ( !w )
-		return 0;
-
-	commit_t *pCommit = get_window_last_done_commit_peek( w );
-	if ( !pCommit )
-		return 0;
-
-	return pCommit->commitID;
-}
-
 // For Steam, etc.
 static bool
 window_wants_no_focus_when_mouse_hidden( steamcompmgr_win_t *w )
@@ -2131,6 +2115,8 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 	{
 		sourceWidth = currentOutputWidth;
 		sourceHeight = currentOutputHeight;
+		baseWidth = sourceWidth;
+		baseHeight = sourceHeight;
 	}
 	else
 	{
@@ -3843,8 +3829,18 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 			{
 				xwm_log.debugf( "determine_and_apply_focus focus %lu", ctx->focus.focusWindow->xwayland().id );
 				char buf[512];
-				sprintf( buf,  "xwininfo -id 0x%lx; xprop -id 0x%lx; xwininfo -root -tree", ctx->focus.focusWindow->xwayland().id, ctx->focus.focusWindow->xwayland().id );
-				system( buf );
+				const int nCommandLength = snprintf( buf, sizeof( buf ),
+					"xwininfo -id 0x%lx; xprop -id 0x%lx; xwininfo -root -tree",
+					ctx->focus.focusWindow->xwayland().id,
+					ctx->focus.focusWindow->xwayland().id );
+				if ( nCommandLength < 0 || static_cast<size_t>( nCommandLength ) >= sizeof( buf ) )
+				{
+					xwm_log.errorf( "failed to format focus-debug command" );
+				}
+				else if ( system( buf ) == -1 )
+				{
+					xwm_log.errorf_errno( "failed to launch focus-debug command" );
+				}
 			}
 		}
 	}
@@ -5782,8 +5778,27 @@ update_runtime_info()
 	if ( g_nRuntimeInfoFd < 0 )
 		return;
 
-	uint32_t limiter_enabled = g_nSteamCompMgrTargetFPS != 0 ? 1 : 0;
-	pwrite( g_nRuntimeInfoFd, &limiter_enabled, sizeof( limiter_enabled ), 0 );
+	const uint32_t limiter_enabled = g_nSteamCompMgrTargetFPS != 0 ? 1 : 0;
+	const uint8_t *pData = reinterpret_cast<const uint8_t *>( &limiter_enabled );
+	size_t nWritten = 0;
+	while ( nWritten < sizeof( limiter_enabled ) )
+	{
+		const ssize_t nResult = pwrite( g_nRuntimeInfoFd, pData + nWritten,
+			sizeof( limiter_enabled ) - nWritten, static_cast<off_t>( nWritten ) );
+		if ( nResult < 0 )
+		{
+			if ( errno == EINTR )
+				continue;
+			xwm_log.errorf_errno( "failed to update limiter runtime info" );
+			return;
+		}
+		if ( nResult == 0 )
+		{
+			xwm_log.errorf( "failed to update limiter runtime info: short write" );
+			return;
+		}
+		nWritten += static_cast<size_t>( nResult );
+	}
 }
 
 static void

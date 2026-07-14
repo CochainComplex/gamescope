@@ -762,6 +762,16 @@ bool CVulkanDevice::createDevice()
 
 		m_bSupportsShaderFloat16 = vulkan12Features.shaderFloat16;
 		m_bSupportsFp16 = m_bSupportsShaderFloat16 && features2.features.shaderInt16;
+		m_bSupportsStorageImageExtendedFormats = features2.features.shaderStorageImageExtendedFormats;
+
+		// Generic compute outputs are bound to the backend-selected image format
+		// (8/10/16-bit integer or float). Declaring one fixed SPIR-V image format
+		// for all of them is invalid even when the byte size happens to match.
+		if ( !features2.features.shaderStorageImageWriteWithoutFormat )
+		{
+			vk_log.errorf( "physical device does not support shaderStorageImageWriteWithoutFormat, required by gamescope output shaders" );
+			return false;
+		}
 	}
 
 	// Queue 0 carries real composites; queue 1 is disposable speculative
@@ -894,6 +904,8 @@ bool CVulkanDevice::createDevice()
 			.shaderInt16 = m_bSupportsFp16,
 		},
 	};
+	features2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	features2.features.shaderStorageImageExtendedFormats = m_bSupportsStorageImageExtendedFormats;
 
 	VkDeviceCreateInfo deviceCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -1634,9 +1646,7 @@ void CVulkanDevice::compileFramegenPipelines()
 		SHADER_TYPE_FRAMEGEN_EXTRAPOLATE,
 		SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT,
 		SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR,
-		SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR,
 		SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA,
-		SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID,
 		SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID_RGBA,
 		SHADER_TYPE_FRAMEGEN_MOTION_MATCH,
 		SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE,
@@ -1654,6 +1664,15 @@ void CVulkanDevice::compileFramegenPipelines()
 
 	for ( ShaderType type : pipelines )
 		pipeline( type );
+
+	// R16F storage images require shaderStorageImageExtendedFormats. Keep the
+	// always-valid RGBA16F fallback warm on every device, and only create the
+	// compact luma pipelines when that feature was enabled at device creation.
+	if ( m_bSupportsStorageImageExtendedFormats )
+	{
+		pipeline( SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR );
+		pipeline( SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID );
+	}
 
 	if ( m_bSupportsShaderFloat16 )
 	{
@@ -2031,6 +2050,7 @@ void CVulkanCmdBuffer::reset()
 	m_ExternalSignals.clear();
 
 	m_bFramegen = false;
+	m_uFramegenDispatchCount = 0;
 }
 
 void CVulkanCmdBuffer::begin()
@@ -2148,6 +2168,18 @@ void CVulkanCmdBuffer::bindPipeline(VkPipeline pipeline)
 
 void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 {
+	if ( m_bFramegen )
+	{
+		const uint32_t uCapacity = m_device->framegenDescriptorSetCapacity();
+		if ( m_uFramegenDispatchCount >= uCapacity ) [[unlikely]]
+		{
+			vk_log.errorf( "framegen descriptor ring exhausted: dispatch %u exceeds capacity %u",
+				m_uFramegenDispatchCount + 1, uCapacity );
+			abort();
+		}
+		m_uFramegenDispatchCount++;
+	}
+
 	for (auto src : m_boundTextures)
 	{
 		if (src)
@@ -5563,11 +5595,11 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 
 	g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
 
-	// Instant (completion checked above). On the shared-queue fallback this also
-	// lets the device recycle the upload arena at a known-idle point; on the
-	// dedicated queue framegen uses push constants and its own timeline, so this
-	// is a cheap already-signalled wait.
-	g_device.waitFramegen( front.seqNo );
+	// The readiness check above is the synchronization proof for generated
+	// images. Do not follow it with vkWaitSemaphores on the presentation path:
+	// even an already-signalled host wait is an avoidable driver round trip at
+	// every generated flip. Framegen uses push constants, so it owns no slice of
+	// the shared upload arena that would need recycling here.
 
 	// Base-layer mode (#02): the pending slot holds a pre-upscale BASE frame;
 	// composite it through the real pipeline with the live layer stack (fresh
@@ -5660,7 +5692,8 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_take_front( const gamescope:
 	if ( front.bReal || g_device.hasCompletedFramegen( front.seqNo ) )
 	{
 		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
-		g_device.waitFramegen( front.seqNo );
+		// hasCompletedFramegen is the image-readiness proof. Blocking waits remain
+		// reserved for reset and teardown, never a steady-state flip.
 		static uint64_t s_uFlipDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uFlipDebugLogCounter ) )
 			vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u (bidir flip substitution)",
@@ -6325,7 +6358,8 @@ static const FramegenDispatch_t &framegen_dispatch_for_format( uint32_t drmForma
 
 	const bool bSupportsShaderFloat16 = g_device.supportsShaderFloat16();
 	const bool bFloatOutput = framegen_is_float_drm_format( drmFormat );
-	const bool bR16FLumaSupported = framegen_format_supports_sampled_storage( DRM_FORMAT_R16F );
+	const bool bR16FLumaSupported = g_device.supportsStorageImageExtendedFormats()
+		&& framegen_format_supports_sampled_storage( DRM_FORMAT_R16F );
 	const bool bMotionSupported = framegen_format_supports_sampled_storage( DRM_FORMAT_ABGR16161616F );
 	VkPhysicalDeviceProperties physProps = {};
 	g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &physProps );

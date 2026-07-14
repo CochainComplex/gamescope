@@ -44,10 +44,15 @@ uint get_layer_colorspace(uint layerIdx) {
     return bitfieldExtract(c_colorspaceMask, int(layerIdx) * colorspace_max_bits, colorspace_max_bits);
 }
 
-layout(binding = 1, rgba8) writeonly uniform image2D dst;
+// Output targets are selected at runtime and include R/B-ordered 8-bit,
+// RGB10A2, 16-bit UNORM and floating-point formats. A fixed SPIR-V image
+// format would only be valid for one of those view formats. Gamescope enables
+// shaderStorageImageWriteWithoutFormat and keeps the concrete compatibility
+// check on the VkImageView before dispatch.
+layout(binding = 1) writeonly uniform image2D dst;
 // alias
-layout(binding = 1, rgba8) writeonly uniform image2D dst_luma;
-layout(binding = 2, rgba8) writeonly uniform image2D dst_chroma;
+layout(binding = 1) writeonly uniform image2D dst_luma;
+layout(binding = 2) writeonly uniform image2D dst_chroma;
 
 layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 layout(binding = 4) uniform sampler2D s_ycbcr_samplers[VKR_SAMPLER_SLOTS];

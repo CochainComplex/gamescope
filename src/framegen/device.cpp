@@ -1,6 +1,7 @@
 // Frame-generation queue submission and timestamp accounting.
 
 #include "../rendervulkan.hpp"
+#include "query_ring.hpp"
 
 #include <utility>
 
@@ -102,16 +103,31 @@ bool CVulkanDevice::hasCompletedFramegen( uint64_t sequence )
 	return currentSeqNo >= sequence;
 }
 
-// Record the opening timestamp of a framegen batch. Rotates the query-pool ring,
-// resets that slot's two queries, and writes a TOP_OF_PIPE timestamp. Returns the
-// slot for framegenTimestampEnd / submitFramegen, or -1 when measurement is off.
+// Record the opening timestamp of a framegen batch. Selects a query-pool slot
+// whose previous result has been consumed, resets its two queries, and writes a
+// TOP_OF_PIPE timestamp. Returns the slot for framegenTimestampEnd /
+// submitFramegen, or -1 when measurement is off or every slot still has an
+// unread association.
 int CVulkanDevice::framegenTimestampBegin( CVulkanCmdBuffer *pCmdBuffer )
 {
 	if ( m_framegenQueryPool == VK_NULL_HANDLE || m_uFramegenQueryRingDepth == 0 || pCmdBuffer == nullptr )
 		return -1;
 
-	const uint32_t nSlot = m_uFramegenQueryHead;
-	m_uFramegenQueryHead = ( m_uFramegenQueryHead + 1 ) % m_uFramegenQueryRingDepth;
+	uint64_t uOccupiedMask = 0;
+	for ( const auto &[ seqNo, association ] : m_framegenQuerySlotBySeqNo )
+	{
+		(void)seqNo;
+		if ( association.nSlot < 64 )
+			uOccupiedMask |= uint64_t{ 1 } << association.nSlot;
+	}
+
+	const std::optional selection = gamescope::framegen::select_query_ring_slot(
+		m_uFramegenQueryHead, m_uFramegenQueryRingDepth, uOccupiedMask );
+	if ( !selection )
+		return -1;
+
+	const uint32_t nSlot = selection->slot;
+	m_uFramegenQueryHead = selection->nextHead;
 
 	VkCommandBuffer raw = pCmdBuffer->rawBuffer();
 	vk.CmdResetQueryPool( raw, m_framegenQueryPool, nSlot * 2, 2 );

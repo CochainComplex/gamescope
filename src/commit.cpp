@@ -69,8 +69,10 @@ void commit_t::Signal()
     uint64_t now = get_time_in_nanos();
     present_time = now;
 
-    uint64_t frametime;
-    if ( m_bMangoNudge )
+    // Snapshot once so initialization and use follow the same commit state.
+    const bool bMangoNudge = m_bMangoNudge;
+    uint64_t frametime = 0;
+    if ( bMangoNudge )
     {
         static uint64_t lastFrameTime = now;
         frametime = now - lastFrameTime;
@@ -90,7 +92,7 @@ void commit_t::Signal()
         } );
     }
 
-    if ( m_bMangoNudge )
+    if ( bMangoNudge )
         mangoapp_update( uint64_t(~0ull), frametime, uint64_t(~0ull) );
 }
 

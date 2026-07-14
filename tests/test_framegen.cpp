@@ -5,6 +5,7 @@
 #include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
+#include "framegen/query_ring.hpp"
 #include "framegen/scheduling.hpp"
 #include "framegen/settings.hpp"
 #include "framegen/temporal.hpp"
@@ -740,6 +741,31 @@ static void test_push_constant_encoding()
 	CHECK( train.historyTimeScale == 0.5f );
 }
 
+static void test_query_ring_selection()
+{
+	using gamescope::framegen::select_query_ring_slot;
+
+	CHECK( !select_query_ring_slot( 0, 0, 0 ) );
+	CHECK( !select_query_ring_slot( 0, 65, 0 ) );
+
+	auto selection = select_query_ring_slot( 2, 4, 0 );
+	CHECK( selection && selection->slot == 2 && selection->nextHead == 3 );
+
+	selection = select_query_ring_slot( 2, 4, uint64_t{ 1 } << 2 );
+	CHECK( selection && selection->slot == 3 && selection->nextHead == 0 );
+
+	selection = select_query_ring_slot( 3, 4,
+		( uint64_t{ 1 } << 3 ) | ( uint64_t{ 1 } << 0 ) );
+	CHECK( selection && selection->slot == 1 && selection->nextHead == 2 );
+
+	selection = select_query_ring_slot( 9, 4, uint64_t{ 1 } << 1 );
+	CHECK( selection && selection->slot == 2 && selection->nextHead == 3 );
+
+	CHECK( !select_query_ring_slot( 0, 4, 0xfull ) );
+	selection = select_query_ring_slot( 63, 64, UINT64_MAX ^ ( uint64_t{ 1 } << 63 ) );
+	CHECK( selection && selection->slot == 63 && selection->nextHead == 0 );
+}
+
 int main()
 {
 	test_degradation_policy();
@@ -753,6 +779,7 @@ int main()
 	test_scheduling_policy();
 	test_dispatch_policy();
 	test_push_constant_encoding();
+	test_query_ring_selection();
 	return g_bPassed ? 0 : 1;
 }
 

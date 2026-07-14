@@ -2356,12 +2356,12 @@ namespace gamescope
 				// Max length of di_edid_display_descriptor_get_string is 14
 				// m_szModel is 16 bytes.
 				const char *pszModel = di_edid_display_descriptor_get_string( pDesc );
-				strncpy( m_Mutable.szModel, pszModel, sizeof( m_Mutable.szModel ) );
+				snprintf( m_Mutable.szModel, sizeof( m_Mutable.szModel ), "%s", pszModel );
 			}
 			else if ( eTag == DI_EDID_DISPLAY_DESCRIPTOR_DATA_STRING )
 			{
 				const char *pszDataString = di_edid_display_descriptor_get_string( pDesc );
-				strncpy( m_Mutable.szDataString, pszDataString, sizeof( m_Mutable.szDataString ) );
+				snprintf( m_Mutable.szDataString, sizeof( m_Mutable.szDataString ), "%s", pszDataString );
 			}
 		}
 

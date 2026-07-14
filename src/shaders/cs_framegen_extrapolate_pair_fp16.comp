@@ -9,8 +9,8 @@
 // fp16 variant of cs_framegen_extrapolate_pair.comp; see that file for the
 // pairing rationale and cs_framegen_extrapolate_fp16.comp for the precision
 // note (uploaded fp32, arithmetic fp16).
-layout(binding = 1, rgba8) writeonly uniform image2D dst0;
-layout(binding = 2, rgba8) writeonly uniform image2D dst1;
+layout(binding = 1) writeonly uniform image2D dst0;
+layout(binding = 2) writeonly uniform image2D dst1;
 layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 
 layout(

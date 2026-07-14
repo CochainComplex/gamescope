@@ -18,7 +18,7 @@ layout(constant_id = 6) const bool c_endpointTrace = false;
 // that dissolves smoothly instead of holding and then jumping. No TAA
 // rectification is needed: every term is a genuine fetch from a real frame,
 // so the shader can never invent a color. Writes the output image, so it
-// reuses descriptor_set.h's rgba8 dst.
+// reuses descriptor_set.h's formatless dst.
 layout(
   local_size_x = 8,
   local_size_y = 8,
