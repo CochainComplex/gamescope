@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <csignal>
+#include <time.h>
 #include <sys/mman.h>
 #include <poll.h>
 #include <linux/input-event-codes.h>
@@ -132,6 +133,12 @@ namespace gamescope
     class CWaylandBackend;
     class CWaylandFb;
 
+    struct WaylandPresentationFeedbackCtx
+    {
+        CWaylandPlane *pPlane;
+        FramegenPresentTag_t tag;
+    };
+
     struct WaylandPlaneState
     {
         wl_buffer *pBuffer;
@@ -238,9 +245,9 @@ namespace gamescope
         void LibDecor_Frame_DismissPopup( libdecor_frame *pFrame, const char *pSeatName );
         static libdecor_frame_interface s_LibDecorFrameInterface;
 
-        void Wayland_PresentationFeedback_SyncOutput( struct wp_presentation_feedback *pFeedback, wl_output *pOutput );
-        void Wayland_PresentationFeedback_Presented( struct wp_presentation_feedback *pFeedback, uint32_t uTVSecHi, uint32_t uTVSecLo, uint32_t uTVNSec, uint32_t uRefresh, uint32_t uSeqHi, uint32_t uSeqLo, uint32_t uFlags );
-        void Wayland_PresentationFeedback_Discarded( struct wp_presentation_feedback *pFeedback );
+        static void Wayland_PresentationFeedback_SyncOutput( void *pData, struct wp_presentation_feedback *pFeedback, wl_output *pOutput );
+        static void Wayland_PresentationFeedback_Presented( void *pData, struct wp_presentation_feedback *pFeedback, uint32_t uTVSecHi, uint32_t uTVSecLo, uint32_t uTVNSec, uint32_t uRefresh, uint32_t uSeqHi, uint32_t uSeqLo, uint32_t uFlags );
+        static void Wayland_PresentationFeedback_Discarded( void *pData, struct wp_presentation_feedback *pFeedback );
         static const wp_presentation_feedback_listener s_PresentationFeedbackListener;
 
         void Wayland_FrogColorManagedSurface_PreferredMetadata(
@@ -321,9 +328,9 @@ namespace gamescope
     };
     const wp_presentation_feedback_listener CWaylandPlane::s_PresentationFeedbackListener =
     {
-        .sync_output = WAYLAND_USERDATA_TO_THIS( CWaylandPlane, Wayland_PresentationFeedback_SyncOutput ),
-        .presented   = WAYLAND_USERDATA_TO_THIS( CWaylandPlane, Wayland_PresentationFeedback_Presented ),
-        .discarded   = WAYLAND_USERDATA_TO_THIS( CWaylandPlane, Wayland_PresentationFeedback_Discarded ),
+        .sync_output = CWaylandPlane::Wayland_PresentationFeedback_SyncOutput,
+        .presented   = CWaylandPlane::Wayland_PresentationFeedback_Presented,
+        .discarded   = CWaylandPlane::Wayland_PresentationFeedback_Discarded,
     };
     const frog_color_managed_surface_listener CWaylandPlane::s_FrogColorManagedSurfaceListener =
     {
@@ -710,6 +717,10 @@ namespace gamescope
         xdg_wm_base *GetXDGWMBase() const { return m_pXdgWmBase; }
         wp_viewporter *GetViewporter() const { return m_pViewporter; }
         wp_presentation *GetPresentation() const { return m_pPresentation; }
+        bool PresentationTimestampsAreMonotonic() const
+        {
+            return m_bPresentationClockIdValid && m_uPresentationClockId == uint32_t( CLOCK_MONOTONIC );
+        }
         frog_color_management_factory_v1 *GetFrogColorManagementFactory() const { return m_pFrogColorMgmtFactory; }
         wp_color_manager_v1 *GetWPColorManager() const { return m_pWPColorManager; }
         wp_image_description_v1 *GetWPImageDescription( GamescopeAppTextureColorspace eColorspace ) const { return m_pWPImageDescriptions[ (uint32_t)eColorspace ]; }
@@ -741,6 +752,9 @@ namespace gamescope
 
         void Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion );
         static const wl_registry_listener s_RegistryListener;
+
+        void Wayland_Presentation_ClockId( wp_presentation *pPresentation, uint32_t uClockId );
+        static const wp_presentation_listener s_PresentationListener;
 
         void Wayland_Modifier( zwp_linux_dmabuf_v1 *pDmabuf, uint32_t uFormat, uint32_t uModifierHi, uint32_t uModifierLo );
 
@@ -798,6 +812,8 @@ namespace gamescope
         OwningRc<CWaylandFb> m_pOwnedBlackFb;
         OwningRc<CVulkanTexture> m_pBlackTexture;
         wp_presentation *m_pPresentation = nullptr;
+        uint32_t m_uPresentationClockId = 0;
+        bool m_bPresentationClockIdValid = false;
         frog_color_management_factory_v1 *m_pFrogColorMgmtFactory = nullptr;
         wp_color_manager_v1 *m_pWPColorManager = nullptr;
         wp_image_description_v1 *m_pWPImageDescriptions[ GamescopeAppTextureColorspace_Count ]{};
@@ -858,6 +874,10 @@ namespace gamescope
     {
         .global        = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_Registry_Global ),
         .global_remove = WAYLAND_NULL(),
+    };
+    const wp_presentation_listener CWaylandBackend::s_PresentationListener =
+    {
+        .clock_id = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_Presentation_ClockId ),
     };
     const wl_output_listener CWaylandBackend::s_OutputListener =
     {
@@ -1178,6 +1198,7 @@ namespace gamescope
                 }
 
                 vulkan_wait( *oCompositeResult, true );
+                vulkan_framegen_note_present_composite_seqno( *oCompositeResult );
 
                 FrameInfo_t::Layer_t compositeLayer{};
                 compositeLayer.scale.x = 1.0;
@@ -1511,7 +1532,11 @@ namespace gamescope
             if ( m_pFrame )
             {
                 struct wp_presentation_feedback *pFeedback = wp_presentation_feedback( m_pBackend->GetPresentation(), m_pSurface );
-                wp_presentation_feedback_add_listener( pFeedback, &s_PresentationFeedbackListener, this );
+                WaylandPresentationFeedbackCtx *pFeedbackCtx = new WaylandPresentationFeedbackCtx{
+                    .pPlane = this,
+                    .tag = vulkan_framegen_take_present_tag(),
+                };
+                wp_presentation_feedback_add_listener( pFeedback, &s_PresentationFeedbackListener, pFeedbackCtx );
             }
 
             if ( m_pWPColorManagedSurface )
@@ -1806,11 +1831,13 @@ namespace gamescope
     {
     }
 
-    void CWaylandPlane::Wayland_PresentationFeedback_SyncOutput( struct wp_presentation_feedback *pFeedback, wl_output *pOutput )
+    void CWaylandPlane::Wayland_PresentationFeedback_SyncOutput( void *pData, struct wp_presentation_feedback *pFeedback, wl_output *pOutput )
     {
     }
-    void CWaylandPlane::Wayland_PresentationFeedback_Presented( struct wp_presentation_feedback *pFeedback, uint32_t uTVSecHi, uint32_t uTVSecLo, uint32_t uTVNSec, uint32_t uRefreshCycle, uint32_t uSeqHi, uint32_t uSeqLo, uint32_t uFlags )
+    void CWaylandPlane::Wayland_PresentationFeedback_Presented( void *pData, struct wp_presentation_feedback *pFeedback, uint32_t uTVSecHi, uint32_t uTVSecLo, uint32_t uTVNSec, uint32_t uRefreshCycle, uint32_t uSeqHi, uint32_t uSeqLo, uint32_t uFlags )
     {
+        WaylandPresentationFeedbackCtx *pFeedbackCtx = static_cast<WaylandPresentationFeedbackCtx *>( pData );
+        CWaylandPlane *pPlane = pFeedbackCtx->pPlane;
         uint64_t ulTime = ( ( ( uint64_t( uTVSecHi ) << 32ul ) | uTVSecLo ) * 1'000'000'000lu ) +
                           ( uint64_t( uTVNSec ) );
 
@@ -1823,24 +1850,31 @@ namespace gamescope
                 g_nOutputRefresh = nRefresh;
             }
 
-            m_pConnector->SetHostCompositorIsCurrentlyVRR( false );
+            pPlane->m_pConnector->SetHostCompositorIsCurrentlyVRR( false );
         }
         else
         {
-            m_pConnector->SetHostCompositorIsCurrentlyVRR( true );
+            pPlane->m_pConnector->SetHostCompositorIsCurrentlyVRR( true );
 
-            UpdateVRRRefreshRate();
+            pPlane->UpdateVRRRefreshRate();
         }
 
         GetVBlankTimer().MarkVBlank( ulTime, true );
+        const uint64_t ulSequence = ( uint64_t( uSeqHi ) << 32ul ) | uSeqLo;
+        vulkan_framegen_publish_present_feedback( pFeedbackCtx->tag, ulTime, ulSequence,
+            true, pPlane->m_pBackend->PresentationTimestampsAreMonotonic() );
         wp_presentation_feedback_destroy( pFeedback );
+        delete pFeedbackCtx;
 
         // Nudge so that steamcompmgr releases commits.
         nudge_steamcompmgr();
     }
-    void CWaylandPlane::Wayland_PresentationFeedback_Discarded( struct wp_presentation_feedback *pFeedback )
+    void CWaylandPlane::Wayland_PresentationFeedback_Discarded( void *pData, struct wp_presentation_feedback *pFeedback )
     {
+        WaylandPresentationFeedbackCtx *pFeedbackCtx = static_cast<WaylandPresentationFeedbackCtx *>( pData );
+        vulkan_framegen_publish_present_feedback( pFeedbackCtx->tag, 0, 0, false, false );
         wp_presentation_feedback_destroy( pFeedback );
+        delete pFeedbackCtx;
 
         // Nudge so that steamcompmgr releases commits.
         nudge_steamcompmgr();
@@ -2557,6 +2591,12 @@ namespace gamescope
     // Wayland Callbacks
     /////////////////////
 
+    void CWaylandBackend::Wayland_Presentation_ClockId( wp_presentation *pPresentation, uint32_t uClockId )
+    {
+        m_uPresentationClockId = uClockId;
+        m_bPresentationClockIdValid = true;
+    }
+
     void CWaylandBackend::Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion )
     {
         if ( !strcmp( pInterface, wl_compositor_interface.name ) && uVersion >= 4u )
@@ -2605,6 +2645,7 @@ namespace gamescope
         else if ( !strcmp( pInterface, wp_presentation_interface.name ) )
         {
             m_pPresentation = (wp_presentation *)wl_registry_bind( pRegistry, uName, &wp_presentation_interface, 1u );
+            wp_presentation_add_listener( m_pPresentation, &s_PresentationListener, this );
         }
         else if ( !strcmp( pInterface, wl_output_interface.name ) )
         {

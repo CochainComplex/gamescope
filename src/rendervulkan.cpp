@@ -5097,6 +5097,179 @@ static FramegenDispatch_t g_framegenDispatch;
 static constexpr float k_flFramegenSuppressLo = 0.08f;
 static constexpr float k_flFramegenSuppressHi = 0.40f;
 
+struct FramegenPresentState_t
+{
+	const CVulkanTexture *pLastBaseTexture = nullptr;
+	uint64_t ulLastPresentToken = 0;
+	uint64_t ulLastSlotId = 0;
+	uint64_t ulPreviousRealFrameId = 0;
+	uint64_t ulCurrentRealFrameId = 0;
+	uint64_t ulPreviousRealCompositeSeqNo = 0;
+	uint64_t ulCurrentRealCompositeSeqNo = 0;
+	gamescope::FramegenPresentTag_t pendingTag = {};
+	bool bTagPending = false;
+};
+static FramegenPresentState_t g_framegenPresentState;
+
+struct DisplayFeedback_t
+{
+	gamescope::FramegenPresentTag_t tag = {};
+	uint64_t ulActualFlipNs = 0;
+	uint64_t ulBackendSequence = 0;
+	bool bPresented = false;
+	bool bTimestampValid = false;
+};
+
+// Backend callbacks are producers and the compositor thread is the sole
+// consumer. The fixed ring keeps the DRM page-flip hot path allocation-free;
+// the mutex only protects mailbox indices and POD copies, never framegen state.
+static constexpr size_t k_nDisplayFeedbackMailboxCapacity = 256;
+struct DisplayFeedbackMailbox_t
+{
+	std::mutex mutex;
+	std::array<DisplayFeedback_t, k_nDisplayFeedbackMailboxCapacity> records;
+	size_t nRead = 0;
+	size_t nCount = 0;
+};
+static DisplayFeedbackMailbox_t g_displayFeedbackMailbox;
+
+static uint64_t framegen_next_present_slot_id()
+{
+	return ++g_framegenPresentState.ulLastSlotId;
+}
+
+static void framegen_select_present_tag( gamescope::FramegenPresentKind_t eKind,
+	uint64_t ulRealFrameId, uint64_t ulSlotId, uint64_t ulCompositeSeqNo,
+	uint64_t ulTargetFlipNs )
+{
+	if ( !g_framegenPresentState.bTagPending )
+	{
+		g_framegenPresentState.pendingTag = {
+			.ulPresentToken = ++g_framegenPresentState.ulLastPresentToken,
+			.ulRealFrameId = g_framegenPresentState.ulCurrentRealFrameId,
+			.ulSlotId = 0,
+			.ulCompositeSeqNo = 0,
+			.ulTargetFlipNs = GetVBlankTimer().GetNextVBlank( 0 ),
+			.eKind = gamescope::FramegenPresentKind_t::Real,
+		};
+		g_framegenPresentState.bTagPending = true;
+	}
+
+	gamescope::FramegenPresentTag_t &tag = g_framegenPresentState.pendingTag;
+	tag.eKind = eKind;
+	tag.ulRealFrameId = ulRealFrameId;
+	tag.ulSlotId = ulSlotId;
+	tag.ulCompositeSeqNo = ulCompositeSeqNo;
+	tag.ulTargetFlipNs = ulTargetFlipNs != 0
+		? ulTargetFlipNs : GetVBlankTimer().GetNextVBlank( 0 );
+}
+
+void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
+{
+	const CVulkanTexture *pBaseTexture = pFrameInfo != nullptr && pFrameInfo->layerCount > 0
+		? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
+	if ( g_framegenPresentState.ulCurrentRealFrameId == 0
+		|| ( pBaseTexture != nullptr && pBaseTexture != g_framegenPresentState.pLastBaseTexture ) )
+	{
+		g_framegenPresentState.ulPreviousRealFrameId = g_framegenPresentState.ulCurrentRealFrameId;
+		g_framegenPresentState.ulPreviousRealCompositeSeqNo =
+			g_framegenPresentState.ulCurrentRealCompositeSeqNo;
+		g_framegenPresentState.ulCurrentRealFrameId++;
+		g_framegenPresentState.ulCurrentRealCompositeSeqNo = 0;
+	}
+	if ( pBaseTexture != nullptr )
+		g_framegenPresentState.pLastBaseTexture = pBaseTexture;
+
+	g_framegenPresentState.pendingTag = {
+		.ulPresentToken = ++g_framegenPresentState.ulLastPresentToken,
+		.ulRealFrameId = g_framegenPresentState.ulCurrentRealFrameId,
+		.ulSlotId = 0,
+		.ulCompositeSeqNo = 0,
+		.ulTargetFlipNs = GetVBlankTimer().GetNextVBlank( 0 ),
+		.eKind = gamescope::FramegenPresentKind_t::Real,
+	};
+	g_framegenPresentState.bTagPending = true;
+}
+
+void vulkan_framegen_note_present_composite_seqno( uint64_t ulCompositeSeqNo )
+{
+	if ( g_framegenPresentState.bTagPending
+		&& g_framegenPresentState.pendingTag.eKind == gamescope::FramegenPresentKind_t::Real )
+	{
+		g_framegenPresentState.pendingTag.ulCompositeSeqNo = ulCompositeSeqNo;
+		g_framegenPresentState.ulCurrentRealCompositeSeqNo = ulCompositeSeqNo;
+	}
+}
+
+gamescope::FramegenPresentTag_t vulkan_framegen_take_present_tag()
+{
+	if ( !g_framegenPresentState.bTagPending )
+		framegen_select_present_tag( gamescope::FramegenPresentKind_t::Real,
+			g_framegenPresentState.ulCurrentRealFrameId, 0, 0, 0 );
+
+	g_framegenPresentState.bTagPending = false;
+	return g_framegenPresentState.pendingTag;
+}
+
+void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentTag_t &tag,
+	uint64_t ulActualFlipNs, uint64_t ulBackendSequence, bool bPresented, bool bTimestampValid )
+{
+	std::scoped_lock lock( g_displayFeedbackMailbox.mutex );
+	if ( g_displayFeedbackMailbox.nCount == k_nDisplayFeedbackMailboxCapacity )
+	{
+		g_displayFeedbackMailbox.nRead =
+			( g_displayFeedbackMailbox.nRead + 1 ) % k_nDisplayFeedbackMailboxCapacity;
+		g_displayFeedbackMailbox.nCount--;
+	}
+
+	const size_t nWrite = ( g_displayFeedbackMailbox.nRead + g_displayFeedbackMailbox.nCount )
+		% k_nDisplayFeedbackMailboxCapacity;
+	g_displayFeedbackMailbox.records[ nWrite ] = {
+		.tag = tag,
+		.ulActualFlipNs = ulActualFlipNs,
+		.ulBackendSequence = ulBackendSequence,
+		.bPresented = bPresented,
+		.bTimestampValid = bTimestampValid,
+	};
+	g_displayFeedbackMailbox.nCount++;
+}
+
+void vulkan_framegen_drain_present_feedback()
+{
+	std::array<DisplayFeedback_t, k_nDisplayFeedbackMailboxCapacity> records;
+	size_t nCount = 0;
+	{
+		std::scoped_lock lock( g_displayFeedbackMailbox.mutex );
+		nCount = g_displayFeedbackMailbox.nCount;
+		for ( size_t i = 0; i < nCount; i++ )
+		{
+			records[ i ] = g_displayFeedbackMailbox.records[ g_displayFeedbackMailbox.nRead ];
+			g_displayFeedbackMailbox.nRead =
+				( g_displayFeedbackMailbox.nRead + 1 ) % k_nDisplayFeedbackMailboxCapacity;
+		}
+		g_displayFeedbackMailbox.nCount = 0;
+	}
+
+	for ( size_t i = 0; i < nCount; i++ )
+	{
+		const DisplayFeedback_t &feedback = records[ i ];
+		if ( !feedback.bPresented || !feedback.bTimestampValid
+			|| feedback.tag.ulPresentToken == 0
+			|| feedback.tag.eKind != gamescope::FramegenPresentKind_t::Real
+			|| feedback.tag.ulTargetFlipNs == 0 )
+			continue;
+
+		static uint64_t s_uAnchorErrorDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uAnchorErrorDebugLogCounter ) )
+		{
+			const double flErrorMs = (double)( (long double)feedback.ulActualFlipNs
+				- (long double)feedback.tag.ulTargetFlipNs ) / 1.0e6;
+			vk_log.infof( "framegen: anchor error real=%" PRIu64 " err=%+.3fms",
+				feedback.tag.ulRealFrameId, flErrorMs );
+		}
+	}
+}
+
 struct FramegenHistory_t
 {
 	// The last two real frames, held as references straight into the
@@ -5132,6 +5305,10 @@ struct FramegenHistory_t
 		gamescope::Rc<CVulkanTexture> tex;
 		uint64_t seqNo = 0;
 		uint64_t frameId = 0;
+		uint64_t ulPresentRealFrameId = 0;
+		uint64_t ulSlotId = 0;
+		uint64_t ulCompositeSeqNo = 0;
+		uint64_t ulTargetFlipNs = 0;
 		float phase = 0.0f; // fraction of the real-frame interval, for logs
 		// Bidir: this entry is a REAL frame riding the queue behind its
 		// interpolations. Its composite completed at its own paint (seqNo 0 on
@@ -5878,6 +6055,11 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 
 	if ( pResult != nullptr )
 	{
+		framegen_select_present_tag(
+			front.bReal ? gamescope::FramegenPresentKind_t::DelayedReal
+				: gamescope::FramegenPresentKind_t::Generated,
+			front.ulPresentRealFrameId, front.ulSlotId,
+			front.ulCompositeSeqNo, front.ulTargetFlipNs );
 		static uint64_t s_uPresentedDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uPresentedDebugLogCounter ) )
 			vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u",
@@ -5965,11 +6147,23 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_take_front( const gamescope:
 		if ( FramegenDebugShouldLog( s_uFlipDebugLogCounter ) )
 			vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u (bidir flip substitution)",
 				front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ) );
+		framegen_select_present_tag(
+			front.bReal ? gamescope::FramegenPresentKind_t::DelayedReal
+				: gamescope::FramegenPresentKind_t::Generated,
+			front.ulPresentRealFrameId, front.ulSlotId,
+			front.ulCompositeSeqNo, front.ulTargetFlipNs );
 		return front.tex;
 	}
 
 	if ( g_framegenHistory.previousReal != nullptr )
+	{
+		framegen_select_present_tag( gamescope::FramegenPresentKind_t::DelayedReal,
+			g_framegenPresentState.ulPreviousRealFrameId,
+			framegen_next_present_slot_id(),
+			g_framegenPresentState.ulPreviousRealCompositeSeqNo,
+			GetVBlankTimer().GetNextVBlank( 0 ) );
 		return g_framegenHistory.previousReal;
+	}
 	return pFallback;
 }
 
@@ -8159,7 +8353,22 @@ struct FramegenColorProbeRequest_t
 	uint64_t endpointTimeNs;
 };
 
-static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr )
+static uint64_t framegen_display_interval_ns()
+{
+	const int nFramegenRefreshMhz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+	return nFramegenRefreshMhz > 0
+		? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
+}
+
+static uint64_t framegen_fixed_slot_target_ns( uint32_t nSlotIndex )
+{
+	if ( g_framegenHistory.ulCurrentRealVblankNs == 0 )
+		return 0;
+	return g_framegenHistory.ulCurrentRealVblankNs
+		+ uint64_t( nSlotIndex ) * framegen_display_interval_ns();
+}
+
+static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr, uint64_t ulSingleTargetFlipNs = 0 )
 {
 	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0 )
 		return false;
@@ -8179,7 +8388,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 
 	// Reserve this interval's output slots up front so an empty batch never
 	// records/submits a command buffer.
-	struct SlotPlan_t { gamescope::Rc<CVulkanTexture> tex; float phase; float strength; uint32_t slotIndex; };
+	struct SlotPlan_t { gamescope::Rc<CVulkanTexture> tex; float phase; float strength; uint32_t slotIndex; uint64_t ulTargetFlipNs; };
 	std::vector<SlotPlan_t> slots;
 	slots.reserve( nRequestCount );
 	for ( uint32_t i = 0; i < nRequestCount; i++ )
@@ -8202,7 +8411,10 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		if ( !pGenerated )
 			continue;
 
-		slots.push_back( { std::move( pGenerated ), pRequests[ i ].phase, pRequests[ i ].strength, pRequests[ i ].slotIndex } );
+		const uint64_t ulTargetFlipNs = nRequestCount == 1 && ulSingleTargetFlipNs != 0
+			? ulSingleTargetFlipNs : framegen_fixed_slot_target_ns( pRequests[ i ].slotIndex );
+		slots.push_back( { std::move( pGenerated ), pRequests[ i ].phase,
+			pRequests[ i ].strength, pRequests[ i ].slotIndex, ulTargetFlipNs } );
 	}
 	if ( slots.size() != nRequestCount )
 	{
@@ -8442,6 +8654,10 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		entry.tex = slot.tex;
 		entry.seqNo = ulSeqNo;
 		entry.frameId = g_framegenHistory.currentFrameId;
+		entry.ulPresentRealFrameId = g_framegenPresentState.ulCurrentRealFrameId;
+		entry.ulSlotId = framegen_next_present_slot_id();
+		entry.ulCompositeSeqNo = ulCompositeSeqNo;
+		entry.ulTargetFlipNs = slot.ulTargetFlipNs;
 		entry.phase = slot.phase;
 		g_framegenHistory.pending.push_back( std::move( entry ) );
 		g_framegenHistory.nLastGeneratedSlot = std::max( g_framegenHistory.nLastGeneratedSlot, slot.slotIndex );
@@ -8608,7 +8824,8 @@ static bool framegen_jit_submit( uint64_t ulCompositeSeqNo, uint32_t nMaxDegrade
 
 	const FramegenEffective_t eff = framegen_effective_config( g_framegenHistory.nDegradeSteps );
 	const FramegenSlotRequest_t request = { flPhase, flStrength, nSlotIndex };
-	return framegen_submit_planned( &request, 1, nGapVblanks, eff, ulCompositeSeqNo, nMaxDegradeSteps, false );
+	return framegen_submit_planned( &request, 1, nGapVblanks, eff, ulCompositeSeqNo,
+		nMaxDegradeSteps, false, nullptr, ulTargetVblankNs );
 }
 
 // VRR hybrid slot (#01). Plan exactly ONE generated frame at the content
@@ -8656,7 +8873,10 @@ static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMax
 
 	const FramegenEffective_t eff = framegen_effective_config( g_framegenHistory.nDegradeSteps );
 	const FramegenSlotRequest_t request = { flPhase, flStrength, 1u };
-	return framegen_submit_planned( &request, 1, nGapVblanks, eff, ulCompositeSeqNo, nMaxDegradeSteps, false );
+	const uint64_t ulTargetFlipNs = g_framegenHistory.ulCurrentRealVblankNs
+		+ ulPredictedIntervalNs / 2u;
+	return framegen_submit_planned( &request, 1, nGapVblanks, eff, ulCompositeSeqNo,
+		nMaxDegradeSteps, false, nullptr, ulTargetFlipNs );
 }
 
 // Reactive JIT catch-all, called by the present decision when a vblank goes to
@@ -9358,6 +9578,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	g_framegenHistory.lastCompositeSeqNo = ulCompositeSeqNo;
 	g_framegenHistory.nLastGeneratedSlot = 0;
 	g_framegenHistory.nLastGenerationGapVblanks = 0;
+	framegen_select_present_tag( gamescope::FramegenPresentKind_t::Real,
+		g_framegenPresentState.ulCurrentRealFrameId, 0, ulCompositeSeqNo,
+		g_framegenHistory.ulCurrentRealVblankNs );
 
 	static uint64_t s_uRealFrameDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uRealFrameDebugLogCounter ) )
@@ -9762,6 +9985,11 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		realEntry.tex = pRealFrame;
 		realEntry.seqNo = 0;
 		realEntry.frameId = g_framegenHistory.currentFrameId;
+		realEntry.ulPresentRealFrameId = g_framegenPresentState.ulCurrentRealFrameId;
+		realEntry.ulSlotId = framegen_next_present_slot_id();
+		realEntry.ulCompositeSeqNo = ulCompositeSeqNo;
+		realEntry.ulTargetFlipNs = GetVBlankTimer().GetNextVBlank( 0 )
+			+ uint64_t( g_framegenHistory.pending.size() ) * framegen_display_interval_ns();
 		realEntry.phase = 1.0f;
 		realEntry.bReal = true;
 		g_framegenHistory.pending.push_back( std::move( realEntry ) );

@@ -558,6 +558,7 @@ extern bool g_bDebugLayers;
 struct DRMPresentCtx
 {
 	uint64_t ulPendingFlipCount = 0;
+	gamescope::FramegenPresentTag_t tag = {};
 };
 
 extern gamescope::ConVar<bool> cv_composite_force;
@@ -766,6 +767,7 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 	// This is the last vblank time
 	uint64_t vblanktime = sec * 1'000'000'000lu + usec * 1'000lu;
 	GetVBlankTimer().MarkVBlank( vblanktime, true );
+	vulkan_framegen_publish_present_feedback( pCtx->tag, vblanktime, frame, true, true );
 
 	// TODO: get the fbids_queued instance from data if we ever have more than one in flight
 
@@ -3774,6 +3776,7 @@ namespace gamescope
 			}
 
 			vulkan_wait( *oCompositeResult, true );
+			vulkan_framegen_note_present_composite_seqno( *oCompositeResult );
 
 			FrameInfo_t presentCompFrameInfo = {};
 			presentCompFrameInfo.allowVRR = pFrameInfo->allowVRR;
@@ -4106,6 +4109,7 @@ namespace gamescope
 			uint32_t uCurrentPresentCtx = m_uNextPresentCtx;
 			m_uNextPresentCtx = ( m_uNextPresentCtx + 1 ) % 3;
 			m_PresentCtxs[uCurrentPresentCtx].ulPendingFlipCount = GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents;
+			m_PresentCtxs[uCurrentPresentCtx].tag = vulkan_framegen_take_present_tag();
 
 			drm_log.debugf("flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents);
 			gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents );

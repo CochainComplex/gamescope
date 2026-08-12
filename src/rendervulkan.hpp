@@ -417,6 +417,18 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 bool vulkan_framegen_is_enabled();
+// Presentation-tag lifecycle. begin_present runs on the compositor thread just
+// before entering a backend; the selected framegen path may refine the tag, and
+// the backend takes the completed value at its existing commit/feedback point.
+void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo );
+void vulkan_framegen_note_present_composite_seqno( uint64_t ulCompositeSeqNo );
+gamescope::FramegenPresentTag_t vulkan_framegen_take_present_tag();
+// Backend feedback callbacks only enqueue immutable records here. The
+// compositor thread owns and drains the records; callbacks never touch framegen
+// history or scheduling state.
+void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentTag_t &tag,
+	uint64_t ulActualFlipNs, uint64_t ulBackendSequence, bool bPresented, bool bTimestampValid );
+void vulkan_framegen_drain_present_feedback();
 bool vulkan_framegen_has_pending_generated_frame();
 // True when a generated frame is pending AND its GPU work has completed, so it
 // can be presented this vblank without stalling scanout. Non-consuming.
