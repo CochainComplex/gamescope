@@ -836,6 +836,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(GetImageMemoryRequirements) \
 	VK_FUNC(GetImageSubresourceLayout) \
 	VK_FUNC(GetMemoryFdKHR) \
+	VK_FUNC(GetMemoryFdPropertiesKHR) \
 	VK_FUNC(GetSemaphoreCounterValue) \
 	VK_FUNC(GetSwapchainImagesKHR) \
 	VK_FUNC(MapMemory) \
@@ -989,6 +990,7 @@ public:
 	inline bool supportsFp16() {return m_bSupportsFp16;}
 	inline bool supportsShaderFloat16() {return m_bSupportsShaderFloat16;}
 	inline bool supportsStorageImageExtendedFormats() { return m_bSupportsStorageImageExtendedFormats; }
+	inline uint32_t maxComputeSharedMemorySize() const { return m_uMaxComputeSharedMemorySize; }
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
 	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size, uint32_t alignment = 16)
@@ -1062,7 +1064,9 @@ protected:
 	bool m_bSupportsStorageImageExtendedFormats = false;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
+	bool m_bSupportsGlobalPriority = false;
 	bool m_bInitialized = false;
+	uint32_t m_uMaxComputeSharedMemorySize = 0;
 
 
 	VkPhysicalDeviceMemoryProperties m_memoryProperties;

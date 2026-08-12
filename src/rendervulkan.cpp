@@ -194,6 +194,18 @@ VulkanOutput_t g_output;
 // Vulkan-guaranteed 128-byte minimum maxPushConstantsSize.
 static constexpr uint32_t k_uFramegenPushConstantSize = 64;
 
+// Shared-memory requirements for cs_framegen_motion_net.comp and
+// cs_framegen_motion_net_train.comp; these byte counts must track their LDS
+// declarations.
+static constexpr uint32_t k_uFramegenMotionNetLdsBytes = 27'904;
+static constexpr uint32_t k_uFramegenMotionNetTrainLdsBytes = 27'136;
+
+static bool framegen_net_lds_supported()
+{
+	return g_device.maxComputeSharedMemorySize() >= k_uFramegenMotionNetLdsBytes
+		&& g_device.maxComputeSharedMemorySize() >= k_uFramegenMotionNetTrainLdsBytes;
+}
+
 uint32_t g_uCompositeDebug = 0u;
 gamescope::ConVar<uint32_t> cv_composite_debug{ "composite_debug", 0, "Debug composition flags" };
 
@@ -611,6 +623,7 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 
 	VkPhysicalDeviceProperties props;
 	vk.GetPhysicalDeviceProperties( m_physDev, &props );
+	m_uMaxComputeSharedMemorySize = props.limits.maxComputeSharedMemorySize;
 	vk_log.infof( "selecting physical device '%s': queue family %x (general queue family %x)", props.deviceName, m_queueFamily, m_generalQueueFamily );
 
 	// Record how many queues the chosen compositor family exposes, so
@@ -658,6 +671,7 @@ bool CVulkanDevice::createDevice()
 	bool hasDrmProps = vulkan_has_drm_props();
 	bool supportsForeignQueue = false;
 	bool supportsHDRMetadata = false;
+	const char *pszGlobalPriorityExtension = nullptr;
 	for (const auto& ext : m_supportedExts) {
 		if ( strcmp(ext.extensionName, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) == 0 )
 			m_bSupportsModifiers = true;
@@ -667,6 +681,18 @@ bool CVulkanDevice::createDevice()
 
 		if ( strcmp(ext.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0 )
 			supportsHDRMetadata = true;
+
+		if ( strcmp(ext.extensionName, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) == 0 )
+		{
+			m_bSupportsGlobalPriority = true;
+			pszGlobalPriorityExtension = VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
+		}
+		else if ( strcmp(ext.extensionName, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME) == 0 )
+		{
+			m_bSupportsGlobalPriority = true;
+			if ( pszGlobalPriorityExtension == nullptr )
+				pszGlobalPriorityExtension = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+		}
 	}
 
 	vk_log.infof( "physical device %s DRM format modifiers", m_bSupportsModifiers ? "supports" : "does not support" );
@@ -802,14 +828,14 @@ bool CVulkanDevice::createDevice()
 	{
 		{
 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-			.pNext = gamescope::Process::HasCapSysNice() ? &queueCreateInfoEXT : nullptr,
+			.pNext = gamescope::Process::HasCapSysNice() && m_bSupportsGlobalPriority ? &queueCreateInfoEXT : nullptr,
 			.queueFamilyIndex = m_queueFamily,
 			.queueCount = nComputeQueues,
 			.pQueuePriorities = queuePriorities
 		},
 		{
 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-			.pNext = gamescope::Process::HasCapSysNice() ? &queueCreateInfoEXT : nullptr,
+			.pNext = gamescope::Process::HasCapSysNice() && m_bSupportsGlobalPriority ? &queueCreateInfoEXT : nullptr,
 			.queueFamilyIndex = m_generalQueueFamily,
 			.queueCount = 1,
 			.pQueuePriorities = queuePriorities
@@ -837,6 +863,9 @@ bool CVulkanDevice::createDevice()
 	enabledExtensions.push_back( VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME );
 
 	enabledExtensions.push_back( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
+
+	if ( m_bSupportsGlobalPriority )
+		enabledExtensions.push_back( pszGlobalPriorityExtension );
 
 	enabledExtensions.push_back( VK_EXT_ROBUSTNESS_2_EXTENSION_NAME );
 #if 0
@@ -937,7 +966,7 @@ bool CVulkanDevice::createDevice()
 	};
 
 	VkResult res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
-	if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() )
+	if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() && m_bSupportsGlobalPriority )
 	{
 		fprintf(stderr, "vkCreateDevice failed with a high-priority queue (general + compute). Falling back to regular priority (general).\n");
 		queueCreateInfos[1].pNext = nullptr;
@@ -1657,13 +1686,19 @@ void CVulkanDevice::compileFramegenPipelines()
 		SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE,
 		SHADER_TYPE_FRAMEGEN_MOTION_STATS,
 		SHADER_TYPE_FRAMEGEN_MOTION_STATS_APPLY,
-		SHADER_TYPE_FRAMEGEN_MOTION_NET,
-		SHADER_TYPE_FRAMEGEN_MOTION_NET_TRAIN,
-		SHADER_TYPE_FRAMEGEN_MOTION_NET_OPT,
 	};
 
 	for ( ShaderType type : pipelines )
 		pipeline( type );
+
+	// pipeline() caches compile failures, including VK_NULL_HANDLE. The runtime
+	// uses this same gate, so unsupported net shaders can never be cached or bound.
+	if ( framegen_net_lds_supported() )
+	{
+		pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET );
+		pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET_TRAIN );
+		pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET_OPT );
+	}
 
 	// R16F storage images require shaderStorageImageExtendedFormats. Keep the
 	// always-valid RGBA16F fallback warm on every device, and only create the
@@ -2766,6 +2801,12 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 			imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
 		}
+		else
+		{
+			vk_log.errorf( "dma-buf modifier 0x%" PRIX64 " for DRM format 0x%" PRIX32 " is not importable",
+				pDMA->modifier, drmFormat );
+			return false;
+		}
 	}
 	else if ( g_bDebugDualGpuRoute && pDMA && pDMA->modifier != DRM_FORMAT_MOD_INVALID )
 	{
@@ -2939,6 +2980,30 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				vk_log.errorf_errno( "dup failed" );
 				return false;
 			}
+
+			VkMemoryFdPropertiesKHR memoryFdProperties = {
+				.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+			};
+			res = g_device.vk.GetMemoryFdPropertiesKHR( g_device.device(),
+				VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &memoryFdProperties );
+			if ( res != VK_SUCCESS )
+			{
+				vk_errorf( res, "vkGetMemoryFdPropertiesKHR failed" );
+				close( fd );
+				return false;
+			}
+
+			// The properties query does not consume fd; the successful import below
+			// retains the existing ownership-transfer semantics.
+			const uint32_t uImportMemoryTypeBits = memRequirements.memoryTypeBits & memoryFdProperties.memoryTypeBits;
+			const int32_t nMemoryTypeIndex = g_device.findMemoryType( properties, uImportMemoryTypeBits );
+			if ( nMemoryTypeIndex < 0 )
+			{
+				vk_errorf( VK_ERROR_FEATURE_NOT_PRESENT, "no compatible memory type for dma-buf import" );
+				close( fd );
+				return false;
+			}
+			allocInfo.memoryTypeIndex = uint32_t( nMemoryTypeIndex );
 
 			// Memory already provided by pDMA
 			importMemoryInfo = {
@@ -5990,14 +6055,16 @@ static bool framegen_is_float_drm_format( uint32_t drmFormat )
 {
 	// Float (scRGB) targets carry HDR highlights above 1.0 and wide-gamut
 	// negatives; fp16 arithmetic can band those, so the extrapolate shader stays
-	// fp32 for them (see the fp16 shader's precision note). 16-bit UNORM
-	// targets need the same treatment for a different reason: fp16's 11-bit
+	// fp32 for them (see the fp16 shader's precision note); 32F formats are float
+	// targets a fortiori. 16-bit UNORM targets need the same treatment for a
+	// different reason: fp16's 11-bit
 	// mantissa cannot represent 16-bit-deep content, so the fp16 path would
 	// band it. Unreachable in output-space mode (scanout formats are
 	// 8/10-bit), but base-layer mode (#02) generates in the CLIENT's format,
 	// and 16-bit UNORM swapchains do occur (e.g. the NVIDIA WSI path here).
 	switch ( drmFormat )
 	{
+		case DRM_FORMAT_ABGR32323232F:
 		case DRM_FORMAT_ABGR16161616F:
 		case DRM_FORMAT_XBGR16161616F:
 		case DRM_FORMAT_ABGR16161616:
@@ -6274,6 +6341,19 @@ static const std::vector<float> &framegen_net_weights()
 
 static bool framegen_net_requested( GamescopeFramegenQuality eQuality )
 {
+	if ( !framegen_net_lds_supported() )
+	{
+		static bool s_bLoggedUnsupported = false;
+		if ( !s_bLoggedUnsupported && ( framegen_net_weights_path() != nullptr
+			|| framegen_net_online_enabled() || framegen_net_profile_path() != nullptr ) )
+		{
+			vk_log.infof( "framegen: learned refinement requires %u bytes of compute shared memory but the device exposes %u; falling back to Stage B",
+				k_uFramegenMotionNetLdsBytes, g_device.maxComputeSharedMemorySize() );
+			s_bLoggedUnsupported = true;
+		}
+		return false;
+	}
+
 	return eQuality >= GamescopeFramegenQuality::High
 		&& !framegen_net_weights().empty();
 }
@@ -8972,6 +9052,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 							: " — ephemeral model, nothing is written to disk" );
 			}
 			else if ( g_eFramegenQuality < GamescopeFramegenQuality::High
+				&& framegen_net_lds_supported()
 				&& ( framegen_net_weights_path() != nullptr || framegen_net_online_enabled() ) )
 			{
 				vk_log.infof( "framegen: learned refinement requested but not scheduled below high quality" );
