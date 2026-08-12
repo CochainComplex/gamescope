@@ -3198,12 +3198,27 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			// The properties query does not consume fd; the successful import below
 			// retains the existing ownership-transfer semantics.
 			const uint32_t uImportMemoryTypeBits = memRequirements.memoryTypeBits & memoryFdProperties.memoryTypeBits;
-			const int32_t nMemoryTypeIndex = g_device.findMemoryType( properties, uImportMemoryTypeBits );
+			int32_t nMemoryTypeIndex = g_device.findMemoryType( properties, uImportMemoryTypeBits );
 			if ( nMemoryTypeIndex < 0 )
 			{
-				vk_errorf( VK_ERROR_FEATURE_NOT_PRESENT, "no compatible memory type for dma-buf import" );
-				close( fd );
-				return false;
+				// Imported memory is already backed; the property preference (e.g.
+				// DEVICE_LOCAL) is a placement hint that a cross-vendor dma-buf may
+				// legitimately not satisfy. Any type in the legal intersection is
+				// spec-correct — only an empty intersection is a real failure.
+				nMemoryTypeIndex = g_device.findMemoryType( 0, uImportMemoryTypeBits );
+				if ( nMemoryTypeIndex < 0 )
+				{
+					vk_errorf( VK_ERROR_FEATURE_NOT_PRESENT, "no compatible memory type for dma-buf import" );
+					close( fd );
+					return false;
+				}
+				static bool s_bLoggedRelaxedImportType = false;
+				if ( !s_bLoggedRelaxedImportType )
+				{
+					vk_log.infof( "dma-buf import: preferred memory properties 0x%x unavailable, using memory type %d from the imported FD's legal set",
+						properties, nMemoryTypeIndex );
+					s_bLoggedRelaxedImportType = true;
+				}
 			}
 			allocInfo.memoryTypeIndex = uint32_t( nMemoryTypeIndex );
 

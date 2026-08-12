@@ -1436,6 +1436,14 @@ import_commit (
 	}
 
 	gamescope::OwningRc<CVulkanTexture> pOwnedTexture = vulkan_create_texture_from_wlr_buffer( buf, std::move( pBackendFb ) );
+	if ( pOwnedTexture == nullptr )
+	{
+		// Import can legitimately fail (unsupported modifier, no legal memory
+		// type for the FD). A null texture must never reach the paint path;
+		// drop the commit like the caller's other discard cases.
+		xwm_log.errorf( "import_commit: buffer import failed (%dx%d), dropping commit", buf->width, buf->height );
+		return nullptr;
+	}
 	commit->vulkanTex = pOwnedTexture;
 
 	s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
