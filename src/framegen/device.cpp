@@ -89,6 +89,16 @@ uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf
 	return nextSeqNo;
 }
 
+void CVulkanDevice::addFramegenDependency( CVulkanCmdBuffer *pCmdBuffer, uint64_t ulFramegenSeqNo )
+{
+	// Shared-queue submission order supplies execution ordering; the internal
+	// image flush barrier supplies visibility, so no timeline wait is needed.
+	if ( !m_bHasFramegenQueue )
+		return;
+
+	pCmdBuffer->AddDependency( m_framegenTimeline, ulFramegenSeqNo );
+}
+
 bool CVulkanDevice::hasCompletedFramegen( uint64_t sequence )
 {
 	if ( !m_bHasFramegenQueue )

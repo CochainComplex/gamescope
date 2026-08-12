@@ -2523,6 +2523,9 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 
 		const VkAccessFlags write_bits = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
 		const VkAccessFlags read_bits = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+		// Same-queue submission order supplies execution order, not memory
+		// visibility, so dirty internal images need a destination scope at flush.
+		const bool bInternalFlush = flush && state.dirty && !isExport && !isPresent;
 
 		if (image->queueFamily == VK_QUEUE_FAMILY_IGNORED)
 			image->queueFamily = m_queueFamily;
@@ -2531,7 +2534,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		{
 			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 			.srcAccessMask = state.dirty ? write_bits : 0u,
-			.dstAccessMask = flush ? 0u : read_bits | write_bits,
+			.dstAccessMask = !flush || bInternalFlush ? read_bits | write_bits : 0u,
 			.oldLayout = state.discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
 			.newLayout = isPresent ? GetBackend()->GetPresentLayout() : VK_IMAGE_LAYOUT_GENERAL,
 			.srcQueueFamilyIndex = isExport ? image->queueFamily : state.needsImport ? externalQueue : image->queueFamily,
@@ -5126,7 +5129,7 @@ static bool framegen_refill_idle();
 static bool framegen_jit_submit( uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps );
 static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps );
 static bool framegen_format_supports_sampled_storage( uint32_t drmFormat );
-static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, const struct FrameInfo_t *pPresentFrameInfo );
+static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo );
 
 static const char *framegen_color_record_dir()
 {
@@ -5660,11 +5663,12 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 
 	g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
 
-	// The readiness check above is the synchronization proof for generated
-	// images. Do not follow it with vkWaitSemaphores on the presentation path:
-	// even an already-signalled host wait is an avoidable driver round trip at
-	// every generated flip. Framegen uses push constants, so it owns no slice of
-	// the shared upload arena that would need recycling here.
+	// The readiness check above is only the non-blocking deadline gate. Do not
+	// follow it with vkWaitSemaphores on the presentation path: the base-layer
+	// composite carries the device-side dependency below, and even an
+	// already-signalled host wait is an avoidable driver round trip at every
+	// generated flip. Framegen uses push constants, so it owns no slice of the
+	// shared upload arena that would need recycling here.
 
 	// Base-layer mode (#02): the pending slot holds a pre-upscale BASE frame;
 	// composite it through the real pipeline with the live layer stack (fresh
@@ -5672,7 +5676,7 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 	// the scanout-ready generated output directly.
 	gamescope::Rc<CVulkanTexture> pResult = front.tex;
 	if ( g_framegenHistory.bBaseLayer )
-		pResult = framegen_base_present_composite( front.tex, pPresentFrameInfo );
+		pResult = framegen_base_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
 
 	if ( pResult != nullptr )
 	{
@@ -5949,7 +5953,7 @@ static bool framegen_ensure_present_pool()
 // composite; the vblank pacing already budgets for compositing
 // (UpdateWasCompositing), and pOutputOverride both keeps this composite out of
 // framegen_record_real_frame (no history poisoning) and off the output ring.
-static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, const struct FrameInfo_t *pPresentFrameInfo )
+static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo )
 {
 	if ( pPresentFrameInfo == nullptr || pPresentFrameInfo->layerCount < 1
 		|| pPresentFrameInfo->layers[ 0 ].tex == nullptr
@@ -5996,7 +6000,9 @@ static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope:
 	FrameInfo_t generatedFrameInfo = *pPresentFrameInfo;
 	generatedFrameInfo.layers[ 0 ].tex = pGeneratedBase;
 
-	std::optional<uint64_t> oSeqNo = vulkan_composite( &generatedFrameInfo, nullptr, false, pTarget, false );
+	auto pCmdBuffer = g_device.commandBuffer();
+	g_device.addFramegenDependency( pCmdBuffer.get(), ulFramegenSeqNo );
+	std::optional<uint64_t> oSeqNo = vulkan_composite( &generatedFrameInfo, nullptr, false, pTarget, false, std::move( pCmdBuffer ) );
 	if ( !oSeqNo )
 		return nullptr;
 	// Same wait the real composition path performs before its flip: the commit

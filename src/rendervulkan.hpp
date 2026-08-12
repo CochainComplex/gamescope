@@ -909,6 +909,7 @@ public:
 	// available they transparently forward to the shared composite path.
 	bool hasFramegenQueue() const { return m_bHasFramegenQueue; }
 	uint64_t submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot = -1, uint32_t nLadderRung = 0, uint32_t nGeneratedCount = 0 );
+	void addFramegenDependency( CVulkanCmdBuffer *pCmdBuffer, uint64_t ulFramegenSeqNo );
 	bool hasCompletedFramegen( uint64_t sequence );
 	void waitFramegen( uint64_t sequence );
 	void framegenGarbageCollect();
