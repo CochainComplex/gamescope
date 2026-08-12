@@ -22,6 +22,14 @@ inline constexpr uint64_t k_uDeadlinePercent = 85u;
 inline constexpr uint32_t k_uDeadlineMinSamples = 3u;
 inline constexpr uint32_t k_uDeadlineHoldFrames = 4u;
 
+// One-slot deadline pacing measures the two materially different causal
+// submission shapes independently.
+enum class DeadlineWorkClass_t : uint8_t
+{
+	FullPreparationAndWarp,
+	CachedWarp,
+};
+
 // JIT only needs one missed refresh interval. VRR hybrid needs two panel-safe
 // halves plus jitter margin before inserting its midpoint flip.
 inline constexpr uint64_t k_uJitKeepUpPercent = 110u;

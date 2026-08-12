@@ -134,6 +134,9 @@ std::string *g_pVROverlayKey = nullptr;
 bool g_bWasPartialComposite = false;
 
 bool ShouldDrawCursor();
+// Step 3 generalizes the former JIT-only repeat hook without expanding the
+// public renderer header surface during the temporary classic A/B window.
+void vulkan_framegen_causal_tick();
 
 std::atomic<uint32_t> g_unCurrentVRSceneAppId;
 std::atomic<uint64_t> g_FocusedVROverlayMouse;
@@ -9316,15 +9319,15 @@ steamcompmgr_main(int argc, char **argv)
 				xwm_log.infof( "framegen: vblank slot=%s", pszSlotType );
 			}
 
-			// JIT display-clock pacing (#06): this vblank is going to a
+			// Absolute-deadline causal pacing: this vblank is going to a
 			// hardware repeat while framegen is active — no real content and
 			// nothing pending (a stall, a too-slow discard, or a mispredicted
-			// keep-up). Ask the JIT planner for the earliest slot that can still be
+			// keep-up). Ask the causal planner for the earliest slot that can still be
 			// prepared. A GPU overrun or the bounded forward-prediction cap may
-			// still require more than one honest repeat. No-op unless
-			// GAMESCOPE_FRAMEGEN_JIT is set and a dedicated framegen queue exists.
+			// still require more than one honest repeat. The planner itself gates
+			// dedicated fixed-refresh causal mode versus the untouched policies.
 			if ( vblank && !bShouldPaint && vulkan_framegen_is_enabled() )
-				vulkan_framegen_jit_tick();
+				vulkan_framegen_causal_tick();
 
 			if ( bShouldPaint )
 			{

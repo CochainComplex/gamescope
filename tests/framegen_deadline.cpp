@@ -146,6 +146,68 @@ TEST_CASE( "flip feedback corrects future causal anchors", "[framegen][deadline]
 	CHECK( future.phase == Approx( 201.0 / 2'000.0 ) );
 }
 
+TEST_CASE( "large anchor correction discards only matching provisional slots", "[framegen][deadline]" )
+{
+	const RealAnchorState_t anchor = {
+		.realFrameId = 42u,
+		.provisionalTargetNs = 10'000u,
+		.epoch = 1u,
+	};
+	const AnchorCorrection_t correction = apply_flip_feedback(
+		anchor, 42u, 18'334u, 300u );
+	REQUIRE( correction.discardProvisional );
+	CHECK( discard_pending_provisional_slot( correction, 42u, true ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, false ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 41u, true ) );
+
+	const AnchorCorrection_t small = apply_flip_feedback(
+		anchor, 42u, 10'300u, 300u );
+	CHECK_FALSE( discard_pending_provisional_slot( small, 42u, true ) );
+}
+
+TEST_CASE( "one-vblank late provisional anchor changes the generated phase", "[framegen][deadline]" )
+{
+	constexpr uint64_t interval = 8'334'000u;
+	const RealAnchorState_t provisional = {
+		.realFrameId = 7u,
+		.sourceReadyNs = 100'000'000u,
+		.provisionalTargetNs = 108'334'000u,
+		.epoch = 5u,
+	};
+	const DisplayGrid_t grid = {
+		.D0 = 116'668'000u,
+		.W0 = 116'000'000u,
+		.T = interval,
+	};
+	const CadencePredictorState cadence = trained_cadence( 4u * interval );
+	const CausalSlotPlan_t before = plan_next_causal_slot(
+		grid, provisional, cadence,
+		dedicated_backup_options( 109'000'000u, 5u ) );
+	REQUIRE( before.admit );
+	CHECK( before.phase == Approx( 0.25 ) );
+
+	const AnchorCorrection_t correction = apply_flip_feedback(
+		provisional, 7u, 100'000'000u, interval / 32u );
+	REQUIRE( correction.discardProvisional );
+	const CausalSlotPlan_t after = plan_next_causal_slot(
+		grid, correction.anchor, cadence,
+		dedicated_backup_options( 109'000'000u, 5u ) );
+	REQUIRE( after.admit );
+	CHECK( after.targetNs == before.targetNs );
+	CHECK( after.phase == Approx( 0.5 ) );
+}
+
+TEST_CASE( "causal deadline costs are keyed by work class", "[framegen][deadline]" )
+{
+	const uint32_t full = deadline_work_class_cost_key(
+		DeadlineWorkClass_t::FullPreparationAndWarp );
+	const uint32_t cached = deadline_work_class_cost_key(
+		DeadlineWorkClass_t::CachedWarp );
+	CHECK( full == 1u );
+	CHECK( cached == 2u );
+	CHECK( full != cached );
+}
+
 TEST_CASE( "missed wake and refresh epochs reject causal slots", "[framegen][deadline]" )
 {
 	const DisplayGrid_t grid = { .D0 = 1'000u, .W0 = 900u, .T = 100u };

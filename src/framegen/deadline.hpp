@@ -14,6 +14,15 @@
 namespace gamescope::framegen
 {
 
+// The Step 3 device timestamp table is shared with the classic batch path for
+// A/B, so use two valid single-slot keys while keeping that storage detail out
+// of the shared work-class type.
+[[nodiscard]] constexpr uint32_t deadline_work_class_cost_key(
+	DeadlineWorkClass_t workClass )
+{
+	return workClass == DeadlineWorkClass_t::FullPreparationAndWarp ? 1u : 2u;
+}
+
 struct DisplayGrid_t
 {
 	uint64_t D0 = 0;
@@ -195,6 +204,19 @@ struct AnchorCorrection_t
 		&& errorNs > arrivalGuardNs;
 	result.anchor.correctedFlipNs = actualFlipNs;
 	return result;
+}
+
+// Pending entries retain the anchor identity and whether their pixels were
+// produced from its provisional display time. A large first correction only
+// invalidates those exact pixels; unrelated/newer anchors and already-corrected
+// work stay untouched.
+[[nodiscard]] constexpr bool discard_pending_provisional_slot(
+	const AnchorCorrection_t &correction, uint64_t slotRealFrameId,
+	bool slotProvisional )
+{
+	return correction.matched && correction.discardProvisional
+		&& slotProvisional
+		&& slotRealFrameId == correction.anchor.realFrameId;
 }
 
 struct BidirEpoch_t
