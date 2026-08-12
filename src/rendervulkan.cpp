@@ -768,9 +768,16 @@ bool CVulkanDevice::createDevice()
 		VkPhysicalDeviceVulkan12Features vulkan12Features = {
 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
 		};
+		VkPhysicalDeviceVulkan13Features vulkan13Features = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+			.pNext = &vulkan12Features,
+		};
+		VkPhysicalDeviceProperties deviceProperties;
+		vk.GetPhysicalDeviceProperties( physDev(), &deviceProperties );
+		const bool bVulkan13 = deviceProperties.apiVersion >= VK_API_VERSION_1_3;
 		VkPhysicalDeviceFeatures2 features2 = {
 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-			.pNext = &vulkan12Features,
+			.pNext = bVulkan13 ? static_cast<void *>( &vulkan13Features ) : &vulkan12Features,
 		};
 		vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
 
@@ -789,6 +796,7 @@ bool CVulkanDevice::createDevice()
 		m_bSupportsShaderFloat16 = vulkan12Features.shaderFloat16;
 		m_bSupportsFp16 = m_bSupportsShaderFloat16 && features2.features.shaderInt16;
 		m_bSupportsStorageImageExtendedFormats = features2.features.shaderStorageImageExtendedFormats;
+		m_bSupportsSync2 = bVulkan13 && vulkan13Features.synchronization2;
 
 		// Generic compute outputs are bound to the backend-selected image format
 		// (8/10/16-bit integer or float). Declaring one fixed SPIR-V image format
@@ -911,6 +919,7 @@ bool CVulkanDevice::createDevice()
 #if 0
 		.pNext = &maintenance5,
 #endif
+		.synchronization2 = m_bSupportsSync2,
 		.dynamicRendering = VK_TRUE,
 	};
 
@@ -2068,6 +2077,8 @@ CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuf
 	m_textureRefs.reserve( k_uInitialTrackedTextureCapacity );
 	m_textureState.reserve( k_uInitialTrackedTextureCapacity );
 	m_imageBarriers.reserve( VKR_SAMPLER_SLOTS + VKR_TARGET_SLOTS );
+	m_imageUses.reserve( VKR_SAMPLER_SLOTS + VKR_TARGET_SLOTS );
+	m_imageBarriers2.reserve( VKR_SAMPLER_SLOTS + VKR_TARGET_SLOTS );
 }
 
 CVulkanCmdBuffer::~CVulkanCmdBuffer()
@@ -2215,16 +2226,8 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		m_uFramegenDispatchCount++;
 	}
 
-	for (auto src : m_boundTextures)
-	{
-		if (src)
-			prepareSrcImage(src);
-	}
 	assert(m_target != nullptr);
-	prepareDestImage(m_target);
-	if (m_target2)
-		prepareDestImage(m_target2);
-	insertBarrier();
+	emitPreDispatchBarriers();
 
 	VkDescriptorSet descriptorSet = m_device->descriptorSet( m_bFramegen );
 
@@ -2390,7 +2393,17 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 	assert(src->height() == dst->height());
 	prepareSrcImage(src.get());
 	prepareDestImage(dst.get());
-	insertBarrier();
+	if ( !m_device->supportsSync2() )
+	{
+		insertBarrier();
+	}
+	else
+	{
+		m_imageUses.clear();
+		addImageUse( src.get(), VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, false );
+		addImageUse( dst.get(), VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, true );
+		emitSync2Barriers();
+	}
 
 	VkImageCopy region = {
 		.srcSubresource = {
@@ -2418,7 +2431,16 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 void CVulkanCmdBuffer::copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst)
 {
 	prepareDestImage(dst.get());
-	insertBarrier();
+	if ( !m_device->supportsSync2() )
+	{
+		insertBarrier();
+	}
+	else
+	{
+		m_imageUses.clear();
+		addImageUse( dst.get(), VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, true );
+		emitSync2Barriers();
+	}
 	VkBufferImageCopy region = {
 		.bufferOffset = offset,
 		.bufferRowLength = stride,
@@ -2438,6 +2460,182 @@ void CVulkanCmdBuffer::copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, u
 	markDirty(dst.get());
 
 	m_textureRefs.emplace_back(std::move(dst));
+}
+
+void CVulkanCmdBuffer::addImageUse( CVulkanTexture *image, VkPipelineStageFlags2 stage, VkAccessFlags2 access, bool bWrite )
+{
+	for ( ImageUse &use : m_imageUses )
+	{
+		if ( use.pTexture != image )
+			continue;
+
+		use.stage |= stage;
+		use.access |= access;
+		use.bWrite |= bWrite;
+		return;
+	}
+
+	m_imageUses.push_back( ImageUse{
+		.pTexture = image,
+		.stage = stage,
+		.access = access,
+		.bWrite = bWrite,
+	} );
+}
+
+void CVulkanCmdBuffer::emitExternalAcquireBarriers()
+{
+	m_imageBarriers.clear();
+
+	const uint32_t externalQueue = m_device->supportsModifiers() ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL_KHR;
+	const VkImageSubresourceRange subResRange = {
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.levelCount = 1,
+		.layerCount = 1,
+	};
+	const VkAccessFlags writeBits = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+	const VkAccessFlags readBits = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+
+	for ( TrackedTextureState &tracked : m_textureState )
+	{
+		CVulkanTexture *image = tracked.pTexture;
+		TextureState &state = tracked.state;
+		if ( !state.needsImport )
+			continue;
+
+		if ( image->queueFamily == VK_QUEUE_FAMILY_IGNORED )
+			image->queueFamily = m_queueFamily;
+
+		m_imageBarriers.push_back( VkImageMemoryBarrier{
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcAccessMask = state.dirty ? writeBits : 0u,
+			.dstAccessMask = readBits | writeBits,
+			.oldLayout = state.discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+			.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.srcQueueFamilyIndex = externalQueue,
+			.dstQueueFamilyIndex = m_queueFamily,
+			.image = image->vkImage(),
+			.subresourceRange = subResRange,
+		} );
+
+		// Preserve the synchronization1 import acquire exactly; synchronization2
+		// below only tracks uses recorded after ownership has reached this queue.
+		state.discarded = false;
+		state.dirty = false;
+		state.needsImport = false;
+	}
+
+	if ( !m_imageBarriers.empty() )
+	{
+		m_device->vk.CmdPipelineBarrier( m_cmdBuffer,
+			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			0, 0, nullptr, 0, nullptr, m_imageBarriers.size(), m_imageBarriers.data() );
+	}
+}
+
+void CVulkanCmdBuffer::emitSync2Barriers()
+{
+	emitExternalAcquireBarriers();
+	m_imageBarriers2.clear();
+
+	const VkImageSubresourceRange subResRange = {
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.levelCount = 1,
+		.layerCount = 1,
+	};
+
+	for ( const ImageUse &use : m_imageUses )
+	{
+		TextureState *state = findTextureState( use.pTexture );
+		assert( state != nullptr );
+		if ( use.pTexture->queueFamily == VK_QUEUE_FAMILY_IGNORED )
+			use.pTexture->queueFamily = m_queueFamily;
+
+		const bool bHasPriorUse = state->lastAccess != 0;
+		const bool bWriteHazard = bHasPriorUse && state->bLastWasWrite;
+		const bool bReadToWriteHazard = bHasPriorUse && !state->bLastWasWrite && use.bWrite;
+		if ( state->discarded || bWriteHazard || bReadToWriteHazard )
+		{
+			m_imageBarriers2.push_back( VkImageMemoryBarrier2{
+				.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+				.srcStageMask = state->discarded ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : state->lastStage,
+				.srcAccessMask = !state->discarded && bWriteHazard ? state->lastAccess : 0u,
+				.dstStageMask = use.stage,
+				.dstAccessMask = use.access,
+				.oldLayout = state->discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+				.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.image = use.pTexture->vkImage(),
+				.subresourceRange = subResRange,
+			} );
+		}
+	}
+
+	if ( !m_imageBarriers2.empty() )
+	{
+		const VkDependencyInfo dependencyInfo = {
+			.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+			.imageMemoryBarrierCount = static_cast<uint32_t>( m_imageBarriers2.size() ),
+			.pImageMemoryBarriers = m_imageBarriers2.data(),
+		};
+		m_device->vk.CmdPipelineBarrier2( m_cmdBuffer, &dependencyInfo );
+	}
+
+	for ( const ImageUse &use : m_imageUses )
+	{
+		TextureState *state = findTextureState( use.pTexture );
+		assert( state != nullptr );
+		const bool bHasPriorUse = state->lastAccess != 0;
+		// A clean first use needs no barrier: submission order plus the producing
+		// command buffer's 3d951b7 flush barrier supplies cross-buffer visibility.
+		// Keep consecutive read stages accumulated so a later WAR waits on every
+		// outstanding reader even though read -> read itself needs no barrier.
+		if ( bHasPriorUse && !state->bLastWasWrite && !use.bWrite )
+		{
+			state->lastStage |= use.stage;
+			state->lastAccess |= use.access;
+		}
+		else
+		{
+			state->lastStage = use.stage;
+			state->lastAccess = use.access;
+		}
+		state->bLastWasWrite = use.bWrite;
+		state->discarded = false;
+		// Keep dirty latched: insertBarrier(true) must publish every image written
+		// in this buffer, including writes already consumed by a narrower RAW here.
+	}
+}
+
+void CVulkanCmdBuffer::emitPreDispatchBarriers()
+{
+	for ( CVulkanTexture *src : m_boundTextures )
+	{
+		if ( src )
+			prepareSrcImage( src );
+	}
+	prepareDestImage( m_target );
+	if ( m_target2 )
+		prepareDestImage( m_target2 );
+
+	if ( !m_device->supportsSync2() )
+	{
+		insertBarrier();
+		return;
+	}
+
+	m_imageUses.clear();
+	for ( CVulkanTexture *src : m_boundTextures )
+	{
+		if ( src )
+			addImageUse( src, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, false );
+	}
+	const VkAccessFlags2 storageAccess = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+	addImageUse( m_target, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, storageAccess, true );
+	if ( m_target2 )
+		addImageUse( m_target2, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, storageAccess, true );
+	emitSync2Barriers();
 }
 
 void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
@@ -7042,8 +7240,8 @@ static void framegen_motion_bind_sampler( CVulkanCmdBuffer *pCmdBuffer, uint32_t
 // already do, at zero added per-pixel cost. The copy at the end lands the raw
 // counters in the host-mapped readback for the CPU-side threshold
 // calibration. The command buffer's barrier tracking orders all of it
-// (accumulate -> apply is a WAR on the field, covered by the execution
-// dependency of the stats image's own barrier). Field-res work plus a 384-byte
+// (accumulate -> apply has a stats WAW plus an execution-only WAR on the
+// field). Field-res work plus a 384-byte
 // copy: still sub-kilobyte and intended to remain in the microsecond range.
 static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH )
 {
