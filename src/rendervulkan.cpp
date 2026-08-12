@@ -43,6 +43,7 @@
 #include "Utils/Process.h"
 #include "framegen/adaptation.hpp"
 #include "framegen/atomic_file.hpp"
+#include "framegen/deadline.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
@@ -5133,6 +5134,32 @@ struct DisplayFeedbackMailbox_t
 };
 static DisplayFeedbackMailbox_t g_displayFeedbackMailbox;
 
+struct FramegenShadowDecision_t
+{
+	gamescope::framegen::CausalSlotPlan_t plan;
+	uint64_t ulRealFrameId = 0;
+	uint32_t nClassicGap = 0;
+	uint32_t nClassicSlot = 0;
+	bool bDiscardedByFeedback = false;
+};
+
+// Step 2 is deliberately one-way: this state reads live measurements, but no
+// live pacing, submission, or presentation path reads it. Keeping the ring
+// fixed-size also makes the shadow path allocation-free.
+static constexpr size_t k_nFramegenShadowDecisionCapacity = 8;
+struct FramegenDeadlineShadowState_t
+{
+	gamescope::framegen::RealAnchorState_t anchor;
+	std::array<FramegenShadowDecision_t, k_nFramegenShadowDecisionCapacity> decisions;
+	size_t nNextDecision = 0;
+	size_t nDecisionCount = 0;
+	uint64_t ulGridEpoch = 0;
+	uint64_t ulGridIntervalNs = 0;
+	bool bSourceProvenanceInitialized = false;
+	bool bSourceTimestampsReliable = false;
+};
+static FramegenDeadlineShadowState_t g_framegenDeadlineShadow;
+
 static uint64_t framegen_next_present_slot_id()
 {
 	return ++g_framegenPresentState.ulLastSlotId;
@@ -5266,6 +5293,32 @@ void vulkan_framegen_drain_present_feedback()
 				- (long double)feedback.tag.ulTargetFlipNs ) / 1.0e6;
 			vk_log.infof( "framegen: anchor error real=%" PRIu64 " err=%+.3fms",
 				feedback.tag.ulRealFrameId, flErrorMs );
+		}
+
+		// Consume Step 1 feedback into the shadow anchor only. In particular,
+		// g_framegenHistory and the classic/JIT/bidir pending queues are untouched.
+		const uint64_t ulArrivalGuardNs = std::max(
+			gamescope::framegen::k_ulCadenceArrivalGuardMinNs,
+			g_framegenDeadlineShadow.ulGridIntervalNs
+				/ gamescope::framegen::k_uCadenceArrivalGuardDivisor );
+		const gamescope::framegen::AnchorCorrection_t correction =
+			gamescope::framegen::apply_flip_feedback(
+				g_framegenDeadlineShadow.anchor,
+				feedback.tag.ulRealFrameId,
+				feedback.ulActualFlipNs,
+				ulArrivalGuardNs );
+		if ( correction.matched )
+		{
+			g_framegenDeadlineShadow.anchor = correction.anchor;
+			if ( correction.discardProvisional )
+			{
+				for ( FramegenShadowDecision_t &decision : g_framegenDeadlineShadow.decisions )
+				{
+					if ( decision.ulRealFrameId == feedback.tag.ulRealFrameId
+						&& decision.plan.provisional )
+						decision.bDiscardedByFeedback = true;
+				}
+			}
 		}
 	}
 }
@@ -8360,6 +8413,77 @@ static uint64_t framegen_display_interval_ns()
 		? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
 }
 
+static void framegen_shadow_plan_real( uint64_t ulRealFrameId,
+	uint64_t ulSourceReadyNs, uint64_t ulProvisionalTargetNs,
+	const gamescope::framegen::CadencePredictorState &cadence,
+	uint64_t ulNowNs, uint64_t ulVblankIntervalNs,
+	bool bSourceTimestampsReliable, bool bDedicatedQueue,
+	bool bSharedQueueProvenEmpty, uint32_t nClassicGap )
+{
+	FramegenDeadlineShadowState_t &shadow = g_framegenDeadlineShadow;
+	const bool bGridChanged = shadow.ulGridEpoch == 0u
+		|| shadow.ulGridIntervalNs != ulVblankIntervalNs;
+	const bool bProvenanceChanged = shadow.bSourceProvenanceInitialized
+		&& shadow.bSourceTimestampsReliable != bSourceTimestampsReliable;
+	if ( bGridChanged || bProvenanceChanged )
+	{
+		shadow.ulGridEpoch++;
+		shadow.nNextDecision = 0;
+		shadow.nDecisionCount = 0;
+		shadow.decisions = {};
+	}
+	shadow.ulGridIntervalNs = ulVblankIntervalNs;
+	shadow.bSourceProvenanceInitialized = true;
+	shadow.bSourceTimestampsReliable = bSourceTimestampsReliable;
+
+	const gamescope::VBlankScheduleTime schedule =
+		GetVBlankTimer().CalcNextWakeupTime( true );
+	const gamescope::framegen::DisplayGrid_t grid = {
+		.D0 = schedule.ulTargetVBlank,
+		.W0 = schedule.ulScheduledWakeupPoint,
+		.T = ulVblankIntervalNs,
+	};
+	shadow.anchor = {
+		.realFrameId = ulRealFrameId,
+		.sourceReadyNs = ulSourceReadyNs,
+		.provisionalTargetNs = ulProvisionalTargetNs,
+		.correctedFlipNs = std::nullopt,
+		.epoch = shadow.ulGridEpoch,
+	};
+	const gamescope::framegen::CausalSlotPlan_t plan =
+		gamescope::framegen::plan_next_causal_slot( grid, shadow.anchor, cadence, {
+			.nowNs = ulNowNs,
+			.gridEpoch = shadow.ulGridEpoch,
+			.configuredStrength = g_flFramegenStrength,
+			.forwardStrengthCap = k_flFramegenMaxForwardStrength,
+			.sourceTimestampsReliable = bSourceTimestampsReliable,
+			.dedicatedQueue = bDedicatedQueue,
+			.sharedQueueProvenEmpty = bSharedQueueProvenEmpty,
+		} );
+
+	shadow.decisions[ shadow.nNextDecision ] = {
+		.plan = plan,
+		.ulRealFrameId = ulRealFrameId,
+		.nClassicGap = nClassicGap,
+		.nClassicSlot = nClassicGap > 1u ? 1u : 0u,
+	};
+	shadow.nNextDecision = ( shadow.nNextDecision + 1u )
+		% k_nFramegenShadowDecisionCapacity;
+	shadow.nDecisionCount = std::min(
+		shadow.nDecisionCount + 1u, k_nFramegenShadowDecisionCapacity );
+
+	static uint64_t s_uShadowDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uShadowDebugLogCounter ) )
+	{
+		const double flTargetFromNowMs = static_cast<double>(
+			static_cast<long double>( plan.targetNs )
+			- static_cast<long double>( ulNowNs ) ) / 1.0e6;
+		vk_log.infof( "framegen: shadow slot target=%+.2fms phase=%.2f admit=%d vs classic gap=%u k=%u",
+			flTargetFromNowMs, plan.phase, plan.admit ? 1 : 0,
+			nClassicGap, nClassicGap > 1u ? 1u : 0u );
+	}
+}
+
 static uint64_t framegen_fixed_slot_target_ns( uint32_t nSlotIndex )
 {
 	if ( g_framegenHistory.ulCurrentRealVblankNs == 0 )
@@ -9683,6 +9807,29 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	const bool bGpuHasHeadroom = g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo );
 	const bool bGeneratable = bLeavesEmptyVblank && bGpuHasHeadroom;
 	const bool bCanSpeculate = g_device.hasFramegenQueue() && bGpuHasHeadroom && ulPrevRealFrameTimeNs != 0;
+	const uint32_t nShadowConfidence = g_framegenHistory.valid
+		? gamescope::framegen::update_cadence_confidence(
+			g_framegenHistory.nStableFrames, bGeneratable )
+		: g_framegenHistory.nStableFrames;
+	const bool bShadowSharedQueueProvenEmpty = g_framegenHistory.valid
+		&& gamescope::framegen::reactive_generation_ready(
+			bGeneratable, nShadowConfidence );
+	const uint32_t nShadowClassicGap = ulPrevRealFrameTimeNs != 0u
+		&& now > ulPrevRealFrameTimeNs
+		? gamescope::framegen::measured_gap_vblanks(
+			now - ulPrevRealFrameTimeNs, ulVblankIntervalNs )
+		: 0u;
+	framegen_shadow_plan_real(
+		g_framegenPresentState.ulCurrentRealFrameId,
+		bUseSourceCadence ? ulSourceReadyTimeNs : 0u,
+		g_framegenPresentState.pendingTag.ulTargetFlipNs,
+		g_framegenHistory.cadence,
+		now,
+		ulVblankIntervalNs,
+		bUseSourceCadence,
+		g_device.hasFramegenQueue(),
+		bShadowSharedQueueProvenEmpty,
+		nShadowClassicGap );
 
 	// History shift, on every kept real frame (even non-generatable ones) so
 	// the two most recent reals stay fresh and a slowdown resumes generation

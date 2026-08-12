@@ -22,3 +22,12 @@ test_framegen = executable(
 	cpp_args: gamescope_cpp_args,
 )
 test('framegen', test_framegen)
+
+test_framegen_deadline = executable(
+	'test_framegen_deadline',
+	['framegen_deadline.cpp'],
+	include_directories: [srcdir],
+	dependencies: [catch2_dep],
+	cpp_args: gamescope_cpp_args,
+)
+test('framegen_deadline', test_framegen_deadline)
