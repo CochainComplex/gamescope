@@ -13,10 +13,11 @@ namespace gamescope::framegen
 {
 
 inline constexpr uint32_t k_uFramegenHudMaxLines = 6u;
-inline constexpr uint32_t k_uFramegenHudMaxColumns = 64u;
+inline constexpr uint32_t k_uFramegenHudMaxColumns = 72u;
 inline constexpr uint32_t k_uFramegenHudPackedTextWords =
 	( k_uFramegenHudMaxLines * k_uFramegenHudMaxColumns ) / 4u;
 inline constexpr uint32_t k_uFramegenHudDeviceNameColumns = 19u;
+inline constexpr size_t k_nFramegenHudSparklineSamples = 12u;
 
 [[nodiscard]] constexpr uint64_t font8x8_glyph(
 	uint8_t row0, uint8_t row1, uint8_t row2, uint8_t row3,
@@ -36,7 +37,16 @@ inline constexpr uint32_t k_uFramegenHudDeviceNameColumns = 19u;
 // Public domain; source rows are stored bottom-to-top and flipped by the HUD
 // shader. https://github.com/dhepper/font8x8/blob/master/font8x8_basic.h
 inline constexpr uint64_t k_uFramegenHudFont8x8[128] = {
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0,
+	font8x8_glyph( 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 ), // spark 1/8
+	font8x8_glyph( 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 ), // spark 2/8
+	font8x8_glyph( 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00 ), // spark 3/8
+	font8x8_glyph( 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00 ), // spark 4/8
+	font8x8_glyph( 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00 ), // spark 5/8
+	font8x8_glyph( 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00 ), // spark 6/8
+	font8x8_glyph( 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 ), // spark 7/8
+	font8x8_glyph( 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF ), // spark 8/8
+	0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, // U+0020 space
 	font8x8_glyph( 0x00, 0x18, 0x00, 0x18, 0x18, 0x3C, 0x3C, 0x18 ), // !
@@ -137,6 +147,25 @@ inline constexpr uint64_t k_uFramegenHudFont8x8[128] = {
 };
 static_assert( std::size( k_uFramegenHudFont8x8 ) == 128u );
 
+using FramegenHudSparkline_t =
+	std::array<char, k_nFramegenHudSparklineSamples + 1u>;
+
+[[nodiscard]] inline FramegenHudSparkline_t framegen_hud_sparkline(
+	const std::array<double, k_nFramegenHudSparklineSamples> &values,
+	double scale )
+{
+	FramegenHudSparkline_t result = {};
+	for ( size_t i = 0u; i < values.size(); i++ )
+	{
+		const double bounded = scale > 0.0 && values[i] > 0.0
+			? std::min( values[i], scale ) : 0.0;
+		const uint32_t level = scale > 0.0
+			? static_cast<uint32_t>( bounded * 7.0 / scale + 0.5 ) : 0u;
+		result[i] = static_cast<char>( 0x01u + std::min( level, 7u ) );
+	}
+	return result;
+}
+
 struct FramegenHudSnapshot_t
 {
 	const char *version = "unknown";
@@ -162,6 +191,8 @@ struct FramegenHudSnapshot_t
 	int32_t biasTenthsMs = 0;
 	uint32_t deadlineHitPercent = 0u;
 	uint32_t pacingSdTenthsMs = 0u;
+	std::array<double, k_nFramegenHudSparklineSamples> deadlineHitHistory = {};
+	std::array<double, k_nFramegenHudSparklineSamples> pacingSdMsHistory = {};
 	uint64_t resets = 0u;
 	uint64_t ringResets = 0u;
 	uint64_t netTrainedSteps = 0u;
@@ -251,33 +282,22 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		999u, snapshot.generated / 5u ) );
 	const uint32_t repeatRate = static_cast<uint32_t>( std::min<uint64_t>(
 		999u, snapshot.repeats / 5u ) );
-	const uint32_t screenRate = static_cast<uint32_t>( std::min<uint64_t>(
+	const uint32_t fillRate = static_cast<uint32_t>( std::min<uint64_t>(
 		999u, ( snapshot.real + snapshot.delayedReal + snapshot.generated ) / 5u ) );
 
 	char line[128] = {};
-	const int headerLength = std::snprintf( line, sizeof( line ),
-		"gameslop %s | %s x%u quality:%s | %uHz %s",
+	std::snprintf( line, sizeof( line ),
+		"%-8s %-21.21s%s x%u . %s . %uHz %s", "gameslop",
 		snapshot.version != nullptr ? snapshot.version : "unknown",
 		mode_name( snapshot.mode ), std::clamp( snapshot.multiplier, 2u, 4u ),
 		quality_name( snapshot.quality ), refreshHz,
 		snapshot.vrrActive ? "VRR" : "fixed" );
-	if ( headerLength < 0
-		|| static_cast<uint32_t>( headerLength ) > k_uFramegenHudMaxColumns )
-	{
-		// Quality tiers affect only motion mode. Keeping the full descriptive
-		// mode name is more useful than truncating an irrelevant quality label.
-		std::snprintf( line, sizeof( line ),
-			"gameslop %s | %s x%u | %uHz %s",
-			snapshot.version != nullptr ? snapshot.version : "unknown",
-			mode_name( snapshot.mode ), std::clamp( snapshot.multiplier, 2u, 4u ),
-			refreshHz, snapshot.vrrActive ? "VRR" : "fixed" );
-	}
 	framegen_hud_add_line( result, line );
 
 	char deviceName[k_uFramegenHudDeviceNameColumns + 1u] = {};
 	framegen_hud_trim_device_name( deviceName, sizeof( deviceName ), snapshot.deviceName );
 	std::snprintf( line, sizeof( line ),
-		"present: %s | client buffers: %s", deviceName,
+		"%-8s %-21sbuffers %s", "present", deviceName,
 		snapshot.clientBuffersStaged ? "staged(cross-GPU)" : "local" );
 	framegen_hud_add_line( result, line );
 
@@ -287,7 +307,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		? ( snapshot.netOnline ? "online" : "blob" )
 		: snapshot.netRequested ? "requested(OFF)" : "off";
 	std::snprintf( line, sizeof( line ),
-		"bidir:%s  base:%s  net:%s  adapt:%s",
+		"%-8s bidir:%s  base:%s  net:%s  adapt:%s", "modes",
 		bidirState, snapshot.baseLayer ? "on" : "off", netState,
 		snapshot.adapt ? "on" : "off" );
 	if ( snapshot.vrrRequested && !snapshot.vrrActive )
@@ -303,46 +323,33 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 			// Conflicting requests are the information to preserve when all four
 			// ordinary state fields and the VRR fallback cannot fit together.
 			std::snprintf( line, sizeof( line ),
-				"bidir:%s  net:%s  vrr:requested(off)", bidirState, netState );
+				"%-8s bidir:%s  net:%s  vrr:requested(off)",
+				"modes", bidirState, netState );
 		}
 	}
 	framegen_hud_add_line( result, line );
 
 	std::snprintf( line, sizeof( line ),
-		"game %ufps -> screen %u/%u slots (gen %u, repeat %u)",
-		gameRate, screenRate, refreshHz, generatedRate, repeatRate );
+		"%-8s game %ufps  gen %ufps  repeat %ufps  fill %u/%u", "rates",
+		gameRate, generatedRate, repeatRate, fillRate, refreshHz );
 	framegen_hud_add_line( result, line );
 
 	if ( level < 2u )
 		return result;
 
-	const int64_t biasTenths = std::clamp<int64_t>( snapshot.biasTenthsMs, -9'999, 9'999 );
-	const char biasSign = biasTenths < 0 ? '-' : '+';
-	const uint64_t biasMagnitude = biasTenths < 0
-		? static_cast<uint64_t>( -biasTenths ) : static_cast<uint64_t>( biasTenths );
 	const uint32_t sdTenths = std::min( snapshot.pacingSdTenthsMs, 9'999u );
-	const int pacingLength = std::snprintf( line, sizeof( line ),
-		"pace: %u%% on-target +/-%u.%ums | bias %c%llu.%llums | resets %llu (ring %llu)",
+	const FramegenHudSparkline_t hitSparkline = framegen_hud_sparkline(
+		snapshot.deadlineHitHistory, 100.0 );
+	// Flip-interval standard deviation uses a fixed 0..4 ms scale; noisier
+	// windows saturate at the full-height glyph.
+	const FramegenHudSparkline_t jitterSparkline = framegen_hud_sparkline(
+		snapshot.pacingSdMsHistory, 4.0 );
+	std::snprintf( line, sizeof( line ),
+		"%-8s hit %u%%  %s   jitter +/-%u.%ums  %s", "pace",
 		std::min( snapshot.deadlineHitPercent, 100u ),
+		hitSparkline.data(),
 		sdTenths / 10u, sdTenths % 10u,
-		biasSign,
-		static_cast<unsigned long long>( biasMagnitude / 10u ),
-		static_cast<unsigned long long>( biasMagnitude % 10u ),
-		static_cast<unsigned long long>( std::min<uint64_t>( snapshot.resets, 999u ) ),
-		static_cast<unsigned long long>( std::min<uint64_t>( snapshot.ringResets, 999u ) ) );
-	if ( pacingLength < 0
-		|| static_cast<uint32_t>( pacingLength ) > k_uFramegenHudMaxColumns )
-	{
-		std::snprintf( line, sizeof( line ),
-			"pace: %u%% on-target +/-%u.%ums | bias %c%llu.%llums | resets %llu/%llu",
-			std::min( snapshot.deadlineHitPercent, 100u ),
-			sdTenths / 10u, sdTenths % 10u,
-			biasSign,
-			static_cast<unsigned long long>( biasMagnitude / 10u ),
-			static_cast<unsigned long long>( biasMagnitude % 10u ),
-			static_cast<unsigned long long>( std::min<uint64_t>( snapshot.resets, 999u ) ),
-			static_cast<unsigned long long>( std::min<uint64_t>( snapshot.ringResets, 999u ) ) );
-	}
+		jitterSparkline.data() );
 	framegen_hud_add_line( result, line );
 
 	if ( snapshot.netActive )
@@ -350,7 +357,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		char steps[24] = {};
 		framegen_hud_format_steps( steps, sizeof( steps ), snapshot.netTrainedSteps );
 		std::snprintf( line, sizeof( line ),
-			"net: %s, %s steps, profile: %s",
+			"%-8s %s . %s steps . profile %s", "net",
 			snapshot.netOnline ? "online" : "offline", steps,
 			snapshot.netProfileLoaded ? "loaded" : "none" );
 		framegen_hud_add_line( result, line );
@@ -375,8 +382,8 @@ struct alignas( 16 ) FramegenHudUniform_t
 
 static_assert( offsetof( FramegenHudUniform_t, lineLengths ) == 16u );
 static_assert( offsetof( FramegenHudUniform_t, text ) == 40u );
-static_assert( offsetof( FramegenHudUniform_t, font ) == 424u );
-static_assert( sizeof( FramegenHudUniform_t ) == 1'456u );
+static_assert( offsetof( FramegenHudUniform_t, font ) == 472u );
+static_assert( sizeof( FramegenHudUniform_t ) == 1'504u );
 
 struct FramegenHudPush_t
 {

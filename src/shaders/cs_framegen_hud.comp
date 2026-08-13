@@ -17,7 +17,7 @@ uniform framegen_hud_t {
     uint u_hdr;
     uint u_reserved;
     uint u_lineLengths[6];
-    uint u_text[96];
+    uint u_text[108];
     uint u_font[256];
 };
 
@@ -35,7 +35,7 @@ layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 const uint kPadding = 4u;
 
 uint text_byte(uint line, uint column) {
-    uint byteIndex = line * 64u + column;
+    uint byteIndex = line * 72u + column;
     uint word = u_text[byteIndex >> 2u];
     return bitfieldExtract(word, int((byteIndex & 3u) * 8u), 8);
 }
@@ -68,8 +68,7 @@ void main() {
     vec4 base = texelFetch(s_samplers[0], ivec2(coord), 0);
     vec3 result = mix(base.rgb, vec3(0.015), 0.42);
 
-    // This HUD intentionally stays a 1 Hz text instrument. Sparklines would
-    // add shader-side history and drawing machinery without useful time detail.
+    // Spark bars are ordinary font glyphs, so text and history share this path.
     uvec2 logical = local / u_scale;
     bool ink = false;
     if (logical.x >= kPadding && logical.y >= kPadding) {

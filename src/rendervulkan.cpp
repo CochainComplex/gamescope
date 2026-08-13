@@ -181,7 +181,8 @@ static constexpr size_t k_nFramegenHudPersistentBytes =
 	k_nFramegenHudUploadSlots * sizeof( gamescope::framegen::FramegenHudUniform_t );
 static constexpr size_t k_nFramegenHudPersistentPad =
 	( ( k_nFramegenHudPersistentBytes + 4095u ) / 4096u ) * 4096u;
-static_assert( k_nFramegenHudPersistentBytes == 2'912u );
+static_assert( k_nFramegenHudPersistentBytes == 3'008u );
+static_assert( k_nFramegenHudPersistentPad == 4'096u );
 static_assert( CVulkanDevice::upload_buffer_persistent_pad
 	>= k_nFramegenHudPersistentPad );
 struct FramegenHudGpuState_t
@@ -7805,6 +7806,25 @@ static const FramegenMetricsWindow_t &framegen_metrics_last_closed_window()
 	return g_framegenMetrics.windows[nLast];
 }
 
+template <typename ValueFn>
+static std::array<double, gamescope::framegen::k_nFramegenHudSparklineSamples>
+framegen_metrics_window_history( ValueFn value )
+{
+	std::array<double, gamescope::framegen::k_nFramegenHudSparklineSamples> result = {};
+	const size_t nCount = static_cast<size_t>( std::min<uint64_t>(
+		g_framegenMetrics.nClosedWindows, g_framegenMetrics.windows.size() ) );
+	const size_t nOldest = ( g_framegenMetrics.nNextWindow
+		+ g_framegenMetrics.windows.size() - nCount )
+		% g_framegenMetrics.windows.size();
+	const size_t nDestination = result.size() - nCount;
+	for ( size_t i = 0u; i < nCount; i++ )
+	{
+		result[nDestination + i] = value( g_framegenMetrics.windows[
+			( nOldest + i ) % g_framegenMetrics.windows.size() ] );
+	}
+	return result;
+}
+
 static const char *framegen_hud_device_name()
 {
 	static const std::array<char, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE> s_name = []()
@@ -7856,6 +7876,19 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 		-9'999.0, 9'999.0 );
 	const double flPacingSdTenths = std::clamp(
 		window.flipIntervals.stddev() * 10.0, 0.0, 9'999.0 );
+	const auto deadlineHitHistory = framegen_metrics_window_history(
+		[]( const FramegenMetricsWindow_t &sample )
+		{
+			return sample.deadlineCount != 0u
+				? static_cast<double>( sample.deadlineHits ) * 100.0
+					/ static_cast<double>( sample.deadlineCount )
+				: 0.0;
+		} );
+	const auto pacingSdMsHistory = framegen_metrics_window_history(
+		[]( const FramegenMetricsWindow_t &sample )
+		{
+			return sample.flipIntervals.stddev();
+		} );
 	return {
 		.version = gamescope::k_szGamescopeHudVersion,
 		.deviceName = framegen_hud_device_name(),
@@ -7883,6 +7916,8 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 		.biasTenthsMs = static_cast<int32_t>( std::llround( flBiasTenths ) ),
 		.deadlineHitPercent = uHitPercent,
 		.pacingSdTenthsMs = static_cast<uint32_t>( std::llround( flPacingSdTenths ) ),
+		.deadlineHitHistory = deadlineHitHistory,
+		.pacingSdMsHistory = pacingSdMsHistory,
 		.resets = window.resets,
 		.ringResets = window.resetsRing,
 		.netTrainedSteps = g_ulFramegenNetProgress,

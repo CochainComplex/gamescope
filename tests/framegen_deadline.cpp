@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -57,6 +58,10 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 		.biasTenthsMs = 1,
 		.deadlineHitPercent = 99u,
 		.pacingSdTenthsMs = 7u,
+		.deadlineHitHistory = { 99.0, 99.0, 99.0, 99.0, 99.0, 99.0,
+			99.0, 99.0, 99.0, 99.0, 99.0, 99.0 },
+		.pacingSdMsHistory = { 0.7, 0.7, 0.7, 0.7, 0.7, 0.7,
+			0.7, 0.7, 0.7, 0.7, 0.7, 0.7 },
 		.netTrainedSteps = 1'200u,
 		.netProfileLoaded = true,
 	};
@@ -64,23 +69,26 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 
 	REQUIRE( text.lineCount == 6u );
 	CHECK( text.lines[0].data() == std::string_view{
-		"gameslop 0.1.0+76e6d5 | motion x2 quality:high | 120Hz fixed" } );
+		"gameslop 0.1.0+76e6d5         motion x2 . high . 120Hz fixed" } );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present: AMD Radeon Graphics | client buffers: staged(cross-GPU)" } );
+		"present  AMD Radeon Graphics  buffers staged(cross-GPU)" } );
 	CHECK( text.lines[2].data() == std::string_view{
-		"bidir:off  base:off  net:online  adapt:on" } );
+		"modes    bidir:off  base:off  net:online  adapt:on" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"game 40fps -> screen 118/120 slots (gen 78, repeat 2)" } );
-	CHECK( text.lines[4].data() == std::string_view{
-		"pace: 99% on-target +/-0.7ms | bias +0.1ms | resets 0 (ring 0)" } );
+		"rates    game 40fps  gen 78fps  repeat 2fps  fill 118/120" } );
+	std::string paceLine = "pace     hit 99%  ";
+	paceLine.append( k_nFramegenHudSparklineSamples, '\x08' );
+	paceLine += "   jitter +/-0.7ms  ";
+	paceLine.append( k_nFramegenHudSparklineSamples, '\x02' );
+	CHECK( text.lines[4].data() == paceLine );
 	CHECK( text.lines[5].data() == std::string_view{
-		"net: online, 1.2k steps, profile: loaded" } );
+		"net      online . 1.2k steps . profile loaded" } );
 	for ( uint32_t line = 0u; line < text.lineCount; line++ )
 		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
 
 	const FramegenHudUniform_t uniform = make_framegen_hud_uniform( text, true );
 	CHECK( uniform.lineCount == 6u );
-	CHECK( uniform.widthChars == 64u );
+	CHECK( uniform.widthChars == 62u );
 	CHECK( uniform.hdr == 1u );
 	CHECK( ( uniform.text[0] & 0xffu ) == static_cast<uint32_t>( 'g' ) );
 	CHECK( uniform.font[static_cast<uint32_t>( 'A' ) * 2u]
@@ -105,21 +113,26 @@ TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hu
 
 	REQUIRE( text.lineCount == 4u );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present: AMD Radeon RX 5700 | client buffers: local" } );
+		"present  AMD Radeon RX 5700   buffers local" } );
 	CHECK( text.lines[2].data() == std::string_view{
-		"bidir:requested(OFF)  base:off  net:off  adapt:off" } );
+		"modes    bidir:requested(OFF)  base:off  net:off  adapt:off" } );
 	auto netOnly = snapshot;
 	netOnly.bidirRequested = false;
 	netOnly.netRequested = true;
 	const FramegenHudText_t netText = format_framegen_hud( 1u, netOnly );
 	CHECK( netText.lines[2].data() == std::string_view{
-		"bidir:off  base:off  net:requested(OFF)  adapt:off" } );
+		"modes    bidir:off  base:off  net:requested(OFF)  adapt:off" } );
+	auto bothRequested = snapshot;
+	bothRequested.netRequested = true;
+	const FramegenHudText_t bothText = format_framegen_hud( 1u, bothRequested );
+	CHECK( bothText.lines[2].data() == std::string_view{
+		"modes    bidir:requested(OFF)  base:off  net:requested(OFF)  adapt:off" } );
 	auto vrrOnly = snapshot;
 	vrrOnly.bidirRequested = false;
 	vrrOnly.vrrRequested = true;
 	const FramegenHudText_t vrrText = format_framegen_hud( 1u, vrrOnly );
 	CHECK( vrrText.lines[2].data() == std::string_view{
-		"bidir:off  base:off  net:off  adapt:off  vrr:requested(off)" } );
+		"modes    bidir:off  base:off  net:off  adapt:off  vrr:requested(off)" } );
 	for ( uint32_t line = 0u; line < text.lineCount; line++ )
 		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
 }
@@ -141,11 +154,48 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 
 	REQUIRE( text.lineCount == 4u );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present: AMD Radeon 890M | client buffers: local" } );
+		"present  AMD Radeon 890M      buffers local" } );
 	CHECK( text.lines[2].data() == std::string_view{
-		"bidir:off  base:off  net:off  adapt:off" } );
+		"modes    bidir:off  base:off  net:off  adapt:off" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"game 40fps -> screen 118/120 slots (gen 78, repeat 2)" } );
+		"rates    game 40fps  gen 78fps  repeat 2fps  fill 118/120" } );
+}
+
+TEST_CASE( "framegen HUD sparkline mapping is monotone and saturated",
+	"[framegen][hud]" )
+{
+	const std::array<double, k_nFramegenHudSparklineSamples> values = {
+		0.0, 10.0, 20.0, 30.0, 40.0, 50.0,
+		60.0, 70.0, 80.0, 90.0, 100.0, 150.0,
+	};
+	const FramegenHudSparkline_t sparkline = framegen_hud_sparkline( values, 100.0 );
+	for ( size_t i = 1u; i < values.size(); i++ )
+	{
+		CHECK( static_cast<uint8_t>( sparkline[i - 1u] )
+			<= static_cast<uint8_t>( sparkline[i] ) );
+	}
+	CHECK( static_cast<uint8_t>( sparkline.front() ) == 0x01u );
+	CHECK( static_cast<uint8_t>( sparkline[10] ) == 0x08u );
+	CHECK( static_cast<uint8_t>( sparkline[11] ) == 0x08u );
+}
+
+TEST_CASE( "framegen HUD sparkline maps empty windows to the shortest bar",
+	"[framegen][hud]" )
+{
+	const std::array<double, k_nFramegenHudSparklineSamples> empty = {};
+	const FramegenHudSparkline_t sparkline = framegen_hud_sparkline( empty, 4.0 );
+	for ( char glyph : std::string_view{ sparkline.data(), empty.size() } )
+		CHECK( static_cast<uint8_t>( glyph ) == 0x01u );
+}
+
+TEST_CASE( "framegen HUD embeds eight full-width spark bars", "[framegen][hud]" )
+{
+	for ( uint32_t level = 1u; level <= 8u; level++ )
+	{
+		const uint64_t expected = level == 8u
+			? UINT64_MAX : ( uint64_t{ 1u } << ( level * 8u ) ) - 1u;
+		CHECK( k_uFramegenHudFont8x8[level] == expected );
+	}
 }
 
 TEST_CASE( "30 fps on 120 Hz follows stable actual-grid phases", "[framegen][deadline]" )
