@@ -5208,7 +5208,7 @@ struct FramegenMetricsDistribution_t
 struct FramegenMetricsWindow_t
 {
 	uint64_t real = 0, generated = 0, delayedReal = 0, repeats = 0;
-	uint64_t discards = 0, slowDrops = 0, resets = 0;
+	uint64_t discards = 0, slowDrops = 0, admissionSkips = 0, resets = 0;
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 	// Feedback that arrived as "discarded" (window hidden/occluded at the host):
 	// nonzero here with near-zero presented counts means the measurement
@@ -5222,7 +5222,7 @@ struct FramegenMetricsWindow_t
 
 struct FramegenMetricsPendingEvents_t
 {
-	uint64_t repeats = 0, discards = 0, slowDrops = 0, resets = 0;
+	uint64_t repeats = 0, discards = 0, slowDrops = 0, admissionSkips = 0, resets = 0;
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 };
 static FramegenMetricsPendingEvents_t g_framegenMetricsPendingEvents;
@@ -5259,6 +5259,7 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	window.repeats += events.repeats;
 	window.discards += events.discards;
 	window.slowDrops += events.slowDrops;
+	window.admissionSkips += events.admissionSkips;
 	window.resets += events.resets;
 	window.resetsCut += events.resetsCut;
 	window.resetsGrid += events.resetsGrid;
@@ -5283,7 +5284,8 @@ static void framegen_metrics_log( const char *pszLabel,
 		" flip_ms_avg=%.3f flip_ms_min=%.3f flip_ms_max=%.3f"
 		" flip_ms_sd=%.3f flip_ms_p95=%.3f bias_ms=%.3f dl_hit=%.3f"
 		" dl_ms_avg=%.3f dl_ms_p95=%.3f dl_ms_worst=%.3f"
-		" disc=%" PRIu64 " slow=%" PRIu64 " resets=%" PRIu64 " fbdisc=%" PRIu64
+		" disc=%" PRIu64 " slow=%" PRIu64 " adm=%" PRIu64
+		" resets=%" PRIu64 " fbdisc=%" PRIu64
 		" resets_cut=%" PRIu64 " resets_grid=%" PRIu64
 		" resets_prov=%" PRIu64 " resets_hitch=%" PRIu64,
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
@@ -5293,7 +5295,8 @@ static void framegen_metrics_log( const char *pszLabel,
 		window.deadlineCount != 0
 			? (double)window.deadlineHits / window.deadlineCount : 0.0,
 		window.deadlineCount != 0 ? window.deadlineSignedSumMs / window.deadlineCount : 0.0,
-		deadline.p95(), deadline.max, window.discards, window.slowDrops, window.resets,
+		deadline.p95(), deadline.max, window.discards, window.slowDrops,
+		window.admissionSkips, window.resets,
 		window.feedbackDiscarded, window.resetsCut, window.resetsGrid,
 		window.resetsProvenance, window.resetsHitch );
 }
@@ -5385,6 +5388,7 @@ void vulkan_framegen_metrics_note_repeat()
 
 static void framegen_metrics_note_discard( uint64_t n ) { g_framegenMetricsPendingEvents.discards += n; }
 static void framegen_metrics_note_slow_drop( uint64_t n ) { g_framegenMetricsPendingEvents.slowDrops += n; }
+static void framegen_metrics_note_admission_skip() { g_framegenMetricsPendingEvents.admissionSkips++; }
 enum class FramegenResetReason_t : uint8_t
 {
 	Cut,
@@ -8989,6 +8993,7 @@ static void framegen_shadow_plan_real( uint64_t ulRealFrameId,
 		gamescope::framegen::plan_next_causal_slot( grid, shadow.anchor, cadence, {
 			.nowNs = ulNowNs,
 			.gridEpoch = shadow.ulGridEpoch,
+			.presentBiasNs = shadow.presentBias.emaNs,
 			.configuredStrength = g_flFramegenStrength,
 			.forwardStrengthCap = k_flFramegenMaxForwardStrength,
 			.sourceTimestampsReliable = bSourceTimestampsReliable,
@@ -9690,13 +9695,20 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 				.nowNs = now,
 				.afterTargetNs = g_framegenHistory.ulLastPlannedTargetNs,
 				.gridEpoch = g_framegenHistory.ulDeadlineGridEpoch,
+				.presentBiasNs =
+					g_framegenPresentState.displayTiming.presentBias.emaNs,
 				.configuredStrength = g_flFramegenStrength,
 				.forwardStrengthCap = k_flFramegenMaxForwardStrength,
 				.sourceTimestampsReliable = g_framegenHistory.bCadenceUsesSourceTime,
 				.dedicatedQueue = true,
 			} );
 	if ( !plan.admit )
+	{
+		if ( plan.skipReason
+			== gamescope::framegen::DeadlineSkipReason_t::NextRealSafelyDue )
+			framegen_metrics_note_admission_skip();
 		return false;
+	}
 	const uint64_t ulStartEstimateNs = plan.provisional
 		? g_framegenHistory.causalAnchor.provisional_start_estimate() : 0u;
 	if ( std::max( now, ulStartEstimateNs ) >= plan.wakeNs )

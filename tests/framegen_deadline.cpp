@@ -647,6 +647,126 @@ TEST_CASE( "source admission distinguishes safe, overdue, and warmup predictions
 	CHECK( plan_next_causal_slot( grid, anchor, warmup, options ).admit );
 }
 
+TEST_CASE( "biased admission preserves both empty vblanks at 46 fps on 120 Hz", "[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'333'333u;
+	constexpr uint64_t biasNs = 7'300'000u;
+	constexpr uint64_t sourceReadyNs = 100'000'000u;
+	constexpr uint64_t cadenceNs = 21'700'000u;
+	constexpr DisplayGrid_t rawGrid = {
+		.D0 = 108'333'333u,
+		.W0 = 107'333'333u,
+		.T = intervalNs,
+	};
+	const DisplayGrid_t grid = apply_present_bias( rawGrid, biasNs );
+	const RealAnchorState_t anchor = {
+		.realFrameId = 1u,
+		.sourceReadyNs = sourceReadyNs,
+		.provisionalTargetNs = apply_present_bias_ns( sourceReadyNs, biasNs ),
+		.provisionalBiasNs = biasNs,
+		.epoch = 1u,
+	};
+	const CadencePredictorState cadence = trained_cadence( cadenceNs );
+	CausalPlanOptions_t options = {
+		.nowNs = 107'000'000u,
+		.gridEpoch = 1u,
+		.presentBiasNs = biasNs,
+		.sourceTimestampsReliable = true,
+		.dedicatedQueue = true,
+	};
+
+	const CausalSlotPlan_t first = plan_next_causal_slot(
+		grid, anchor, cadence, options );
+	REQUIRE( first.admit );
+	options.afterTargetNs = first.targetNs;
+	const CausalSlotPlan_t second = plan_next_causal_slot(
+		grid, anchor, cadence, options );
+
+	const FixedCadenceAdmission oldAsymmetricAdmission =
+		fixed_cadence_admission( sourceReadyNs, cadence, options.nowNs,
+			second.wakeNs, intervalNs );
+	REQUIRE_FALSE( oldAsymmetricAdmission.generateBackup );
+	CHECK( oldAsymmetricAdmission.predictedReadyNs == 121'700'000u );
+	CHECK( oldAsymmetricAdmission.safetyMarginNs == 260'416u );
+	CHECK( second.wakeNs == 122'966'666u );
+	CHECK( remove_present_bias_ns( second.wakeNs, biasNs ) == 115'666'666u );
+	CHECK( apply_present_bias_ns(
+		oldAsymmetricAdmission.predictedReadyNs
+			+ oldAsymmetricAdmission.safetyMarginNs,
+		biasNs ) > second.targetNs );
+	CHECK( second.admit );
+}
+
+TEST_CASE( "zero present bias retains source-wake admission behavior", "[framegen][deadline]" )
+{
+	constexpr DisplayGrid_t grid = {
+		.D0 = 108'333'333u,
+		.W0 = 107'333'333u,
+		.T = 8'333'333u,
+	};
+	const RealAnchorState_t anchor = {
+		.realFrameId = 1u,
+		.sourceReadyNs = 100'000'000u,
+		.provisionalTargetNs = 100'000'000u,
+		.epoch = 1u,
+	};
+	const CausalPlanOptions_t options = {
+		.nowNs = 100'100'000u,
+		.gridEpoch = 1u,
+		.presentBiasNs = 0,
+		.forwardStrengthCap = 3.0f,
+		.sourceTimestampsReliable = true,
+		.dedicatedQueue = true,
+	};
+
+	for ( const uint64_t cadenceNs : { 7'000'000u, 8'000'000u } )
+	{
+		const CadencePredictorState cadence = trained_cadence( cadenceNs );
+		const FixedCadenceAdmission unchanged = fixed_cadence_admission(
+			anchor.sourceReadyNs, cadence, options.nowNs, grid.W0, grid.T );
+		CHECK( plan_next_causal_slot( grid, anchor, cadence, options ).admit
+			== unchanged.generateBackup );
+	}
+}
+
+TEST_CASE( "admission skips a real displayable before the slot vblank", "[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'333'333u;
+	constexpr int64_t biasNs = 7'300'000;
+	constexpr uint64_t sourceReadyNs = 100'000'000u;
+	const DisplayGrid_t grid = apply_present_bias( {
+		.D0 = 116'666'666u,
+		.W0 = 115'666'666u,
+		.T = intervalNs,
+	}, biasNs );
+	const RealAnchorState_t anchor = {
+		.realFrameId = 1u,
+		.sourceReadyNs = sourceReadyNs,
+		.provisionalTargetNs = apply_present_bias_ns( sourceReadyNs, biasNs ),
+		.provisionalBiasNs = biasNs,
+		.epoch = 1u,
+	};
+	const CadencePredictorState cadence = trained_cadence( 13'000'000u );
+	const CausalPlanOptions_t options = {
+		.nowNs = 107'000'000u,
+		.gridEpoch = 1u,
+		.presentBiasNs = biasNs,
+		.sourceTimestampsReliable = true,
+		.dedicatedQueue = true,
+	};
+
+	const FixedCadenceAdmission admission = fixed_cadence_admission(
+		sourceReadyNs, cadence, options.nowNs,
+		remove_present_bias_ns( grid.W0, biasNs ), intervalNs );
+	REQUIRE( apply_present_bias_ns(
+		admission.predictedReadyNs + admission.safetyMarginNs,
+		biasNs ) < grid.D0 );
+	const CausalSlotPlan_t plan = plan_next_causal_slot(
+		grid, anchor, cadence, options );
+	CHECK_FALSE( plan.admit );
+	CHECK( plan.skipReason == DeadlineSkipReason_t::NextRealSafelyDue );
+}
+
 TEST_CASE( "bidir multiplier ceiling selects evenly distributed grid targets", "[framegen][deadline]" )
 {
 	const DisplayGrid_t grid = { .D0 = 1'000u, .W0 = 990u, .T = 100u };

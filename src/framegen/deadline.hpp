@@ -180,6 +180,10 @@ struct CausalPlanOptions_t
 	uint64_t nowNs = 0;
 	uint64_t afterTargetNs = 0;
 	uint64_t gridEpoch = 0;
+	// Display targets and generation wakes carry this learned chain bias.
+	// Source-cadence admission removes it again so both compared timestamps
+	// remain in the pre-display-chain domain.
+	int64_t presentBiasNs = 0;
 	float configuredStrength = k_flNeutralStrength;
 	float forwardStrengthCap = 1.5f;
 	bool sourceTimestampsReliable = true;
@@ -274,8 +278,10 @@ struct CausalSlotPlan_t
 		return result;
 	}
 
+	const uint64_t admissionWakeNs = remove_present_bias_ns(
+		result.wakeNs, options.presentBiasNs );
 	const FixedCadenceAdmission admission = fixed_cadence_admission(
-		anchor.sourceReadyNs, cadence, options.nowNs, result.wakeNs, grid.T );
+		anchor.sourceReadyNs, cadence, options.nowNs, admissionWakeNs, grid.T );
 	if ( !admission.generateBackup )
 	{
 		result.skipReason = DeadlineSkipReason_t::NextRealSafelyDue;
