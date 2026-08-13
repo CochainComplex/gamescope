@@ -27,7 +27,7 @@ display, and generation only fills vblanks that would have shown a repeat anyway
 (Full honesty: running a compositor at all replaces direct scanout, so measure your
 own input feel — the algorithm adds no frame buffering, but the compositor is not
 literally free.) What you gain is **motion clarity**: tracking a
-target through a smooth 120 Hz sweep instead of a 45 fps judder makes the *real*
+target through a smooth full-refresh sweep instead of a 45 fps judder makes the *real*
 information easier to read. What you don't gain is reaction time — generated frames
 carry no new input, and nothing here (or in DLSS/FSR framegen) changes that. Skip
 bidir mode in ranked; that one trades a frame of latency for beauty and says so.
@@ -44,7 +44,7 @@ A **poor man's DLSS 4.5 / FSR 4.1 frame-generation surrogate** that runs on *any
  │ renders the game at full │  finished    │ estimates motion, generates  │      real +
  │ speed — nothing added,   │  frames      │ the in-between frames,       │    generated
  │ nothing taken away       │ ───────────▶ │ composites, drives the       │ ───────────▶  display
- │                          │  (dma-buf)   │ display's fixed 120 Hz grid  │   (120 Hz)
+ │                          │  (dma-buf)   │ display's fixed refresh grid │  (any Hz)
  └──────────────────────────┘              └──────────────────────────────┘
 ```
 
@@ -99,8 +99,9 @@ The full mapping — what's already here, what the engine-integrated methods (DL
 
 **Your in-game FPS counter measures the wrong end of the pipe.** Game-side counters
 (HUD, MangoHud, engine stats) can only count frames the *game* renders — generated
-frames never travel back into the game, so a 40 fps game on a 120 Hz screen reports
-40 forever while the display gets ~80–120 content updates a second. Smooth screen +
+frames never travel back into the game, so a 40 fps game on a 120 Hz screen reports 40
+forever while the display gets ~80–120 content updates a second (the same logic fills
+a 60 or 144 Hz panel — the grid is whatever your display runs). Smooth screen +
 "low" counter is what *working* frame generation looks like.
 
 The mechanism is **VRR mirrored**: VRR bends the display's clock to follow the game;
