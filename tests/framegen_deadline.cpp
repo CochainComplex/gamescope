@@ -124,19 +124,25 @@ TEST_CASE( "causal phase follows cadence trend", "[framegen][deadline]" )
 
 TEST_CASE( "flip feedback corrects future causal anchors", "[framegen][deadline]" )
 {
+	const PresentBiasState_t matureBias = {
+		.samples = k_uPresentBiasWarmupSamples,
+		.consecutiveGuardExceeds = 1u,
+	};
 	const RealAnchorState_t anchor = {
 		.realFrameId = 9u,
 		.sourceReadyNs = 1'000u,
 		.provisionalTargetNs = 2'000u,
 		.epoch = 3u,
 	};
-	const AnchorCorrection_t large = apply_flip_feedback( anchor, 9u, 2'301u, 300u );
+	const AnchorCorrection_t large = apply_flip_feedback(
+		anchor, matureBias, 9u, 2'301u, 300u );
 	REQUIRE( large.matched );
 	CHECK( large.discardProvisional );
 	REQUIRE( large.anchor.correctedFlipNs );
 	CHECK( *large.anchor.correctedFlipNs == 2'301u );
 
-	const AnchorCorrection_t small = apply_flip_feedback( anchor, 9u, 2'299u, 300u );
+	const AnchorCorrection_t small = apply_flip_feedback(
+		anchor, matureBias, 9u, 2'299u, 300u );
 	REQUIRE( small.matched );
 	CHECK_FALSE( small.discardProvisional );
 	const DisplayGrid_t grid = { .D0 = 2'000u, .W0 = 1'999u, .T = 500u };
@@ -148,20 +154,24 @@ TEST_CASE( "flip feedback corrects future causal anchors", "[framegen][deadline]
 
 TEST_CASE( "large anchor correction discards only matching provisional slots", "[framegen][deadline]" )
 {
+	const PresentBiasState_t matureBias = {
+		.samples = k_uPresentBiasWarmupSamples,
+		.consecutiveGuardExceeds = 1u,
+	};
 	const RealAnchorState_t anchor = {
 		.realFrameId = 42u,
 		.provisionalTargetNs = 10'000u,
 		.epoch = 1u,
 	};
 	const AnchorCorrection_t correction = apply_flip_feedback(
-		anchor, 42u, 18'334u, 300u );
+		anchor, matureBias, 42u, 18'334u, 300u );
 	REQUIRE( correction.discardProvisional );
 	CHECK( discard_pending_provisional_slot( correction, 42u, true ) );
 	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, false ) );
 	CHECK_FALSE( discard_pending_provisional_slot( correction, 41u, true ) );
 
 	const AnchorCorrection_t small = apply_flip_feedback(
-		anchor, 42u, 10'300u, 300u );
+		anchor, matureBias, 42u, 10'300u, 300u );
 	CHECK_FALSE( discard_pending_provisional_slot( small, 42u, true ) );
 }
 
@@ -187,7 +197,12 @@ TEST_CASE( "one-vblank late provisional anchor changes the generated phase", "[f
 	CHECK( before.phase == Approx( 0.25 ) );
 
 	const AnchorCorrection_t correction = apply_flip_feedback(
-		provisional, 7u, 100'000'000u, interval / 32u );
+		provisional,
+		PresentBiasState_t{
+			.samples = k_uPresentBiasWarmupSamples,
+			.consecutiveGuardExceeds = 1u,
+		},
+		7u, 100'000'000u, interval / 32u );
 	REQUIRE( correction.discardProvisional );
 	const CausalSlotPlan_t after = plan_next_causal_slot(
 		grid, correction.anchor, cadence,
@@ -195,6 +210,176 @@ TEST_CASE( "one-vblank late provisional anchor changes the generated phase", "[f
 	REQUIRE( after.admit );
 	CHECK( after.targetNs == before.targetNs );
 	CHECK( after.phase == Approx( 0.5 ) );
+}
+
+TEST_CASE( "present bias converges during warmup without discarding pixels", "[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'333'333u;
+	constexpr uint64_t guardNs = intervalNs / 32u;
+	PresentBiasState_t bias;
+
+	for ( uint64_t frame = 1u; frame <= 12u; frame++ )
+	{
+		const uint64_t rawTargetNs = 100'000'000u + frame * intervalNs;
+		const RealAnchorState_t anchor = {
+			.realFrameId = frame,
+			.provisionalTargetNs = apply_present_bias_ns(
+				rawTargetNs, bias.emaNs ),
+			.provisionalBiasNs = bias.emaNs,
+			.epoch = 1u,
+		};
+		const AnchorCorrection_t correction = apply_flip_feedback(
+			anchor, bias, frame, rawTargetNs + intervalNs, guardNs );
+		REQUIRE( correction.matched );
+		CHECK_FALSE( correction.discardProvisional );
+		bias = correction.presentBias;
+	}
+
+	CHECK( bias.samples == 12u );
+	CHECK( bias.emaNs == static_cast<int64_t>( intervalNs ) );
+	const DisplayGrid_t rawGrid = {
+		.D0 = 200'000'000u,
+		.W0 = 199'000'000u,
+		.T = intervalNs,
+	};
+	const DisplayGrid_t biasedGrid = apply_present_bias( rawGrid, bias.emaNs );
+	CHECK( biasedGrid.D0 == rawGrid.D0 + intervalNs );
+	CHECK( biasedGrid.W0 == rawGrid.W0 + intervalNs );
+}
+
+TEST_CASE( "present-bias outliers require two consecutive guard failures", "[framegen][deadline]" )
+{
+	constexpr uint64_t baselineLeadNs = 1'000u;
+	constexpr uint64_t guardNs = 300u;
+	constexpr uint64_t spikeNs = 2'000u;
+	PresentBiasState_t bias = {
+		.emaNs = baselineLeadNs,
+		.samples = k_uPresentBiasWarmupSamples,
+	};
+	uint64_t frame = 1u;
+	uint64_t rawTargetNs = 100'000u;
+	const auto feedback = [&]( uint64_t extraLeadNs ) {
+		const RealAnchorState_t anchor = {
+			.realFrameId = frame,
+			.provisionalTargetNs = apply_present_bias_ns(
+				rawTargetNs, bias.emaNs ),
+			.provisionalBiasNs = bias.emaNs,
+			.epoch = 1u,
+		};
+		const AnchorCorrection_t correction = apply_flip_feedback(
+			anchor, bias, frame, rawTargetNs + baselineLeadNs + extraLeadNs,
+			guardNs );
+		bias = correction.presentBias;
+		frame++;
+		rawTargetNs += 10'000u;
+		return correction;
+	};
+
+	CHECK_FALSE( feedback( spikeNs ).discardProvisional );
+	CHECK_FALSE( feedback( 0u ).discardProvisional );
+	CHECK( bias.consecutiveGuardExceeds == 0u );
+	CHECK_FALSE( feedback( spikeNs ).discardProvisional );
+	CHECK( feedback( spikeNs ).discardProvisional );
+}
+
+TEST_CASE( "deadline hit arithmetic uses the biased target", "[framegen][deadline]" )
+{
+	constexpr uint64_t rawTargetNs = 10'000u;
+	constexpr int64_t biasNs = 1'000;
+	constexpr uint64_t actualFlipNs = 11'050u;
+	constexpr uint64_t intervalNs = 1'000u;
+
+	const DeadlineFeedbackSample_t raw = deadline_feedback_sample(
+		actualFlipNs, rawTargetNs, intervalNs );
+	const DeadlineFeedbackSample_t biased = deadline_feedback_sample(
+		actualFlipNs, apply_present_bias_ns( rawTargetNs, biasNs ), intervalNs );
+	REQUIRE( raw.valid );
+	REQUIRE( biased.valid );
+	CHECK_FALSE( raw.hit );
+	CHECK( raw.signedErrorNs == 1'050 );
+	CHECK( biased.hit );
+	CHECK( biased.signedErrorNs == 50 );
+}
+
+TEST_CASE( "biased wake preserves the raw provisional admission bound", "[framegen][deadline]" )
+{
+	const RealAnchorState_t anchor = {
+		.provisionalTargetNs = 11'000u,
+		.provisionalBiasNs = 1'000,
+	};
+	CHECK( anchor.provisional_start_estimate() == 10'000u );
+	CHECK( deadline_cost_fits(
+		8'500u, 20'000u, 10'000u,
+		anchor.provisional_start_estimate() ) );
+	CHECK_FALSE( deadline_cost_fits(
+		8'500u, 20'000u, 10'000u,
+		anchor.provisionalTargetNs ) );
+}
+
+TEST_CASE( "display timing bias survives content invalidation and resets on grid change", "[framegen][deadline]" )
+{
+	const DisplayChainKey_t chain = {
+		.backendId = 11u,
+		.connectorId = 22u,
+		.intervalNs = 8'333'333u,
+		.vrrActive = false,
+		.sourceTimestampsReliable = true,
+	};
+	DisplayChainTimingState_t timing =
+		observe_display_chain( {}, chain ).state;
+	timing.presentBias = {
+		.emaNs = 8'000'000,
+		.samples = 19u,
+		.consecutiveGuardExceeds = 1u,
+	};
+	timing.presentLead = {
+		.emaNs = 1'250'000,
+		.samples = 23u,
+	};
+	const uint64_t generation = timing.generation;
+
+	// Content history can disappear and re-prime while the observed display
+	// chain remains identical. Re-observation must retain both learned EMAs.
+	const DisplayChainTimingTransition_t contentReprime =
+		observe_display_chain( timing, chain );
+	CHECK_FALSE( contentReprime.displayChainChanged );
+	CHECK( contentReprime.state.generation == generation );
+	CHECK( contentReprime.state.presentBias.emaNs == 8'000'000 );
+	CHECK( contentReprime.state.presentBias.samples == 19u );
+	CHECK( contentReprime.state.presentBias.consecutiveGuardExceeds == 1u );
+	CHECK( contentReprime.state.presentLead.emaNs == 1'250'000 );
+	CHECK( contentReprime.state.presentLead.samples == 23u );
+
+	DisplayChainKey_t changedGrid = chain;
+	changedGrid.intervalNs = 16'666'667u;
+	const DisplayChainTimingTransition_t gridChange =
+		observe_display_chain( contentReprime.state, changedGrid );
+	REQUIRE( gridChange.displayChainChanged );
+	CHECK( gridChange.state.generation == generation + 1u );
+	CHECK( gridChange.state.presentBias.samples == 0u );
+	CHECK( gridChange.state.presentBias.emaNs == 0 );
+	CHECK( gridChange.state.presentLead.samples == 0u );
+	CHECK( gridChange.state.presentLead.emaNs == 0 );
+
+	const auto checkChainReset = [&]( const DisplayChainKey_t &changedChain ) {
+		const DisplayChainTimingTransition_t changed =
+			observe_display_chain( timing, changedChain );
+		REQUIRE( changed.displayChainChanged );
+		CHECK( changed.state.presentBias.samples == 0u );
+		CHECK( changed.state.presentLead.samples == 0u );
+	};
+	DisplayChainKey_t changedBackend = chain;
+	changedBackend.backendId++;
+	checkChainReset( changedBackend );
+	DisplayChainKey_t changedConnector = chain;
+	changedConnector.connectorId++;
+	checkChainReset( changedConnector );
+	DisplayChainKey_t changedVrr = chain;
+	changedVrr.vrrActive = true;
+	checkChainReset( changedVrr );
+	DisplayChainKey_t changedClock = chain;
+	changedClock.sourceTimestampsReliable = false;
+	checkChainReset( changedClock );
 }
 
 TEST_CASE( "causal deadline costs are keyed by work class", "[framegen][deadline]" )
@@ -265,6 +450,44 @@ TEST_CASE( "bidir epoch starts at the current live-path display target", "[frame
 	CHECK( epoch.displayEpochNs == 5'000u );
 	CHECK( epoch.endpoint_display_time( 1'000u ) == 5'000u );
 	CHECK( epoch.endpoint_display_time( 1'250u ) == 5'250u );
+}
+
+TEST_CASE( "bidir epoch re-establishment does not thrash across a cut sequence", "[framegen][deadline]" )
+{
+	constexpr uint64_t gridEpoch = 9u;
+	BidirEpoch_t epoch = establish_bidir_epoch( 1'000u, 5'000u, gridEpoch );
+	BidirCutEpisodeState_t cutState;
+	uint32_t invalidations = 0u;
+	uint32_t establishments = 1u;
+	const std::array cutSequence = {
+		false, true, true, true, false, true, true,
+	};
+
+	for ( size_t i = 0u; i < cutSequence.size(); i++ )
+	{
+		const BidirCutTransition_t cut = observe_bidir_scene_cut(
+			cutState, cutSequence[ i ] );
+		cutState = cut.state;
+		CHECK( cut.discardInterpolations == cutSequence[ i ] );
+		if ( cut.invalidateEpoch )
+		{
+			epoch = {};
+			invalidations++;
+		}
+		if ( !epoch.valid )
+		{
+			epoch = establish_bidir_epoch(
+				1'100u + i * 100u, 5'100u + i * 100u, gridEpoch );
+			REQUIRE( epoch.valid );
+			CHECK( epoch.epoch == gridEpoch );
+			establishments++;
+		}
+	}
+
+	// One invalidation/re-establishment per cut episode, not per asserted
+	// detector sample. The clean pair between episodes re-arms a genuine cut.
+	CHECK( invalidations == 2u );
+	CHECK( establishments == 3u );
 }
 
 TEST_CASE( "delayed-real feedback corrects only future bidir targets", "[framegen][deadline]" )
