@@ -570,24 +570,127 @@ struct BidirPlan_t
 	bool validEpoch = false;
 };
 
-// Return oldest-first generated entries to shed until the requested capacity
-// is met. Real endpoints are never returned; if endpoints alone exceed the
-// soft capacity, the caller preserves that endpoint backlog.
-[[nodiscard]] inline std::vector<size_t> bidir_generated_shed_indices(
-	std::span<const BidirSlotKind_t> kinds, size_t capacity )
+struct BidirQueueEntry_t
 {
-	std::vector<size_t> result;
-	if ( kinds.size() <= capacity )
+	BidirSlotKind_t kind = BidirSlotKind_t::Generated;
+	uint64_t targetNs = 0;
+	uint64_t realFrameId = 0;
+};
+
+struct BidirQueueShedPlan_t
+{
+	std::vector<size_t> indices;
+	std::optional<size_t> newestRetainedEndpoint;
+	size_t generated = 0;
+	size_t endpoints = 0;
+};
+
+// Preserve the old latency bound (two intervals at the configured density),
+// but make it subordinate to the physical output ring. Two ring positions stay
+// outside the pending timeline for the real composite being acquired and normal
+// backend/history progress.
+[[nodiscard]] constexpr size_t bidir_pending_hard_capacity(
+	size_t outputRingImages, uint32_t multiplier )
+{
+	const size_t ringCapacity = outputRingImages > 2u
+		? outputRingImages - 2u : 0u;
+	const size_t latencyCapacity = 2u
+		* ( static_cast<size_t>( std::max( 2u, multiplier ) ) + 1u );
+	return std::min( ringCapacity, latencyCapacity );
+}
+
+// A future display target is a pacing hint only while the queue has room. Once
+// the hard ceiling is reached the next display opportunity must present or drop
+// its front; otherwise the queue itself can prevent the composite which would
+// have advanced the timeline.
+[[nodiscard]] constexpr bool bidir_queue_forces_drain(
+	size_t depth, size_t hardCapacity )
+{
+	return depth != 0u && depth >= hardCapacity;
+}
+
+// Select entries to remove until capacity is met. Generated work is disposable
+// and is shed oldest-first. If that is insufficient, stale real endpoints are
+// shed oldest-first too. Endpoints sharing a display target are coalesced to the
+// newest real frame before distinct targets are sacrificed. The retained anchor
+// lets the caller re-establish its source/display epoch after endpoint shedding.
+[[nodiscard]] inline BidirQueueShedPlan_t plan_bidir_queue_shed(
+	std::span<const BidirQueueEntry_t> entries, size_t capacity )
+{
+	BidirQueueShedPlan_t result;
+	if ( entries.size() <= capacity )
 		return result;
 
-	size_t remaining = kinds.size();
-	for ( size_t i = 0u; i < kinds.size() && remaining > capacity; i++ )
-	{
-		if ( kinds[ i ] != BidirSlotKind_t::Generated )
-			continue;
-		result.push_back( i );
+	std::vector<bool> removed( entries.size(), false );
+	size_t remaining = entries.size();
+	const auto shed = [&]( size_t i, bool endpoint ) {
+		removed[ i ] = true;
+		result.indices.push_back( i );
 		remaining--;
+		if ( endpoint )
+			result.endpoints++;
+		else
+			result.generated++;
+	};
+
+	for ( size_t i = 0u; i < entries.size() && remaining > capacity; i++ )
+	{
+		if ( entries[ i ].kind == BidirSlotKind_t::Generated )
+			shed( i, false );
 	}
+
+	while ( remaining > capacity )
+	{
+		std::optional<size_t> candidate;
+		// Prefer an older duplicate so each target retains its newest endpoint.
+		for ( size_t i = 0u; i < entries.size() && !candidate; i++ )
+		{
+			if ( removed[ i ]
+				|| entries[ i ].kind != BidirSlotKind_t::RealEndpoint )
+				continue;
+			for ( size_t j = 0u; j < entries.size(); j++ )
+			{
+				if ( !removed[ j ]
+					&& entries[ j ].kind == BidirSlotKind_t::RealEndpoint
+					&& entries[ j ].targetNs == entries[ i ].targetNs
+					&& ( entries[ j ].realFrameId > entries[ i ].realFrameId
+						|| ( entries[ j ].realFrameId == entries[ i ].realFrameId
+							&& j > i ) ) )
+				{
+					candidate = i;
+					break;
+				}
+			}
+		}
+		if ( !candidate )
+		{
+			for ( size_t i = 0u; i < entries.size(); i++ )
+			{
+				if ( !removed[ i ]
+					&& entries[ i ].kind == BidirSlotKind_t::RealEndpoint )
+				{
+					candidate = i;
+					break;
+				}
+			}
+		}
+		if ( !candidate )
+			break;
+		shed( *candidate, true );
+	}
+
+	for ( size_t i = 0u; i < entries.size(); i++ )
+	{
+		if ( removed[ i ]
+			|| entries[ i ].kind != BidirSlotKind_t::RealEndpoint )
+			continue;
+		if ( !result.newestRetainedEndpoint
+			|| entries[ i ].realFrameId
+				>= entries[ *result.newestRetainedEndpoint ].realFrameId )
+			result.newestRetainedEndpoint = i;
+	}
+
+	std::sort( result.indices.begin(), result.indices.end() );
 	return result;
 }
 

@@ -792,30 +792,109 @@ TEST_CASE( "bidir multiplier ceiling selects evenly distributed grid targets", "
 	CHECK( generatedTargets[ 1 ] == 1'400u );
 }
 
-TEST_CASE( "bidir pressure sheds oldest generated slots before endpoints", "[framegen][deadline]" )
+TEST_CASE( "bidir pressure has a ring-derived hard ceiling and ordered shedding", "[framegen][deadline]" )
 {
-	const std::array kinds = {
-		BidirSlotKind_t::RealEndpoint,
-		BidirSlotKind_t::Generated,
-		BidirSlotKind_t::Generated,
-		BidirSlotKind_t::RealEndpoint,
-		BidirSlotKind_t::Generated,
+	CHECK( bidir_pending_hard_capacity( 8u, 2u ) == 6u );
+	CHECK( bidir_pending_hard_capacity( 10u, 3u ) == 8u );
+	CHECK( bidir_pending_hard_capacity( 12u, 4u ) == 10u );
+	CHECK( bidir_pending_hard_capacity( 2u, 4u ) == 0u );
+
+	const std::array entries = {
+		BidirQueueEntry_t{ BidirSlotKind_t::RealEndpoint, 100u, 1u },
+		BidirQueueEntry_t{ BidirSlotKind_t::Generated, 200u, 0u },
+		BidirQueueEntry_t{ BidirSlotKind_t::Generated, 300u, 0u },
+		BidirQueueEntry_t{ BidirSlotKind_t::RealEndpoint, 400u, 2u },
+		BidirQueueEntry_t{ BidirSlotKind_t::Generated, 500u, 0u },
 	};
-	const std::vector<size_t> shed = bidir_generated_shed_indices( kinds, 3u );
-	REQUIRE( shed.size() == 2u );
-	CHECK( shed[ 0 ] == 1u );
-	CHECK( shed[ 1 ] == 2u );
+	const BidirQueueShedPlan_t generatedFirst =
+		plan_bidir_queue_shed( entries, 3u );
+	REQUIRE( generatedFirst.indices.size() == 2u );
+	CHECK( generatedFirst.indices[ 0 ] == 1u );
+	CHECK( generatedFirst.indices[ 1 ] == 2u );
+	CHECK( generatedFirst.generated == 2u );
+	CHECK( generatedFirst.endpoints == 0u );
 
 	const std::array endpointBacklog = {
-		BidirSlotKind_t::RealEndpoint,
-		BidirSlotKind_t::Generated,
-		BidirSlotKind_t::RealEndpoint,
-		BidirSlotKind_t::RealEndpoint,
+		BidirQueueEntry_t{ BidirSlotKind_t::RealEndpoint, 100u, 1u },
+		BidirQueueEntry_t{ BidirSlotKind_t::Generated, 150u, 0u },
+		BidirQueueEntry_t{ BidirSlotKind_t::RealEndpoint, 200u, 2u },
+		BidirQueueEntry_t{ BidirSlotKind_t::RealEndpoint, 200u, 3u },
+		BidirQueueEntry_t{ BidirSlotKind_t::RealEndpoint, 300u, 4u },
 	};
-	const std::vector<size_t> endpointSafe = bidir_generated_shed_indices(
-		endpointBacklog, 2u );
-	REQUIRE( endpointSafe.size() == 1u );
-	CHECK( endpointSafe.front() == 1u );
+	const BidirQueueShedPlan_t endpointShed =
+		plan_bidir_queue_shed( endpointBacklog, 2u );
+	REQUIRE( endpointShed.indices.size() == 3u );
+	CHECK( endpointShed.indices[ 0 ] == 0u );
+	CHECK( endpointShed.indices[ 1 ] == 1u );
+	CHECK( endpointShed.indices[ 2 ] == 2u );
+	CHECK( endpointShed.generated == 1u );
+	CHECK( endpointShed.endpoints == 2u );
+	REQUIRE( endpointShed.newestRetainedEndpoint.has_value() );
+	CHECK( *endpointShed.newestRetainedEndpoint == 4u );
+	CHECK_FALSE( bidir_queue_forces_drain( 5u, 6u ) );
+	CHECK( bidir_queue_forces_drain( 6u, 6u ) );
+}
+
+TEST_CASE( "bidir 46 fps into 120 Hz remains bounded for 1000 frames", "[framegen][deadline]" )
+{
+	constexpr uint64_t displayIntervalNs = 8'333'333u;
+	constexpr uint64_t sourceIntervalNs = 1'000'000'000u / 46u;
+	constexpr size_t ringImages = 8u;
+	constexpr uint32_t multiplier = 2u;
+	constexpr size_t hardCapacity =
+		bidir_pending_hard_capacity( ringImages, multiplier );
+	std::vector<BidirQueueEntry_t> queue;
+	uint64_t nextVblankNs = displayIntervalNs;
+	size_t maxDepth = 0u;
+	size_t compositeBlockingStates = 0u;
+
+	for ( uint64_t frame = 1u; frame <= 1'000u; frame++ )
+	{
+		const uint64_t sourceReadyNs = frame * sourceIntervalNs;
+		while ( nextVblankNs <= sourceReadyNs )
+		{
+			if ( !queue.empty()
+				&& ( queue.front().targetNs <= nextVblankNs
+					|| bidir_queue_forces_drain(
+						queue.size(), hardCapacity ) ) )
+				queue.erase( queue.begin() );
+			nextVblankNs += displayIntervalNs;
+		}
+
+		// Reserve the real endpoint plus every empty display slot in this source
+		// interval before the composite records them.
+		const uint64_t endpointTargetNs = nextVblankNs + sourceIntervalNs;
+		std::vector<BidirQueueEntry_t> incoming;
+		for ( uint64_t targetNs = nextVblankNs + displayIntervalNs;
+			targetNs < endpointTargetNs; targetNs += displayIntervalNs )
+		{
+			incoming.push_back( {
+				BidirSlotKind_t::Generated, targetNs, 0u } );
+		}
+		incoming.push_back( {
+			BidirSlotKind_t::RealEndpoint, endpointTargetNs, frame } );
+
+		queue.insert( queue.end(), incoming.begin(), incoming.end() );
+		std::ranges::sort( queue, {}, &BidirQueueEntry_t::targetNs );
+		const BidirQueueShedPlan_t shed =
+			plan_bidir_queue_shed( queue, hardCapacity );
+		for ( auto it = shed.indices.rbegin(); it != shed.indices.rend(); ++it )
+			queue.erase( queue.begin() + *it );
+
+		maxDepth = std::max( maxDepth, queue.size() );
+		// One non-queue ring owner models ordinary backend/history ownership;
+		// the second reserved image must remain acquirable by this composite.
+		compositeBlockingStates += queue.size() + 1u >= ringImages;
+		REQUIRE( queue.size() <= hardCapacity );
+		REQUIRE( std::ranges::any_of( queue,
+			[&]( const BidirQueueEntry_t &entry ) {
+				return entry.kind == BidirSlotKind_t::RealEndpoint
+					&& entry.realFrameId == frame;
+			} ) );
+	}
+
+	CHECK( maxDepth <= hardCapacity );
+	CHECK( compositeBlockingStates == 0u );
 }
 
 TEST_CASE( "VRR midpoint wake compensates tagged backend present lead", "[framegen][deadline]" )
