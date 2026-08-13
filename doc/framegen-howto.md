@@ -25,15 +25,14 @@ export GRAVITYMARK_DIR=/path/to/GravityMark/bin
 export FRAMEGEN_BEST_PROFILE="$HOME/.cache/gamescope-fg-gravitymark-best-dc58b2d5.bin"
 
 test -r "$FRAMEGEN_BEST_PROFILE" # this must succeed before continuing
-unset GAMESCOPE_FRAMEGEN_JIT GAMESCOPE_FRAMEGEN_VRR_HYBRID \
-  GAMESCOPE_FRAMEGEN_BASE GAMESCOPE_FRAMEGEN_NET_ONLINE \
+unset GAMESCOPE_FRAMEGEN_VRR_HYBRID GAMESCOPE_FRAMEGEN_BASE \
+  GAMESCOPE_FRAMEGEN_NET_ONLINE \
   GAMESCOPE_FRAMEGEN_NET_PROFILE GAMESCOPE_FRAMEGEN_RECORD_COLOR \
   GAMESCOPE_FRAMEGEN_BIDIR_TRACE
 
 GAMESCOPE_BUILD_DIR=build-perf \
 GAMESCOPE_FRAMEGEN_BIDIR=1 \
 GAMESCOPE_FRAMEGEN_NET="$FRAMEGEN_BEST_PROFILE" \
-GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS=0 \
 GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0 \
 GAMESCOPE_FRAMEGEN_RESERVOIR=1 \
 GAMESCOPE_FRAMEGEN_SHADING=1 \
@@ -90,23 +89,24 @@ At x4, a five-vblank gap necessarily leaves one repeat because only three
 generated frames are available. Treat the limiter as a controlled pacing test,
 not as the frozen visual baseline or a guaranteed stutter fix.
 
-### Optional causal fixed-cadence JIT variant
+### Default causal fixed-cadence behavior
 
-`GAMESCOPE_FRAMEGEN_JIT=1` implements the fixed-display idea without delaying a
-real frame. For each refresh slot, it uses the renderer buffer's acquire-ready
+On a dedicated framegen queue, fixed-refresh scheduling uses the deadline
+timeline by default and does not delay a real frame. For each refresh slot, it
+uses the renderer buffer's acquire-ready
 timestamps to learn cadence, bounded trend, and recent late error. It generates
 one disposable forward-predicted backup only when the next real frame is not
 confidently due before the compositor's exact wake deadline. At presentation,
 the order remains real frame, ready generated frame, then hardware repeat.
 
 This is intentionally separate from the preferred bidirectional x4 baseline:
-JIT is causal and low latency; bidirectional mode waits for the next real frame
-and usually has better endpoint evidence. Do not enable both.
+causal mode is low latency; bidirectional mode waits for the next real frame and
+usually has better endpoint evidence. Select causal mode by leaving
+`GAMESCOPE_FRAMEGEN_BIDIR` unset.
 
-The startup log must contain `causal fixed-cadence JIT active`. If it instead
-reports bidirectional interpolation, or reports that bidirectional mode was
-ignored, the shell still contains a conflicting pacing toggle and the run is
-not a JIT comparison.
+The startup log must contain `causal fixed-refresh deadline scheduling active by
+default`. If it instead reports bidirectional interpolation, the shell still
+contains a conflicting mode setting and the run is not a causal comparison.
 
 Using the variables defined by the preferred baseline command above:
 
@@ -116,7 +116,6 @@ unset GAMESCOPE_FRAMEGEN_BIDIR GAMESCOPE_FRAMEGEN_VRR_HYBRID \
   GAMESCOPE_FRAMEGEN_NET_PROFILE GAMESCOPE_FRAMEGEN_RECORD_COLOR
 
 GAMESCOPE_BUILD_DIR=build-perf \
-GAMESCOPE_FRAMEGEN_JIT=1 \
 GAMESCOPE_FRAMEGEN_NET="$FRAMEGEN_BEST_PROFILE" \
 GAMESCOPE_FRAMEGEN_RESERVOIR=1 \
 GAMESCOPE_FRAMEGEN_SHADING=1 \
@@ -136,10 +135,10 @@ gamescope --expose-wayland --backend wayland \
     -asteroids 1000000 -width 2560 -height 1440 -vsync 0
 ```
 
-The timing predictor adapts in memory whenever JIT is active; it has no profile
-file and adds no Vulkan dispatch. This is independent of C2 image-model
+The timing predictor adapts in memory during causal deadline scheduling; it has
+no profile file and adds no Vulkan dispatch. This is independent of C2 image-model
 training. To continue in-situ image-model learning, use the writable working
-profile procedure below. In JIT mode the multiplier sizes the existing output
+profile procedure below. In causal mode the multiplier sizes the existing output
 capacity and policy, but it does not force three generated frames per real: the
 effective multiplier follows available display slots and stops at the forward
 prediction cap.
@@ -361,9 +360,7 @@ about one frame of lag**, so avoid it for fast/competitive shooters. Great for
 single-player, racing, scenery. Extreme's causal acceleration, guided
 reconstruction, disocclusion reservoir and shading-persistence correction do
 not run in this mode; bidirectional interpolation uses two checked endpoint
-fields instead. `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS=0.25` is an experimental
-compromise for low-source-rate A/B: it slightly evens generated phase spacing
-without adding flip latency. The default `0` is the established sharp/snappy path.
+fields instead. Bidir phases are timestamp-exact since the deadline timeline.
 `GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0.5` is a separate experimental edge A/B:
 it lets a clearly surviving checked side retain slightly more authority instead
 of dissolving into the unwarped crossfade. It changes neither motion fields nor
@@ -463,8 +460,8 @@ can keep up (see limits).
   frames improve motion cadence, not the 20 Hz input sampling rate.
 - **VRR mode** needs a real VRR (FreeSync/G-Sync) monitor actively in VRR; it
   does nothing on ordinary screens or typical laptop panels.
-- **Base-layer** and **bidirectional** can't be used at the same time. So can't
-  bidirectional and VRR, or bidirectional and JIT — pick one "smart" mode.
+- **Base-layer** and **bidirectional** can't be used at the same time. Neither can
+  bidirectional and VRR — pick one of those modes.
 - **AI refiner** needs `--framegen-mode motion` and `--framegen-quality high`
   or above; bidirectional is optional (it works in the zero-latency forward
   path too).
@@ -504,7 +501,7 @@ Add `--framegen-debug` and watch the terminal:
   endpoint instead of predicting across unrelated content.
 - `… ignored (requires …)` → you enabled a mode without its requirement (e.g.
   `GAMESCOPE_FRAMEGEN_BIDIR=1` without `--framegen-mode motion`, or combined
-  with a mode that owns its own timeline like base-layer/VRR/JIT).
+  with a mode that owns its own timeline like base-layer or VRR).
 
 | Problem | Likely cause / fix |
 |---------|--------------------|

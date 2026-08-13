@@ -4966,7 +4966,7 @@ struct FramegenMotionResources_t
 	uint64_t uMotionHistoryFrameId = 0;
 	uint64_t uMotionHistoryIntervalNs = 0;
 	// The finalized field for the current real-frame pair remains resident in
-	// mvField/mvFieldNet. JIT and idle refills reuse it instead of estimating,
+	// mvField/mvFieldNet. Deadline slots and classic idle refills reuse it instead of estimating,
 	// refining, probing and training on the same pair again. On the next
 	// consecutive pair it is copied to mvFieldHistory before preparation
 	// overwrites the working images.
@@ -5428,7 +5428,7 @@ struct FramegenHistory_t
 	uint64_t currentFrameId = 0;
 	uint64_t previousPresentTimeNs = 0;
 	uint64_t currentPresentTimeNs = 0;
-	// Display-clock pacing (#06 JIT phase). cadence learns source-buffer readiness
+	// Default display-clock pacing (#06). cadence learns source-buffer readiness
 	// from acquire-fence completion times, before fixed-refresh quantization. Its
 	// bounded trend predicts smooth rate changes and its one-sided late envelope
 	// decides whether the next display slot needs a speculative backup. Backends
@@ -5747,7 +5747,7 @@ static bool framegen_causal_deadline_enabled()
 // VRR hybrid (#01): instead of suppressing adaptive sync, present real frames
 // immediately (full VRR latency win) and show the one generated frame via a
 // timer-armed mid-interval flip. Requires the dedicated framegen queue for the
-// same reason JIT does. "Requested" gates the allowVRR decision in steamcompmgr
+// same reason causal deadline scheduling does. "Requested" gates the allowVRR decision in steamcompmgr
 // (VRR can only BECOME active if real flips carry allowVRR=true); "active"
 // additionally requires the connector to actually be in VRR right now — when it
 // is not (nested, panel without VRR, adaptive sync toggled off), every decision
@@ -5830,30 +5830,12 @@ static bool framegen_base_layer_usable( const struct FrameInfo_t *pFrameInfo )
 // both motion layers). The price is intrinsic: the real frame can only be
 // presented AFTER its interpolations, i.e. up to one real-frame interval of
 // added latency — which is why it is opt-in. Motion mode only; the pacing
-// prototypes (#01 VRR hybrid, #06 JIT) and the base-layer path (#02) keep
-// their own timelines and are mutually exclusive with it.
+// VRR hybrid and base-layer paths remain mutually exclusive with it; bidir
+// otherwise uses the shared absolute-deadline timeline.
 static bool framegen_bidir_enabled()
 {
 	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_BIDIR" ) );
 	return s_bEnabled;
-}
-
-// Step 4 phases are timestamp-exact on actual display targets. Keep parsing the
-// legacy knob for one migration interval, but it can no longer perturb pixels.
-// The function stays compiled because Step 5 owns removal of the gap planner.
-static float framegen_bidir_phase_bias()
-{
-	static const bool s_bLogged = []()
-	{
-		if ( gamescope::framegen::non_empty_setting(
-			getenv( "GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS" ) ) != nullptr )
-		{
-			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS is ignored; bidirectional phases are timestamp-exact (removal scheduled for Step 5)" );
-		}
-		return true;
-	}();
-	(void)s_bLogged;
-	return 0.0f;
 }
 
 // Experimental occlusion-side authority for bidirectional interpolation. The
@@ -6151,24 +6133,6 @@ bool vulkan_framegen_generated_frame_due()
 	if ( !vulkan_framegen_bidir_active() )
 		return true;
 	return front.ulTargetFlipNs <= GetVBlankTimer().GetNextVBlank( 0 );
-}
-
-// Legacy Step 3 offset API, retained compiled until Step 5. The production
-// arming path consumes vulkan_framegen_vrr_hybrid_wake_deadline_ns() and never
-// derives identity from an unlabelled vblank sample.
-uint64_t vulkan_framegen_vrr_hybrid_mid_offset_ns()
-{
-	const uint64_t ulPredictedIntervalNs = framegen_predicted_interval_ns();
-	if ( !vulkan_framegen_vrr_hybrid_active()
-		|| g_framegenHistory.pending.empty()
-		|| ulPredictedIntervalNs == 0 )
-		return 0;
-
-	const float flPhase = g_framegenHistory.pending.front().phase;
-	if ( flPhase <= 0.0f )
-		return 0;
-
-	return (uint64_t)( (double)ulPredictedIntervalNs * (double)flPhase );
 }
 
 bool vulkan_framegen_generated_frame_ready()
@@ -6821,22 +6785,6 @@ static bool framegen_net_online_enabled()
 {
 	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_NET_ONLINE" ) );
 	return s_bEnabled;
-}
-
-// Endpoint reconstruction has an aperture-problem null space: several motion
-// vectors can sample the same next-frame color while tracing very different
-// paths through bidirectional intermediate phases. Keep learned bidir geometry
-// behind an explicit attribution switch until a true intermediate-time target
-// exists; confidence-only service/training is the safe default.
-static bool framegen_net_bidir_flow_enabled()
-{
-	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW" ) );
-	return s_bEnabled;
-}
-
-static bool framegen_net_bidir_conservative()
-{
-	return vulkan_framegen_bidir_active() && !framegen_net_bidir_flow_enabled();
 }
 
 static float framegen_net_online_lr()
@@ -7762,7 +7710,7 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 	}
 
 	const uint32_t pg = 8; // = the shader's output tile
-	const bool bConservativeBidir = framegen_net_bidir_conservative();
+	const bool bConservativeBidir = vulkan_framegen_bidir_active();
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET ) );
 	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldNet );
 	pCmdBuffer->bindTarget2( g_framegenMotion.netShadingFocus );
@@ -7884,7 +7832,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	g_ulFramegenNetProgress++;
 	const uint32_t uHalf = k_uFramegenNetTrainTiles / 2;
 	const uint32_t uSeed = m.uNetTrainStep * 0x9E3779B9u + 0x61C88647u;
-	const bool bConservativeBidir = framegen_net_bidir_conservative();
+	const bool bConservativeBidir = vulkan_framegen_bidir_active();
 	const int nReservoirRead = framegen_luma_reservoir_read_index();
 	const bool bShadingHistoryValid = eQuality == GamescopeFramegenQuality::Extreme
 		&& framegen_shading_enabled( eQuality )
@@ -8845,7 +8793,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	const bool bBidir = vulkan_framegen_bidir_active();
 	const bool bMotionRequested = eff.mode == GamescopeFramegenMode::Motion
 		&& dispatch.motionSupported;
-	// The classic/JIT/idle planners can submit several batches for one real
+	// The classic/deadline/idle planners can submit several batches for one real
 	// interval. Re-estimating and re-training on that identical pair both wastes
 	// the deadline and statistically overweights slow intervals. The finalized
 	// field remains resident until any new preparation explicitly invalidates it.
@@ -9004,7 +8952,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// this same-command-buffer copy is ordered after those reads and publishes
 	// lumaPrev for the next consecutive Extreme batch. At 1/8 resolution this
 	// is 1/64 the texel traffic of copying the full color frame. Two tiny images
-	// retain both current-2 (for JIT/refill slots of this same interval) and
+	// retain both current-2 (for deadline/refill slots of this same interval) and
 	// current-1 (for the next interval); a refill finds the latter already
 	// published and records no redundant copy.
 	if ( bMotion && !bBidir && eff.quality == GamescopeFramegenQuality::Extreme
@@ -9149,8 +9097,6 @@ static bool framegen_submit_batch( uint32_t nFirstSlot, uint32_t nGapVblanks, ui
 	// with framegen_causal_submit below, where the deadline planner supplies it.
 	std::vector<FramegenSlotRequest_t> requests;
 	requests.reserve( nGenerate );
-	const float flBidirPhaseBias = vulkan_framegen_bidir_active()
-		? framegen_bidir_phase_bias() : 0.0f;
 	for ( uint32_t i = 0; i < nGenerate; i++ )
 	{
 		const uint32_t k = nFirstSlot + i;
@@ -9159,8 +9105,8 @@ static bool framegen_submit_batch( uint32_t nFirstSlot, uint32_t nGapVblanks, ui
 		// Idle refill can move past the originally expected next-real slot when
 		// the game stalls, but never lets prediction run away unbounded.
 		requests.push_back( gamescope::framegen::classic_slot_request(
-			k, i, nGapVblanks, nGenerate, flBidirPhaseBias,
-			g_flFramegenStrength, k_flFramegenMaxForwardStrength ) );
+			k, nGapVblanks, g_flFramegenStrength,
+			k_flFramegenMaxForwardStrength ) );
 	}
 
 	return framegen_submit_planned( requests.data(), (uint32_t)requests.size(), nGapVblanks, eff, ulCompositeSeqNo, nMaxDegradeSteps, bClearPending );
@@ -9455,7 +9401,7 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 
 // VRR hybrid slot (#01). Plan exactly ONE generated frame at the content
 // midpoint of the measured real-frame interval. This inverts #06: under a
-// fixed refresh, JIT asks "given the next vblank, what phase is that?"; under
+// fixed refresh, the deadline planner asks "given the next vblank, what phase is that?"; under
 // active adaptive sync there is no grid — the real frame scanned out on
 // arrival — so we PICK the phase (0.5, the content-correct midpoint, exact by
 // construction) and manufacture the display event for it: steamcompmgr arms an
@@ -10507,9 +10453,6 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			{
 				vk_log.infof( "framegen: bidirectional quality path — symmetric checked forward/reverse fields%s; causal acceleration, Extreme color-guided reconstruction, reservoir and shading are not scheduled",
 					framegen_agreement_enabled( g_eFramegenQuality ) ? " + full-resolution agreement" : "" );
-				if ( framegen_bidir_phase_bias() > 0.0f )
-					vk_log.infof( "framegen: experimental bidir phase bias %.2f — low-latency queue timing preserved; generated phases move partially from k/gap toward uniform multiplier spacing",
-						framegen_bidir_phase_bias() );
 				if ( framegen_bidir_one_sided_strength() > 0.0f )
 					vk_log.infof( "framegen: experimental bidir one-sided occlusion authority %.2f — strongly asymmetric checked fields retain more of the surviving warped side without changing both-valid or both-killed fallback",
 						framegen_bidir_one_sided_strength() );
@@ -10536,9 +10479,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				vk_log.infof( "framegen: self-supervised adaptation disabled (GAMESCOPE_FRAMEGEN_ADAPT=0)" );
 			if ( framegen_net_requested( g_eFramegenQuality ) )
 			{
-				const bool bConservativeBidir = framegen_net_bidir_conservative();
+				const bool bConservativeBidir = vulkan_framegen_bidir_active();
 				if ( bConservativeBidir )
-					vk_log.infof( "framegen: learned bidirectional confidence veto active (C) — FB-checked geometry is preserved, confidence can only decrease; GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW=1 restores experimental endpoint-trained flow correction" );
+					vk_log.infof( "framegen: learned bidirectional confidence veto active (C) — FB-checked geometry is preserved and confidence can only decrease" );
 				else
 					vk_log.infof( "framegen: learned forward-field refinement active (C) — the net improves causal motion prediction once per real frame (bounded flow residual + evidence-gated confidence)" );
 				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme && !bBidirActive )
@@ -10972,9 +10915,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// VRR hybrid (#01): the real frame just presented immediately (adaptive
 	// sync — no grid quantization, no added latency), and the one generated
 	// frame is placed at the content midpoint of the measured interval by a
-	// timer-armed flip (steamcompmgr owns the timer and reads the offset via
-	// vulkan_framegen_vrr_hybrid_mid_offset_ns). Keep-up guard: skip when the
-	// interval is too short to split; scheduling.hpp owns the threshold.
+	// correlated absolute deadline. Keep-up guard: skip when the interval is too
+	// short to split; scheduling.hpp owns the threshold.
 	if ( bVrrHybrid )
 	{
 		g_framegenHistory.pending.clear();
@@ -10993,9 +10935,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		return;
 	}
 
-	// Step 4 production bidir path. The absolute-epoch planner schedules the
-	// real endpoint even when it emits zero candidates; the rounded-gap branch
-	// below remains compiled for Step 5 removal but is unreachable in bidir.
+	// The absolute-epoch planner schedules the real endpoint even when it emits
+	// zero candidates.
 	if ( bBidirDeadline )
 	{
 		framegen_bidir_plan_pair(
@@ -11011,16 +10952,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// is the next real frame). The ladder's effective multiplier can lower this
 	// ceiling below the startup one under GPU pressure; it is always
 	// <= g_nFramegenMultiplier, so the pre-sized output pool holds.
-	//
-	// Bidir (B3) never speculates past the measured gap: its slots are appended
-	// to the presentation queue rather than superseded by the next real frame,
-	// so planning more slots than the interval has vblanks would accumulate
-	// latency instead of being discarded. The measured (just-completed)
-	// interval is also exactly the span its phases interpolate.
-	const bool bBidir = vulkan_framegen_bidir_active();
 	const uint32_t nGapVblanks = gamescope::framegen::expanded_gap_vblanks(
-		nMeasuredGapVblanks, eff.multiplier, bCanSpeculate && !bBidir );
-	uint32_t nGenerate = gamescope::framegen::generated_slots_for_gap(
+		nMeasuredGapVblanks, eff.multiplier, bCanSpeculate );
+	const uint32_t nGenerate = gamescope::framegen::generated_slots_for_gap(
 		nGapVblanks, eff.multiplier, g_device.hasFramegenQueue() );
 
 	// Without a dedicated framegen queue the batch is submitted to the same
@@ -11030,70 +10964,6 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// generated_slots_for_gap applies that cap while forming nGenerate above.
 	if ( nGenerate == 0 )
 		return;
-
-	if ( bBidir )
-	{
-		// The interpolations lead INTO this real frame on the delayed timeline;
-		// queued REAL entries must stay ordered, but an interpolation becomes a
-		// latency liability once the game outruns the one-flip-per-vblank drain.
-		// Reserve room for this batch AND its real endpoint before appending: the
-		// old check ran against the pre-append size, so a nominal cap of 10 could
-		// repeatedly reach 14 with an x4 batch. Shed oldest predictions first,
-		// never real frames; if real backlog alone consumes the budget, admit fewer
-		// new interpolations and let the timeline catch up.
-		const size_t uMaxPending = (size_t)( 2u * ( eff.multiplier + 1u ) );
-		const uint32_t nRequested = nGenerate;
-		const size_t uDesiredOldMax = uMaxPending > (size_t)nGenerate + 1u
-			? uMaxPending - (size_t)nGenerate - 1u : 0u;
-		size_t uShed = 0;
-		for ( auto it = g_framegenHistory.pending.begin();
-			g_framegenHistory.pending.size() > uDesiredOldMax && it != g_framegenHistory.pending.end(); )
-		{
-			if ( !it->bReal )
-			{
-				it = g_framegenHistory.pending.erase( it );
-				uShed++;
-			}
-			else
-			{
-				++it;
-			}
-		}
-		const size_t uReservedForReal = g_framegenHistory.pending.size() < uMaxPending
-			? 1u : 0u;
-		const size_t uAvailableGenerated = uMaxPending - std::min( uMaxPending,
-			g_framegenHistory.pending.size() + uReservedForReal );
-		nGenerate = std::min<uint32_t>( nGenerate, (uint32_t)uAvailableGenerated );
-		static uint64_t s_uOverflowDebugLogCounter = 0;
-		if ( ( uShed > 0 || nGenerate != nRequested ) && FramegenDebugShouldLog( s_uOverflowDebugLogCounter ) )
-		{
-			vk_log.infof( "framegen: bidir queue pressure pending=%zu/%zu shed=%zu admitted=%u/%u",
-				g_framegenHistory.pending.size(), uMaxPending, uShed, nGenerate, nRequested );
-		}
-
-		if ( nGenerate > 0 )
-			framegen_submit_batch( 1, nGapVblanks, nGenerate, eff, ulCompositeSeqNo, nMaxDegradeSteps, false );
-
-		// Queue the real frame itself behind its interpolations. Its composite
-		// rides the realtime queue (seqNo 0 on the framegen timeline = always
-		// ready); the flip substitution presents the queue front in its place
-		// this paint. Queued even if the batch failed — the queue then just
-		// presents it next, degrading to (near-)zero added delay.
-		FramegenHistory_t::PendingGenerated_t realEntry;
-		realEntry.tex = pRealFrame;
-		realEntry.seqNo = 0;
-		realEntry.frameId = g_framegenHistory.currentFrameId;
-		realEntry.ulPresentRealFrameId = g_framegenPresentState.ulCurrentRealFrameId;
-		realEntry.ulSlotId = framegen_next_present_slot_id();
-		realEntry.ulCompositeSeqNo = ulCompositeSeqNo;
-		realEntry.ulTargetFlipNs = GetVBlankTimer().GetNextVBlank( 0 )
-			+ uint64_t( g_framegenHistory.pending.size() ) * framegen_display_interval_ns();
-		realEntry.phase = 1.0f;
-		realEntry.bReal = true;
-		g_framegenHistory.pending.push_back( std::move( realEntry ) );
-		g_framegenHistory.bBidirQueuedReal = true;
-		return;
-	}
 
 	// Any leftover pending frames belong to an older prediction; drop them before
 	// queuing this interval's batch (normally already done by the supersede path

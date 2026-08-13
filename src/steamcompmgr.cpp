@@ -8367,21 +8367,6 @@ static gamescope::CTimerFunction g_FramegenMidTimer{ []
 	g_bFramegenMidDeadline = true;
 }};
 
-// Step 3 VRR arming is intentionally retained as compiled legacy until Step 5.
-// No production caller remains: Step 4 consumes the correlated absolute
-// W_mid below instead of inferring identity from GetLastVBlank().
-[[maybe_unused]] static void framegen_arm_legacy_midpoint_timer()
-{
-	const uint64_t ulMidOffsetNs =
-		vulkan_framegen_vrr_hybrid_mid_offset_ns();
-	if ( ulMidOffsetNs != 0u && !g_bFramegenMidDeadline )
-	{
-		g_ulFramegenMidTargetNs =
-			GetVBlankTimer().GetLastVBlank() + ulMidOffsetNs;
-		g_FramegenMidTimer.ArmTimer( g_ulFramegenMidTargetNs );
-	}
-}
-
 void
 steamcompmgr_main(int argc, char **argv)
 {

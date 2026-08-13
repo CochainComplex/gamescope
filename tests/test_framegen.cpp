@@ -451,24 +451,16 @@ static void test_temporal_policy()
 	CHECK_NEAR( motion_acceleration_time_factor( 20u, 10u ), 2.0f / 3.0f, 1e-6f );
 
 	const SlotRequest measured = classic_slot_request(
-		1u, 0u, 4u, 2u, 0.0f, 0.5f, 1.5f );
+		1u, 4u, 0.5f, 1.5f );
 	CHECK( measured.phase == 0.25f );
 	CHECK( measured.strength == 0.25f );
 	CHECK( measured.slotIndex == 1u );
 
-	const SlotRequest uniform = classic_slot_request(
-		1u, 0u, 4u, 2u, 1.0f, 0.5f, 1.5f );
-	CHECK_NEAR( uniform.phase, 1.0f / 3.0f, 1e-6f );
-	const SlotRequest halfway = classic_slot_request(
-		1u, 0u, 4u, 2u, 0.5f, 0.5f, 1.5f );
-	CHECK_NEAR( halfway.phase, ( 0.25f + 1.0f / 3.0f ) * 0.5f, 1e-6f );
-
 	const SlotRequest capped = classic_slot_request(
-		2u, 0u, 2u, 1u, 0.0f, 1.0f, 1.5f );
+		2u, 2u, 1.0f, 1.5f );
 	CHECK( capped.phase == 1.0f );
 	CHECK( capped.strength == 1.5f );
 
-	constexpr std::array biases = { 0.0f, 0.5f, 1.0f };
 	constexpr std::array strengths = { 0.25f, 0.5f, 1.0f };
 	for ( uint32_t generatedCount = 1u; generatedCount <= 3u; generatedCount++ )
 	{
@@ -478,21 +470,14 @@ static void test_temporal_policy()
 			{
 				const uint32_t slot = i + 1u;
 				const float gapPhase = static_cast<float>( slot ) / static_cast<float>( gap );
-				const float uniformPhase = static_cast<float>( i + 1u )
-					/ static_cast<float>( generatedCount + 1u );
-				for ( const float bias : biases )
+				for ( const float strength : strengths )
 				{
-					const float expectedPhase = bias > 0.0f
-						? gapPhase + ( uniformPhase - gapPhase ) * bias : gapPhase;
-					for ( const float strength : strengths )
-					{
-						const SlotRequest request = classic_slot_request(
-							slot, i, gap, generatedCount, bias, strength, 1.5f );
-						CHECK_NEAR( request.phase, expectedPhase, 1e-7f );
-						CHECK_NEAR( request.strength,
-							std::clamp( expectedPhase * ( strength / 0.5f ), 0.0f, 1.5f ), 1e-7f );
-						CHECK( request.slotIndex == slot );
-					}
+					const SlotRequest request = classic_slot_request(
+						slot, gap, strength, 1.5f );
+					CHECK_NEAR( request.phase, gapPhase, 1e-7f );
+					CHECK_NEAR( request.strength,
+						std::clamp( gapPhase * ( strength / 0.5f ), 0.0f, 1.5f ), 1e-7f );
+					CHECK( request.slotIndex == slot );
 				}
 			}
 		}
@@ -502,14 +487,6 @@ static void test_temporal_policy()
 		10'000'000u, 20'000'000u, 0.5f );
 	CHECK( prediction.phase == 0.5f );
 	CHECK( prediction.rawStrength == 0.5f );
-	const JitBookkeeping regular = jit_bookkeeping(
-		10'000'000u, 20'000'000u, 10'000'000u );
-	CHECK( regular.slotIndex == 1u );
-	CHECK( regular.gapVblanks == 2u );
-	const JitBookkeeping late = jit_bookkeeping(
-		26'000'000u, 20'000'000u, 10'000'000u );
-	CHECK( late.slotIndex == 3u );
-	CHECK( late.gapVblanks == 4u );
 	CHECK( interval_gap_vblanks( 25'000'000u, 10'000'000u ) == 3u );
 	CHECK( forward_strength_raw( 2.0f, 0.5f ) > 1.5f );
 }

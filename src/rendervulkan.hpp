@@ -469,11 +469,10 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<
 void vulkan_framegen_discard_generated_frame( const char *reason );
 void vulkan_framegen_invalidate_history( const char *reason );
 void vulkan_framegen_reset( const char *reason );
-// JIT display-clock pacing (#06, GAMESCOPE_FRAMEGEN_JIT=1 + dedicated queue):
-// reactive fill hook for the present decision. Call on a vblank that is going
-// to a hardware repeat while framegen is active; plans one generated frame for
-// the next vblank with its phase measured against the display clock. No-op
-// when JIT pacing is disabled.
+// Default display-clock pacing (#06, dedicated queue): reactive fill hook for
+// the present decision. Call on a vblank that is going to a hardware repeat
+// while framegen is active; plans one generated frame for the next vblank with
+// its phase measured against the display clock.
 void vulkan_framegen_jit_tick();
 // VRR hybrid (#01, GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 + dedicated queue): keep
 // adaptive sync active while framegen runs — real frames flip immediately,
@@ -488,10 +487,6 @@ bool vulkan_framegen_vrr_hybrid_active();
 // arms its timer at this wake point; zero means no midpoint is pending.
 uint64_t vulkan_framegen_vrr_hybrid_wake_deadline_ns();
 void vulkan_framegen_cancel_vrr_hybrid_slot( const char *reason );
-// Nanoseconds after the real frame's KMS flip timestamp at which the pending
-// generated frame should be flipped (phase * predicted source cadence); 0 when there is
-// nothing to schedule. Legacy Step 3 API; no production caller remains.
-uint64_t vulkan_framegen_vrr_hybrid_mid_offset_ns();
 
 // Standalone GPU microbenchmark of the frame-generation dispatches (extrapolate,
 // motion, blend). Times the real production shaders with timestamp queries and

@@ -63,20 +63,12 @@ struct SlotRequest
 	return std::clamp( rawStrength, 0.0f, maxForwardStrength );
 }
 
-// Classic fixed-grid slot k/N. Bidirectional phase bias moves the measured-gap
-// phase toward uniform generated-slot spacing without changing queue timing.
-// Preconditions: gapVblanks and generatedCount are non-zero.
-[[nodiscard]] constexpr SlotRequest classic_slot_request( uint32_t slotIndex, uint32_t generatedIndex,
-	uint32_t gapVblanks, uint32_t generatedCount, float bidirPhaseBias,
-	float configuredStrength, float maxForwardStrength )
+// Classic fixed-grid slot k/N. Precondition: gapVblanks is non-zero.
+[[nodiscard]] constexpr SlotRequest classic_slot_request( uint32_t slotIndex,
+	uint32_t gapVblanks, float configuredStrength, float maxForwardStrength )
 {
-	const float flGapPhase = static_cast<float>( slotIndex )
+	const float phase = static_cast<float>( slotIndex )
 		/ static_cast<float>( gapVblanks );
-	const float flUniformPhase = static_cast<float>( generatedIndex + 1u )
-		/ static_cast<float>( generatedCount + 1u );
-	const float phase = bidirPhaseBias > 0.0f
-		? flGapPhase + ( flUniformPhase - flGapPhase ) * bidirPhaseBias
-		: flGapPhase;
 	const float flStrength = clamp_forward_strength(
 		forward_strength_raw( phase, configuredStrength ), maxForwardStrength );
 	return { phase, flStrength, slotIndex };
@@ -97,27 +89,6 @@ struct TimedPrediction
 	const float flPhase = static_cast<float>( static_cast<double>( targetDeltaNs )
 		/ static_cast<double>( frametimeEmaNs ) );
 	return { flPhase, forward_strength_raw( flPhase, configuredStrength ) };
-}
-
-struct JitBookkeeping
-{
-	uint32_t slotIndex;
-	uint32_t gapVblanks;
-};
-
-// These rounded values key logging and degradation cost only. JIT phase always
-// comes from timed_prediction(), never from this synthetic gap. Precondition:
-// vblankIntervalNs is non-zero.
-[[nodiscard]] constexpr JitBookkeeping jit_bookkeeping( uint64_t targetDeltaNs,
-	uint64_t frametimeEmaNs, uint64_t vblankIntervalNs )
-{
-	const uint32_t nSlotIndex = std::max( 1u,
-		static_cast<uint32_t>( ( targetDeltaNs + vblankIntervalNs / 2u )
-			/ vblankIntervalNs ) );
-	const uint32_t nGapVblanks = std::max( nSlotIndex + 1u, std::max( 2u,
-		static_cast<uint32_t>( ( frametimeEmaNs + vblankIntervalNs / 2u )
-			/ vblankIntervalNs ) ) );
-	return { nSlotIndex, nGapVblanks };
 }
 
 // VRR has no fixed grid; this equivalent gap is used only for logs and timing
