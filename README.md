@@ -48,6 +48,31 @@ Working from finished frames only is the *hard* frontier of frame generation, an
 
 The full mapping — what's already here, what the engine-integrated methods (DLSS, FSR, Mob-FGSR) do that a frames-only compositor *can't*, and the concrete gaps worth closing — is written against a primary-source-verified survey in **[the research doc](doc/research-framegen.md)** and **[SOTA-alignment proposal #07](doc/framegen-proposals/07-frames-only-sota-alignment.md)**.
 
+### Why your FPS counter reads "low" — think of it as reverse VRR
+
+**Your in-game FPS counter is not lying, it's just measuring the wrong end of the pipe.**
+Every counter the game can see — its own HUD, MangoHud, the engine's stats — counts
+frames the *game* renders. Generated frames are the compositor's own; by design they
+never travel back into the game (see the non-intervention rule above), so no game-side
+counter can ever include them. A game rendering 40 fps under gameslop on a 120 Hz
+screen will forever report 40 while your display shows ~80–120 content updates a
+second. Smooth screen + "low" counter is what *working* frame generation looks like.
+
+The mental model that makes it click: **this is VRR run in reverse.** VRR bends the
+*display's* clock to follow the game — the panel waits for each real frame and scans
+it out whenever it arrives. Gameslop does the opposite: the display keeps its natural
+fixed frequency, and the compositor bends the *content stream* to fit that grid — each
+generated frame is planned against an exact display slot (a real vblank deadline) and
+the gaps the game leaves empty get filled. The game's cadence is absorbed on the
+content side instead of the clock side. Same goal as VRR — every refresh shows
+something temporally correct — opposite mechanism.
+
+To see the *true* output rate, ask the layer that actually presents:
+`GAMESCOPE_FRAMEGEN_METRICS=1` makes gamescope log one line every 5 seconds — real,
+generated, and repeated frames per window, flip-to-flip timing statistics, and how
+precisely generated frames hit their intended vblanks. That is the number your eyes
+are seeing.
+
 ### Reality check
 
 It's **experimental**. Expect shimmer on fine detail, ghost trails on fast motion (use base-layer mode for HUDs), and the odd crash. Bidirectional mode adds ~1 frame of lag (skip it for competitive shooters). VRR mode only does something on an actual FreeSync/G-Sync display. The generated frames only fill vblanks the game left empty — if you're already at refresh, there's nothing to do. And the whole economic pitch — a spare/old card doing the heavy lifting — is also its main requirement.
