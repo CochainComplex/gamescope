@@ -13,6 +13,23 @@
 - **It learns your game while you play** — a tiny in-situ-trained net with per-game profiles, bounded so it can only veto motion, never invent detail.
 - **Honest by design**: your in-game FPS counter keeps showing the *real* rate; `GAMESCOPE_FRAMEGEN_METRICS=1` shows what your screen actually gets.
 
+### What's actually in it for you
+
+**Casual gamer:** your 40–60 fps game *looks and feels* like a 120 Hz game — panning a
+map, spinning a camera, driving fast all go from stutter to butter — without buying a
+new GPU. The card doing the work is the one you already own: the iGPU in your laptop,
+the old card from your last upgrade, the weak second slot in your desktop. Flagship
+smoothness, junk-drawer hardware.
+
+**Competitive / pro:** the default mode is built around one promise — **your inputs
+and your real frames are never touched**. The game renders at full speed on its own
+card, real frames always win the display, and generation only fills vblanks that
+would have shown a repeat anyway. What you gain is **motion clarity**: tracking a
+target through a smooth 120 Hz sweep instead of a 45 fps judder makes the *real*
+information easier to read. What you don't gain is reaction time — generated frames
+carry no new input, and nothing here (or in DLSS/FSR framegen) changes that. Skip
+bidir mode in ranked; that one trades a frame of latency for beauty and says so.
+
 ### What it is
 
 A **poor man's DLSS 4.5 / FSR 4.1 frame-generation surrogate** that runs on *any* Vulkan GPU — no RTX 50, no RDNA 4, no tensor cores, no vendor optical-flow or AI block, no driver lock-in. Those premium stacks generate frames *inside* the game from engine motion vectors and only on the newest silicon (DLSS 4.5's 6× multi-frame gen is RTX-50-exclusive; the ML-based FSR 4.1 stack is built for RDNA 4, only now trickling down to older Radeons). Gameslop chases the same outcome — more frames in the gaps — one layer down in the compositor, from the *finished frames alone*, tied to no vendor, no engine, and no per-game integration. It's a stopgap for the ongoing GPU/VRAM price crunch: it wrings smooth high-fps *motion* out of hardware you already own. It doesn't lower latency and it can't show detail the game never rendered — it buys smoothness, nothing else.
