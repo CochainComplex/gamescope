@@ -15,11 +15,10 @@
 
 ### What's actually in it for you
 
-**Casual gamer:** your 40–60 fps game *looks and feels* like a 120 Hz game — panning a
-map, spinning a camera, driving fast all go from stutter to butter — without buying a
-new GPU. The card doing the work is the one you already own: the iGPU in your laptop,
-the old card from your last upgrade, the weak second slot in your desktop. Flagship
-smoothness, junk-drawer hardware.
+**Casual gamer:** your 40–60 fps game *moves* noticeably smoother — camera pans and
+fast motion lose most of their judder — without buying a new GPU. The card doing the
+generation is one you already own: the iGPU in your laptop, the old card from your
+last upgrade, the second slot in your desktop.
 
 **Competitive / pro:** the default mode is built around one promise — **your inputs
 and your real frames are never touched**. The game renders at full speed on its own
@@ -35,6 +34,23 @@ bidir mode in ranked; that one trades a frame of latency for beauty and says so.
 A **poor man's DLSS 4.5 / FSR 4.1 frame-generation surrogate** that runs on *any* Vulkan GPU — no RTX 50, no RDNA 4, no tensor cores, no vendor optical-flow or AI block, no driver lock-in. Those premium stacks generate frames *inside* the game from engine motion vectors and only on the newest silicon (DLSS 4.5's 6× multi-frame gen is RTX-50-exclusive; the ML-based FSR 4.1 stack is built for RDNA 4, only now trickling down to older Radeons). Gameslop chases the same outcome — more frames in the gaps — one layer down in the compositor, from the *finished frames alone*, tied to no vendor, no engine, and no per-game integration. It's a stopgap for the ongoing GPU/VRAM price crunch: it wrings smooth high-fps *motion* out of hardware you already own. It doesn't lower latency and it can't show detail the game never rendered — it buys smoothness, nothing else.
 
 ### The one principle to understand first: this is a **two-GPU** technique
+
+```
+ CARD 1 — render (your good GPU)          CARD 2 — present (old card / iGPU)
+ ┌──────────────────────────┐              ┌──────────────────────────────┐
+ │ renders the game at full │  finished    │ estimates motion, generates  │      real +
+ │ speed — nothing added,   │  frames      │ the in-between frames,       │    generated
+ │ nothing taken away       │ ───────────▶ │ composites, drives the       │ ───────────▶  display
+ │                          │  (dma-buf)   │ display's fixed 120 Hz grid  │   (120 Hz)
+ └──────────────────────────┘              └──────────────────────────────┘
+```
+
+The basic idea: frame generation always costs GPU work, so doing it **on the render
+card itself** drains the very resources the game needs — that's why the in-game
+DLSS/FSR route keeps demanding newer, more expensive silicon to come out ahead. But a
+laptop already has an iGPU next to its render GPU, and a desktop can take last
+generation's card in the second slot — hardware whose spare capacity pays for the
+generated frames while the render card stays untouched.
 
 Generating a frame costs real GPU work. If you do that on the **same** card that's rendering the game, you are stealing performance *from the game* to fake frames on top of it — usually a wash or a net loss (you'd get more by just rendering real frames, or by using the game's own FSR/DLSS). So doing this on one GPU is, in general, **not worth it**.
 
