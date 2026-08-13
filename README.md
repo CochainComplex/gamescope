@@ -2,6 +2,17 @@
 
 *A compositor-side **frame-generation** fork of [gamescope](https://github.com/ValveSoftware/gamescope). The name is tongue-in-cheek: yes, most of the pixels you see are machine-invented in-between frames — "slop" — but they're honestly labelled (the game never sees them) and produced by a real motion-estimation pipeline that **predicts *or* interpolates**, not a dumb frame average.*
 
+### The scoop, in eight lines
+
+- **Derived from Valve's gamescope** — everything gamescope does, plus a frame-generation engine in the compositor.
+- **Harvests your idle second GPU**: the strong card renders the game untouched; the spare/old/integrated card next to it invents the in-between frames. Any Vulkan GPUs, mixed vendors — NVIDIA renders, AMD presents, Intel welcome.
+- **An advanced poor man's DLSS/FSR frame gen**: no tensor cores, no engine hooks, no per-game work — it sees only finished frames and estimates motion itself.
+- **Reverse VRR** — a poor man's VRR, mirrored: instead of bending the display clock to the game, it bends the *content* onto your display's natural rhythm — every generated frame is planned against a real vblank deadline.
+- **Zero-added-latency by default**: forward prediction, continuously *taught by interpolation hindsight* — every arriving frame becomes ground truth that grades and trains the predictor.
+- **True interpolation on demand** (bidir mode) when you'll trade one frame of latency for maximum smoothness.
+- **It learns your game while you play** — a tiny in-situ-trained net with per-game profiles, bounded so it can only veto motion, never invent detail.
+- **Honest by design**: your in-game FPS counter keeps showing the *real* rate; `GAMESCOPE_FRAMEGEN_METRICS=1` shows what your screen actually gets.
+
 ### What it is
 
 A **poor man's DLSS 4.5 / FSR 4.1 frame-generation surrogate** that runs on *any* Vulkan GPU — no RTX 50, no RDNA 4, no tensor cores, no vendor optical-flow or AI block, no driver lock-in. Those premium stacks generate frames *inside* the game from engine motion vectors and only on the newest silicon (DLSS 4.5's 6× multi-frame gen is RTX-50-exclusive; the ML-based FSR 4.1 stack is built for RDNA 4, only now trickling down to older Radeons). Gameslop chases the same outcome — more frames in the gaps — one layer down in the compositor, from the *finished frames alone*, tied to no vendor, no engine, and no per-game integration. It's a stopgap for the ongoing GPU/VRAM price crunch: it wrings smooth high-fps *motion* out of hardware you already own. It doesn't lower latency and it can't show detail the game never rendered — it buys smoothness, nothing else.
@@ -24,7 +35,7 @@ The generation is essentially **free** because it runs on silicon that would oth
 
 ### It's not a *dumb* blend — extrapolate, or truly interpolate
 
-"In-between frames" makes people picture crude frame-averaging. Gameslop can do **genuine interpolation** — its opt-in **bidirectional** mode warps *both* neighbouring real frames to the in-between phase and blends them by confidence. The catch is latency: interpolation holds the newer real frame back, so this mode always runs **~1 frame behind**. The primary path instead **predicts forward** from the last two real frames, adds zero algorithmic latency, and can apply the learned refiner directly to that causal forward field. A plain frame-blend (`blend`) exists only as a debug aid.
+"In-between frames" makes people picture crude frame-averaging. Gameslop can do **genuine interpolation** — its opt-in **bidirectional** mode warps *both* neighbouring real frames to the in-between phase and blends them by confidence. The catch is latency: interpolation holds the newer real frame back, so this mode always runs **~1 frame behind**. The primary path instead **predicts forward** from the last two real frames with zero algorithmic latency — and here's the trick: **interpolation still does the teaching**. Every time a real frame arrives, the just-closed interval has both endpoints known — interpolation geometry — and the pipeline spends that hindsight causally: forward-backward consistency validates the motion field, the self-supervised loop grades the prediction against what actually arrived, and the net trains on the closed pair. Supervision looks backward; presentation looks forward. A plain frame-blend (`blend`) exists only as a debug aid.
 
 **And it works blind — on purpose.** FSR and DLSS Frame Generation are handed the scene's *true* motion by the game engine — per-pixel **motion vectors**, depth, and — on DLSS — a dedicated **flow accelerator** (fixed-function hardware on DLSS 3, a learned network on DLSS 4). Gameslop takes **none** of that, and that is a deliberate design choice, not just a missing feature. It *could* try to pull motion vectors, depth or the framebuffer off the render card — but ferrying that data across to the second GPU every frame would **bottleneck the whole system** and add latency to the very render path this design exists to leave alone. So the rule is **non-intervention**: never touch the game's rendering, its GPU, or its input latency. The second card sits **downstream as a pure post-processor** — it sees only the **finished frames** and works out the motion itself from the pixels alone. That's a harder, more artifact-prone problem, which is exactly why most of the pipeline below is not "generate a frame" but "estimate the motion, then decide how much of it to trust":
 
@@ -34,7 +45,7 @@ Under the hood it's a staged, self-correcting motion pipeline:
 - **Artifact control** — a **forward-backward consistency check** (round-trip a vector; if it doesn't close, drop its confidence — kills disocclusion/mislock fizzle), a **per-pixel two-source agreement test** that stops ghosted double-exposures at edges, TAA-style neighbourhood clamping, and an Extreme-tier three-real-frame reservoir that validates adjacent background motion before filling a newly revealed boundary.
 - **Extrapolate *or* interpolate** — default **forward extrapolation** (zero added latency), or true **bidirectional interpolation** (warp *both* real frames to the in-between phase, confidence-blend, phase-correct crossfade in the gaps) for the smoothest motion at the cost of ~1 frame of latency.
 - **It learns** — a small (~4.6k-param) **convolutional refiner net** cleans up the motion fields (bounded flow residual + confidence recalibration), trainable offline from captured frames *or* **learning in-situ on the GPU while you play**, with per-game persistence. In Extreme, its zero-neutral fourth head learns whether aligned lighting/color trends persist across three causal real frames; the warp applies only a tightly bounded analytic correction. On top of that a **self-supervised loop** grades every real frame against the prediction that targeted it and auto-tunes its own thresholds.
-- **Pacing & display** — **display-clock (KMS pageflip) JIT pacing** places each generated frame against the real vblank cadence; a **VRR/adaptive-sync-compatible** hybrid; and a **base-layer** path that composites HUD/cursor *after* generation so UI text stays crisp.
+- **Pacing & display** — an **absolute-deadline scheduler** plans one slot at a time against the real vblank grid, corrects its anchor from tagged pageflip feedback, and *learns* the display chain's present lead instead of rediscovering it; a **VRR/adaptive-sync-compatible** hybrid; and a **base-layer** path that composites HUD/cursor *after* generation so UI text stays crisp.
 - **Engineering** — generation runs on a **dedicated async-compute queue** so it can never stall the real frame; **zero-copy** history; **fp16** + vendor-aware shader dispatch; and a **deadline-driven degradation ladder** that measures its own GPU time and sheds quality *before* it misses a vblank.
 
 ### How it maps to the state of the art
@@ -48,30 +59,20 @@ Working from finished frames only is the *hard* frontier of frame generation, an
 
 The full mapping — what's already here, what the engine-integrated methods (DLSS, FSR, Mob-FGSR) do that a frames-only compositor *can't*, and the concrete gaps worth closing — is written against a primary-source-verified survey in **[the research doc](doc/research-framegen.md)** and **[SOTA-alignment proposal #07](doc/framegen-proposals/07-frames-only-sota-alignment.md)**.
 
-### Why your FPS counter reads "low" — think of it as reverse VRR
+### Why your FPS counter reads "low" — reverse VRR, spelled out
 
-**Your in-game FPS counter is not lying, it's just measuring the wrong end of the pipe.**
-Every counter the game can see — its own HUD, MangoHud, the engine's stats — counts
-frames the *game* renders. Generated frames are the compositor's own; by design they
-never travel back into the game (see the non-intervention rule above), so no game-side
-counter can ever include them. A game rendering 40 fps under gameslop on a 120 Hz
-screen will forever report 40 while your display shows ~80–120 content updates a
-second. Smooth screen + "low" counter is what *working* frame generation looks like.
+**Your in-game FPS counter measures the wrong end of the pipe.** Game-side counters
+(HUD, MangoHud, engine stats) can only count frames the *game* renders — generated
+frames never travel back into the game, so a 40 fps game on a 120 Hz screen reports
+40 forever while the display gets ~80–120 content updates a second. Smooth screen +
+"low" counter is what *working* frame generation looks like.
 
-The mental model that makes it click: **this is VRR run in reverse.** VRR bends the
-*display's* clock to follow the game — the panel waits for each real frame and scans
-it out whenever it arrives. Gameslop does the opposite: the display keeps its natural
-fixed frequency, and the compositor bends the *content stream* to fit that grid — each
-generated frame is planned against an exact display slot (a real vblank deadline) and
-the gaps the game leaves empty get filled. The game's cadence is absorbed on the
-content side instead of the clock side. Same goal as VRR — every refresh shows
-something temporally correct — opposite mechanism.
-
-To see the *true* output rate, ask the layer that actually presents:
-`GAMESCOPE_FRAMEGEN_METRICS=1` makes gamescope log one line every 5 seconds — real,
-generated, and repeated frames per window, flip-to-flip timing statistics, and how
-precisely generated frames hit their intended vblanks. That is the number your eyes
-are seeing.
+The mechanism is **VRR mirrored**: VRR bends the display's clock to follow the game;
+gameslop keeps the display's natural frequency and bends the *content stream* onto
+that fixed grid — each generated frame planned against a real vblank deadline. Same
+goal — every refresh temporally correct — opposite side of the equation. The true
+output rate lives where presentation happens: `GAMESCOPE_FRAMEGEN_METRICS=1` logs
+real/generated/repeat counts, flip timing, and vblank-hit precision every 5 seconds.
 
 ### Reality check
 
