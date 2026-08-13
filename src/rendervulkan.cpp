@@ -5125,6 +5125,10 @@ struct FramegenPresentState_t
 	uint64_t ulPreviousRealCompositeSeqNo = 0;
 	uint64_t ulCurrentRealCompositeSeqNo = 0;
 	gamescope::framegen::DisplayChainTimingState_t displayTiming;
+	// acquireReadyTimeNs is optional per frame. Once one sample is absent or
+	// invalid, keep this display-chain session on the always-available composite
+	// clock instead of changing clock provenance on every subsequent sample.
+	bool bSourceTimestampFallbackLatched = false;
 	gamescope::FramegenPresentTag_t pendingTag = {};
 	bool bTagPending = false;
 };
@@ -5205,6 +5209,7 @@ struct FramegenMetricsWindow_t
 {
 	uint64_t real = 0, generated = 0, delayedReal = 0, repeats = 0;
 	uint64_t discards = 0, slowDrops = 0, resets = 0;
+	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 	// Feedback that arrived as "discarded" (window hidden/occluded at the host):
 	// nonzero here with near-zero presented counts means the measurement
 	// environment is invalid, not that the compositor idled.
@@ -5218,6 +5223,7 @@ struct FramegenMetricsWindow_t
 struct FramegenMetricsPendingEvents_t
 {
 	uint64_t repeats = 0, discards = 0, slowDrops = 0, resets = 0;
+	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 };
 static FramegenMetricsPendingEvents_t g_framegenMetricsPendingEvents;
 
@@ -5254,6 +5260,10 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	window.discards += events.discards;
 	window.slowDrops += events.slowDrops;
 	window.resets += events.resets;
+	window.resetsCut += events.resetsCut;
+	window.resetsGrid += events.resetsGrid;
+	window.resetsProvenance += events.resetsProvenance;
+	window.resetsHitch += events.resetsHitch;
 }
 
 static void framegen_metrics_flush_events()
@@ -5273,7 +5283,9 @@ static void framegen_metrics_log( const char *pszLabel,
 		" flip_ms_avg=%.3f flip_ms_min=%.3f flip_ms_max=%.3f"
 		" flip_ms_sd=%.3f flip_ms_p95=%.3f bias_ms=%.3f dl_hit=%.3f"
 		" dl_ms_avg=%.3f dl_ms_p95=%.3f dl_ms_worst=%.3f"
-		" disc=%" PRIu64 " slow=%" PRIu64 " resets=%" PRIu64 " fbdisc=%" PRIu64,
+		" disc=%" PRIu64 " slow=%" PRIu64 " resets=%" PRIu64 " fbdisc=%" PRIu64
+		" resets_cut=%" PRIu64 " resets_grid=%" PRIu64
+		" resets_prov=%" PRIu64 " resets_hitch=%" PRIu64,
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -5282,7 +5294,8 @@ static void framegen_metrics_log( const char *pszLabel,
 			? (double)window.deadlineHits / window.deadlineCount : 0.0,
 		window.deadlineCount != 0 ? window.deadlineSignedSumMs / window.deadlineCount : 0.0,
 		deadline.p95(), deadline.max, window.discards, window.slowDrops, window.resets,
-		window.feedbackDiscarded );
+		window.feedbackDiscarded, window.resetsCut, window.resetsGrid,
+		window.resetsProvenance, window.resetsHitch );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs )
@@ -5372,7 +5385,25 @@ void vulkan_framegen_metrics_note_repeat()
 
 static void framegen_metrics_note_discard( uint64_t n ) { g_framegenMetricsPendingEvents.discards += n; }
 static void framegen_metrics_note_slow_drop( uint64_t n ) { g_framegenMetricsPendingEvents.slowDrops += n; }
-static void framegen_metrics_note_reset() { g_framegenMetricsPendingEvents.resets++; }
+enum class FramegenResetReason_t : uint8_t
+{
+	Cut,
+	Grid,
+	Provenance,
+	Hitch,
+};
+
+static void framegen_metrics_note_reset( FramegenResetReason_t reason )
+{
+	g_framegenMetricsPendingEvents.resets++;
+	switch ( reason )
+	{
+		case FramegenResetReason_t::Cut: g_framegenMetricsPendingEvents.resetsCut++; break;
+		case FramegenResetReason_t::Grid: g_framegenMetricsPendingEvents.resetsGrid++; break;
+		case FramegenResetReason_t::Provenance: g_framegenMetricsPendingEvents.resetsProvenance++; break;
+		case FramegenResetReason_t::Hitch: g_framegenMetricsPendingEvents.resetsHitch++; break;
+	}
+}
 
 static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback );
 static void framegen_apply_bidir_flip_feedback( const DisplayFeedback_t &feedback );
@@ -5418,25 +5449,41 @@ static void framegen_invalidate_deadline_shadow_content()
 		ulDisplayChainGeneration;
 }
 
-static void framegen_observe_display_chain( uint64_t ulIntervalNs,
-	bool bSourceTimestampsReliable )
+static bool framegen_observe_display_chain( uint64_t ulIntervalNs,
+	bool bSourceTimestampValid )
 {
 	gamescope::IBackend *pBackend = GetBackend();
 	gamescope::IBackendConnector *pConnector = pBackend != nullptr
 		? pBackend->GetCurrentConnector() : nullptr;
-	const gamescope::framegen::DisplayChainKey_t key = {
+	const gamescope::framegen::DisplayChainKey_t physicalKey = {
 		.backendId = static_cast<uint64_t>( reinterpret_cast<uintptr_t>( pBackend ) ),
 		.connectorId = pConnector != nullptr ? pConnector->GetConnectorID() : 0u,
 		.intervalNs = ulIntervalNs,
 		.vrrActive = pConnector != nullptr && pConnector->IsVRRActive(),
-		.sourceTimestampsReliable = bSourceTimestampsReliable,
 	};
+	const gamescope::framegen::DisplayChainKey_t &oldKey =
+		g_framegenPresentState.displayTiming.key;
+	const bool bPhysicalChainChanged =
+		g_framegenPresentState.displayTiming.initialized
+		&& ( oldKey.backendId != physicalKey.backendId
+			|| oldKey.connectorId != physicalKey.connectorId
+			|| oldKey.intervalNs != physicalKey.intervalNs
+			|| oldKey.vrrActive != physicalKey.vrrActive );
+	if ( !g_framegenPresentState.displayTiming.initialized || bPhysicalChainChanged )
+		g_framegenPresentState.bSourceTimestampFallbackLatched = !bSourceTimestampValid;
+	else if ( !bSourceTimestampValid )
+		g_framegenPresentState.bSourceTimestampFallbackLatched = true;
+
+	const bool bSourceTimestampsReliable =
+		!g_framegenPresentState.bSourceTimestampFallbackLatched;
+	gamescope::framegen::DisplayChainKey_t key = physicalKey;
+	key.sourceTimestampsReliable = bSourceTimestampsReliable;
 	const gamescope::framegen::DisplayChainTimingTransition_t transition =
 		gamescope::framegen::observe_display_chain(
 			g_framegenPresentState.displayTiming, key );
 	g_framegenPresentState.displayTiming = transition.state;
 	if ( !transition.displayChainChanged )
-		return;
+		return bSourceTimestampsReliable;
 
 	// Feedback already queued by the old connector/provenance must not warm the
 	// freshly reset learners. The compositor is the sole mailbox consumer.
@@ -5445,7 +5492,10 @@ static void framegen_observe_display_chain( uint64_t ulIntervalNs,
 		g_displayFeedbackMailbox.nRead = 0;
 		g_displayFeedbackMailbox.nCount = 0;
 	}
-	framegen_metrics_note_reset();
+	framegen_metrics_note_reset( bPhysicalChainChanged
+		? FramegenResetReason_t::Grid
+		: FramegenResetReason_t::Provenance );
+	return bSourceTimestampsReliable;
 }
 
 static uint64_t framegen_next_present_slot_id()
@@ -6261,7 +6311,17 @@ void vulkan_framegen_invalidate_history( const char *reason )
 		&& g_framegenHistory.cadence.intervalNs == 0
 		&& g_framegenHistory.ulCurrentCadenceTimeNs == 0 )
 		return;
-	framegen_metrics_note_reset();
+	const bool bCut = reason != nullptr
+		&& ( strcmp( reason, "base_colorspace_change" ) == 0
+			|| strcmp( reason, "output_eotf_change" ) == 0
+			|| strcmp( reason, "layer_count_change" ) == 0 );
+	const bool bHitch = reason != nullptr
+		&& ( strcmp( reason, "frame_gap" ) == 0
+			|| strcmp( reason, "idle_frame_gap" ) == 0
+			|| strcmp( reason, "real_output_ring_pressure" ) == 0 );
+	framegen_metrics_note_reset( bCut ? FramegenResetReason_t::Cut
+		: bHitch ? FramegenResetReason_t::Hitch
+		: FramegenResetReason_t::Grid );
 
 	if ( g_bFramegenDebug )
 		vk_log.infof( "framegen: history valid=false reason=%s", reason ? reason : "unknown" );
@@ -6369,7 +6429,7 @@ static void framegen_net_profile_flush();
 
 void vulkan_framegen_reset( const char *reason )
 {
-	framegen_metrics_note_reset();
+	framegen_metrics_note_reset( FramegenResetReason_t::Grid );
 	if ( g_bFramegenDebug )
 		vk_log.infof( "framegen: reset history reason=%s", reason ? reason : "unknown" );
 
@@ -7596,7 +7656,7 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 		}
 		if ( cut.invalidateEpoch )
 		{
-			framegen_metrics_note_reset();
+			framegen_metrics_note_reset( FramegenResetReason_t::Cut );
 			vk_log.infof( "framegen: content scene cut detected (%u/9 sections, histogram distance %.2f); presenting a real endpoint",
 				measurement->changedSections,
 				gamescope::framegen::scene_histogram_distance( *measurement ) );
@@ -7606,7 +7666,7 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 	}
 	else if ( bSceneCut )
 	{
-		framegen_metrics_note_reset();
+		framegen_metrics_note_reset( FramegenResetReason_t::Cut );
 		vk_log.infof( "framegen: content scene cut detected (%u/9 sections, histogram distance %.2f); presenting a real endpoint",
 			measurement->changedSections,
 			gamescope::framegen::scene_histogram_distance( *measurement ) );
@@ -10934,12 +10994,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	uint64_t ulPrevRealFrameTimeNs = g_framegenHistory.currentPresentTimeNs;
 	const uint64_t ulSourceReadyTimeNs = pFrameInfo->layerCount > 0
 		? pFrameInfo->layers[ 0 ].acquireReadyTimeNs : 0u;
-	const bool bUseSourceCadence = ulSourceReadyTimeNs != 0u
+	const bool bSourceTimestampValid = ulSourceReadyTimeNs != 0u
 		&& ulSourceReadyTimeNs <= now;
-	const uint64_t ulCadenceTimeNs = bUseSourceCadence
-		? ulSourceReadyTimeNs : now;
-	const uint64_t ulPreviousCadenceTimeNs =
-		g_framegenHistory.ulCurrentCadenceTimeNs;
 
 	g_framegenHistory.currentFrameId++;
 	g_framegenHistory.previousPresentTimeNs = ulPrevRealFrameTimeNs;
@@ -10988,8 +11044,12 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		g_framegenHistory.ulCurrentRealVblankNs = ulRawRealVblankNs;
 		g_framegenHistory.lastCompositeSeqNo = ulCompositeSeqNo;
 	}
-	framegen_observe_display_chain(
-		ulVblankIntervalNs, bUseSourceCadence );
+	const bool bUseSourceCadence = framegen_observe_display_chain(
+		ulVblankIntervalNs, bSourceTimestampValid );
+	const uint64_t ulCadenceTimeNs = bUseSourceCadence
+		? ulSourceReadyTimeNs : now;
+	const uint64_t ulPreviousCadenceTimeNs =
+		g_framegenHistory.ulCurrentCadenceTimeNs;
 
 	// Live cadence predictor (#06): acquire-fence completion is the earliest
 	// trustworthy observation that the renderer's frame can enter the compositor,
@@ -11015,7 +11075,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		// display-chain observer above. Only malformed ordering within the same
 		// provenance is an additional cadence reset.
 		if ( bSameCadenceClock )
-			framegen_metrics_note_reset();
+			framegen_metrics_note_reset( FramegenResetReason_t::Provenance );
 		g_framegenHistory.cadence = {};
 	}
 
