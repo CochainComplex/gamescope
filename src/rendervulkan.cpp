@@ -5122,6 +5122,7 @@ struct FramegenPresentState_t
 	uint64_t ulCurrentRealFrameId = 0;
 	uint64_t ulPreviousRealCompositeSeqNo = 0;
 	uint64_t ulCurrentRealCompositeSeqNo = 0;
+	gamescope::framegen::PresentLeadState_t presentLead;
 	gamescope::FramegenPresentTag_t pendingTag = {};
 	bool bTagPending = false;
 };
@@ -5150,6 +5151,8 @@ struct DisplayFeedbackMailbox_t
 static DisplayFeedbackMailbox_t g_displayFeedbackMailbox;
 
 static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback );
+static void framegen_apply_bidir_flip_feedback( const DisplayFeedback_t &feedback );
+static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback );
 
 struct FramegenShadowDecision_t
 {
@@ -5194,6 +5197,7 @@ static void framegen_select_present_tag( gamescope::FramegenPresentKind_t eKind,
 			.ulSlotId = 0,
 			.ulCompositeSeqNo = 0,
 			.ulTargetFlipNs = GetVBlankTimer().GetNextVBlank( 0 ),
+			.ulCommitSubmitNs = 0,
 			.eKind = gamescope::FramegenPresentKind_t::Real,
 		};
 		g_framegenPresentState.bTagPending = true;
@@ -5206,6 +5210,7 @@ static void framegen_select_present_tag( gamescope::FramegenPresentKind_t eKind,
 	tag.ulCompositeSeqNo = ulCompositeSeqNo;
 	tag.ulTargetFlipNs = ulTargetFlipNs != 0
 		? ulTargetFlipNs : GetVBlankTimer().GetNextVBlank( 0 );
+	tag.ulCommitSubmitNs = 0;
 }
 
 void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
@@ -5230,6 +5235,7 @@ void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
 		.ulSlotId = 0,
 		.ulCompositeSeqNo = 0,
 		.ulTargetFlipNs = GetVBlankTimer().GetNextVBlank( 0 ),
+		.ulCommitSubmitNs = 0,
 		.eKind = gamescope::FramegenPresentKind_t::Real,
 	};
 	g_framegenPresentState.bTagPending = true;
@@ -5297,8 +5303,29 @@ void vulkan_framegen_drain_present_feedback()
 	for ( size_t i = 0; i < nCount; i++ )
 	{
 		const DisplayFeedback_t &feedback = records[ i ];
+		if ( feedback.tag.ulPresentToken == 0 )
+			continue;
+
+		if ( feedback.bPresented && feedback.bTimestampValid )
+		{
+			g_framegenPresentState.presentLead =
+				gamescope::framegen::update_present_lead(
+					g_framegenPresentState.presentLead,
+					feedback.tag.ulCommitSubmitNs,
+					feedback.ulActualFlipNs );
+		}
+
+		if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::DelayedReal )
+		{
+			framegen_apply_bidir_flip_feedback( feedback );
+			continue;
+		}
+
+		// A discarded real completion is still identity-bearing cancellation
+		// evidence for VRR; no timestamp-based anchor correction is possible.
+		if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real )
+			framegen_apply_vrr_flip_feedback( feedback );
 		if ( !feedback.bPresented || !feedback.bTimestampValid
-			|| feedback.tag.ulPresentToken == 0
 			|| feedback.tag.eKind != gamescope::FramegenPresentKind_t::Real
 			|| feedback.tag.ulTargetFlipNs == 0 )
 			continue;
@@ -5313,8 +5340,8 @@ void vulkan_framegen_drain_present_feedback()
 		}
 
 		// Preserve the Step 2 shadow ring for A/B logging, then apply the same
-		// correlated record to the live causal anchor below. Classic, VRR, and
-		// bidir queues remain untouched by the live helper.
+		// correlated record to the live causal anchor below. Other policies apply
+		// their typed feedback through the handlers above.
 		const uint64_t ulArrivalGuardNs = std::max(
 			gamescope::framegen::k_ulCadenceArrivalGuardMinNs,
 			g_framegenDeadlineShadow.ulGridIntervalNs
@@ -5382,6 +5409,7 @@ struct FramegenHistory_t
 		uint64_t ulSlotId = 0;
 		uint64_t ulCompositeSeqNo = 0;
 		uint64_t ulTargetFlipNs = 0;
+		uint64_t ulWakeDeadlineNs = 0;
 		uint64_t ulAnchorRealFrameId = 0;
 		float phase = 0.0f; // fraction of the real-frame interval, for logs
 		bool bProvisional = false;
@@ -5422,6 +5450,31 @@ struct FramegenHistory_t
 	bool bDeadlineProvenanceInitialized = false;
 	bool bDeadlineSourceTimestampsReliable = false;
 	bool bCausalDeadlineMissed = false;
+	// Fixed-delay bidirectional timeline. Epoch feedback mutates only this
+	// mapping; queued slot targets remain immutable values. Source records are
+	// retained until their tagged delayed-real completion can correct the epoch.
+	gamescope::framegen::BidirEpoch_t bidirEpoch;
+	uint64_t ulBidirGridEpoch = 0;
+	uint64_t ulBidirGridIntervalNs = 0;
+	uint64_t ulBidirGridTargetNs = 0;
+	uint64_t ulBidirGridWakeNs = 0;
+	bool bBidirProvenanceInitialized = false;
+	bool bBidirSourceTimestampsReliable = false;
+	struct BidirFeedbackEndpoint_t
+	{
+		gamescope::framegen::BidirEndpoint_t endpoint;
+		uint64_t ulEpoch = 0;
+	};
+	std::vector<BidirFeedbackEndpoint_t> bidirFeedbackEndpoints;
+	gamescope::Rc<CVulkanTexture> bidirLastOutput;
+	// VRR midpoint work is not submitted until the correlated Real feedback
+	// establishes its non-grid target and lead-compensated wake deadline.
+	uint64_t ulVrrAwaitingRealFrameId = 0;
+	uint64_t ulVrrAwaitingCompositeSeqNo = 0;
+	uint64_t ulVrrAwaitingCadenceNs = 0;
+	uint64_t ulVrrPanelIntervalNs = 0;
+	uint64_t ulVrrMidTargetNs = 0;
+	uint64_t ulVrrMidWakeNs = 0;
 	uint64_t lastCompositeSeqNo = 0;
 	// Latest submission on the framegen execution path, including descriptor-free
 	// base-history copies. Reset paths wait for this token before releasing pools
@@ -5588,6 +5641,7 @@ static uint64_t framegen_predicted_interval_ns()
 static bool framegen_refill_idle();
 static bool framegen_causal_submit( uint64_t ulCompositeSeqNo );
 static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps );
+static void framegen_clear_vrr_midpoint_state( bool bClearPending );
 static bool framegen_format_supports_sampled_storage( uint32_t drmFormat );
 static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo );
 
@@ -5784,22 +5838,22 @@ static bool framegen_bidir_enabled()
 	return s_bEnabled;
 }
 
-// Experimental low-latency cadence compromise. The accepted bidir baseline
-// places generated phases on the measured-gap grid (k/gap), which keeps warp
-// distance and endpoint latency low but leaves a larger final jump whenever
-// the source gap exceeds the multiplier. A value in [0,1] moves those phases
-// part-way toward the uniform multiplier grid without changing queue drain or
-// flip timing. Zero is the exact established behavior; keep it the default
-// until live A/B proves a non-zero compromise improves both motion and image.
+// Step 4 phases are timestamp-exact on actual display targets. Keep parsing the
+// legacy knob for one migration interval, but it can no longer perturb pixels.
+// The function stays compiled because Step 5 owns removal of the gap planner.
 static float framegen_bidir_phase_bias()
 {
-	static const float s_flBias = []()
+	static const bool s_bLogged = []()
 	{
-		const auto value = gamescope::framegen::parse_finite_float_setting(
-			getenv( "GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS" ) );
-		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 0.0f;
+		if ( gamescope::framegen::non_empty_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS" ) ) != nullptr )
+		{
+			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS is ignored; bidirectional phases are timestamp-exact (removal scheduled for Step 5)" );
+		}
+		return true;
 	}();
-	return s_flBias;
+	(void)s_bLogged;
+	return 0.0f;
 }
 
 // Experimental occlusion-side authority for bidirectional interpolation. The
@@ -5977,6 +6031,20 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.bDeadlineProvenanceInitialized = false;
 	g_framegenHistory.bDeadlineSourceTimestampsReliable = false;
 	g_framegenHistory.bCausalDeadlineMissed = false;
+	g_framegenHistory.bidirEpoch = {};
+	g_framegenHistory.ulBidirGridEpoch = 0;
+	g_framegenHistory.ulBidirGridIntervalNs = 0;
+	g_framegenHistory.ulBidirGridTargetNs = 0;
+	g_framegenHistory.ulBidirGridWakeNs = 0;
+	g_framegenHistory.bBidirProvenanceInitialized = false;
+	g_framegenHistory.bBidirSourceTimestampsReliable = false;
+	g_framegenHistory.bidirFeedbackEndpoints.clear();
+	g_framegenHistory.ulVrrAwaitingRealFrameId = 0;
+	g_framegenHistory.ulVrrAwaitingCompositeSeqNo = 0;
+	g_framegenHistory.ulVrrAwaitingCadenceNs = 0;
+	g_framegenHistory.ulVrrPanelIntervalNs = 0;
+	g_framegenHistory.ulVrrMidTargetNs = 0;
+	g_framegenHistory.ulVrrMidWakeNs = 0;
 	g_framegenHistory.lastCompositeSeqNo = 0;
 	g_framegenHistory.nLastGeneratedSlot = 0;
 	g_framegenHistory.nLastGenerationGapVblanks = 0;
@@ -6065,11 +6133,29 @@ bool vulkan_framegen_has_pending_generated_frame()
 	return vulkan_framegen_is_enabled() && !g_framegenHistory.pending.empty();
 }
 
-// VRR hybrid (#01): how long after the real frame's scanout the pending
-// generated frame should flip. steamcompmgr arms an absolute CLOCK_MONOTONIC
-// timer for (KMS flip timestamp of the real frame) + this offset — the same
-// clock the pageflip events are stamped in, so the spacing is measured on
-// display ground truth end to end. 0 = nothing to schedule.
+bool vulkan_framegen_generated_frame_due()
+{
+	if ( !vulkan_framegen_has_pending_generated_frame() )
+		return false;
+	const FramegenHistory_t::PendingGenerated_t &front =
+		g_framegenHistory.pending.front();
+	if ( front.ulTargetFlipNs == 0u )
+		return true;
+	// The non-grid timer already represents W_mid; its target is deliberately
+	// still in the future when the compositor initiates the commit.
+	if ( g_framegenHistory.ulVrrMidWakeNs != 0u
+		&& front.ulTargetFlipNs == g_framegenHistory.ulVrrMidTargetNs )
+		return get_time_in_nanos() >= g_framegenHistory.ulVrrMidWakeNs;
+	// The Step 3 causal/default and classic fallback admission semantics are
+	// unchanged. Their queue front already represents the next opportunity.
+	if ( !vulkan_framegen_bidir_active() )
+		return true;
+	return front.ulTargetFlipNs <= GetVBlankTimer().GetNextVBlank( 0 );
+}
+
+// Legacy Step 3 offset API, retained compiled until Step 5. The production
+// arming path consumes vulkan_framegen_vrr_hybrid_wake_deadline_ns() and never
+// derives identity from an unlabelled vblank sample.
 uint64_t vulkan_framegen_vrr_hybrid_mid_offset_ns()
 {
 	const uint64_t ulPredictedIntervalNs = framegen_predicted_interval_ns();
@@ -6113,6 +6199,12 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 		&& pPresentFrameInfo->layerCount > 0
 		&& pPresentFrameInfo->layers[ 0 ].tex != nullptr
 		&& pPresentFrameInfo->layers[ 0 ].tex.get() != g_framegenHistory.pLastBaseTexture )
+		return nullptr;
+	// Overlay-driven composites can enter the backend between scheduled bidir
+	// opportunities. Leave a future queue front untouched; flip substitution
+	// below the composite will explicitly hold the last valid output instead.
+	if ( vulkan_framegen_bidir_active()
+		&& !vulkan_framegen_generated_frame_due() )
 		return nullptr;
 
 	FramegenHistory_t::PendingGenerated_t front = g_framegenHistory.pending.front();
@@ -6160,6 +6252,8 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 
 	if ( pResult != nullptr )
 	{
+		if ( vulkan_framegen_bidir_active() )
+			g_framegenHistory.bidirLastOutput = pResult;
 		framegen_select_present_tag(
 			front.bReal ? gamescope::FramegenPresentKind_t::DelayedReal
 				: gamescope::FramegenPresentKind_t::Generated,
@@ -6181,6 +6275,7 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 			// exactly where the next real frame is expected, and the panel's
 			// minimum flip spacing could then delay that real frame. A stall
 			// is left to the panel's own LFC instead.
+			framegen_clear_vrr_midpoint_state( false );
 		}
 		else if ( framegen_causal_deadline_enabled()
 			&& !vulkan_framegen_bidir_active() )
@@ -6231,6 +6326,8 @@ void vulkan_framegen_discard_generated_frame( const char *reason )
 		// shown after the real frame. Drop them all.
 		g_framegenHistory.pending.clear();
 	}
+	if ( g_framegenHistory.ulVrrMidTargetNs != 0u )
+		framegen_clear_vrr_midpoint_state( false );
 
 	const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
 	static uint64_t s_uDiscardDebugLogCounter = 0;
@@ -6251,9 +6348,29 @@ void vulkan_framegen_discard_generated_frame( const char *reason )
 // a visual no-op and the delayed timeline simply starts one vblank later).
 static gamescope::Rc<CVulkanTexture> framegen_bidir_take_front( const gamescope::Rc<CVulkanTexture> &pFallback )
 {
-	FramegenHistory_t::PendingGenerated_t front = g_framegenHistory.pending.front();
-	if ( front.bReal || g_device.hasCompletedFramegen( front.seqNo ) )
+	const uint64_t ulOpportunityNs = g_framegenPresentState.bTagPending
+		? g_framegenPresentState.pendingTag.ulTargetFlipNs
+		: GetVBlankTimer().GetNextVBlank( 0 );
+	while ( !g_framegenHistory.pending.empty() )
 	{
+		FramegenHistory_t::PendingGenerated_t front =
+			g_framegenHistory.pending.front();
+		if ( front.ulTargetFlipNs != 0u
+			&& front.ulTargetFlipNs > ulOpportunityNs )
+			break;
+
+		// Interpolation is disposable and never slides to a later display
+		// opportunity. Endpoints remain ordered and may catch up after a hitch.
+		if ( !front.bReal
+			&& ( ( front.ulTargetFlipNs != 0u
+					&& front.ulTargetFlipNs < ulOpportunityNs )
+				|| !g_device.hasCompletedFramegen( front.seqNo ) ) )
+		{
+			g_framegenHistory.pending.erase(
+				g_framegenHistory.pending.begin() );
+			continue;
+		}
+
 		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
 		// hasCompletedFramegen is the image-readiness proof. Blocking waits remain
 		// reserved for reset and teardown, never a steady-state flip.
@@ -6266,17 +6383,20 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_take_front( const gamescope:
 				: gamescope::FramegenPresentKind_t::Generated,
 			front.ulPresentRealFrameId, front.ulSlotId,
 			front.ulCompositeSeqNo, front.ulTargetFlipNs );
+		g_framegenHistory.bidirLastOutput = front.tex;
 		return front.tex;
 	}
 
-	if ( g_framegenHistory.previousReal != nullptr )
+	if ( g_framegenHistory.bidirLastOutput != nullptr )
 	{
-		framegen_select_present_tag( gamescope::FramegenPresentKind_t::DelayedReal,
-			g_framegenPresentState.ulPreviousRealFrameId,
+		// This is an explicit hold, not endpoint feedback. Classify it as
+		// generated so it can update backend lead without moving the epoch.
+		framegen_select_present_tag( gamescope::FramegenPresentKind_t::Generated,
+			g_framegenPresentState.ulCurrentRealFrameId,
 			framegen_next_present_slot_id(),
-			g_framegenPresentState.ulPreviousRealCompositeSeqNo,
-			GetVBlankTimer().GetNextVBlank( 0 ) );
-		return g_framegenHistory.previousReal;
+			g_framegenPresentState.ulCurrentRealCompositeSeqNo,
+			ulOpportunityNs );
+		return g_framegenHistory.bidirLastOutput;
 	}
 	return pFallback;
 }
@@ -6291,8 +6411,6 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<
 		// This composite recorded a new real frame and queued it behind its
 		// interpolations; present the queue front in its place.
 		g_framegenHistory.bBidirQueuedReal = false;
-		if ( g_framegenHistory.pending.empty() )
-			return pComposite;
 		return framegen_bidir_take_front( pComposite );
 	}
 
@@ -6304,6 +6422,12 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<
 		// update rides the next real frame's (delayed) composite.
 		return framegen_bidir_take_front( pComposite );
 	}
+
+	// Prime/cut/hitch holds use the same deadline selector. In particular, a
+	// zero-generated interval never falls through to the newest live composite.
+	if ( g_framegenHistory.bidirLastOutput != nullptr
+		|| g_framegenHistory.bidirEpoch.valid )
+		return framegen_bidir_take_front( pComposite );
 
 	// This composite is presenting LIVE (framegen dormant, prime frame after a
 	// scene change, game keeping up with refresh). Anything still pending
@@ -6317,6 +6441,7 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<
 				g_framegenHistory.pending.size() );
 		g_framegenHistory.pending.clear();
 	}
+	g_framegenHistory.bidirLastOutput = pComposite;
 	return pComposite;
 }
 
@@ -7209,6 +7334,22 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 		vk_log.infof( "framegen: content scene cut detected (%u/9 sections, histogram distance %.2f); presenting a real endpoint",
 			measurement->changedSections,
 			gamescope::framegen::scene_histogram_distance( *measurement ) );
+		if ( vulkan_framegen_bidir_active() )
+		{
+			// CPU readback arrives one batch later: discard every still-pending
+			// interpolation, retain scheduled real endpoints, and invalidate the
+			// translation. The current compatible post-cut pair can then establish
+			// a fresh epoch without ever exposing its live composite.
+			std::erase_if( h.pending,
+				[]( const FramegenHistory_t::PendingGenerated_t &entry ) {
+					return !entry.bReal;
+				} );
+			h.bidirEpoch = {};
+			h.bidirFeedbackEndpoints.clear();
+			h.ulBidirGridEpoch++;
+			if ( h.ulBidirGridEpoch == 0u )
+				h.ulBidirGridEpoch = 1u;
+		}
 	}
 
 	// Slow EMA (1/8), hysteretic mode selection, and bounded tolerance slew:
@@ -8553,7 +8694,72 @@ static uint64_t framegen_fixed_slot_target_ns( uint32_t nSlotIndex )
 		+ uint64_t( nSlotIndex ) * framegen_display_interval_ns();
 }
 
-static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr, uint64_t ulSingleTargetFlipNs = 0, bool bDeadlineCostKeying = false )
+// Deadline order is authoritative. Real endpoints own a colliding target, and
+// multiple endpoints quantized to that target coalesce to the newest frame.
+static bool framegen_insert_pending_entry(
+	FramegenHistory_t::PendingGenerated_t entry )
+{
+	if ( entry.ulTargetFlipNs == 0u )
+	{
+		g_framegenHistory.pending.push_back( std::move( entry ) );
+		return true;
+	}
+
+	auto it = std::lower_bound(
+		g_framegenHistory.pending.begin(), g_framegenHistory.pending.end(),
+		entry.ulTargetFlipNs,
+		[]( const FramegenHistory_t::PendingGenerated_t &pending,
+			uint64_t targetNs ) {
+			return pending.ulTargetFlipNs < targetNs;
+		} );
+	if ( it == g_framegenHistory.pending.end()
+		|| it->ulTargetFlipNs != entry.ulTargetFlipNs )
+	{
+		g_framegenHistory.pending.insert( it, std::move( entry ) );
+		return true;
+	}
+
+	if ( entry.bReal )
+	{
+		if ( !it->bReal
+			|| entry.ulPresentRealFrameId >= it->ulPresentRealFrameId )
+		{
+			*it = std::move( entry );
+			return true;
+		}
+		return false;
+	}
+
+	// A real endpoint already owns this opportunity. For two generated
+	// candidates, retain the newer interval's pixels.
+	if ( it->bReal )
+		return false;
+	if ( entry.frameId >= it->frameId )
+	{
+		*it = std::move( entry );
+		return true;
+	}
+	return false;
+}
+
+static size_t framegen_bidir_shed_to_capacity( size_t capacity )
+{
+	std::vector<gamescope::framegen::BidirSlotKind_t> kinds;
+	kinds.reserve( g_framegenHistory.pending.size() );
+	for ( const FramegenHistory_t::PendingGenerated_t &entry : g_framegenHistory.pending )
+	{
+		kinds.push_back( entry.bReal
+			? gamescope::framegen::BidirSlotKind_t::RealEndpoint
+			: gamescope::framegen::BidirSlotKind_t::Generated );
+	}
+	const std::vector<size_t> shed =
+		gamescope::framegen::bidir_generated_shed_indices( kinds, capacity );
+	for ( auto it = shed.rbegin(); it != shed.rend(); ++it )
+		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() + *it );
+	return shed.size();
+}
+
+static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr, uint64_t ulSingleTargetFlipNs = 0, bool bDeadlineCostKeying = false, uint64_t ulAnchorRealFrameId = 0, bool bExplicitProvisional = false )
 {
 	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0 )
 		return false;
@@ -8573,7 +8779,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 
 	// Reserve this interval's output slots up front so an empty batch never
 	// records/submits a command buffer.
-	struct SlotPlan_t { gamescope::Rc<CVulkanTexture> tex; float phase; float strength; uint32_t slotIndex; uint64_t ulTargetFlipNs; };
+	struct SlotPlan_t { gamescope::Rc<CVulkanTexture> tex; float phase; float strength; uint32_t slotIndex; uint64_t ulTargetFlipNs; uint64_t ulWakeDeadlineNs; };
 	std::vector<SlotPlan_t> slots;
 	slots.reserve( nRequestCount );
 	for ( uint32_t i = 0; i < nRequestCount; i++ )
@@ -8596,10 +8802,14 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		if ( !pGenerated )
 			continue;
 
-		const uint64_t ulTargetFlipNs = nRequestCount == 1 && ulSingleTargetFlipNs != 0
-			? ulSingleTargetFlipNs : framegen_fixed_slot_target_ns( pRequests[ i ].slotIndex );
+		const uint64_t ulTargetFlipNs = pRequests[ i ].targetFlipNs != 0u
+			? pRequests[ i ].targetFlipNs
+			: ( nRequestCount == 1 && ulSingleTargetFlipNs != 0
+				? ulSingleTargetFlipNs
+				: framegen_fixed_slot_target_ns( pRequests[ i ].slotIndex ) );
 		slots.push_back( { std::move( pGenerated ), pRequests[ i ].phase,
-			pRequests[ i ].strength, pRequests[ i ].slotIndex, ulTargetFlipNs } );
+			pRequests[ i ].strength, pRequests[ i ].slotIndex, ulTargetFlipNs,
+			pRequests[ i ].wakeDeadlineNs } );
 	}
 	if ( slots.size() != nRequestCount )
 	{
@@ -8850,12 +9060,16 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		entry.ulSlotId = framegen_next_present_slot_id();
 		entry.ulCompositeSeqNo = ulCompositeSeqNo;
 		entry.ulTargetFlipNs = slot.ulTargetFlipNs;
-		entry.ulAnchorRealFrameId = bDeadlineCostKeying
-			? g_framegenHistory.causalAnchor.realFrameId : 0u;
+		entry.ulWakeDeadlineNs = slot.ulWakeDeadlineNs;
+		entry.ulAnchorRealFrameId = ulAnchorRealFrameId != 0u
+			? ulAnchorRealFrameId
+			: ( bDeadlineCostKeying
+				? g_framegenHistory.causalAnchor.realFrameId : 0u );
 		entry.phase = slot.phase;
-		entry.bProvisional = bDeadlineCostKeying
-			&& !g_framegenHistory.causalAnchor.correctedFlipNs.has_value();
-		g_framegenHistory.pending.push_back( std::move( entry ) );
+		entry.bProvisional = bExplicitProvisional
+			|| ( bDeadlineCostKeying && ulAnchorRealFrameId == 0u
+				&& !g_framegenHistory.causalAnchor.correctedFlipNs.has_value() );
+		framegen_insert_pending_entry( std::move( entry ) );
 		g_framegenHistory.nLastGeneratedSlot = std::max( g_framegenHistory.nLastGeneratedSlot, slot.slotIndex );
 	}
 
@@ -9160,6 +9374,8 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 		.strength = gamescope::framegen::clamp_forward_strength(
 			plan.rawStrength, k_flFramegenMaxForwardStrength ),
 		.slotIndex = nSlotIndex,
+		.targetFlipNs = plan.targetNs,
+		.wakeDeadlineNs = plan.wakeNs,
 	};
 	const uint32_t nMaxCausalDegradeSteps = gamescope::framegen::max_degrade_steps(
 		g_eFramegenMode, g_eFramegenQuality, 2 );
@@ -9286,6 +9502,444 @@ static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMax
 		+ ulPredictedIntervalNs / 2u;
 	return framegen_submit_planned( &request, 1, nGapVblanks, eff, ulCompositeSeqNo,
 		nMaxDegradeSteps, false, nullptr, ulTargetFlipNs );
+}
+
+static void framegen_clear_vrr_midpoint_state( bool bClearPending )
+{
+	if ( bClearPending && g_framegenHistory.ulVrrMidTargetNs != 0u )
+		g_framegenHistory.pending.clear();
+	g_framegenHistory.ulVrrAwaitingRealFrameId = 0;
+	g_framegenHistory.ulVrrAwaitingCompositeSeqNo = 0;
+	g_framegenHistory.ulVrrAwaitingCadenceNs = 0;
+	g_framegenHistory.ulVrrPanelIntervalNs = 0;
+	g_framegenHistory.ulVrrMidTargetNs = 0;
+	g_framegenHistory.ulVrrMidWakeNs = 0;
+}
+
+void vulkan_framegen_cancel_vrr_hybrid_slot( const char *reason )
+{
+	const bool bHadSlot = g_framegenHistory.ulVrrAwaitingRealFrameId != 0u
+		|| g_framegenHistory.ulVrrMidTargetNs != 0u;
+	framegen_clear_vrr_midpoint_state( true );
+	static uint64_t s_uVrrCancelDebugLogCounter = 0;
+	if ( bHadSlot && FramegenDebugShouldLog( s_uVrrCancelDebugLogCounter ) )
+		vk_log.infof( "framegen: cancelled VRR midpoint reason=%s",
+			reason ? reason : "unknown" );
+}
+
+uint64_t vulkan_framegen_vrr_hybrid_wake_deadline_ns()
+{
+	if ( !vulkan_framegen_vrr_hybrid_active()
+		|| g_framegenHistory.ulVrrMidWakeNs == 0u
+		|| g_framegenHistory.pending.empty() )
+		return 0u;
+	return g_framegenHistory.ulVrrMidWakeNs;
+}
+
+static void framegen_record_vrr_real_for_feedback( uint64_t ulRealFrameId,
+	uint64_t ulCompositeSeqNo, uint64_t ulPredictedIntervalNs,
+	uint64_t ulPanelIntervalNs, bool bCanGenerate )
+{
+	// A real arrival supersedes the previous interval's midpoint, whether its
+	// timer fired, its GPU work remained in flight, or its feedback was lost.
+	framegen_clear_vrr_midpoint_state( true );
+	if ( !bCanGenerate || ulRealFrameId == 0u || ulCompositeSeqNo == 0u
+		|| !gamescope::framegen::vrr_hybrid_interval_eligible(
+			ulPredictedIntervalNs, ulPanelIntervalNs ) )
+		return;
+
+	g_framegenHistory.ulVrrAwaitingRealFrameId = ulRealFrameId;
+	g_framegenHistory.ulVrrAwaitingCompositeSeqNo = ulCompositeSeqNo;
+	g_framegenHistory.ulVrrAwaitingCadenceNs = ulPredictedIntervalNs;
+	g_framegenHistory.ulVrrPanelIntervalNs = ulPanelIntervalNs;
+}
+
+static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback )
+{
+	if ( feedback.tag.eKind != gamescope::FramegenPresentKind_t::Real
+		|| feedback.tag.ulRealFrameId == 0u
+		|| feedback.tag.ulRealFrameId
+			!= g_framegenHistory.ulVrrAwaitingRealFrameId )
+		return;
+
+	if ( !feedback.bPresented || !feedback.bTimestampValid
+		|| !vulkan_framegen_vrr_hybrid_active() )
+	{
+		vulkan_framegen_cancel_vrr_hybrid_slot(
+			feedback.bPresented ? "invalid_real_feedback" : "real_feedback_discarded" );
+		return;
+	}
+
+	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	{
+		vulkan_framegen_cancel_vrr_hybrid_slot( "generation_in_flight" );
+		return;
+	}
+
+	const uint64_t ulNowNs = get_time_in_nanos();
+	const uint64_t ulMarginNs = g_framegenHistory.ulVrrPanelIntervalNs / 10u;
+	const gamescope::framegen::VrrMidpointPlan_t plan =
+		gamescope::framegen::plan_vrr_midpoint(
+			feedback.ulActualFlipNs,
+			g_framegenHistory.ulVrrAwaitingCadenceNs,
+			g_framegenPresentState.presentLead.emaNs,
+			ulMarginNs, ulNowNs );
+	if ( !plan.valid )
+	{
+		vulkan_framegen_cancel_vrr_hybrid_slot( "late_target" );
+		return;
+	}
+
+	// One-slot deadline work has no useful multiplier rung. Walk only the
+	// quality/mode portion and admit the first cold or measured-fitting class.
+	const uint32_t nMaxDegradeSteps = gamescope::framegen::max_degrade_steps(
+		g_eFramegenMode, g_eFramegenQuality, 2u );
+	g_framegenHistory.nDegradeSteps = std::min(
+		g_framegenHistory.nDegradeSteps, nMaxDegradeSteps );
+	FramegenEffective_t eff = framegen_effective_config(
+		g_framegenHistory.nDegradeSteps );
+	bool bFits = false;
+	for ( uint32_t nRung = g_framegenHistory.nDegradeSteps;
+		nRung <= nMaxDegradeSteps; nRung++ )
+	{
+		const FramegenEffective_t candidate = framegen_effective_config( nRung );
+		const gamescope::framegen::DeadlineWorkClass_t workClass =
+			framegen_causal_work_class( candidate );
+		const uint32_t nCostKey =
+			gamescope::framegen::deadline_work_class_cost_key( workClass );
+		const uint64_t ulCostNs = g_device.framegenRungCostNs( nRung, nCostKey );
+		const uint32_t uSamples = g_device.framegenRungSampleCount(
+			nRung, nCostKey );
+		const bool bMature = ulCostNs != 0u
+			&& uSamples >= gamescope::framegen::k_uDeadlineMinSamples;
+		if ( !bMature || gamescope::framegen::deadline_cost_fits(
+			ulCostNs, plan.wakeDeadlineNs, ulNowNs, 0u ) )
+		{
+			eff = candidate;
+			if ( nRung != g_framegenHistory.nDegradeSteps )
+			{
+				g_framegenHistory.nDegradeSteps = nRung;
+				g_framegenHistory.nDegradeHold =
+					gamescope::framegen::k_uDeadlineHoldFrames;
+			}
+			bFits = true;
+			break;
+		}
+	}
+	if ( !bFits )
+	{
+		vulkan_framegen_cancel_vrr_hybrid_slot( "unfittable_generation" );
+		return;
+	}
+
+	const float flPhase = 0.5f;
+	const FramegenSlotRequest_t request = {
+		.phase = flPhase,
+		.strength = gamescope::framegen::clamp_forward_strength(
+			gamescope::framegen::forward_strength_raw(
+				flPhase, g_flFramegenStrength ),
+			k_flFramegenMaxForwardStrength ),
+		.slotIndex = 1u,
+		.targetFlipNs = plan.targetFlipNs,
+		.wakeDeadlineNs = plan.wakeDeadlineNs,
+	};
+	const uint32_t nGapVblanks = gamescope::framegen::interval_gap_vblanks(
+		g_framegenHistory.ulVrrAwaitingCadenceNs,
+		g_framegenHistory.ulVrrPanelIntervalNs );
+	const uint64_t ulCompositeSeqNo =
+		g_framegenHistory.ulVrrAwaitingCompositeSeqNo;
+	const bool bSubmitted = framegen_submit_planned(
+		&request, 1u, nGapVblanks, eff, ulCompositeSeqNo,
+		nMaxDegradeSteps, false, nullptr, 0u, true,
+		feedback.tag.ulRealFrameId, false );
+	if ( !bSubmitted )
+	{
+		vulkan_framegen_cancel_vrr_hybrid_slot( "submission_unavailable" );
+		return;
+	}
+
+	g_framegenHistory.ulVrrAwaitingRealFrameId = 0u;
+	g_framegenHistory.ulVrrAwaitingCompositeSeqNo = 0u;
+	g_framegenHistory.ulVrrAwaitingCadenceNs = 0u;
+	g_framegenHistory.ulVrrMidTargetNs = plan.targetFlipNs;
+	g_framegenHistory.ulVrrMidWakeNs = plan.wakeDeadlineNs;
+	static uint64_t s_uVrrDeadlineDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uVrrDeadlineDebugLogCounter ) )
+	{
+		vk_log.infof( "framegen: VRR midpoint real=%" PRIu64
+			" target=+%.2fms wake=+%.2fms lead=%.2fms margin=%.2fms",
+			feedback.tag.ulRealFrameId,
+			( plan.targetFlipNs - ulNowNs ) / 1.0e6,
+			( plan.wakeDeadlineNs - ulNowNs ) / 1.0e6,
+			g_framegenPresentState.presentLead.emaNs / 1.0e6,
+			ulMarginNs / 1.0e6 );
+	}
+}
+
+static void framegen_apply_bidir_flip_feedback( const DisplayFeedback_t &feedback )
+{
+	if ( !vulkan_framegen_bidir_active() || !feedback.bPresented
+		|| !feedback.bTimestampValid
+		|| feedback.tag.eKind != gamescope::FramegenPresentKind_t::DelayedReal )
+		return;
+
+	auto it = std::ranges::find_if(
+		g_framegenHistory.bidirFeedbackEndpoints,
+		[&]( const FramegenHistory_t::BidirFeedbackEndpoint_t &record ) {
+			return record.endpoint.realFrameId == feedback.tag.ulRealFrameId;
+		} );
+	if ( it == g_framegenHistory.bidirFeedbackEndpoints.end() )
+		return;
+
+	if ( it->ulEpoch == g_framegenHistory.bidirEpoch.epoch )
+	{
+		const gamescope::framegen::BidirEpochCorrection_t correction =
+			gamescope::framegen::apply_bidir_endpoint_feedback(
+				g_framegenHistory.bidirEpoch,
+				it->endpoint.sourceReadyNs,
+				feedback.ulActualFlipNs );
+		if ( correction.applied )
+		{
+			g_framegenHistory.bidirEpoch = correction.epoch;
+			static uint64_t s_uBidirFeedbackDebugLogCounter = 0;
+			if ( FramegenDebugShouldLog( s_uBidirFeedbackDebugLogCounter ) )
+				vk_log.infof( "framegen: bidir epoch corrected by delayed real=%" PRIu64,
+					feedback.tag.ulRealFrameId );
+		}
+	}
+
+	std::erase_if( g_framegenHistory.bidirFeedbackEndpoints,
+		[&]( const FramegenHistory_t::BidirFeedbackEndpoint_t &record ) {
+			return record.endpoint.realFrameId <= feedback.tag.ulRealFrameId;
+		} );
+}
+
+static void framegen_bidir_record_feedback_endpoint(
+	const gamescope::framegen::BidirEndpoint_t &endpoint )
+{
+	std::erase_if( g_framegenHistory.bidirFeedbackEndpoints,
+		[&]( const FramegenHistory_t::BidirFeedbackEndpoint_t &record ) {
+			return record.endpoint.realFrameId == endpoint.realFrameId;
+		} );
+	g_framegenHistory.bidirFeedbackEndpoints.push_back( {
+		.endpoint = endpoint,
+		.ulEpoch = g_framegenHistory.bidirEpoch.epoch,
+	} );
+}
+
+static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
+	uint64_t ulCurrentSourceNs, uint64_t ulLiveTargetNs,
+	uint64_t ulVblankIntervalNs, const FramegenEffective_t &eff,
+	uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps,
+	bool bAllowGeneration, bool bSourceTimestampsReliable )
+{
+	if ( ulPreviousSourceNs == 0u || ulCurrentSourceNs <= ulPreviousSourceNs
+		|| ulLiveTargetNs == 0u || ulVblankIntervalNs == 0u
+		|| g_framegenHistory.previousReal == nullptr
+		|| g_framegenHistory.currentReal == nullptr )
+		return false;
+
+	const bool bGridChanged = g_framegenHistory.ulBidirGridEpoch == 0u
+		|| g_framegenHistory.ulBidirGridIntervalNs != ulVblankIntervalNs;
+	const bool bProvenanceChanged =
+		g_framegenHistory.bBidirProvenanceInitialized
+		&& g_framegenHistory.bBidirSourceTimestampsReliable
+			!= bSourceTimestampsReliable;
+	if ( bGridChanged || bProvenanceChanged )
+	{
+		g_framegenHistory.bidirEpoch = {};
+		g_framegenHistory.bidirFeedbackEndpoints.clear();
+		g_framegenHistory.ulBidirGridEpoch++;
+		if ( g_framegenHistory.ulBidirGridEpoch == 0u )
+			g_framegenHistory.ulBidirGridEpoch = 1u;
+	}
+	g_framegenHistory.ulBidirGridIntervalNs = ulVblankIntervalNs;
+	g_framegenHistory.bBidirProvenanceInitialized = true;
+	g_framegenHistory.bBidirSourceTimestampsReliable =
+		bSourceTimestampsReliable;
+
+	bool bEstablished = false;
+	if ( !g_framegenHistory.bidirEpoch.valid )
+	{
+		if ( g_framegenHistory.ulBidirGridEpoch == 0u )
+			g_framegenHistory.ulBidirGridEpoch = 1u;
+		g_framegenHistory.bidirEpoch =
+			gamescope::framegen::establish_bidir_epoch(
+				ulPreviousSourceNs, ulLiveTargetNs,
+				g_framegenHistory.ulBidirGridEpoch );
+		if ( !g_framegenHistory.bidirEpoch.valid )
+			return false;
+
+		const gamescope::VBlankScheduleTime schedule =
+			GetVBlankTimer().CalcNextWakeupTime( true );
+		g_framegenHistory.ulBidirGridTargetNs = ulLiveTargetNs;
+		g_framegenHistory.ulBidirGridWakeNs =
+			schedule.ulScheduledWakeupPoint;
+		if ( schedule.ulTargetVBlank > ulLiveTargetNs )
+		{
+			const uint64_t deltaNs = schedule.ulTargetVBlank - ulLiveTargetNs;
+			if ( deltaNs < g_framegenHistory.ulBidirGridWakeNs )
+				g_framegenHistory.ulBidirGridWakeNs -= deltaNs;
+		}
+		else if ( ulLiveTargetNs > schedule.ulTargetVBlank )
+		{
+			g_framegenHistory.ulBidirGridWakeNs =
+				gamescope::framegen::saturating_add_ns(
+					schedule.ulScheduledWakeupPoint,
+					ulLiveTargetNs - schedule.ulTargetVBlank );
+		}
+		bEstablished = true;
+	}
+
+	const gamescope::framegen::DisplayGrid_t grid = {
+		.D0 = g_framegenHistory.ulBidirGridTargetNs,
+		.W0 = g_framegenHistory.ulBidirGridWakeNs,
+		.T = ulVblankIntervalNs,
+	};
+	const std::array endpoints = {
+		gamescope::framegen::BidirEndpoint_t{
+			.realFrameId = g_framegenPresentState.ulPreviousRealFrameId,
+			.sourceReadyNs = ulPreviousSourceNs,
+		},
+		gamescope::framegen::BidirEndpoint_t{
+			.realFrameId = g_framegenPresentState.ulCurrentRealFrameId,
+			.sourceReadyNs = ulCurrentSourceNs,
+		},
+	};
+	const uint32_t nPlannerMultiplier = g_device.hasFramegenQueue()
+		? eff.multiplier : 2u;
+	const gamescope::framegen::BidirPlan_t plan =
+		gamescope::framegen::plan_bidir_slots(
+			grid, g_framegenHistory.bidirEpoch, endpoints,
+			nPlannerMultiplier, g_framegenHistory.ulBidirGridEpoch );
+	if ( !plan.validEpoch )
+		return false;
+
+	std::vector<FramegenSlotRequest_t> requests;
+	const uint64_t ulNowNs = get_time_in_nanos();
+	for ( const gamescope::framegen::BidirSlot_t &slot : plan.slots )
+	{
+		if ( slot.kind != gamescope::framegen::BidirSlotKind_t::Generated
+			|| slot.endpointFrameId != endpoints[ 1 ].realFrameId
+			|| !bAllowGeneration || ulNowNs >= slot.wakeNs )
+			continue;
+		if ( std::ranges::any_of( g_framegenHistory.pending,
+			[&]( const FramegenHistory_t::PendingGenerated_t &entry ) {
+				return entry.ulTargetFlipNs == slot.targetNs;
+			} ) )
+			continue;
+		requests.push_back( {
+			.phase = static_cast<float>( slot.phase ),
+			.strength = static_cast<float>( slot.phase ),
+			.slotIndex = static_cast<uint32_t>( std::min<uint64_t>(
+				gamescope::framegen::grid_index_at_or_after(
+					grid, slot.targetNs ), UINT32_MAX ) ),
+			.targetFlipNs = slot.targetNs,
+			.wakeDeadlineNs = slot.wakeNs,
+		} );
+	}
+
+	const size_t uIncomingEndpoints = std::ranges::count_if(
+		plan.slots,
+		[&]( const gamescope::framegen::BidirSlot_t &slot ) {
+			return slot.kind == gamescope::framegen::BidirSlotKind_t::RealEndpoint
+				&& ( slot.endpointFrameId == endpoints[ 1 ].realFrameId
+					|| ( bEstablished
+						&& slot.endpointFrameId == endpoints[ 0 ].realFrameId ) );
+		} );
+	const size_t uMaxPending = static_cast<size_t>(
+		2u * ( eff.multiplier + 1u ) );
+	const size_t uDesiredOldMax = uMaxPending > requests.size() + uIncomingEndpoints
+		? uMaxPending - requests.size() - uIncomingEndpoints : 0u;
+	const size_t uShed = framegen_bidir_shed_to_capacity( uDesiredOldMax );
+	const size_t uEndpointBacklog = std::ranges::count_if(
+		g_framegenHistory.pending,
+		[]( const FramegenHistory_t::PendingGenerated_t &entry ) {
+			return entry.bReal;
+		} ) + uIncomingEndpoints;
+	const size_t uExistingGenerated = std::ranges::count_if(
+		g_framegenHistory.pending,
+		[]( const FramegenHistory_t::PendingGenerated_t &entry ) {
+			return !entry.bReal;
+		} );
+	const size_t uGeneratedCapacity = uMaxPending > uEndpointBacklog
+		? uMaxPending - uEndpointBacklog : 0u;
+	const size_t uNewCapacity = uGeneratedCapacity > uExistingGenerated
+		? uGeneratedCapacity - uExistingGenerated : 0u;
+	if ( requests.size() > uNewCapacity )
+		requests.resize( uNewCapacity );
+
+	// A mature batch estimate must fit before the earliest surviving wake.
+	if ( !requests.empty() )
+	{
+		const uint32_t nCostKey = static_cast<uint32_t>( requests.size() );
+		const uint64_t ulCostNs = g_device.framegenRungCostNs(
+			g_framegenHistory.nDegradeSteps, nCostKey );
+		const uint32_t uSamples = g_device.framegenRungSampleCount(
+			g_framegenHistory.nDegradeSteps, nCostKey );
+		if ( ulCostNs != 0u
+			&& uSamples >= gamescope::framegen::k_uDeadlineMinSamples
+			&& !gamescope::framegen::deadline_cost_fits(
+				ulCostNs, requests.front().wakeDeadlineNs,
+				ulNowNs, 0u ) )
+			requests.clear();
+	}
+
+	if ( !requests.empty() )
+	{
+		const uint64_t sourceSpanNs = ulCurrentSourceNs - ulPreviousSourceNs;
+		const uint32_t nGapVblanks = std::max<uint32_t>( 1u,
+			static_cast<uint32_t>( std::min<uint64_t>( UINT32_MAX,
+				( sourceSpanNs + ulVblankIntervalNs - 1u )
+					/ ulVblankIntervalNs ) ) );
+		framegen_submit_planned( requests.data(),
+			static_cast<uint32_t>( requests.size() ), nGapVblanks,
+			eff, ulCompositeSeqNo, nMaxDegradeSteps, false );
+	}
+
+	const auto queueEndpoint = [&]( const gamescope::framegen::BidirEndpoint_t &endpoint,
+		const gamescope::Rc<CVulkanTexture> &texture, uint64_t frameId,
+		uint64_t compositeSeqNo ) {
+		const auto slot = std::ranges::find_if( plan.slots,
+			[&]( const gamescope::framegen::BidirSlot_t &candidate ) {
+				return candidate.kind == gamescope::framegen::BidirSlotKind_t::RealEndpoint
+					&& candidate.endpointFrameId == endpoint.realFrameId;
+			} );
+		if ( slot == plan.slots.end() )
+			return;
+		FramegenHistory_t::PendingGenerated_t entry;
+		entry.tex = texture;
+		entry.frameId = frameId;
+		entry.ulPresentRealFrameId = endpoint.realFrameId;
+		entry.ulSlotId = framegen_next_present_slot_id();
+		entry.ulCompositeSeqNo = compositeSeqNo;
+		entry.ulTargetFlipNs = slot->targetNs;
+		entry.ulWakeDeadlineNs = slot->wakeNs;
+		entry.phase = 1.0f;
+		entry.bReal = true;
+		if ( framegen_insert_pending_entry( std::move( entry ) ) )
+			framegen_bidir_record_feedback_endpoint( endpoint );
+	};
+	if ( bEstablished )
+	{
+		queueEndpoint( endpoints[ 0 ], g_framegenHistory.previousReal,
+			g_framegenHistory.previousFrameId,
+			g_framegenPresentState.ulPreviousRealCompositeSeqNo );
+	}
+	queueEndpoint( endpoints[ 1 ], g_framegenHistory.currentReal,
+		g_framegenHistory.currentFrameId, ulCompositeSeqNo );
+	g_framegenHistory.bBidirQueuedReal = true;
+
+	static uint64_t s_uBidirDeadlineDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uBidirDeadlineDebugLogCounter ) )
+	{
+		vk_log.infof( "framegen: bidir epoch=%" PRIu64
+			" candidates=%zu pending=%zu/%zu shed=%zu%s",
+			g_framegenHistory.bidirEpoch.epoch, requests.size(),
+			g_framegenHistory.pending.size(), uMaxPending, uShed,
+			bEstablished ? " established" : "" );
+	}
+	return true;
 }
 
 // Reactive causal catch-all, called by the present decision when a vblank goes to
@@ -9991,6 +10645,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		&& ulSourceReadyTimeNs <= now;
 	const uint64_t ulCadenceTimeNs = bUseSourceCadence
 		? ulSourceReadyTimeNs : now;
+	const uint64_t ulPreviousCadenceTimeNs =
+		g_framegenHistory.ulCurrentCadenceTimeNs;
 
 	g_framegenHistory.currentFrameId++;
 	g_framegenHistory.previousPresentTimeNs = ulPrevRealFrameTimeNs;
@@ -10185,6 +10841,29 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// only on frames we actually generate, so it steps on real generating frames
 	// and never on an idle/dormant frame.
 	const uint32_t nMaxDegradeSteps = framegen_max_degrade_steps();
+	const bool bVrrHybrid = vulkan_framegen_vrr_hybrid_active();
+	const bool bBidirDeadline = vulkan_framegen_bidir_active();
+	const uint64_t ulBidirPreviousSourceNs = ulCadenceSampleNs != 0u
+		? ulPreviousCadenceTimeNs : 0u;
+	if ( bBidirDeadline && bGpuHasHeadroom )
+	{
+		// Consume scene classification before planning the new pair. A cut keeps
+		// queued endpoints but invalidates the translation, allowing this pair to
+		// re-prime only when both post-cut source timestamps are compatible.
+		framegen_adapt_consume(
+			framegen_effective_config(
+				g_framegenHistory.nDegradeSteps ).quality );
+	}
+
+	if ( bVrrHybrid )
+	{
+		framegen_record_vrr_real_for_feedback(
+			g_framegenPresentState.ulCurrentRealFrameId,
+			ulCompositeSeqNo, framegen_predicted_interval_ns(),
+			ulVblankIntervalNs,
+			bCanSpeculate && ulCadenceSampleNs != 0u );
+		return;
+	}
 
 	const bool bReactiveReady = gamescope::framegen::reactive_generation_ready(
 		bGeneratable, g_framegenHistory.nStableFrames );
@@ -10192,6 +10871,18 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	if ( !bShouldGenerate )
 	{
+		if ( bBidirDeadline )
+		{
+			framegen_bidir_plan_pair(
+				ulBidirPreviousSourceNs, ulCadenceTimeNs,
+				g_framegenPresentState.pendingTag.ulTargetFlipNs,
+				ulVblankIntervalNs,
+				framegen_effective_config(
+					g_framegenHistory.nDegradeSteps ),
+				ulCompositeSeqNo, nMaxDegradeSteps, false,
+				bUseSourceCadence );
+			return;
+		}
 		static uint64_t s_uDormantDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uDormantDebugLogCounter ) )
 		{
@@ -10244,7 +10935,6 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// (motion tier or motion->extrapolate) can shed work — a multiplier notch cannot reduce a
 	// count that is already minimal, and the "does the step actually help"
 	// check below correctly never takes it.
-	const bool bVrrHybrid = vulkan_framegen_vrr_hybrid_active();
 	const bool bSingleSlotPacing = bVrrHybrid;
 	const uint32_t nCurGenForLadder = gamescope::framegen::ladder_generated_count(
 		nGapSlots, curEffForLadder.multiplier, bSingleSlotPacing );
@@ -10300,6 +10990,19 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				vk_log.infof( "framegen: vrr-hybrid keep-up skip cadence=%.2fms min-flip-interval=%.2fms",
 					ulPredictedIntervalNs / 1.0e6, ulVblankIntervalNs / 1.0e6 );
 		}
+		return;
+	}
+
+	// Step 4 production bidir path. The absolute-epoch planner schedules the
+	// real endpoint even when it emits zero candidates; the rounded-gap branch
+	// below remains compiled for Step 5 removal but is unreachable in bidir.
+	if ( bBidirDeadline )
+	{
+		framegen_bidir_plan_pair(
+			ulBidirPreviousSourceNs, ulCadenceTimeNs,
+			g_framegenPresentState.pendingTag.ulTargetFlipNs,
+			ulVblankIntervalNs, eff, ulCompositeSeqNo,
+			nMaxDegradeSteps, true, bUseSourceCadence );
 		return;
 	}
 

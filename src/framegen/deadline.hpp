@@ -235,6 +235,49 @@ struct BidirEpoch_t
 	}
 };
 
+// Establish the fixed-delay translation at the first compatible real pair.
+// The previous source endpoint is due where the current frame's live path
+// would have displayed, introducing the invariant one-real-interval delay.
+[[nodiscard]] constexpr BidirEpoch_t establish_bidir_epoch(
+	uint64_t previousSourceReadyNs, uint64_t currentLiveTargetNs,
+	uint64_t gridEpoch )
+{
+	return {
+		.sourceEpochNs = previousSourceReadyNs,
+		.displayEpochNs = currentLiveTargetNs,
+		.epoch = gridEpoch,
+		.valid = previousSourceReadyNs != 0u
+			&& currentLiveTargetNs != 0u && gridEpoch != 0u,
+	};
+}
+
+struct BidirEpochCorrection_t
+{
+	BidirEpoch_t epoch;
+	bool applied = false;
+};
+
+// A delayed endpoint proves where that source timestamp actually scanned out.
+// Only the epoch value is returned: already-created slots are values and remain
+// untouched, while later plans observe the corrected source/display mapping.
+[[nodiscard]] constexpr BidirEpochCorrection_t apply_bidir_endpoint_feedback(
+	const BidirEpoch_t &epoch, uint64_t endpointSourceReadyNs,
+	uint64_t actualFlipNs )
+{
+	BidirEpochCorrection_t result = { .epoch = epoch };
+	if ( !epoch.valid || endpointSourceReadyNs < epoch.sourceEpochNs
+		|| actualFlipNs == 0u )
+		return result;
+
+	const uint64_t sourceDeltaNs = endpointSourceReadyNs - epoch.sourceEpochNs;
+	if ( sourceDeltaNs > actualFlipNs )
+		return result;
+
+	result.epoch.displayEpochNs = actualFlipNs - sourceDeltaNs;
+	result.applied = true;
+	return result;
+}
+
 struct BidirEndpoint_t
 {
 	uint64_t realFrameId = 0;
@@ -262,6 +305,27 @@ struct BidirPlan_t
 	std::vector<BidirSlot_t> slots;
 	bool validEpoch = false;
 };
+
+// Return oldest-first generated entries to shed until the requested capacity
+// is met. Real endpoints are never returned; if endpoints alone exceed the
+// soft capacity, the caller preserves that endpoint backlog.
+[[nodiscard]] inline std::vector<size_t> bidir_generated_shed_indices(
+	std::span<const BidirSlotKind_t> kinds, size_t capacity )
+{
+	std::vector<size_t> result;
+	if ( kinds.size() <= capacity )
+		return result;
+
+	size_t remaining = kinds.size();
+	for ( size_t i = 0u; i < kinds.size() && remaining > capacity; i++ )
+	{
+		if ( kinds[ i ] != BidirSlotKind_t::Generated )
+			continue;
+		result.push_back( i );
+		remaining--;
+	}
+	return result;
+}
 
 // Builds a fixed-delay timeline directly from absolute endpoint display times.
 // Each interval is independently density-capped; selected candidates retain
@@ -364,6 +428,63 @@ struct BidirPlan_t
 	const uint64_t jitterBudgetNs = ( budgetNs / 100u ) * k_uDeadlinePercent
 		+ ( ( budgetNs % 100u ) * k_uDeadlinePercent ) / 100u;
 	return costNs <= jitterBudgetNs;
+}
+
+struct PresentLeadState_t
+{
+	uint64_t emaNs = 0;
+	uint32_t samples = 0;
+};
+
+// A deliberately slow 1/8 EMA. Invalid/reordered timestamp pairs do not
+// contaminate the backend lead estimate.
+[[nodiscard]] constexpr PresentLeadState_t update_present_lead(
+	PresentLeadState_t state, uint64_t commitSubmitNs, uint64_t actualFlipNs )
+{
+	if ( commitSubmitNs == 0u || actualFlipNs <= commitSubmitNs )
+		return state;
+
+	const uint64_t sampleNs = actualFlipNs - commitSubmitNs;
+	if ( state.samples == 0u )
+		state.emaNs = sampleNs;
+	else if ( sampleNs >= state.emaNs )
+		state.emaNs += ( sampleNs - state.emaNs ) / 8u;
+	else
+		state.emaNs -= ( state.emaNs - sampleNs ) / 8u;
+	if ( state.samples != UINT32_MAX )
+		state.samples++;
+	return state;
+}
+
+struct VrrMidpointPlan_t
+{
+	uint64_t targetFlipNs = 0;
+	uint64_t wakeDeadlineNs = 0;
+	bool valid = false;
+};
+
+// VRR has no fixed display grid. Correlated real feedback supplies its anchor;
+// presentation lead and a small compositor margin move the wake/commit early
+// enough for the resulting scanout to land at the content midpoint.
+[[nodiscard]] constexpr VrrMidpointPlan_t plan_vrr_midpoint(
+	uint64_t realFlipNs, uint64_t predictedCadenceNs,
+	uint64_t presentLeadNs, uint64_t presentMarginNs, uint64_t nowNs )
+{
+	VrrMidpointPlan_t result;
+	if ( realFlipNs == 0u || predictedCadenceNs == 0u )
+		return result;
+
+	result.targetFlipNs = saturating_add_ns(
+		realFlipNs, predictedCadenceNs / 2u );
+	const uint64_t advanceNs = saturating_add_ns(
+		presentLeadNs, presentMarginNs );
+	if ( advanceNs >= result.targetFlipNs )
+		return result;
+
+	result.wakeDeadlineNs = result.targetFlipNs - advanceNs;
+	result.valid = result.wakeDeadlineNs != 0u
+		&& nowNs < result.wakeDeadlineNs;
+	return result;
 }
 
 } // namespace gamescope::framegen

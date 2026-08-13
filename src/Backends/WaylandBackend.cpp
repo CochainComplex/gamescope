@@ -1536,6 +1536,7 @@ namespace gamescope
                     .pPlane = this,
                     .tag = vulkan_framegen_take_present_tag(),
                 };
+                pFeedbackCtx->tag.ulCommitSubmitNs = get_time_in_nanos();
                 wp_presentation_feedback_add_listener( pFeedback, &s_PresentationFeedbackListener, pFeedbackCtx );
             }
 

@@ -430,6 +430,9 @@ void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentT
 	uint64_t ulActualFlipNs, uint64_t ulBackendSequence, bool bPresented, bool bTimestampValid );
 void vulkan_framegen_drain_present_feedback();
 bool vulkan_framegen_has_pending_generated_frame();
+// True when the queue front owns the current fixed-grid opportunity, or when
+// the non-grid VRR wake deadline has arrived.
+bool vulkan_framegen_generated_frame_due();
 // True when a generated frame is pending AND its GPU work has completed, so it
 // can be presented this vblank without stalling scanout. Non-consuming.
 bool vulkan_framegen_generated_frame_ready();
@@ -481,9 +484,13 @@ void vulkan_framegen_jit_tick();
 // behavior live when VRR drops.
 bool vulkan_framegen_vrr_hybrid_requested();
 bool vulkan_framegen_vrr_hybrid_active();
+// Correlated Real feedback creates one absolute non-grid deadline. Steamcompmgr
+// arms its timer at this wake point; zero means no midpoint is pending.
+uint64_t vulkan_framegen_vrr_hybrid_wake_deadline_ns();
+void vulkan_framegen_cancel_vrr_hybrid_slot( const char *reason );
 // Nanoseconds after the real frame's KMS flip timestamp at which the pending
 // generated frame should be flipped (phase * predicted source cadence); 0 when there is
-// nothing to schedule. steamcompmgr arms the mid-interval timer with this.
+// nothing to schedule. Legacy Step 3 API; no production caller remains.
 uint64_t vulkan_framegen_vrr_hybrid_mid_offset_ns();
 
 // Standalone GPU microbenchmark of the frame-generation dispatches (extrapolate,

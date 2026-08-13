@@ -171,6 +171,7 @@ namespace gamescope
         uint64_t ulSlotId;
         uint64_t ulCompositeSeqNo;
         uint64_t ulTargetFlipNs;
+        uint64_t ulCommitSubmitNs;
         FramegenPresentKind_t eKind;
     };
 

@@ -46,6 +46,11 @@ struct SlotRequest
 	float phase;
 	float strength;
 	uint32_t slotIndex;
+	// Absolute display deadline metadata. Legacy gap planners leave these zero
+	// and retain their existing fixed_slot_target derivation; deadline policies
+	// carry the exact grid/non-grid times end to end.
+	uint64_t targetFlipNs = 0;
+	uint64_t wakeDeadlineNs = 0;
 };
 
 [[nodiscard]] constexpr float forward_strength_raw( float phase, float configuredStrength )

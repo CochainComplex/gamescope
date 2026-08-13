@@ -8348,13 +8348,10 @@ static gamescope::CTimerFunction g_FPSLimitVRRTimer{ []
 	g_FPSLimitVRRTimer.DisarmTimer();
 }};
 
-// VRR hybrid (#01): one-shot absolute timer for the mid-interval generated
-// flip. Armed after a real frame's flip completes, for (KMS flip timestamp +
-// phase * predicted source cadence) — timerfd and the pageflip events share
-// CLOCK_MONOTONIC, so the spacing is display ground truth end to end. The
-// callback runs on this thread inside PollEvents (no atomics needed); the
-// deadline flag persists until acted on, so a fire that finds a flip still in
-// flight retries on the flip-completion nudge instead of dropping the frame.
+// One-shot absolute timer used by the non-grid deadline policy. VRR supplies
+// W_mid from correlated feedback; timerfd and presentation timestamps share
+// CLOCK_MONOTONIC. The callback runs on this thread inside PollEvents (no
+// atomics needed), and the flag persists until the arbiter acts on it.
 static bool g_bFramegenMidDeadline = false;
 static bool g_bFramegenMidArmPending = false;
 // The absolute time the timer is currently armed for. Disarming a timerfd does
@@ -8369,6 +8366,21 @@ static gamescope::CTimerFunction g_FramegenMidTimer{ []
 	g_FramegenMidTimer.DisarmTimer();
 	g_bFramegenMidDeadline = true;
 }};
+
+// Step 3 VRR arming is intentionally retained as compiled legacy until Step 5.
+// No production caller remains: Step 4 consumes the correlated absolute
+// W_mid below instead of inferring identity from GetLastVBlank().
+[[maybe_unused]] static void framegen_arm_legacy_midpoint_timer()
+{
+	const uint64_t ulMidOffsetNs =
+		vulkan_framegen_vrr_hybrid_mid_offset_ns();
+	if ( ulMidOffsetNs != 0u && !g_bFramegenMidDeadline )
+	{
+		g_ulFramegenMidTargetNs =
+			GetVBlankTimer().GetLastVBlank() + ulMidOffsetNs;
+		g_FramegenMidTimer.ArmTimer( g_ulFramegenMidTargetNs );
+	}
+}
 
 void
 steamcompmgr_main(int argc, char **argv)
@@ -8616,6 +8628,9 @@ steamcompmgr_main(int argc, char **argv)
 		{
 			g_bFramegenMidDeadline = false;
 			g_bFramegenMidArmPending = false;
+			g_ulFramegenMidTargetNs = 0;
+			g_FramegenMidTimer.DisarmTimer();
+			vulkan_framegen_cancel_vrr_hybrid_slot( "vrr_deactivated" );
 		}
 
 		bool flush_root = false;
@@ -9250,9 +9265,13 @@ steamcompmgr_main(int argc, char **argv)
 						// longer exists; the new real frame re-plans and re-arms.
 						g_bFramegenMidDeadline = false;
 						g_FramegenMidTimer.DisarmTimer();
+						vulkan_framegen_cancel_vrr_hybrid_slot(
+							"superseded_by_real_frame" );
 					}
 				}
-				else if ( ( bVrrHybridActive ? g_bFramegenMidDeadline : vblank ) && !bHybridInFlight )
+				else if ( ( bVrrHybridActive ? g_bFramegenMidDeadline : vblank )
+					&& !bHybridInFlight
+					&& vulkan_framegen_generated_frame_due() )
 				{
 					if ( bVrrHybridActive )
 						g_bFramegenMidDeadline = false;
@@ -9364,32 +9383,31 @@ steamcompmgr_main(int argc, char **argv)
 			}
 		}
 
-		// VRR hybrid (#01): arm the mid-interval timer for a freshly planned
-		// generated frame — but only once the real frame's flip has completed,
-		// so the anchor is the KMS-reported scanout timestamp (GetLastVBlank is
-		// fed by the pageflip handler) rather than a composite-side guess. Both
-		// flips then pay the same commit->latch latency and it cancels out of
-		// the spacing. The completion nudge wakes this loop, so the deferred
-		// arm happens within a scanout of the paint; the timer is absolute, so
-		// wake latency doesn't shift the deadline.
+		// The feedback handler has already correlated the exact Real flip and
+		// planned W_mid = D_mid - presentLead - margin. The timer is now a
+		// generic absolute wake/commit deadline and never samples LastVBlank.
 		if ( bVrrHybridActive )
 		{
-			if ( bPainted && vulkan_framegen_has_pending_generated_frame() )
-				g_bFramegenMidArmPending = true;
-
-			if ( g_bFramegenMidArmPending
-				&& GetBackend()->GetCurrentConnector()
-				&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() == 0 )
+			uint64_t ulWakeDeadlineNs =
+				vulkan_framegen_vrr_hybrid_wake_deadline_ns();
+			if ( ulWakeDeadlineNs != 0u && !g_bFramegenMidDeadline
+				&& get_time_in_nanos() >= ulWakeDeadlineNs )
 			{
-				g_bFramegenMidArmPending = false;
-				// Re-check: the prediction may have been superseded while the
-				// real flip was still in flight.
-				const uint64_t ulMidOffsetNs = vulkan_framegen_vrr_hybrid_mid_offset_ns();
-				if ( ulMidOffsetNs != 0 && !g_bFramegenMidDeadline )
-				{
-					g_ulFramegenMidTargetNs = GetVBlankTimer().GetLastVBlank() + ulMidOffsetNs;
-					g_FramegenMidTimer.ArmTimer( g_ulFramegenMidTargetNs );
-				}
+				vulkan_framegen_cancel_vrr_hybrid_slot(
+					"late_wake_arm" );
+				ulWakeDeadlineNs = 0u;
+			}
+			if ( ulWakeDeadlineNs != 0u
+				&& ulWakeDeadlineNs != g_ulFramegenMidTargetNs )
+			{
+				g_bFramegenMidDeadline = false;
+				g_ulFramegenMidTargetNs = ulWakeDeadlineNs;
+				g_FramegenMidTimer.ArmTimer( ulWakeDeadlineNs );
+			}
+			else if ( ulWakeDeadlineNs == 0u )
+			{
+				g_ulFramegenMidTargetNs = 0u;
+				g_FramegenMidTimer.DisarmTimer();
 			}
 		}
 

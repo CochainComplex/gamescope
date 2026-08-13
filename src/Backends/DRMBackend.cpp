@@ -4110,6 +4110,7 @@ namespace gamescope
 			m_uNextPresentCtx = ( m_uNextPresentCtx + 1 ) % 3;
 			m_PresentCtxs[uCurrentPresentCtx].ulPendingFlipCount = GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents;
 			m_PresentCtxs[uCurrentPresentCtx].tag = vulkan_framegen_take_present_tag();
+			m_PresentCtxs[uCurrentPresentCtx].tag.ulCommitSubmitNs = get_time_in_nanos();
 
 			drm_log.debugf("flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents);
 			gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents );
@@ -4117,6 +4118,9 @@ namespace gamescope
 			ret = drmModeAtomicCommit(drm->fd, drm->req, drm->flags, &m_PresentCtxs[uCurrentPresentCtx] );
 			if ( ret != 0 )
 			{
+				vulkan_framegen_publish_present_feedback(
+					m_PresentCtxs[uCurrentPresentCtx].tag,
+					0u, 0u, false, false );
 				drm_log.errorf_errno( "flip error" );
 
 				if ( ret != -EBUSY && ret != -EACCES )

@@ -254,6 +254,48 @@ TEST_CASE( "bidir gap-one schedules the delayed real without a live snap", "[fra
 	CHECK( plan.slots.back().targetNs == 1'100u );
 }
 
+TEST_CASE( "bidir epoch starts at the current live-path display target", "[framegen][deadline]" )
+{
+	const BidirEpoch_t invalid = establish_bidir_epoch( 0u, 5'000u, 3u );
+	CHECK_FALSE( invalid.valid );
+
+	const BidirEpoch_t epoch = establish_bidir_epoch( 1'000u, 5'000u, 3u );
+	REQUIRE( epoch.valid );
+	CHECK( epoch.sourceEpochNs == 1'000u );
+	CHECK( epoch.displayEpochNs == 5'000u );
+	CHECK( epoch.endpoint_display_time( 1'000u ) == 5'000u );
+	CHECK( epoch.endpoint_display_time( 1'250u ) == 5'250u );
+}
+
+TEST_CASE( "delayed-real feedback corrects only future bidir targets", "[framegen][deadline]" )
+{
+	const DisplayGrid_t grid = { .D0 = 5'000u, .W0 = 4'990u, .T = 100u };
+	const BidirEpoch_t epoch = establish_bidir_epoch( 1'000u, 5'000u, 4u );
+	const std::array firstPair = {
+		BidirEndpoint_t{ .realFrameId = 1u, .sourceReadyNs = 1'000u },
+		BidirEndpoint_t{ .realFrameId = 2u, .sourceReadyNs = 1'200u },
+	};
+	const BidirPlan_t alreadyQueued = plan_bidir_slots(
+		grid, epoch, firstPair, 2u, 4u );
+	REQUIRE( alreadyQueued.slots.back().targetNs == 5'200u );
+
+	const BidirEpochCorrection_t correction = apply_bidir_endpoint_feedback(
+		epoch, 1'200u, 5'250u );
+	REQUIRE( correction.applied );
+	CHECK( correction.epoch.displayEpochNs == 5'050u );
+	// The queued plan is a value and is never retimed by feedback.
+	CHECK( alreadyQueued.slots.back().targetNs == 5'200u );
+
+	const std::array futurePair = {
+		BidirEndpoint_t{ .realFrameId = 2u, .sourceReadyNs = 1'200u },
+		BidirEndpoint_t{ .realFrameId = 3u, .sourceReadyNs = 1'400u },
+	};
+	const BidirPlan_t future = plan_bidir_slots(
+		grid, correction.epoch, futurePair, 2u, 4u );
+	REQUIRE( future.slots.back().kind == BidirSlotKind_t::RealEndpoint );
+	CHECK( future.slots.back().targetNs == 5'500u );
+}
+
 TEST_CASE( "bidir 24 fps on 60 Hz uses a drift-free absolute epoch", "[framegen][deadline]" )
 {
 	const DisplayGrid_t grid = { .D0 = 1'000u, .W0 = 999u, .T = 2u };
@@ -405,6 +447,56 @@ TEST_CASE( "bidir multiplier ceiling selects evenly distributed grid targets", "
 	REQUIRE( generatedTargets.size() == 2u );
 	CHECK( generatedTargets[ 0 ] == 1'200u );
 	CHECK( generatedTargets[ 1 ] == 1'400u );
+}
+
+TEST_CASE( "bidir pressure sheds oldest generated slots before endpoints", "[framegen][deadline]" )
+{
+	const std::array kinds = {
+		BidirSlotKind_t::RealEndpoint,
+		BidirSlotKind_t::Generated,
+		BidirSlotKind_t::Generated,
+		BidirSlotKind_t::RealEndpoint,
+		BidirSlotKind_t::Generated,
+	};
+	const std::vector<size_t> shed = bidir_generated_shed_indices( kinds, 3u );
+	REQUIRE( shed.size() == 2u );
+	CHECK( shed[ 0 ] == 1u );
+	CHECK( shed[ 1 ] == 2u );
+
+	const std::array endpointBacklog = {
+		BidirSlotKind_t::RealEndpoint,
+		BidirSlotKind_t::Generated,
+		BidirSlotKind_t::RealEndpoint,
+		BidirSlotKind_t::RealEndpoint,
+	};
+	const std::vector<size_t> endpointSafe = bidir_generated_shed_indices(
+		endpointBacklog, 2u );
+	REQUIRE( endpointSafe.size() == 1u );
+	CHECK( endpointSafe.front() == 1u );
+}
+
+TEST_CASE( "VRR midpoint wake compensates tagged backend present lead", "[framegen][deadline]" )
+{
+	PresentLeadState_t lead;
+	lead = update_present_lead( lead, 10'000u, 11'000u );
+	CHECK( lead.emaNs == 1'000u );
+	CHECK( lead.samples == 1u );
+	lead = update_present_lead( lead, 20'000u, 23'000u );
+	CHECK( lead.emaNs == 1'250u );
+	CHECK( lead.samples == 2u );
+	CHECK( update_present_lead( lead, 30'000u, 29'000u ).emaNs == 1'250u );
+
+	const VrrMidpointPlan_t plan = plan_vrr_midpoint(
+		1'000'000u, 40'000u, 3'000u, 1'000u, 1'010'000u );
+	REQUIRE( plan.valid );
+	CHECK( plan.targetFlipNs == 1'020'000u );
+	CHECK( plan.wakeDeadlineNs == 1'016'000u );
+
+	const VrrMidpointPlan_t late = plan_vrr_midpoint(
+		1'000'000u, 40'000u, 3'000u, 1'000u, 1'016'000u );
+	CHECK_FALSE( late.valid );
+	CHECK( late.targetFlipNs == plan.targetFlipNs );
+	CHECK( late.wakeDeadlineNs == plan.wakeDeadlineNs );
 }
 
 TEST_CASE( "slot budget applies 0.85 to actual remaining time", "[framegen][deadline]" )
