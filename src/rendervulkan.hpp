@@ -183,8 +183,15 @@ public:
 	inline VkImage vkImage() { return m_vkImage; }
 	inline bool outputImage() { return m_bOutputImage; }
 	inline bool externalImage() { return m_bExternal; }
+	inline bool deviceLocal() const { return m_bDeviceLocal; }
 	inline VkDeviceSize totalSize() const { return m_size; }
 	inline uint32_t drmFormat() const { return m_drmFormat; }
+
+	// Imported client images which landed outside DEVICE_LOCAL keep their
+	// device-local sampling copies here. The pool belongs to the imported image,
+	// so image identity, dimensions, and format are all part of the key without
+	// a process-global cache or stale raw-pointer entries.
+	gamescope::Rc<CVulkanTexture> AcquireDeviceLocalStagingImage();
 
 	inline uint32_t lumaOffset() const { return m_lumaOffset; }
 	inline uint32_t lumaRowPitch() const { return m_lumaPitch; }
@@ -210,6 +217,8 @@ private:
 	bool m_bInitialized = false;
 	bool m_bExternal = false;
 	bool m_bOutputImage = false;
+	bool m_bDeviceLocal = false;
+	bool m_bTransferSrc = false;
 
 	uint32_t m_drmFormat = DRM_FORMAT_INVALID;
 
@@ -247,6 +256,9 @@ private:
 	EStreamColorspace m_streamColorspace = k_EStreamColorspace_Unknown;
 
 	struct wlr_dmabuf_attributes m_dmabuf = {};
+
+	std::vector<gamescope::OwningRc<CVulkanTexture>> m_deviceLocalStagingImages;
+	size_t m_uDeviceLocalStagingCursor = 0;
 };
 
 struct vec2_t
@@ -296,6 +308,14 @@ struct FrameInfo_t
 	struct Layer_t
 	{
 		gamescope::Rc<CVulkanTexture> tex;
+		// Client layers point back to the commit's texture slot. If composition
+		// stages a non-device-local import, updating this slot makes that copy the
+		// commit's sole sampled representation and lets the imported buffer release
+		// as soon as the copy command retires. Null for compositor-owned layers.
+		gamescope::Rc<CVulkanTexture> *pCommitTexture = nullptr;
+		// Per-window counter owned by steamcompmgr; incremented once for each
+		// imported-buffer copy actually recorded.
+		uint64_t *pStagedCopyCount = nullptr;
 		// CLOCK_MONOTONIC time at which this client buffer's acquire fence
 		// became ready. Framegen uses the base layer's value only as a causal
 		// source-cadence observation; it is never forwarded as presentation

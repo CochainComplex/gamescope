@@ -52,6 +52,7 @@
 #include <queue>
 #include <filesystem>
 #include <variant>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <assert.h>
@@ -1134,6 +1135,10 @@ unsigned int	frameCounter;
 unsigned int	lastSampledFrameTime;
 float			currentFrameRate;
 
+// Interval counters are keyed by stable window sequence rather than focus, so
+// staging done for any window remains attributable when stats are published.
+static std::unordered_map<uint64_t, uint64_t> s_StagedCopyCountByWindow;
+
 static bool		debugFocus = false;
 static bool		drawDebugInfo = false;
 static bool		debugEvents = false;
@@ -2050,6 +2055,8 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 	if (layer->colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB)
 		layer->ctm = s_scRGB709To2020Matrix;
 	layer->tex = commit->vulkanTex;
+	layer->pCommitTexture = &commit->vulkanTex;
+	layer->pStagedCopyCount = &s_StagedCopyCountByWindow[ commit->win_seq ];
 	layer->acquireReadyTimeNs = commit->present_time;
 
 	layer->filter = base.filter;
@@ -2120,6 +2127,9 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 	layer->filter = ( flags & PaintWindowFlag::NoFilter ) ? GamescopeUpscaleFilter::LINEAR : g_upscaleFilter;
 
 	layer->tex = lastCommit->GetTexture( layer->filter, g_upscaleScaler, layer->colorspace );
+	if ( layer->tex == lastCommit->vulkanTex )
+		layer->pCommitTexture = &lastCommit->vulkanTex;
+	layer->pStagedCopyCount = &s_StagedCopyCountByWindow[ lastCommit->win_seq ];
 	layer->acquireReadyTimeNs = lastCommit->present_time;
 
 	if ( flags & PaintWindowFlag::NoScale )
@@ -2548,6 +2558,8 @@ paint_all( global_focus_t *pFocus, bool async )
 		frameCounter = 0;
 
 		stats_printf( "fps=%f\n", currentFrameRate );
+		stats_printf( "stage=%" PRIu64 "\n",
+			w ? std::exchange( s_StagedCopyCountByWindow[ w->seq ], 0u ) : 0u );
 
 		if ( window_is_steam( w ) )
 		{
@@ -7358,6 +7370,10 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 	int fence = -1;
 	if ( newCommit != nullptr )
 	{
+		// Composition may replace newCommit->vulkanTex with a device-local
+		// staging image. Keep the imported texture alive through release-point
+		// setup; after that, only the copy command retains it until GPU completion.
+		gamescope::Rc<CVulkanTexture> pClientTexture = newCommit->vulkanTex;
 		global_focus_t *pCurrentFocus = GetCurrentFocus();
 
 		static bool bMangoappSocketDisable = env_to_bool( getenv( "GAMESCOPE_MANGOAPP_SOCKET_DISABLE" ));
@@ -7456,7 +7472,7 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 			}
 		}
 
-		if ( gamescope::IBackendFb *pBackendFb = newCommit->vulkanTex->GetBackendFb() )
+		if ( gamescope::IBackendFb *pBackendFb = pClientTexture->GetBackendFb() )
 		{
 			if ( reslistentry.pReleasePoint )
 				pBackendFb->SetReleasePoint( reslistentry.pReleasePoint );
@@ -7478,7 +7494,7 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 			}
 			else
 			{
-				fence = newCommit->vulkanTex->memoryFence();
+				fence = pClientTexture->memoryFence();
 			}
 		}
 

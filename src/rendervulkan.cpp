@@ -2870,6 +2870,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	{
 		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	}
+	m_bTransferSrc = flags.bTransferSrc;
 
 	if ( flags.bTransferDst == true )
 	{
@@ -2920,7 +2921,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	if ( g_bDebugDualGpuRoute && pDMA )
 	{
-		vk_log.infof( "dual-gpu-route: client dma-buf Vulkan import request %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d usage 0x%x sampled %s storage %s transfer-dst %s",
+		vk_log.infof( "dual-gpu-route: client dma-buf Vulkan import request %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d usage 0x%x sampled %s storage %s transfer-src %s transfer-dst %s",
 			pDMA->width,
 			pDMA->height,
 			pDMA->format,
@@ -2929,6 +2930,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			usage,
 			flags.bSampled ? "yes" : "no",
 			flags.bStorage ? "yes" : "no",
+			flags.bTransferSrc ? "yes" : "no",
 			flags.bTransferDst ? "yes" : "no" );
 
 		for ( int i = 0; i < pDMA->n_planes; i++ )
@@ -3241,6 +3243,8 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		}
 
 		m_vkImageMemory = memoryHandle;
+		m_bDeviceLocal = g_device.findMemoryType( VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			1u << allocInfo.memoryTypeIndex ) >= 0;
 	}
 	else
 	{
@@ -3249,6 +3253,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 		memoryHandle = pExistingImageToReuseMemory->m_vkImageMemory;
 		m_vkImageMemory = VK_NULL_HANDLE;
+		m_bDeviceLocal = pExistingImageToReuseMemory->m_bDeviceLocal;
 	}
 	
 	res = g_device.vk.BindImageMemory( g_device.device(), m_vkImage, memoryHandle, 0 );
@@ -3549,6 +3554,50 @@ bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t
 	m_bInitialized = true;
 
 	return true;
+}
+
+gamescope::Rc<CVulkanTexture> CVulkanTexture::AcquireDeviceLocalStagingImage()
+{
+	if ( !m_bExternal || m_bDeviceLocal || !m_bTransferSrc )
+		return nullptr;
+
+	const size_t uPoolSize = m_deviceLocalStagingImages.size();
+	for ( size_t i = 0; i < uPoolSize; i++ )
+	{
+		const size_t uIndex = ( m_uDeviceLocalStagingCursor + i ) % uPoolSize;
+		auto &pTexture = m_deviceLocalStagingImages[ uIndex ];
+		if ( pTexture->IsInUse() )
+			continue;
+
+		m_uDeviceLocalStagingCursor = ( uIndex + 1 ) % uPoolSize;
+		return pTexture;
+	}
+
+	gamescope::OwningRc<CVulkanTexture> pTexture = new CVulkanTexture();
+	CVulkanTexture::createFlags flags;
+	flags.bSampled = true;
+	flags.bTransferDst = true;
+	if ( !pTexture->BInit( m_width, m_height, m_depth, m_drmFormat, flags,
+			nullptr, m_contentWidth, m_contentHeight ) )
+	{
+		vk_log.errorf( "dma-buf staging: failed to allocate %ux%u format 0x%" PRIX32,
+			m_width, m_height, m_drmFormat );
+		return nullptr;
+	}
+	if ( !pTexture->deviceLocal() )
+	{
+		vk_log.errorf( "dma-buf staging: %ux%u format 0x%" PRIX32 " did not allocate in DEVICE_LOCAL memory",
+			m_width, m_height, m_drmFormat );
+		return nullptr;
+	}
+
+	pTexture->setStreamColorspace( m_streamColorspace );
+	m_deviceLocalStagingImages.emplace_back( std::move( pTexture ) );
+	m_uDeviceLocalStagingCursor = 0;
+
+	vk_log.infof( "dma-buf staging: grew image pool for %p (%ux%u format 0x%" PRIX32 ") to %zu",
+		this, m_width, m_height, m_drmFormat, m_deviceLocalStagingImages.size() );
+	return m_deviceLocalStagingImages.back();
 }
 
 uint32_t CVulkanTexture::IncRef()
@@ -4494,6 +4543,10 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 
 	CVulkanTexture::createFlags texCreateFlags;
 	texCreateFlags.bSampled = true;
+	// A legal cross-device import can reside in host-visible memory. Give
+	// composited client buffers a transfer-source usage so their one-time
+	// device-local staging copy can use vkCmdCopyImage without changing pixels.
+	texCreateFlags.bTransferSrc = true;
 
 	//fprintf(stderr, "pDMA->width: %d pDMA->height: %d pDMA->format: 0x%x pDMA->modifier: 0x%lx pDMA->n_planes: %d\n",
 	//	pDMA->width, pDMA->height, pDMA->format, pDMA->modifier, pDMA->n_planes);
@@ -11569,6 +11622,77 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	framegen_submit_batch( 1, nGapVblanks, nGenerate, eff, ulCompositeSeqNo, nMaxDegradeSteps, true );
 }
 
+static bool frame_has_non_device_local_base_import( const struct FrameInfo_t *pFrameInfo )
+{
+	for ( int i = 0; i < pFrameInfo->layerCount; i++ )
+	{
+		const FrameInfo_t::Layer_t &layer = pFrameInfo->layers[ i ];
+		if ( layer.zpos == g_zposBase
+			&& layer.tex
+			&& layer.tex->externalImage()
+			&& !layer.tex->deviceLocal()
+			&& layer.pCommitTexture != nullptr )
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool stage_non_device_local_base_imports( struct FrameInfo_t *pFrameInfo,
+	CVulkanCmdBuffer *pCmdBuffer )
+{
+	bool bCopied = false;
+	for ( int i = 0; i < pFrameInfo->layerCount; i++ )
+	{
+		FrameInfo_t::Layer_t &layer = pFrameInfo->layers[ i ];
+		gamescope::Rc<CVulkanTexture> pSource = layer.tex;
+		if ( layer.zpos != g_zposBase
+			|| !pSource
+			|| !pSource->externalImage()
+			|| pSource->deviceLocal()
+			|| layer.pCommitTexture == nullptr )
+		{
+			continue;
+		}
+
+		// The same commit can appear more than once during a fade. Once its owner
+		// has been swapped, point every duplicate layer at the already-recorded
+		// copy rather than copying the import twice.
+		if ( layer.pCommitTexture->get() != pSource.get() )
+		{
+			gamescope::Rc<CVulkanTexture> pExisting = *layer.pCommitTexture;
+			if ( pExisting
+				&& pExisting->deviceLocal()
+				&& pExisting->width() == pSource->width()
+				&& pExisting->height() == pSource->height()
+				&& pExisting->drmFormat() == pSource->drmFormat() )
+			{
+				layer.tex = std::move( pExisting );
+			}
+			continue;
+		}
+
+		gamescope::Rc<CVulkanTexture> pStaging = pSource->AcquireDeviceLocalStagingImage();
+		if ( !pStaging )
+			continue;
+
+		pCmdBuffer->copyImage( pSource, pStaging );
+		layer.tex = pStaging;
+		*layer.pCommitTexture = std::move( pStaging );
+		if ( layer.pStagedCopyCount )
+			( *layer.pStagedCopyCount )++;
+		bCopied = true;
+
+		if ( g_bDebugDualGpuRoute )
+		{
+			vk_log.infof( "dual-gpu-route: staged base import %p -> %p (%ux%u format 0x%" PRIX32 ")",
+				pSource.get(), layer.tex.get(), layer.tex->width(), layer.tex->height(), layer.tex->drmFormat() );
+		}
+	}
+	return bCopied;
+}
+
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer )
 {
 	// Bidir (B3): each composite decides afresh whether it queued its real
@@ -11612,6 +11736,25 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				frameInfo->layers[0].scale.x,
 				frameInfo->layers[0].scale.y,
 				frameInfo->layers[0].colorspace );
+		}
+	}
+
+	// ReShade records its own submission before the normal composite command
+	// buffer. Stage first in that case so the effect also samples DEVICE_LOCAL;
+	// duplicate only the acquire waits, while the caller's release signals stay
+	// attached to the final composite submission.
+	if ( !g_reshade_effect.empty() && frame_has_non_device_local_base_import( frameInfo ) )
+	{
+		std::unique_ptr<CVulkanCmdBuffer> pStageCommandBuffer = g_device.commandBuffer();
+		if ( pStageCommandBuffer )
+		{
+			if ( pInCommandBuffer )
+			{
+				for ( const VulkanTimelinePoint_t &dependency : pInCommandBuffer->GetExternalDependencies() )
+					pStageCommandBuffer->AddDependency( dependency.pTimelineSemaphore, dependency.ulPoint );
+			}
+			if ( stage_non_device_local_base_imports( frameInfo, pStageCommandBuffer.get() ) )
+				g_device.submit( std::move( pStageCommandBuffer ) );
 		}
 	}
 
@@ -11712,6 +11855,8 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
+	if ( g_reshade_effect.empty() )
+		stage_non_device_local_base_imports( frameInfo, cmdBuffer.get() );
 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
