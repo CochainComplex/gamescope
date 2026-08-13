@@ -24,9 +24,11 @@ last upgrade, the second slot in your desktop.
 is ever delayed behind generated work, and late generation is dropped, never waited
 for**. The game renders at full speed on its own card, real frames always win the
 display, and generation only fills vblanks that would have shown a repeat anyway.
-(Full honesty: running a compositor at all replaces direct scanout, so measure your
-own input feel — the algorithm adds no frame buffering, but the compositor is not
-literally free.) What you gain is **motion clarity**: tracking a
+(Full honesty, with a measured number: on our reference laptop, an identical
+GravityMark benchmark scored 100% bare, 95.8% inside gamescope with framegen off,
+and 95.3% with generation active — i.e. the compositing pipeline costs ~4%, and
+turning generation on costs the game a further ~0.5%, within noise. The compositor
+is not free; the generation effectively is.) What you gain is **motion clarity**: tracking a
 target through a smooth full-refresh sweep instead of a 45 fps judder makes the *real*
 information easier to read. What you don't gain is reaction time — generated frames
 carry no new input, and nothing here (or in DLSS/FSR framegen) changes that. Skip
