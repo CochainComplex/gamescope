@@ -37,36 +37,19 @@ CausalPlanOptions_t dedicated_backup_options( uint64_t nowNs, uint64_t epoch )
 
 } // namespace
 
-TEST_CASE( "framegen HUD level one formats the closed five-second window", "[framegen][hud]" )
+TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]" )
 {
 	const FramegenHudSnapshot_t snapshot = {
-		.mode = GamescopeFramegenMode::Extrapolate,
-		.quality = GamescopeFramegenQuality::Ultra,
-		.multiplier = 2u,
-		.refreshMilliHz = 119'600u,
-		.real = 150u,
-		.delayedReal = 50u,
-		.generated = 390u,
-		.repeats = 10u,
-	};
-	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
-
-	REQUIRE( text.lineCount == 1u );
-	CHECK( text.lines[0].data()
-		== std::string_view{ "E2 U 120Hz  real 40/s  gen 78/s  rep 2/s" } );
-	CHECK( std::strlen( text.lines[0].data() ) <= k_uFramegenHudMaxColumns );
-}
-
-TEST_CASE( "framegen HUD level two remains structured at the 48-column limit", "[framegen][hud]" )
-{
-	const FramegenHudSnapshot_t snapshot = {
+		.version = "0.1.0+76e6d5",
+		.deviceName = "  AMD Radeon Graphics  ",
 		.mode = GamescopeFramegenMode::Motion,
 		.quality = GamescopeFramegenQuality::High,
-		.multiplier = 4u,
+		.multiplier = 2u,
 		.refreshMilliHz = 120'000u,
-		.bidir = true,
-		.baseLayer = true,
+		.clientBuffersStaged = true,
+		.netRequested = true,
 		.netActive = true,
+		.netOnline = true,
 		.adapt = true,
 		.real = 200u,
 		.generated = 390u,
@@ -74,29 +57,95 @@ TEST_CASE( "framegen HUD level two remains structured at the 48-column limit", "
 		.biasTenthsMs = 1,
 		.deadlineHitPercent = 99u,
 		.pacingSdTenthsMs = 7u,
-		.netOnline = true,
 		.netTrainedSteps = 1'200u,
-		.netProfilePresent = true,
+		.netProfileLoaded = true,
 	};
 	const FramegenHudText_t text = format_framegen_hud( 2u, snapshot );
 
-	REQUIRE( text.lineCount == 3u );
-	CHECK( text.lines[0].data()
-		== std::string_view{ "M4 BIDIR BASE NET ADAPT H 120Hz R40/s G78/s P2/s" } );
-	CHECK( text.lines[1].data()
-		== std::string_view{ "pace: bias +0.1ms  hit 99%  sd 0.7ms" } );
-	CHECK( text.lines[2].data()
-		== std::string_view{ "net: online, 1.2k steps, profile loaded" } );
+	REQUIRE( text.lineCount == 6u );
+	CHECK( text.lines[0].data() == std::string_view{
+		"gameslop 0.1.0+76e6d5 | motion x2 quality:high | 120Hz fixed" } );
+	CHECK( text.lines[1].data() == std::string_view{
+		"present: AMD Radeon Graphics | client buffers: staged(cross-GPU)" } );
+	CHECK( text.lines[2].data() == std::string_view{
+		"bidir:off  base:off  net:online  adapt:on" } );
+	CHECK( text.lines[3].data() == std::string_view{
+		"game 40fps -> screen 118/120 slots (gen 78, repeat 2)" } );
+	CHECK( text.lines[4].data() == std::string_view{
+		"pace: 99% on-target +/-0.7ms | bias +0.1ms | resets 0 (ring 0)" } );
+	CHECK( text.lines[5].data() == std::string_view{
+		"net: online, 1.2k steps, profile: loaded" } );
 	for ( uint32_t line = 0u; line < text.lineCount; line++ )
 		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
 
 	const FramegenHudUniform_t uniform = make_framegen_hud_uniform( text, true );
-	CHECK( uniform.lineCount == 3u );
-	CHECK( uniform.widthChars == 48u );
+	CHECK( uniform.lineCount == 6u );
+	CHECK( uniform.widthChars == 64u );
 	CHECK( uniform.hdr == 1u );
-	CHECK( ( uniform.text[0] & 0xffu ) == static_cast<uint32_t>( 'M' ) );
+	CHECK( ( uniform.text[0] & 0xffu ) == static_cast<uint32_t>( 'g' ) );
 	CHECK( uniform.font[static_cast<uint32_t>( 'A' ) * 2u]
 		== static_cast<uint32_t>( k_uFramegenHudFont8x8[static_cast<uint32_t>( 'A' )] ) );
+}
+
+TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hud]" )
+{
+	const FramegenHudSnapshot_t snapshot = {
+		.version = "0.1.0+76e6d5",
+		.deviceName = "AMD Radeon RX 5700 XT",
+		.mode = GamescopeFramegenMode::Motion,
+		.quality = GamescopeFramegenQuality::High,
+		.multiplier = 2u,
+		.refreshMilliHz = 120'000u,
+		.bidirRequested = true,
+		.real = 200u,
+		.generated = 390u,
+		.repeats = 10u,
+	};
+	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
+
+	REQUIRE( text.lineCount == 4u );
+	CHECK( text.lines[1].data() == std::string_view{
+		"present: AMD Radeon RX 5700 | client buffers: local" } );
+	CHECK( text.lines[2].data() == std::string_view{
+		"bidir:requested(OFF)  base:off  net:off  adapt:off" } );
+	auto netOnly = snapshot;
+	netOnly.bidirRequested = false;
+	netOnly.netRequested = true;
+	const FramegenHudText_t netText = format_framegen_hud( 1u, netOnly );
+	CHECK( netText.lines[2].data() == std::string_view{
+		"bidir:off  base:off  net:requested(OFF)  adapt:off" } );
+	auto vrrOnly = snapshot;
+	vrrOnly.bidirRequested = false;
+	vrrOnly.vrrRequested = true;
+	const FramegenHudText_t vrrText = format_framegen_hud( 1u, vrrOnly );
+	CHECK( vrrText.lines[2].data() == std::string_view{
+		"bidir:off  base:off  net:off  adapt:off  vrr:requested(off)" } );
+	for ( uint32_t line = 0u; line < text.lineCount; line++ )
+		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
+}
+
+TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hud]" )
+{
+	const FramegenHudSnapshot_t snapshot = {
+		.version = "0.1.0+76e6d5",
+		.deviceName = "AMD Radeon 890M",
+		.mode = GamescopeFramegenMode::Motion,
+		.quality = GamescopeFramegenQuality::High,
+		.multiplier = 2u,
+		.refreshMilliHz = 120'000u,
+		.real = 200u,
+		.generated = 390u,
+		.repeats = 10u,
+	};
+	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
+
+	REQUIRE( text.lineCount == 4u );
+	CHECK( text.lines[1].data() == std::string_view{
+		"present: AMD Radeon 890M | client buffers: local" } );
+	CHECK( text.lines[2].data() == std::string_view{
+		"bidir:off  base:off  net:off  adapt:off" } );
+	CHECK( text.lines[3].data() == std::string_view{
+		"game 40fps -> screen 118/120 slots (gen 78, repeat 2)" } );
 }
 
 TEST_CASE( "30 fps on 120 Hz follows stable actual-grid phases", "[framegen][deadline]" )

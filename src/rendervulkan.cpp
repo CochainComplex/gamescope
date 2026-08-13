@@ -55,6 +55,7 @@
 #include "framegen/scheduling.hpp"
 #include "framegen/settings.hpp"
 #include "framegen/temporal.hpp"
+#include "GamescopeVersion.h"
 
 #include "cs_composite_blit.h"
 #include "cs_composite_blur.h"
@@ -138,7 +139,51 @@ static uint32_t framegen_hud_level()
 	return s_uLevel;
 }
 
+enum class FramegenHudCorner : uint32_t
+{
+	TopLeft,
+	TopRight,
+	BottomLeft,
+	BottomRight,
+};
+
+static uint32_t framegen_hud_scale( uint32_t uOutputHeight )
+{
+	static const uint32_t s_uOverride = []()
+	{
+		const auto parsed = gamescope::framegen::parse_uint32_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_HUD_SCALE" ), false );
+		return parsed.has_value() && *parsed >= 1u && *parsed <= 6u
+			? *parsed : 0u;
+	}();
+	return s_uOverride != 0u ? s_uOverride
+		: std::clamp( uOutputHeight / 720u, 2u, 4u );
+}
+
+static FramegenHudCorner framegen_hud_corner()
+{
+	static const FramegenHudCorner s_eCorner = []()
+	{
+		const char *pszCorner = getenv( "GAMESCOPE_FRAMEGEN_HUD_CORNER" );
+		if ( pszCorner != nullptr && strcmp( pszCorner, "tr" ) == 0 )
+			return FramegenHudCorner::TopRight;
+		if ( pszCorner != nullptr && strcmp( pszCorner, "bl" ) == 0 )
+			return FramegenHudCorner::BottomLeft;
+		if ( pszCorner != nullptr && strcmp( pszCorner, "br" ) == 0 )
+			return FramegenHudCorner::BottomRight;
+		return FramegenHudCorner::TopLeft;
+	}();
+	return s_eCorner;
+}
+
 static constexpr size_t k_nFramegenHudUploadSlots = 2u;
+static constexpr size_t k_nFramegenHudPersistentBytes =
+	k_nFramegenHudUploadSlots * sizeof( gamescope::framegen::FramegenHudUniform_t );
+static constexpr size_t k_nFramegenHudPersistentPad =
+	( ( k_nFramegenHudPersistentBytes + 4095u ) / 4096u ) * 4096u;
+static_assert( k_nFramegenHudPersistentBytes == 2'912u );
+static_assert( CVulkanDevice::upload_buffer_persistent_pad
+	>= k_nFramegenHudPersistentPad );
 struct FramegenHudGpuState_t
 {
 	struct UploadSlot_t
@@ -146,8 +191,8 @@ struct FramegenHudGpuState_t
 		void *pMapped = nullptr;
 		uint32_t offset = 0u;
 		uint64_t lastSubmitSeqNo = 0u;
-		uint32_t widthPixels = 0u;
-		uint32_t heightPixels = 0u;
+		uint32_t logicalWidthPixels = 0u;
+		uint32_t logicalHeightPixels = 0u;
 	};
 
 	std::array<UploadSlot_t, k_nFramegenHudUploadSlots> uploadSlots;
@@ -3656,6 +3701,7 @@ gamescope::Rc<CVulkanTexture> CVulkanTexture::AcquireDeviceLocalStagingImage()
 	}
 
 	pTexture->setStreamColorspace( m_streamColorspace );
+	pTexture->m_bDeviceLocalStagingImage = true;
 	m_deviceLocalStagingImages.emplace_back( std::move( pTexture ) );
 	m_uDeviceLocalStagingCursor = 0;
 
@@ -6222,10 +6268,15 @@ static bool framegen_causal_deadline_enabled()
 // additionally requires the connector to actually be in VRR right now — when it
 // is not (nested, panel without VRR, adaptive sync toggled off), every decision
 // point falls back to the fixed-refresh paths, live, with no restart.
-bool vulkan_framegen_vrr_hybrid_requested()
+static bool framegen_vrr_hybrid_configured()
 {
 	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_VRR_HYBRID" ) );
-	return s_bEnabled && g_device.hasFramegenQueue();
+	return s_bEnabled;
+}
+
+bool vulkan_framegen_vrr_hybrid_requested()
+{
+	return framegen_vrr_hybrid_configured() && g_device.hasFramegenQueue();
 }
 
 bool vulkan_framegen_vrr_hybrid_active()
@@ -7379,6 +7430,7 @@ static std::vector<float> g_framegenNetLiveWeights;
 // allocates at most two 18.6 kB vectors instead of allocating and freeing one
 // on every completed real-frame training step.
 static std::vector<float> g_framegenNetReadbackWeights;
+static bool g_bFramegenNetProfileLoaded = false;
 static uint64_t g_ulFramegenNetProgress = 0;                     // trained steps, all-time
 static uint64_t g_ulFramegenNetLiveProgress = 0;                 // progress at the cached readback
 static std::atomic<uint64_t> g_ulFramegenNetSavedProgress = { 0 }; // progress at the last successful write
@@ -7437,6 +7489,7 @@ static const std::vector<float> &framegen_net_weights()
 		std::vector<float> weights;
 		if ( framegen_net_profile_path() != nullptr && framegen_net_parse_blob( framegen_net_profile_path(), weights, false ) )
 		{
+			g_bFramegenNetProfileLoaded = true;
 			vk_log.infof( "framegen: net prior loaded from profile '%s'", framegen_net_profile_path() );
 			return weights;
 		}
@@ -7752,7 +7805,41 @@ static const FramegenMetricsWindow_t &framegen_metrics_last_closed_window()
 	return g_framegenMetrics.windows[nLast];
 }
 
-static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot()
+static const char *framegen_hud_device_name()
+{
+	static const std::array<char, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE> s_name = []()
+	{
+		std::array<char, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE> result = {};
+		VkPhysicalDeviceProperties properties = {};
+		g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &properties );
+		std::snprintf( result.data(), result.size(), "%s", properties.deviceName );
+		return result;
+	}();
+	return s_name.data();
+}
+
+static bool framegen_hud_client_buffers_staged( const struct FrameInfo_t *pFrameInfo )
+{
+	if ( pFrameInfo == nullptr )
+		return false;
+	for ( int i = 0; i < pFrameInfo->layerCount; i++ )
+	{
+		const FrameInfo_t::Layer_t &layer = pFrameInfo->layers[i];
+		if ( layer.zpos == g_zposBase && layer.pCommitTexture != nullptr )
+		{
+			const gamescope::Rc<CVulkanTexture> &pClientTexture = *layer.pCommitTexture;
+			if ( pClientTexture != nullptr
+				&& pClientTexture->deviceLocalStagingImage() )
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
+	const struct FrameInfo_t *pFrameInfo )
 {
 	const FramegenMetricsWindow_t &window = framegen_metrics_last_closed_window();
 	const uint32_t uHitPercent = window.deadlineCount != 0u
@@ -7762,22 +7849,33 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot()
 		: 0u;
 	const int nRefreshMilliHz = GetVBlankTimer().GetRefresh();
 	const bool bNetActive = g_framegenMotion.bNetActive;
+	const FramegenEffective_t effective = framegen_effective_config(
+		g_framegenHistory.nDegradeSteps );
 	const double flBiasTenths = std::clamp(
 		g_framegenPresentState.displayTiming.presentBias.emaNs / 100'000.0,
 		-9'999.0, 9'999.0 );
 	const double flPacingSdTenths = std::clamp(
 		window.flipIntervals.stddev() * 10.0, 0.0, 9'999.0 );
 	return {
-		.mode = g_eFramegenMode,
-		.quality = g_eFramegenQuality,
-		.multiplier = static_cast<uint32_t>( g_nFramegenMultiplier ),
+		.version = gamescope::k_szGamescopeHudVersion,
+		.deviceName = framegen_hud_device_name(),
+		.mode = effective.mode,
+		.quality = effective.quality,
+		.multiplier = effective.multiplier,
 		.refreshMilliHz = nRefreshMilliHz > 0
 			? static_cast<uint32_t>( nRefreshMilliHz ) : 0u,
-		.bidir = vulkan_framegen_bidir_active(),
+		.vrrRequested = framegen_vrr_hybrid_configured(),
+		.vrrActive = vulkan_framegen_vrr_hybrid_active(),
+		.bidirRequested = framegen_bidir_enabled(),
+		.bidirActive = vulkan_framegen_bidir_active(),
 		.baseLayer = vulkan_framegen_base_layer_active(),
+		.clientBuffersStaged = framegen_hud_client_buffers_staged( pFrameInfo ),
+		.netRequested = framegen_net_weights_path() != nullptr
+			|| framegen_net_online_enabled() || framegen_net_profile_path() != nullptr,
 		.netActive = bNetActive,
-		.adapt = g_eFramegenMode == GamescopeFramegenMode::Motion
-			&& framegen_adapt_enabled( g_eFramegenQuality ),
+		.netOnline = bNetActive && framegen_net_online_enabled(),
+		.adapt = effective.mode == GamescopeFramegenMode::Motion
+			&& framegen_adapt_enabled( effective.quality ),
 		.real = window.real,
 		.delayedReal = window.delayedReal,
 		.generated = window.generated,
@@ -7785,9 +7883,10 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot()
 		.biasTenthsMs = static_cast<int32_t>( std::llround( flBiasTenths ) ),
 		.deadlineHitPercent = uHitPercent,
 		.pacingSdTenthsMs = static_cast<uint32_t>( std::llround( flPacingSdTenths ) ),
-		.netOnline = bNetActive && framegen_net_online_enabled(),
+		.resets = window.resets,
+		.ringResets = window.resetsRing,
 		.netTrainedSteps = g_ulFramegenNetProgress,
-		.netProfilePresent = framegen_net_profile_path() != nullptr,
+		.netProfileLoaded = g_bFramegenNetProfileLoaded,
 	};
 }
 
@@ -7809,7 +7908,8 @@ static int framegen_hud_record( CVulkanCmdBuffer *pCmdBuffer,
 	if ( !g_framegenHud.textValid || ulNowNs >= g_framegenHud.nextRebuildNs )
 	{
 		const gamescope::framegen::FramegenHudText_t text =
-			gamescope::framegen::format_framegen_hud( uLevel, framegen_hud_snapshot() );
+			gamescope::framegen::format_framegen_hud(
+				uLevel, framegen_hud_snapshot( pFrameInfo ) );
 		if ( !g_framegenHud.textValid || text != g_framegenHud.text )
 		{
 			g_framegenHud.text = text;
@@ -7847,8 +7947,8 @@ static int framegen_hud_record( CVulkanCmdBuffer *pCmdBuffer,
 				gamescope::framegen::make_framegen_hud_uniform(
 					g_framegenHud.text, g_framegenHud.hdr );
 			memcpy( slot.pMapped, &uniform, sizeof( uniform ) );
-			slot.widthPixels = uniform.widthChars * 8u + 8u;
-			slot.heightPixels = uniform.lineCount * 8u + 8u;
+			slot.logicalWidthPixels = uniform.widthChars * 8u + 8u;
+			slot.logicalHeightPixels = uniform.lineCount * 8u + 8u;
 			g_framegenHud.activeUploadSlot = nUploadSlot;
 			g_framegenHud.dirty = false;
 		}
@@ -7858,19 +7958,38 @@ static int framegen_hud_record( CVulkanCmdBuffer *pCmdBuffer,
 		return -1;
 	const int nSlot = g_framegenHud.activeUploadSlot;
 	const auto &slot = g_framegenHud.uploadSlots[nSlot];
-	if ( slot.widthPixels == 0u || slot.heightPixels == 0u )
+	if ( slot.logicalWidthPixels == 0u || slot.logicalHeightPixels == 0u )
 		return -1;
+	const uint32_t uScale = framegen_hud_scale( pTarget->height() );
+	const uint32_t uWidthPixels = slot.logicalWidthPixels * uScale;
+	const uint32_t uHeightPixels = slot.logicalHeightPixels * uScale;
+	const uint32_t uMargin = 8u * uScale;
+	const FramegenHudCorner eCorner = framegen_hud_corner();
+	const bool bRight = eCorner == FramegenHudCorner::TopRight
+		|| eCorner == FramegenHudCorner::BottomRight;
+	const bool bBottom = eCorner == FramegenHudCorner::BottomLeft
+		|| eCorner == FramegenHudCorner::BottomRight;
+	const uint32_t uOffsetX = bRight
+		? ( pTarget->width() > uWidthPixels + uMargin
+			? pTarget->width() - uWidthPixels - uMargin : 0u )
+		: ( pTarget->width() > uWidthPixels + uMargin ? uMargin : 0u );
+	const uint32_t uOffsetY = bBottom
+		? ( pTarget->height() > uHeightPixels + uMargin
+			? pTarget->height() - uHeightPixels - uMargin : 0u )
+		: ( pTarget->height() > uHeightPixels + uMargin ? uMargin : 0u );
 
 	pCmdBuffer->clearState();
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_HUD ) );
+	pCmdBuffer->pushConstants<gamescope::framegen::FramegenHudPush_t>(
+		uOffsetX, uOffsetY, uScale );
 	pCmdBuffer->bindTexture( 0u, pTarget );
 	pCmdBuffer->setTextureSrgb( 0u, true );
 	pCmdBuffer->setSamplerNearest( 0u, true );
 	pCmdBuffer->bindTarget( pTarget );
 	pCmdBuffer->bindUploadedConstants( slot.offset,
 		sizeof( gamescope::framegen::FramegenHudUniform_t ) );
-	pCmdBuffer->dispatch( div_roundup( slot.widthPixels, 8u ),
-		div_roundup( slot.heightPixels, 8u ) );
+	pCmdBuffer->dispatch( div_roundup( uWidthPixels, 8u ),
+		div_roundup( uHeightPixels, 8u ) );
 	return nSlot;
 }
 

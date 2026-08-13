@@ -2,6 +2,7 @@ project(
   'gamescope',
   'c',
   'cpp',
+  version: '0.1.0',
   meson_version: '>=0.58.0',
   default_options: [
     'cpp_std=c++20',

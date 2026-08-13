@@ -202,9 +202,16 @@ compiler_version = cc.version()
 vcs_tag_cmd = ['git', 'describe', '--always', '--tags', '--dirty=+']
 vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
 version_tag = vcs_tag + ' (' + compiler_name + ' ' + compiler_version + ')'
+vcs_sha_cmd = ['git', 'rev-parse', '--short=6', 'HEAD']
+vcs_sha = run_command(vcs_sha_cmd, check: false).stdout().strip()
+if vcs_sha == ''
+  vcs_sha = 'unknown'
+endif
+hud_version = meson.project_version() + '+' + vcs_sha
 
 gamescope_version_conf = configuration_data()
 gamescope_version_conf.set('VCS_TAG', version_tag)
+gamescope_version_conf.set('HUD_VERSION', hud_version)
 
 gamescope_version = configure_file(
   input : 'GamescopeVersion.h.in',

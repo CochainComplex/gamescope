@@ -184,6 +184,7 @@ public:
 	inline bool outputImage() { return m_bOutputImage; }
 	inline bool externalImage() { return m_bExternal; }
 	inline bool deviceLocal() const { return m_bDeviceLocal; }
+	inline bool deviceLocalStagingImage() const { return m_bDeviceLocalStagingImage; }
 	inline VkDeviceSize totalSize() const { return m_size; }
 	inline uint32_t drmFormat() const { return m_drmFormat; }
 
@@ -218,6 +219,7 @@ private:
 	bool m_bExternal = false;
 	bool m_bOutputImage = false;
 	bool m_bDeviceLocal = false;
+	bool m_bDeviceLocalStagingImage = false;
 	bool m_bTransferSrc = false;
 
 	uint32_t m_drmFormat = DRM_FORMAT_INVALID;

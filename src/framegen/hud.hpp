@@ -12,10 +12,11 @@
 namespace gamescope::framegen
 {
 
-inline constexpr uint32_t k_uFramegenHudMaxLines = 4u;
-inline constexpr uint32_t k_uFramegenHudMaxColumns = 48u;
+inline constexpr uint32_t k_uFramegenHudMaxLines = 6u;
+inline constexpr uint32_t k_uFramegenHudMaxColumns = 64u;
 inline constexpr uint32_t k_uFramegenHudPackedTextWords =
 	( k_uFramegenHudMaxLines * k_uFramegenHudMaxColumns ) / 4u;
+inline constexpr uint32_t k_uFramegenHudDeviceNameColumns = 19u;
 
 [[nodiscard]] constexpr uint64_t font8x8_glyph(
 	uint8_t row0, uint8_t row1, uint8_t row2, uint8_t row3,
@@ -138,13 +139,21 @@ static_assert( std::size( k_uFramegenHudFont8x8 ) == 128u );
 
 struct FramegenHudSnapshot_t
 {
+	const char *version = "unknown";
+	const char *deviceName = "unknown";
 	GamescopeFramegenMode mode = GamescopeFramegenMode::Extrapolate;
 	GamescopeFramegenQuality quality = GamescopeFramegenQuality::Low;
 	uint32_t multiplier = 2u;
 	uint32_t refreshMilliHz = 0u;
-	bool bidir = false;
+	bool vrrRequested = false;
+	bool vrrActive = false;
+	bool bidirRequested = false;
+	bool bidirActive = false;
 	bool baseLayer = false;
+	bool clientBuffersStaged = false;
+	bool netRequested = false;
 	bool netActive = false;
+	bool netOnline = false;
 	bool adapt = false;
 	uint64_t real = 0u;
 	uint64_t delayedReal = 0u;
@@ -153,9 +162,10 @@ struct FramegenHudSnapshot_t
 	int32_t biasTenthsMs = 0;
 	uint32_t deadlineHitPercent = 0u;
 	uint32_t pacingSdTenthsMs = 0u;
-	bool netOnline = false;
+	uint64_t resets = 0u;
+	uint64_t ringResets = 0u;
 	uint64_t netTrainedSteps = 0u;
-	bool netProfilePresent = false;
+	bool netProfileLoaded = false;
 };
 
 struct FramegenHudText_t
@@ -166,36 +176,44 @@ struct FramegenHudText_t
 	bool operator==( const FramegenHudText_t &other ) const = default;
 };
 
-[[nodiscard]] constexpr char framegen_hud_mode_glyph( GamescopeFramegenMode mode )
-{
-	switch ( mode )
-	{
-		case GamescopeFramegenMode::Motion: return 'M';
-		case GamescopeFramegenMode::Extrapolate: return 'E';
-		case GamescopeFramegenMode::Blend: return 'B';
-	}
-	return '?';
-}
-
-[[nodiscard]] constexpr char framegen_hud_quality_glyph( GamescopeFramegenQuality quality )
-{
-	switch ( quality )
-	{
-		case GamescopeFramegenQuality::Low: return 'L';
-		case GamescopeFramegenQuality::Medium: return 'M';
-		case GamescopeFramegenQuality::High: return 'H';
-		case GamescopeFramegenQuality::Ultra: return 'U';
-		case GamescopeFramegenQuality::Extreme: return 'X';
-	}
-	return '?';
-}
-
 inline void framegen_hud_append( char *dst, size_t capacity, const char *text )
 {
 	const size_t used = std::strlen( dst );
-	if ( used + 1u >= capacity )
+	if ( used + std::strlen( text ) >= capacity )
 		return;
 	std::snprintf( dst + used, capacity - used, "%s", text );
+}
+
+inline void framegen_hud_trim_device_name( char *dst, size_t capacity,
+	const char *deviceName )
+{
+	if ( capacity == 0u )
+		return;
+	const char *begin = deviceName != nullptr ? deviceName : "";
+	while ( *begin == ' ' || *begin == '\t' )
+		begin++;
+	const char *end = begin + std::strlen( begin );
+	while ( end > begin && ( end[-1] == ' ' || end[-1] == '\t' ) )
+		end--;
+	size_t length = std::min<size_t>(
+		static_cast<size_t>( end - begin ),
+		std::min<size_t>( capacity - 1u, k_uFramegenHudDeviceNameColumns ) );
+	while ( length > 0u && ( begin[length - 1u] == ' ' || begin[length - 1u] == '\t' ) )
+		length--;
+	if ( length != 0u )
+		std::memcpy( dst, begin, length );
+	dst[length] = '\0';
+	if ( length == 0u )
+		std::snprintf( dst, capacity, "unknown" );
+}
+
+inline void framegen_hud_add_line( FramegenHudText_t &text, const char *line )
+{
+	if ( line == nullptr || *line == '\0' || text.lineCount >= k_uFramegenHudMaxLines )
+		return;
+	std::snprintf( text.lines[text.lineCount].data(),
+		text.lines[text.lineCount].size(), "%s", line );
+	text.lineCount++;
 }
 
 inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t steps )
@@ -225,55 +243,75 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	if ( level == 0u )
 		return result;
 
-	char mode[64] = {};
-	std::snprintf( mode, sizeof( mode ), "%c%u",
-		framegen_hud_mode_glyph( snapshot.mode ),
-		std::clamp( snapshot.multiplier, 2u, 4u ) );
-	if ( snapshot.bidir )
-		framegen_hud_append( mode, sizeof( mode ), " BIDIR" );
-	if ( snapshot.baseLayer )
-		framegen_hud_append( mode, sizeof( mode ), " BASE" );
-	if ( snapshot.netActive )
-		framegen_hud_append( mode, sizeof( mode ), " NET" );
-	if ( snapshot.adapt )
-		framegen_hud_append( mode, sizeof( mode ), " ADAPT" );
-	char quality[4] = { ' ', framegen_hud_quality_glyph( snapshot.quality ), '\0', '\0' };
-	framegen_hud_append( mode, sizeof( mode ), quality );
-
 	const uint32_t refreshHz = std::min( 999u,
 		( snapshot.refreshMilliHz + 500u ) / 1'000u );
-	const uint32_t realRate = static_cast<uint32_t>( std::min<uint64_t>(
+	const uint32_t gameRate = static_cast<uint32_t>( std::min<uint64_t>(
 		999u, ( snapshot.real + snapshot.delayedReal ) / 5u ) );
 	const uint32_t generatedRate = static_cast<uint32_t>( std::min<uint64_t>(
 		999u, snapshot.generated / 5u ) );
 	const uint32_t repeatRate = static_cast<uint32_t>( std::min<uint64_t>(
 		999u, snapshot.repeats / 5u ) );
+	const uint32_t screenRate = static_cast<uint32_t>( std::min<uint64_t>(
+		999u, ( snapshot.real + snapshot.delayedReal + snapshot.generated ) / 5u ) );
 
-	char detailed[96] = {};
-	const int detailedLength = std::snprintf( detailed, sizeof( detailed ),
-		"%s %uHz  real %u/s  gen %u/s  rep %u/s",
-		mode, refreshHz, realRate, generatedRate, repeatRate );
-	if ( detailedLength >= 0
-		&& static_cast<uint32_t>( detailedLength ) <= k_uFramegenHudMaxColumns )
+	char line[128] = {};
+	const int headerLength = std::snprintf( line, sizeof( line ),
+		"gameslop %s | %s x%u quality:%s | %uHz %s",
+		snapshot.version != nullptr ? snapshot.version : "unknown",
+		mode_name( snapshot.mode ), std::clamp( snapshot.multiplier, 2u, 4u ),
+		quality_name( snapshot.quality ), refreshHz,
+		snapshot.vrrActive ? "VRR" : "fixed" );
+	if ( headerLength < 0
+		|| static_cast<uint32_t>( headerLength ) > k_uFramegenHudMaxColumns )
 	{
-		std::snprintf( result.lines[0].data(), result.lines[0].size(), "%s", detailed );
+		// Quality tiers affect only motion mode. Keeping the full descriptive
+		// mode name is more useful than truncating an irrelevant quality label.
+		std::snprintf( line, sizeof( line ),
+			"gameslop %s | %s x%u | %uHz %s",
+			snapshot.version != nullptr ? snapshot.version : "unknown",
+			mode_name( snapshot.mode ), std::clamp( snapshot.multiplier, 2u, 4u ),
+			refreshHz, snapshot.vrrActive ? "VRR" : "fixed" );
 	}
-	else
+	framegen_hud_add_line( result, line );
+
+	char deviceName[k_uFramegenHudDeviceNameColumns + 1u] = {};
+	framegen_hud_trim_device_name( deviceName, sizeof( deviceName ), snapshot.deviceName );
+	std::snprintf( line, sizeof( line ),
+		"present: %s | client buffers: %s", deviceName,
+		snapshot.clientBuffersStaged ? "staged(cross-GPU)" : "local" );
+	framegen_hud_add_line( result, line );
+
+	const char *bidirState = snapshot.bidirActive ? "on"
+		: snapshot.bidirRequested ? "requested(OFF)" : "off";
+	const char *netState = snapshot.netActive
+		? ( snapshot.netOnline ? "online" : "blob" )
+		: snapshot.netRequested ? "requested(OFF)" : "off";
+	std::snprintf( line, sizeof( line ),
+		"bidir:%s  base:%s  net:%s  adapt:%s",
+		bidirState, snapshot.baseLayer ? "on" : "off", netState,
+		snapshot.adapt ? "on" : "off" );
+	if ( snapshot.vrrRequested && !snapshot.vrrActive )
 	{
-		char compact[96] = {};
-		int compactLength = std::snprintf( compact, sizeof( compact ),
-			"%s %uHz R%u/s G%u/s P%u/s",
-			mode, refreshHz, realRate, generatedRate, repeatRate );
-		if ( compactLength < 0
-			|| static_cast<uint32_t>( compactLength ) > k_uFramegenHudMaxColumns )
+		constexpr const char *pszVrrFallback = "  vrr:requested(off)";
+		if ( std::strlen( line ) + std::strlen( pszVrrFallback )
+			<= k_uFramegenHudMaxColumns )
 		{
-			std::snprintf( compact, sizeof( compact ), "%s %uHz R%u G%u P%u",
-				mode, refreshHz, realRate, generatedRate, repeatRate );
+			framegen_hud_append( line, sizeof( line ), pszVrrFallback );
 		}
-		std::snprintf( result.lines[0].data(), result.lines[0].size(), "%.*s",
-			static_cast<int>( k_uFramegenHudMaxColumns ), compact );
+		else
+		{
+			// Conflicting requests are the information to preserve when all four
+			// ordinary state fields and the VRR fallback cannot fit together.
+			std::snprintf( line, sizeof( line ),
+				"bidir:%s  net:%s  vrr:requested(off)", bidirState, netState );
+		}
 	}
-	result.lineCount = 1u;
+	framegen_hud_add_line( result, line );
+
+	std::snprintf( line, sizeof( line ),
+		"game %ufps -> screen %u/%u slots (gen %u, repeat %u)",
+		gameRate, screenRate, refreshHz, generatedRate, repeatRate );
+	framegen_hud_add_line( result, line );
 
 	if ( level < 2u )
 		return result;
@@ -283,24 +321,39 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	const uint64_t biasMagnitude = biasTenths < 0
 		? static_cast<uint64_t>( -biasTenths ) : static_cast<uint64_t>( biasTenths );
 	const uint32_t sdTenths = std::min( snapshot.pacingSdTenthsMs, 9'999u );
-	std::snprintf( result.lines[1].data(), result.lines[1].size(),
-		"pace: bias %c%llu.%llums  hit %u%%  sd %u.%ums",
+	const int pacingLength = std::snprintf( line, sizeof( line ),
+		"pace: %u%% on-target +/-%u.%ums | bias %c%llu.%llums | resets %llu (ring %llu)",
+		std::min( snapshot.deadlineHitPercent, 100u ),
+		sdTenths / 10u, sdTenths % 10u,
 		biasSign,
 		static_cast<unsigned long long>( biasMagnitude / 10u ),
 		static_cast<unsigned long long>( biasMagnitude % 10u ),
-		std::min( snapshot.deadlineHitPercent, 100u ),
-		sdTenths / 10u, sdTenths % 10u );
-	result.lineCount = 2u;
+		static_cast<unsigned long long>( std::min<uint64_t>( snapshot.resets, 999u ) ),
+		static_cast<unsigned long long>( std::min<uint64_t>( snapshot.ringResets, 999u ) ) );
+	if ( pacingLength < 0
+		|| static_cast<uint32_t>( pacingLength ) > k_uFramegenHudMaxColumns )
+	{
+		std::snprintf( line, sizeof( line ),
+			"pace: %u%% on-target +/-%u.%ums | bias %c%llu.%llums | resets %llu/%llu",
+			std::min( snapshot.deadlineHitPercent, 100u ),
+			sdTenths / 10u, sdTenths % 10u,
+			biasSign,
+			static_cast<unsigned long long>( biasMagnitude / 10u ),
+			static_cast<unsigned long long>( biasMagnitude % 10u ),
+			static_cast<unsigned long long>( std::min<uint64_t>( snapshot.resets, 999u ) ),
+			static_cast<unsigned long long>( std::min<uint64_t>( snapshot.ringResets, 999u ) ) );
+	}
+	framegen_hud_add_line( result, line );
 
 	if ( snapshot.netActive )
 	{
 		char steps[24] = {};
 		framegen_hud_format_steps( steps, sizeof( steps ), snapshot.netTrainedSteps );
-		std::snprintf( result.lines[2].data(), result.lines[2].size(),
-			"net: %s, %s steps, profile %s",
+		std::snprintf( line, sizeof( line ),
+			"net: %s, %s steps, profile: %s",
 			snapshot.netOnline ? "online" : "offline", steps,
-			snapshot.netProfilePresent ? "loaded" : "none" );
-		result.lineCount = 3u;
+			snapshot.netProfileLoaded ? "loaded" : "none" );
+		framegen_hud_add_line( result, line );
 	}
 
 	return result;
@@ -321,9 +374,23 @@ struct alignas( 16 ) FramegenHudUniform_t
 };
 
 static_assert( offsetof( FramegenHudUniform_t, lineLengths ) == 16u );
-static_assert( offsetof( FramegenHudUniform_t, text ) == 32u );
-static_assert( offsetof( FramegenHudUniform_t, font ) == 224u );
-static_assert( sizeof( FramegenHudUniform_t ) == 1'248u );
+static_assert( offsetof( FramegenHudUniform_t, text ) == 40u );
+static_assert( offsetof( FramegenHudUniform_t, font ) == 424u );
+static_assert( sizeof( FramegenHudUniform_t ) == 1'456u );
+
+struct FramegenHudPush_t
+{
+	uint32_t offsetX;
+	uint32_t offsetY;
+	uint32_t scale;
+	uint32_t pad = 0u;
+
+	FramegenHudPush_t( uint32_t x, uint32_t y, uint32_t uScale )
+		: offsetX( x ), offsetY( y ), scale( uScale )
+	{
+	}
+};
+static_assert( sizeof( FramegenHudPush_t ) == 16u );
 
 [[nodiscard]] inline FramegenHudUniform_t make_framegen_hud_uniform(
 	const FramegenHudText_t &text, bool hdr )

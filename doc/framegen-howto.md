@@ -311,6 +311,31 @@ export GRAVITYMARK_DIR=/path/to/GravityMark/bin
 `--framegen-debug` makes gamescope print what it's doing — watch the terminal
 for lines like `framegen: generated 1 frame(s) …`.
 
+### The on-screen HUD and what its terms mean
+
+`GAMESCOPE_FRAMEGEN_HUD=1` draws a one-line status block on screen; `=2` adds pacing
+and learning lines. `GAMESCOPE_FRAMEGEN_HUD_SCALE=1..6` sizes it,
+`GAMESCOPE_FRAMEGEN_HUD_CORNER=tl|tr|bl|br` places it. Legend:
+
+| Term | Meaning |
+|---|---|
+| `motion x2 quality:high` | active mode, frame multiplier, quality tier |
+| `120Hz fixed` / `120Hz VRR` | display refresh and whether VRR is actually driving it |
+| `present:` | the GPU that generates and drives the display |
+| `client buffers: local` | game frames arrive on the same GPU — zero-copy |
+| `client buffers: staged(cross-GPU)` | dual-GPU path active: frames are copied once into present-GPU memory |
+| `bidir` | bidirectional interpolation (real frames shown one interval late) |
+| `base` | base-layer mode: HUD/cursor composited *after* generation |
+| `net: off / blob / online` | learned refiner: disabled / offline weights / training while you play |
+| `adapt` | self-supervised adaptation grading each prediction against reality |
+| `requested(OFF)` | you set the env var but the mode is NOT running — check the terminal for why (fallback or incompatible combination) |
+| `game 40fps -> screen 118/120 slots` | real game rate vs display refresh slots actually filled |
+| `gen / repeat` | compositor-generated frames per second / refresh slots that showed a repeat |
+| `pace: 99% on-target ±0.7ms` | share of generated frames flipped within half a refresh of their planned time, and the flip-time spread (jitter) |
+| `bias` | learned display-chain delay the scheduler compensates automatically |
+| `resets (ring N)` | pacing/history re-primes (scene cuts, hitches); `ring` counts emergency queue flushes — nonzero means overload |
+| `steps / profile` | net training steps this session / whether a per-game profile was loaded |
+
 ---
 
 ## 5. The modes — pick one, copy the command
