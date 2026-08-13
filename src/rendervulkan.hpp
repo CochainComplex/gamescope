@@ -474,6 +474,9 @@ void vulkan_framegen_reset( const char *reason );
 // while framegen is active; plans one generated frame for the next vblank with
 // its phase measured against the display clock.
 void vulkan_framegen_jit_tick();
+// Cheap compositor-thread counter hook used by the repeat arbiter. Aggregation
+// and reporting remain in vulkan_framegen_drain_present_feedback().
+void vulkan_framegen_metrics_note_repeat();
 // VRR hybrid (#01, GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 + dedicated queue): keep
 // adaptive sync active while framegen runs — real frames flip immediately,
 // the generated frame flips mid-interval on a timer. "Requested" (env + queue)

@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cmath>
+#include <limits>
 #include <thread>
 #include <dlfcn.h>
 #include "vulkan_include.h"
@@ -5150,6 +5152,214 @@ struct DisplayFeedbackMailbox_t
 };
 static DisplayFeedbackMailbox_t g_displayFeedbackMailbox;
 
+static constexpr uint64_t k_ulFramegenMetricsWindowNs = 5'000'000'000ull;
+static constexpr uint64_t k_ulFramegenMetricsHistogramStepNs = 250'000ull;
+static constexpr size_t k_nFramegenMetricsHistogramBuckets = 64;
+
+struct FramegenMetricsDistribution_t
+{
+	uint64_t n = 0;
+	double sum = 0.0;
+	double sumSquares = 0.0;
+	double min = std::numeric_limits<double>::max();
+	double max = 0.0;
+	std::array<uint64_t, k_nFramegenMetricsHistogramBuckets> histogram = {};
+
+	void add( uint64_t ulNs )
+	{
+		const double flMs = ulNs / 1.0e6;
+		n++;
+		sum += flMs;
+		sumSquares += flMs * flMs;
+		min = std::min( min, flMs );
+		max = std::max( max, flMs );
+		const size_t nBucket = std::min<size_t>(
+			ulNs / k_ulFramegenMetricsHistogramStepNs,
+			k_nFramegenMetricsHistogramBuckets - 1 );
+		histogram[ nBucket ]++;
+	}
+
+	double average() const { return n != 0 ? sum / n : 0.0; }
+	double stddev() const
+	{
+		return n != 0 ? std::sqrt( std::max( 0.0,
+			sumSquares / n - average() * average() ) ) : 0.0;
+	}
+	double p95() const
+	{
+		if ( n == 0 )
+			return 0.0;
+		const uint64_t nRank = ( n * 95u + 99u ) / 100u;
+		uint64_t nSeen = 0;
+		for ( size_t i = 0; i < histogram.size(); i++ )
+		{
+			nSeen += histogram[ i ];
+			if ( nSeen >= nRank )
+				return ( i + 1 ) * k_ulFramegenMetricsHistogramStepNs / 1.0e6;
+		}
+		return 16.0;
+	}
+};
+
+struct FramegenMetricsWindow_t
+{
+	uint64_t real = 0, generated = 0, delayedReal = 0, repeats = 0;
+	uint64_t discards = 0, slowDrops = 0, resets = 0;
+	uint64_t deadlineCount = 0, deadlineHits = 0;
+	double deadlineSignedSumMs = 0.0;
+	FramegenMetricsDistribution_t flipIntervals;
+	FramegenMetricsDistribution_t deadlineErrors;
+};
+
+struct FramegenMetricsPendingEvents_t
+{
+	uint64_t repeats = 0, discards = 0, slowDrops = 0, resets = 0;
+};
+static FramegenMetricsPendingEvents_t g_framegenMetricsPendingEvents;
+
+struct FramegenMetricsState_t
+{
+	std::array<FramegenMetricsWindow_t, 12> windows;
+	FramegenMetricsWindow_t current;
+	FramegenMetricsWindow_t total;
+	uint64_t ulNextWindowNs = 0;
+	uint64_t ulLastFlipNs = 0;
+	uint64_t nClosedWindows = 0;
+	size_t nNextWindow = 0;
+};
+static FramegenMetricsState_t g_framegenMetrics;
+
+static void framegen_metrics_shutdown();
+
+static bool framegen_metrics_enabled()
+{
+	static const bool s_bEnabled = []()
+	{
+		const bool bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_METRICS" ) );
+		if ( bEnabled )
+			atexit( framegen_metrics_shutdown );
+		return bEnabled;
+	}();
+	return s_bEnabled;
+}
+
+static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
+	const FramegenMetricsPendingEvents_t &events )
+{
+	window.repeats += events.repeats;
+	window.discards += events.discards;
+	window.slowDrops += events.slowDrops;
+	window.resets += events.resets;
+}
+
+static void framegen_metrics_flush_events()
+{
+	framegen_metrics_add_events( g_framegenMetrics.current, g_framegenMetricsPendingEvents );
+	framegen_metrics_add_events( g_framegenMetrics.total, g_framegenMetricsPendingEvents );
+	g_framegenMetricsPendingEvents = {};
+}
+
+static void framegen_metrics_log( const char *pszLabel,
+	const FramegenMetricsWindow_t &window )
+{
+	const FramegenMetricsDistribution_t &flip = window.flipIntervals;
+	const FramegenMetricsDistribution_t &deadline = window.deadlineErrors;
+	vk_log.infof( "framegen-metrics: %s real=%" PRIu64 " gen=%" PRIu64
+		" dreal=%" PRIu64 " rep=%" PRIu64
+		" flip_ms_avg=%.3f flip_ms_min=%.3f flip_ms_max=%.3f"
+		" flip_ms_sd=%.3f flip_ms_p95=%.3f dl_hit=%.3f"
+		" dl_ms_avg=%.3f dl_ms_p95=%.3f dl_ms_worst=%.3f"
+		" disc=%" PRIu64 " slow=%" PRIu64 " resets=%" PRIu64,
+		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
+		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
+		flip.stddev(), flip.p95(), window.deadlineCount != 0
+			? (double)window.deadlineHits / window.deadlineCount : 0.0,
+		window.deadlineCount != 0 ? window.deadlineSignedSumMs / window.deadlineCount : 0.0,
+		deadline.p95(), deadline.max, window.discards, window.slowDrops, window.resets );
+}
+
+static void framegen_metrics_close_windows( uint64_t ulNowNs )
+{
+	while ( ulNowNs >= g_framegenMetrics.ulNextWindowNs )
+	{
+		g_framegenMetrics.windows[ g_framegenMetrics.nNextWindow ] =
+			g_framegenMetrics.current;
+		g_framegenMetrics.nNextWindow = ( g_framegenMetrics.nNextWindow + 1 )
+			% g_framegenMetrics.windows.size();
+		g_framegenMetrics.nClosedWindows++;
+		char szWindow[32];
+		snprintf( szWindow, sizeof( szWindow ), "w=%" PRIu64,
+			g_framegenMetrics.nClosedWindows );
+		framegen_metrics_log( szWindow, g_framegenMetrics.current );
+		g_framegenMetrics.current = {};
+		g_framegenMetrics.ulNextWindowNs += k_ulFramegenMetricsWindowNs;
+	}
+}
+
+static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
+{
+	if ( !feedback.bPresented )
+		return;
+	auto addKind = [&]( FramegenMetricsWindow_t &window )
+	{
+		switch ( feedback.tag.eKind )
+		{
+			case gamescope::FramegenPresentKind_t::Real: window.real++; break;
+			case gamescope::FramegenPresentKind_t::Generated: window.generated++; break;
+			case gamescope::FramegenPresentKind_t::DelayedReal: window.delayedReal++; break;
+		}
+	};
+	addKind( g_framegenMetrics.current );
+	addKind( g_framegenMetrics.total );
+	if ( !feedback.bTimestampValid )
+		return;
+	if ( g_framegenMetrics.ulLastFlipNs != 0
+		&& feedback.ulActualFlipNs > g_framegenMetrics.ulLastFlipNs )
+	{
+		const uint64_t ulIntervalNs = feedback.ulActualFlipNs
+			- g_framegenMetrics.ulLastFlipNs;
+		g_framegenMetrics.current.flipIntervals.add( ulIntervalNs );
+		g_framegenMetrics.total.flipIntervals.add( ulIntervalNs );
+	}
+	g_framegenMetrics.ulLastFlipNs = feedback.ulActualFlipNs;
+	if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real
+		|| feedback.tag.ulTargetFlipNs == 0 )
+		return;
+	const long double flSignedErrorNs = (long double)feedback.ulActualFlipNs
+		- (long double)feedback.tag.ulTargetFlipNs;
+	const uint64_t ulAbsErrorNs = (uint64_t)std::fabs( flSignedErrorNs );
+	const int nRefreshMhz = GetVBlankTimer().GetRefresh();
+	const uint64_t ulVblankNs = nRefreshMhz > 0
+		? 1'000'000'000'000ull / (uint64_t)nRefreshMhz : 8'333'333ull;
+	auto addDeadline = [&]( FramegenMetricsWindow_t &window )
+	{
+		window.deadlineCount++;
+		window.deadlineHits += ulAbsErrorNs <= ulVblankNs / 2u;
+		window.deadlineSignedSumMs += (double)( flSignedErrorNs / 1.0e6L );
+		window.deadlineErrors.add( ulAbsErrorNs );
+	};
+	addDeadline( g_framegenMetrics.current );
+	addDeadline( g_framegenMetrics.total );
+}
+
+static void framegen_metrics_shutdown()
+{
+	framegen_metrics_flush_events();
+	char szTotal[32];
+	snprintf( szTotal, sizeof( szTotal ), "TOTAL w=%" PRIu64,
+		g_framegenMetrics.nClosedWindows );
+	framegen_metrics_log( szTotal, g_framegenMetrics.total );
+}
+
+void vulkan_framegen_metrics_note_repeat()
+{
+	g_framegenMetricsPendingEvents.repeats++;
+}
+
+static void framegen_metrics_note_discard( uint64_t n ) { g_framegenMetricsPendingEvents.discards += n; }
+static void framegen_metrics_note_slow_drop( uint64_t n ) { g_framegenMetricsPendingEvents.slowDrops += n; }
+static void framegen_metrics_note_reset() { g_framegenMetricsPendingEvents.resets++; }
+
 static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback );
 static void framegen_apply_bidir_flip_feedback( const DisplayFeedback_t &feedback );
 static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback );
@@ -5286,6 +5496,15 @@ void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentT
 
 void vulkan_framegen_drain_present_feedback()
 {
+	const bool bMetricsEnabled = framegen_metrics_enabled();
+	if ( bMetricsEnabled )
+	{
+		const uint64_t ulNowNs = get_time_in_nanos();
+		if ( g_framegenMetrics.ulNextWindowNs == 0 )
+			g_framegenMetrics.ulNextWindowNs = ulNowNs + k_ulFramegenMetricsWindowNs;
+		framegen_metrics_close_windows( ulNowNs );
+		framegen_metrics_flush_events();
+	}
 	std::array<DisplayFeedback_t, k_nDisplayFeedbackMailboxCapacity> records;
 	size_t nCount = 0;
 	{
@@ -5305,6 +5524,8 @@ void vulkan_framegen_drain_present_feedback()
 		const DisplayFeedback_t &feedback = records[ i ];
 		if ( feedback.tag.ulPresentToken == 0 )
 			continue;
+		if ( bMetricsEnabled )
+			framegen_metrics_add_feedback( feedback );
 
 		if ( feedback.bPresented && feedback.bTimestampValid )
 		{
@@ -5977,6 +6198,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 		&& g_framegenHistory.cadence.intervalNs == 0
 		&& g_framegenHistory.ulCurrentCadenceTimeNs == 0 )
 		return;
+	framegen_metrics_note_reset();
 
 	if ( g_bFramegenDebug )
 		vk_log.infof( "framegen: history valid=false reason=%s", reason ? reason : "unknown" );
@@ -6077,6 +6299,7 @@ static void framegen_net_profile_flush();
 
 void vulkan_framegen_reset( const char *reason )
 {
+	framegen_metrics_note_reset();
 	if ( g_bFramegenDebug )
 		vk_log.infof( "framegen: reset history reason=%s", reason ? reason : "unknown" );
 
@@ -6183,6 +6406,7 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 	if ( !front.bReal && !g_device.hasCompletedFramegen( front.seqNo ) )
 	{
 		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
+		framegen_metrics_note_slow_drop( 1 );
 		g_framegenHistory.bCausalDeadlineMissed |=
 			front.ulAnchorRealFrameId != 0u;
 		static uint64_t s_uTooSlowDebugLogCounter = 0;
@@ -6294,6 +6518,8 @@ void vulkan_framegen_discard_generated_frame( const char *reason )
 		framegen_clear_vrr_midpoint_state( false );
 
 	const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
+	if ( reason != nullptr && strcmp( reason, "generation_too_slow" ) == 0 )
+		framegen_metrics_note_slow_drop( nDiscarded );
 	static uint64_t s_uDiscardDebugLogCounter = 0;
 	if ( nDiscarded > 0 && FramegenDebugShouldLog( s_uDiscardDebugLogCounter ) )
 		vk_log.infof( "framegen: discarded %zu generated frame(s) reason=%s",
@@ -7279,6 +7505,7 @@ static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
 
 	if ( measurement->sceneCut != 0u )
 	{
+		framegen_metrics_note_reset();
 		vk_log.infof( "framegen: content scene cut detected (%u/9 sections, histogram distance %.2f); presenting a real endpoint",
 			measurement->changedSections,
 			gamescope::framegen::scene_histogram_distance( *measurement ) );
@@ -9232,6 +9459,8 @@ static void framegen_record_causal_anchor( uint64_t ulRealFrameId,
 			!= bSourceTimestampsReliable;
 	if ( bGridChanged || bProvenanceChanged )
 	{
+		if ( g_framegenHistory.ulDeadlineGridEpoch != 0u )
+			framegen_metrics_note_reset();
 		g_framegenHistory.ulDeadlineGridEpoch++;
 		if ( g_framegenHistory.ulDeadlineGridEpoch == 0u )
 			g_framegenHistory.ulDeadlineGridEpoch = 1u;
@@ -9385,6 +9614,7 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 		// authoritative. Re-enter from the corrected anchor so an exact one-vblank
 		// correction can move the next generated phase by that full interval.
 		g_framegenHistory.ulLastPlannedTargetNs = 0u;
+		framegen_metrics_note_discard( nBefore - g_framegenHistory.pending.size() );
 		static uint64_t s_uFeedbackDiscardDebugLogCounter = 0;
 		if ( nBefore != g_framegenHistory.pending.size()
 			&& FramegenDebugShouldLog( s_uFeedbackDiscardDebugLogCounter ) )
@@ -9693,6 +9923,8 @@ static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
 			!= bSourceTimestampsReliable;
 	if ( bGridChanged || bProvenanceChanged )
 	{
+		if ( g_framegenHistory.ulBidirGridEpoch != 0u )
+			framegen_metrics_note_reset();
 		g_framegenHistory.bidirEpoch = {};
 		g_framegenHistory.bidirFeedbackEndpoints.clear();
 		g_framegenHistory.ulBidirGridEpoch++;
@@ -9896,6 +10128,7 @@ static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
 // forward-prediction cap can require additional honest repeats.
 void vulkan_framegen_causal_tick()
 {
+	vulkan_framegen_metrics_note_repeat();
 	// VRR and bidir retain their own Step 3 policies. The classic A/B switch and
 	// shared-queue fallback are intentionally no-ops here.
 	if ( !framegen_causal_deadline_enabled()
@@ -10657,6 +10890,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	}
 	else if ( g_framegenHistory.ulCurrentCadenceTimeNs != 0u )
 	{
+		framegen_metrics_note_reset();
 		g_framegenHistory.cadence = {};
 	}
 
