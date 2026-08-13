@@ -1,0 +1,84 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set_constants.h"
+
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(binding = 0, scalar)
+uniform framegen_hud_t {
+    uint u_lineCount;
+    uint u_widthChars;
+    uint u_hdr;
+    uint u_reserved;
+    uint u_lineLengths[4];
+    uint u_text[48];
+    uint u_font[256];
+};
+
+layout(binding = 1) writeonly uniform image2D dst;
+layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+
+const uint kPadding = 4u;
+const uint kOrigin = 8u;
+
+uint text_byte(uint line, uint column) {
+    uint byteIndex = line * 48u + column;
+    uint word = u_text[byteIndex >> 2u];
+    return bitfieldExtract(word, int((byteIndex & 3u) * 8u), 8);
+}
+
+bool glyph_pixel(uint glyph, uvec2 pixel) {
+    // font8x8_basic stores its source rows bottom-to-top. Each uint contains
+    // four rows, with the first source row in its least-significant byte.
+    uint sourceRow = 7u - pixel.y;
+    uint word = u_font[glyph * 2u + (sourceRow >> 2u)];
+    uint rowBits = bitfieldExtract(word, int((sourceRow & 3u) * 8u), 8);
+    return ((rowBits >> pixel.x) & 1u) != 0u;
+}
+
+void main() {
+    uvec2 local = gl_GlobalInvocationID.xy;
+    uvec2 blockSize = uvec2(u_widthChars * 8u, u_lineCount * 8u)
+        + uvec2(kPadding * 2u);
+    if (local.x >= blockSize.x || local.y >= blockSize.y)
+        return;
+
+    uvec2 coord = local + uvec2(kOrigin);
+    uvec2 outSize = imageSize(dst);
+    if (coord.x >= outSize.x || coord.y >= outSize.y)
+        return;
+
+    // The target is rebound through its raw sampled view. Reading and writing
+    // the same unique pixel lets this single pass provide real alpha blending
+    // without requiring shaderStorageImageReadWithoutFormat.
+    vec4 base = texelFetch(s_samplers[0], ivec2(coord), 0);
+    vec3 result = mix(base.rgb, vec3(0.015), 0.42);
+
+    bool ink = false;
+    if (local.x >= kPadding && local.y >= kPadding) {
+        uvec2 textPixel = local - uvec2(kPadding);
+        uint line = textPixel.y >> 3u;
+        uint column = textPixel.x >> 3u;
+        if (line < u_lineCount && column < u_lineLengths[line]) {
+            uint glyph = min(text_byte(line, column), 127u);
+            ink = glyph_pixel(glyph, textPixel & 7u);
+        }
+    }
+
+    if (ink) {
+        // Known HDR simplification: this deliberately bypasses the compositor's
+        // color-management pipeline. 0.579 is the fixed ST-2084 code value for
+        // roughly 200 nits; SDR uses a fixed light gray. The backing is likewise
+        // a low-alpha raw-code blend rather than a color-managed overlay.
+        float glyphValue = u_hdr != 0u ? 0.579f : 0.82f;
+        result = mix(result, vec3(glyphValue), 0.96);
+    }
+
+    imageStore(dst, ivec2(coord), vec4(result, base.a));
+}

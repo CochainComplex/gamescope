@@ -65,6 +65,7 @@ Parsing and benchmark early-exit are in `src/main.cpp`.
 - `GAMESCOPE_FRAMEGEN_BENCHMARK` — **presence-only** (even `=0` triggers); runs the microbench then `exit(0)` *before* output creation.
 - `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE` — needs a **truthy int** (`=0` does not force it); selects the shared-queue regime.
 - `GAMESCOPE_FRAMEGEN_DEBUG_EVERY` — debug log rate (default 60; rejects 0/non-uint → 60).
+- `GAMESCOPE_FRAMEGEN_HUD={1,2}` — built-in present-only status HUD, off by default. Level 1 shows mode/quality, current refresh and the last closed five-second real/generated/repeat rates; level 2 adds pacing and the net line when active. Its text UBO is rebuilt at 1 Hz and one compute dispatch is appended to eligible real composites, after capture copies, with no extra submission. HDR uses a deliberately fixed raw-code approximation (glyphs near 200 nits plus a low-alpha backing), not a color-managed text pipeline.
 - `GAMESCOPE_FRAMEGEN_JIT` — legacy compatibility setting; causal fixed-refresh deadline scheduling is now the **default behavior** on a dedicated framegen queue. A truthy value only emits a one-time “now default” notice.
 - `GAMESCOPE_FRAMEGEN_VRR_HYBRID` — truthy int; opt-in **#01 VRR hybrid** prototype (`vulkan_framegen_vrr_hybrid_requested`). Real frames present VRR-style, one generated frame flips mid-interval on a timer. Gated on the dedicated queue **and** only active while the connector is actually in VRR (`IsVRRActive()`); otherwise it falls back live to the fixed-refresh paths.
 - `GAMESCOPE_FRAMEGEN_BASE` — truthy int; opt-in **#02 base-layer generation** prototype (`framegen_base_layer_enabled`). Generates on the pre-upscale game layer (`layers[0].tex`), then `framegen_base_present_composite` runs against the live `FrameInfo_t`: generated frames go through the full FSR/color pipeline and carry fresh overlays and cursor. It does not need the dedicated queue. `framegen_base_layer_usable` selects it per frame (base plane, non-YCbCr, no ReShade, sampled+storage format) and falls back live to output-space generation for unusable scenes.
@@ -91,7 +92,7 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - **`IBackend::SupportsFramegen()`** in `src/backend.h` — defaults false; DRM and nested Wayland return true, and `CDeferredBackend` delegates to its child. It contains the forced-composite/present-timing cost to capable backends.
 
 ### Shader build wiring (`src/meson.build`)
-The 21 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) and registered unconditionally by the `SHADER()` macro table; `MOTION_WARP_ACCEL` serves Ultra acceleration and Extreme guided reconstruction. **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays**, so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
+The 22 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) and registered unconditionally by the `SHADER()` macro table; `MOTION_WARP_ACCEL` serves Ultra acceleration and Extreme guided reconstruction. **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays**, so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
 
 ---
 
@@ -848,8 +849,10 @@ cache hit.
   rendervulkan call sites that emit the scheduler's live state: priming, overlay-only
   filtering, the `busy/stabilizing/dormant degrade=N/M` line, the
   `generated N frame(s) … mode=… gpu=X.XXms` line, and the real/generated/repeat slot
-  classification in `steamcompmgr`. **This is the only way to observe the state machine
-  described above at runtime.**
+  classification in `steamcompmgr`.
+- **`GAMESCOPE_FRAMEGEN_HUD={1,2}`** is the low-overhead on-screen view of the same existing
+  metrics/state. It uses only the last closed five-second window, refresh and current mode/net
+  globals; capture and screenshot composites skip it.
 - **`--debug-dual-gpu-route` / `g_bDebugDualGpuRoute`** is a distinct,
   per-frame, **un-throttled** channel for the cross-GPU import path — do not confuse it with the
   rate-limited framegen debug.

@@ -47,6 +47,7 @@
 #include "framegen/atomic_file.hpp"
 #include "framegen/deadline.hpp"
 #include "framegen/dispatch_policy.hpp"
+#include "framegen/hud.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
@@ -67,6 +68,7 @@
 #include "cs_framegen_extrapolate_fp16.h"
 #include "cs_framegen_extrapolate_pair.h"
 #include "cs_framegen_extrapolate_pair_fp16.h"
+#include "cs_framegen_hud.h"
 #include "cs_framegen_motion_luma_pair.h"
 #include "cs_framegen_motion_luma_pair_rgba.h"
 #include "cs_framegen_motion_pyramid.h"
@@ -123,6 +125,58 @@ private:
 };
 
 } // namespace
+
+static uint32_t framegen_hud_level()
+{
+	static const uint32_t s_uLevel = []()
+	{
+		const auto parsed = gamescope::framegen::parse_uint32_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_HUD" ), true );
+		return parsed.has_value() && ( *parsed == 1u || *parsed == 2u )
+			? *parsed : 0u;
+	}();
+	return s_uLevel;
+}
+
+static constexpr size_t k_nFramegenHudUploadSlots = 2u;
+struct FramegenHudGpuState_t
+{
+	struct UploadSlot_t
+	{
+		void *pMapped = nullptr;
+		uint32_t offset = 0u;
+		uint64_t lastSubmitSeqNo = 0u;
+		uint32_t widthPixels = 0u;
+		uint32_t heightPixels = 0u;
+	};
+
+	std::array<UploadSlot_t, k_nFramegenHudUploadSlots> uploadSlots;
+	gamescope::framegen::FramegenHudText_t text;
+	uint64_t nextRebuildNs = 0u;
+	int activeUploadSlot = -1;
+	bool textValid = false;
+	bool dirty = false;
+	bool hdr = false;
+	bool hdrValid = false;
+};
+static FramegenHudGpuState_t g_framegenHud;
+
+static void framegen_hud_init_upload_buffer( CVulkanDevice *pDevice )
+{
+	if ( framegen_hud_level() == 0u )
+		return;
+	for ( auto &slot : g_framegenHud.uploadSlots )
+	{
+		const auto [pMapped, offset] = pDevice->reservePersistentUniformBufferData(
+			sizeof( gamescope::framegen::FramegenHudUniform_t ) );
+		slot.pMapped = pMapped;
+		slot.offset = offset;
+	}
+}
+
+static int framegen_hud_record( CVulkanCmdBuffer *pCmdBuffer,
+	const gamescope::Rc<CVulkanTexture> &pTarget, const struct FrameInfo_t *pFrameInfo );
+static void framegen_hud_note_submit( int nSlot, uint64_t ulSeqNo );
 
 static bool framegen_backend_supported()
 {
@@ -473,6 +527,7 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 		return false;
 	if (!createScratchResources())
 		return false;
+	framegen_hud_init_upload_buffer( this );
 
 	m_bInitialized = true;
 	m_unusedCmdBufs.reserve( k_uInitialSubmissionCapacity );
@@ -1312,6 +1367,7 @@ bool CVulkanDevice::createShaders()
 		SHADER(FRAMEGEN_EXTRAPOLATE_PAIR_FP16, cs_framegen_extrapolate_pair_fp16);
 	else
 		SHADER(FRAMEGEN_EXTRAPOLATE_PAIR_FP16, cs_framegen_extrapolate_pair);
+	SHADER(FRAMEGEN_HUD, cs_framegen_hud);
 	SHADER(FRAMEGEN_MOTION_LUMA_PAIR, cs_framegen_motion_luma_pair);
 	SHADER(FRAMEGEN_MOTION_LUMA_PAIR_RGBA, cs_framegen_motion_luma_pair_rgba);
 	SHADER(FRAMEGEN_MOTION_PYRAMID, cs_framegen_motion_pyramid);
@@ -1401,7 +1457,7 @@ bool CVulkanDevice::createScratchResources()
 	
 	VkBufferCreateInfo bufferCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size = upload_buffer_size,
+		.size = upload_buffer_size + upload_buffer_persistent_pad,
 		.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 	};
 
@@ -1702,6 +1758,8 @@ void CVulkanDevice::compileFramegenPipelines()
 
 	for ( ShaderType type : pipelines )
 		pipeline( type );
+	if ( framegen_hud_level() != 0u )
+		pipeline( SHADER_TYPE_FRAMEGEN_HUD );
 
 	// pipeline() caches compile failures, including VK_NULL_HANDLE. The runtime
 	// uses this same gate, so unsupported net shaders can never be cached or bound.
@@ -2187,6 +2245,12 @@ void CVulkanCmdBuffer::clearState()
 	m_renderBufferOffset = 0;
 	m_renderBufferSize = 0;
 	m_useSrgb.reset();
+}
+
+void CVulkanCmdBuffer::bindUploadedConstants(uint32_t offset, uint32_t size)
+{
+	m_renderBufferOffset = offset;
+	m_renderBufferSize = size;
 }
 
 template<class PushData, class... Args>
@@ -5358,7 +5422,7 @@ static void framegen_metrics_log( const char *pszLabel,
 		window.resetsProvenance, window.resetsHitch, window.resetsRing );
 }
 
-static void framegen_metrics_close_windows( uint64_t ulNowNs )
+static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
 {
 	while ( ulNowNs >= g_framegenMetrics.ulNextWindowNs )
 	{
@@ -5367,10 +5431,13 @@ static void framegen_metrics_close_windows( uint64_t ulNowNs )
 		g_framegenMetrics.nNextWindow = ( g_framegenMetrics.nNextWindow + 1 )
 			% g_framegenMetrics.windows.size();
 		g_framegenMetrics.nClosedWindows++;
-		char szWindow[32];
-		snprintf( szWindow, sizeof( szWindow ), "w=%" PRIu64,
-			g_framegenMetrics.nClosedWindows );
-		framegen_metrics_log( szWindow, g_framegenMetrics.current );
+		if ( bLog )
+		{
+			char szWindow[32];
+			snprintf( szWindow, sizeof( szWindow ), "w=%" PRIu64,
+				g_framegenMetrics.nClosedWindows );
+			framegen_metrics_log( szWindow, g_framegenMetrics.current );
+		}
 		g_framegenMetrics.current = {};
 		g_framegenMetrics.ulNextWindowNs += k_ulFramegenMetricsWindowNs;
 	}
@@ -5667,13 +5734,15 @@ void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentT
 
 void vulkan_framegen_drain_present_feedback()
 {
-	const bool bMetricsEnabled = framegen_metrics_enabled();
-	if ( bMetricsEnabled )
+	const bool bMetricsLoggingEnabled = framegen_metrics_enabled();
+	const bool bMetricsCollectionEnabled = bMetricsLoggingEnabled
+		|| framegen_hud_level() != 0u;
+	if ( bMetricsCollectionEnabled )
 	{
 		const uint64_t ulNowNs = get_time_in_nanos();
 		if ( g_framegenMetrics.ulNextWindowNs == 0 )
 			g_framegenMetrics.ulNextWindowNs = ulNowNs + k_ulFramegenMetricsWindowNs;
-		framegen_metrics_close_windows( ulNowNs );
+		framegen_metrics_close_windows( ulNowNs, bMetricsLoggingEnabled );
 		framegen_metrics_flush_events();
 	}
 	std::array<DisplayFeedback_t, k_nDisplayFeedbackMailboxCapacity> records;
@@ -5695,7 +5764,7 @@ void vulkan_framegen_drain_present_feedback()
 		const DisplayFeedback_t &feedback = records[ i ];
 		if ( feedback.tag.ulPresentToken == 0 )
 			continue;
-		if ( bMetricsEnabled )
+		if ( bMetricsCollectionEnabled )
 			framegen_metrics_add_feedback( feedback );
 
 		if ( feedback.bPresented && feedback.bTimestampValid )
@@ -7671,6 +7740,144 @@ static bool framegen_adapt_enabled( GamescopeFramegenQuality eQuality )
 		return pszEnv == nullptr || env_to_bool( pszEnv );
 	}();
 	return s_bEnabled;
+}
+
+static const FramegenMetricsWindow_t &framegen_metrics_last_closed_window()
+{
+	static const FramegenMetricsWindow_t s_empty;
+	if ( g_framegenMetrics.nClosedWindows == 0u )
+		return s_empty;
+	const size_t nLast = ( g_framegenMetrics.nNextWindow
+		+ g_framegenMetrics.windows.size() - 1u ) % g_framegenMetrics.windows.size();
+	return g_framegenMetrics.windows[nLast];
+}
+
+static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot()
+{
+	const FramegenMetricsWindow_t &window = framegen_metrics_last_closed_window();
+	const uint32_t uHitPercent = window.deadlineCount != 0u
+		? static_cast<uint32_t>( std::min<uint64_t>( 100u,
+			( window.deadlineHits * 100u + window.deadlineCount / 2u )
+				/ window.deadlineCount ) )
+		: 0u;
+	const int nRefreshMilliHz = GetVBlankTimer().GetRefresh();
+	const bool bNetActive = g_framegenMotion.bNetActive;
+	const double flBiasTenths = std::clamp(
+		g_framegenPresentState.displayTiming.presentBias.emaNs / 100'000.0,
+		-9'999.0, 9'999.0 );
+	const double flPacingSdTenths = std::clamp(
+		window.flipIntervals.stddev() * 10.0, 0.0, 9'999.0 );
+	return {
+		.mode = g_eFramegenMode,
+		.quality = g_eFramegenQuality,
+		.multiplier = static_cast<uint32_t>( g_nFramegenMultiplier ),
+		.refreshMilliHz = nRefreshMilliHz > 0
+			? static_cast<uint32_t>( nRefreshMilliHz ) : 0u,
+		.bidir = vulkan_framegen_bidir_active(),
+		.baseLayer = vulkan_framegen_base_layer_active(),
+		.netActive = bNetActive,
+		.adapt = g_eFramegenMode == GamescopeFramegenMode::Motion
+			&& framegen_adapt_enabled( g_eFramegenQuality ),
+		.real = window.real,
+		.delayedReal = window.delayedReal,
+		.generated = window.generated,
+		.repeats = window.repeats,
+		.biasTenthsMs = static_cast<int32_t>( std::llround( flBiasTenths ) ),
+		.deadlineHitPercent = uHitPercent,
+		.pacingSdTenthsMs = static_cast<uint32_t>( std::llround( flPacingSdTenths ) ),
+		.netOnline = bNetActive && framegen_net_online_enabled(),
+		.netTrainedSteps = g_ulFramegenNetProgress,
+		.netProfilePresent = framegen_net_profile_path() != nullptr,
+	};
+}
+
+static int framegen_hud_record( CVulkanCmdBuffer *pCmdBuffer,
+	const gamescope::Rc<CVulkanTexture> &pTarget, const struct FrameInfo_t *pFrameInfo )
+{
+	const uint32_t uLevel = framegen_hud_level();
+	if ( uLevel == 0u || pTarget == nullptr )
+		return -1;
+
+	const uint64_t ulNowNs = get_time_in_nanos();
+	const bool bHdr = pFrameInfo->outputEncodingEOTF == EOTF_PQ;
+	if ( !g_framegenHud.hdrValid || g_framegenHud.hdr != bHdr )
+	{
+		g_framegenHud.hdr = bHdr;
+		g_framegenHud.hdrValid = true;
+		g_framegenHud.dirty = true;
+	}
+	if ( !g_framegenHud.textValid || ulNowNs >= g_framegenHud.nextRebuildNs )
+	{
+		const gamescope::framegen::FramegenHudText_t text =
+			gamescope::framegen::format_framegen_hud( uLevel, framegen_hud_snapshot() );
+		if ( !g_framegenHud.textValid || text != g_framegenHud.text )
+		{
+			g_framegenHud.text = text;
+			g_framegenHud.dirty = true;
+		}
+		g_framegenHud.textValid = true;
+		g_framegenHud.nextRebuildNs = ulNowNs + 1'000'000'000ull;
+	}
+
+	// Empty text is a CPU-side no-op: do not bind the pipeline or consume a
+	// scratch descriptor merely to let the shader discover there is no work.
+	if ( g_framegenHud.text.lineCount == 0u )
+		return -1;
+
+	if ( g_framegenHud.dirty )
+	{
+		int nUploadSlot = -1;
+		for ( size_t i = 0u; i < g_framegenHud.uploadSlots.size(); i++ )
+		{
+			if ( static_cast<int>( i ) == g_framegenHud.activeUploadSlot )
+				continue;
+			const auto &candidate = g_framegenHud.uploadSlots[i];
+			if ( candidate.lastSubmitSeqNo == 0u
+				|| g_device.hasCompleted( candidate.lastSubmitSeqNo ) )
+			{
+				nUploadSlot = static_cast<int>( i );
+				break;
+			}
+		}
+
+		if ( nUploadSlot >= 0 )
+		{
+			auto &slot = g_framegenHud.uploadSlots[nUploadSlot];
+			const gamescope::framegen::FramegenHudUniform_t uniform =
+				gamescope::framegen::make_framegen_hud_uniform(
+					g_framegenHud.text, g_framegenHud.hdr );
+			memcpy( slot.pMapped, &uniform, sizeof( uniform ) );
+			slot.widthPixels = uniform.widthChars * 8u + 8u;
+			slot.heightPixels = uniform.lineCount * 8u + 8u;
+			g_framegenHud.activeUploadSlot = nUploadSlot;
+			g_framegenHud.dirty = false;
+		}
+	}
+
+	if ( g_framegenHud.activeUploadSlot < 0 )
+		return -1;
+	const int nSlot = g_framegenHud.activeUploadSlot;
+	const auto &slot = g_framegenHud.uploadSlots[nSlot];
+	if ( slot.widthPixels == 0u || slot.heightPixels == 0u )
+		return -1;
+
+	pCmdBuffer->clearState();
+	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_HUD ) );
+	pCmdBuffer->bindTexture( 0u, pTarget );
+	pCmdBuffer->setTextureSrgb( 0u, true );
+	pCmdBuffer->setSamplerNearest( 0u, true );
+	pCmdBuffer->bindTarget( pTarget );
+	pCmdBuffer->bindUploadedConstants( slot.offset,
+		sizeof( gamescope::framegen::FramegenHudUniform_t ) );
+	pCmdBuffer->dispatch( div_roundup( slot.widthPixels, 8u ),
+		div_roundup( slot.heightPixels, 8u ) );
+	return nSlot;
+}
+
+static void framegen_hud_note_submit( int nSlot, uint64_t ulSeqNo )
+{
+	if ( nSlot >= 0 && static_cast<size_t>( nSlot ) < g_framegenHud.uploadSlots.size() )
+		g_framegenHud.uploadSlots[nSlot].lastSubmitSeqNo = ulSeqNo;
 }
 
 // An explicit GAMESCOPE_FRAMEGEN_FB_TOL is a manual tuning decision; the
@@ -12061,7 +12268,22 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		}
 	}
 
+	// The HUD is the final pass of a real composite. Capture/screenshot side
+	// composites and base-layer late composites are identified by their capture
+	// or override target and deliberately never enter this path; the direct
+	// pipewire copy above also happens before the HUD is drawn.
+	int nFramegenHudSlot = -1;
+	if ( framegen_hud_level() != 0u
+		&& !GetBackend()->UsesVulkanSwapchain()
+		&& !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr
+		&& vulkan_framegen_is_enabled() )
+	{
+		nFramegenHudSlot = framegen_hud_record(
+			cmdBuffer.get(), compositeImage, frameInfo );
+	}
+
 	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+	framegen_hud_note_submit( nFramegenHudSlot, sequence );
 
 	// Submitted separately, after the composite: the real frame's present
 	// waits on `sequence` only and is never delayed by framegen work.

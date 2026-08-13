@@ -2,10 +2,12 @@
 #include <catch2/catch_approx.hpp>
 
 #include "framegen/deadline.hpp"
+#include "framegen/hud.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 using Catch::Approx;
@@ -34,6 +36,68 @@ CausalPlanOptions_t dedicated_backup_options( uint64_t nowNs, uint64_t epoch )
 }
 
 } // namespace
+
+TEST_CASE( "framegen HUD level one formats the closed five-second window", "[framegen][hud]" )
+{
+	const FramegenHudSnapshot_t snapshot = {
+		.mode = GamescopeFramegenMode::Extrapolate,
+		.quality = GamescopeFramegenQuality::Ultra,
+		.multiplier = 2u,
+		.refreshMilliHz = 119'600u,
+		.real = 150u,
+		.delayedReal = 50u,
+		.generated = 390u,
+		.repeats = 10u,
+	};
+	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
+
+	REQUIRE( text.lineCount == 1u );
+	CHECK( text.lines[0].data()
+		== std::string_view{ "E2 U 120Hz  real 40/s  gen 78/s  rep 2/s" } );
+	CHECK( std::strlen( text.lines[0].data() ) <= k_uFramegenHudMaxColumns );
+}
+
+TEST_CASE( "framegen HUD level two remains structured at the 48-column limit", "[framegen][hud]" )
+{
+	const FramegenHudSnapshot_t snapshot = {
+		.mode = GamescopeFramegenMode::Motion,
+		.quality = GamescopeFramegenQuality::High,
+		.multiplier = 4u,
+		.refreshMilliHz = 120'000u,
+		.bidir = true,
+		.baseLayer = true,
+		.netActive = true,
+		.adapt = true,
+		.real = 200u,
+		.generated = 390u,
+		.repeats = 10u,
+		.biasTenthsMs = 1,
+		.deadlineHitPercent = 99u,
+		.pacingSdTenthsMs = 7u,
+		.netOnline = true,
+		.netTrainedSteps = 1'200u,
+		.netProfilePresent = true,
+	};
+	const FramegenHudText_t text = format_framegen_hud( 2u, snapshot );
+
+	REQUIRE( text.lineCount == 3u );
+	CHECK( text.lines[0].data()
+		== std::string_view{ "M4 BIDIR BASE NET ADAPT H 120Hz R40/s G78/s P2/s" } );
+	CHECK( text.lines[1].data()
+		== std::string_view{ "pace: bias +0.1ms  hit 99%  sd 0.7ms" } );
+	CHECK( text.lines[2].data()
+		== std::string_view{ "net: online, 1.2k steps, profile loaded" } );
+	for ( uint32_t line = 0u; line < text.lineCount; line++ )
+		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
+
+	const FramegenHudUniform_t uniform = make_framegen_hud_uniform( text, true );
+	CHECK( uniform.lineCount == 3u );
+	CHECK( uniform.widthChars == 48u );
+	CHECK( uniform.hdr == 1u );
+	CHECK( ( uniform.text[0] & 0xffu ) == static_cast<uint32_t>( 'M' ) );
+	CHECK( uniform.font[static_cast<uint32_t>( 'A' ) * 2u]
+		== static_cast<uint32_t>( k_uFramegenHudFont8x8[static_cast<uint32_t>( 'A' )] ) );
+}
 
 TEST_CASE( "30 fps on 120 Hz follows stable actual-grid phases", "[framegen][deadline]" )
 {

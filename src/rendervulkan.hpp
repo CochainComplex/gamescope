@@ -685,6 +685,7 @@ enum ShaderType {
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_PAIR_FP16,
+	SHADER_TYPE_FRAMEGEN_HUD,
 	SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR,
 	SHADER_TYPE_FRAMEGEN_MOTION_LUMA_PAIR_RGBA,
 	SHADER_TYPE_FRAMEGEN_MOTION_PYRAMID,
@@ -1010,6 +1011,10 @@ public:
 	std::shared_ptr<VulkanTimelineSemaphore_t> ImportTimelineSemaphore( gamescope::CTimeline *pTimeline );
 
 	static const uint32_t upload_buffer_size = 1920 * 1080 * 4;
+	// Tail padding for persistent reservations (HUD uniforms). The transient
+	// arena is sized to exactly fit its largest single upload, so persistent
+	// slices must come from extra capacity, never out of upload_buffer_size.
+	static const uint32_t upload_buffer_persistent_pad = 4096;
 
 	inline VkDevice device() { return m_device; }
 	inline VkPhysicalDevice physDev() {return m_physDev; }
@@ -1035,15 +1040,16 @@ public:
 
 	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size, uint32_t alignment = 16)
 	{
-		assert(size <= upload_buffer_size);
+		assert(size <= m_uploadBufferCapacity);
 		assert(alignment != 0 && (alignment & (alignment - 1)) == 0);
 
 		m_uploadBufferOffset = align(m_uploadBufferOffset, alignment);
-		if (m_uploadBufferOffset + size > upload_buffer_size)
+		if (m_uploadBufferOffset + size > m_uploadBufferCapacity)
 		{
 			fprintf(stderr, "Exceeded uploadBufferData\n");
 			waitIdle(false);
 		}
+		assert(m_uploadBufferOffset + size <= m_uploadBufferCapacity);
 
 		uint32_t uOffset = m_uploadBufferOffset;
 
@@ -1055,6 +1061,22 @@ public:
 	inline std::pair<void *, uint32_t> uploadUniformBufferData(uint32_t size)
 	{
 		return uploadBufferData(size, m_uniformBufferOffsetAlignment);
+	}
+
+	// Reserve fixed, aligned slices at the tail of the existing mapped upload
+	// arena. The HUD uses two only when requested, avoiding a separate buffer or
+	// descriptor-allocation path.
+	inline std::pair<void *, uint32_t> reservePersistentUniformBufferData(uint32_t size)
+	{
+		const uint32_t alignedSize = align(size, m_uniformBufferOffsetAlignment);
+		assert(m_uploadBufferOffset == 0u);
+		assert(alignedSize <= m_uploadBufferCapacity);
+		m_uploadBufferCapacity =
+			(m_uploadBufferCapacity - alignedSize) & ~(m_uniformBufferOffsetAlignment - 1u);
+		return {
+			static_cast<uint8_t *>(m_uploadBufferData) + m_uploadBufferCapacity,
+			m_uploadBufferCapacity,
+		};
 	}
 
 	#define VK_FUNC(x) PFN_vk##x x = nullptr;
@@ -1142,6 +1164,7 @@ protected:
 	VkDeviceMemory m_uploadBufferMemory;
 	void *m_uploadBufferData;
 	uint32_t m_uploadBufferOffset = 0;
+	uint32_t m_uploadBufferCapacity = upload_buffer_size + upload_buffer_persistent_pad;
 	uint32_t m_uniformBufferOffsetAlignment = 16;
 
 	VkSemaphore m_scratchTimelineSemaphore;
@@ -1239,6 +1262,7 @@ public:
 	// generated frames from one dispatch. Cleared by bindTarget()/state reset.
 	void bindTarget2(gamescope::Rc<CVulkanTexture> target);
 	void clearState();
+	void bindUploadedConstants(uint32_t offset, uint32_t size);
 	template<class PushData, class... Args>
 	void uploadConstants(Args&&... args);
 	template<class PushData, class... Args>
