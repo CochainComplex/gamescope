@@ -5,10 +5,10 @@
 ### The scoop, in eight lines
 
 - **Derived from Valve's gamescope** — everything gamescope does, plus a frame-generation engine in the compositor.
-- **Harvests your idle second GPU**: the strong card renders the game untouched; the spare/old/integrated card next to it invents the in-between frames. Any Vulkan GPUs, mixed vendors — NVIDIA renders, AMD presents, Intel welcome.
+- **Harvests your idle second GPU**: the strong card renders the game untouched; the spare/old/integrated card next to it invents the in-between frames. Mixed vendors by design — NVIDIA-renders/AMD-presents is the validated pair; other Vulkan combinations should work but haven't been proven yet.
 - **An advanced poor man's DLSS/FSR frame gen**: no tensor cores, no engine hooks, no per-game work — it sees only finished frames and estimates motion itself.
 - **Reverse VRR** — a poor man's VRR, mirrored: instead of bending the display clock to the game, it bends the *content* onto your display's natural rhythm — every generated frame is planned against a real vblank deadline.
-- **Zero-added-latency by default**: forward prediction, continuously *taught by interpolation hindsight* — every arriving frame becomes ground truth that grades and trains the predictor.
+- **No frame buffering by default**: forward prediction never holds a real frame back and drops late generated work instead of waiting — continuously *taught by interpolation hindsight*, since every arriving frame becomes ground truth that grades and trains the predictor.
 - **True interpolation on demand** (bidir mode) when you'll trade one frame of latency for maximum smoothness.
 - **It learns your game while you play** — a tiny in-situ-trained net with per-game profiles, bounded so it can only veto motion, never invent detail.
 - **Honest by design**: your in-game FPS counter keeps showing the *real* rate; `GAMESCOPE_FRAMEGEN_METRICS=1` shows what your screen actually gets.
@@ -20,10 +20,13 @@ fast motion lose most of their judder — without buying a new GPU. The card doi
 generation is one you already own: the iGPU in your laptop, the old card from your
 last upgrade, the second slot in your desktop.
 
-**Competitive / pro:** the default mode is built around one promise — **your inputs
-and your real frames are never touched**. The game renders at full speed on its own
-card, real frames always win the display, and generation only fills vblanks that
-would have shown a repeat anyway. What you gain is **motion clarity**: tracking a
+**Competitive / pro:** the default mode is built around one promise — **no real frame
+is ever delayed behind generated work, and late generation is dropped, never waited
+for**. The game renders at full speed on its own card, real frames always win the
+display, and generation only fills vblanks that would have shown a repeat anyway.
+(Full honesty: running a compositor at all replaces direct scanout, so measure your
+own input feel — the algorithm adds no frame buffering, but the compositor is not
+literally free.) What you gain is **motion clarity**: tracking a
 target through a smooth 120 Hz sweep instead of a 45 fps judder makes the *real*
 information easier to read. What you don't gain is reaction time — generated frames
 carry no new input, and nothing here (or in DLSS/FSR framegen) changes that. Skip
@@ -60,7 +63,7 @@ Gameslop's whole reason to exist is to put the generation on a **second, cheaper
 - a **weak "present" card — ⚠️ this must be the GPU your display is physically connected to** — generates the in-between frames *and* drives the display;
 - the two are bridged over dma-buf.
 
-The generation is essentially **free** because it runs on silicon that would otherwise sit idle. Normally that present card does almost nothing — it just composites and flips *finished* frames straight to the screen, which barely touches it. Gameslop spends that leftover budget doing **more than passthrough**: instead of forwarding a frame and waiting for the next real one, the present card uses its idle time to estimate motion and **synthesise extra frames** in the gap, while its consistency checks try to keep the artifacts down. That second card can be a laptop iGPU (e.g. an AMD 890M), an old GPU you never threw out (a 5700 XT), or the second card in a desktop — cheap hardware doing the work a new flagship would charge you a fortune for.
+The generation runs on silicon that would otherwise sit mostly idle — not literally free, but paid from a budget nothing else was using. Normally that present card does almost nothing — it just composites and flips *finished* frames straight to the screen, which barely touches it. Gameslop spends that leftover budget doing **more than passthrough**: instead of forwarding a frame and waiting for the next real one, the present card uses its idle time to estimate motion and **synthesise extra frames** in the gap, while its consistency checks try to keep the artifacts down. That second card can be a laptop iGPU (e.g. an AMD 890M), an old GPU you never threw out (a 5700 XT), or the second card in a desktop — cheap hardware doing the work a new flagship would charge you a fortune for.
 
 **When a single GPU *is* worth it (the exception):** only when you have GPU headroom to spare and no better option — typically an **older game that can't use FSR/DLSS frame generation** and doesn't fully load your (good) card. Then spending that idle headroom on generated frames is a real win. For a modern game that already pegs your GPU, single-GPU framegen just robs Peter to pay Paul — use the game's built-in frame generation instead.
 
@@ -79,7 +82,7 @@ Under the hood it's a staged, self-correcting motion pipeline:
 - **Extrapolate *or* interpolate** — default **forward extrapolation** (zero added latency), or true **bidirectional interpolation** (warp *both* real frames to the in-between phase, confidence-blend, phase-correct crossfade in the gaps) for the smoothest motion at the cost of ~1 frame of latency.
 - **It learns** — a small (~4.6k-param) **convolutional refiner net** cleans up the motion fields (bounded flow residual + confidence recalibration), trainable offline from captured frames *or* **learning in-situ on the GPU while you play**, with per-game persistence. In Extreme, its zero-neutral fourth head learns whether aligned lighting/color trends persist across three causal real frames; the warp applies only a tightly bounded analytic correction. On top of that a **self-supervised loop** grades every real frame against the prediction that targeted it and auto-tunes its own thresholds.
 - **Pacing & display** — an **absolute-deadline scheduler** plans one slot at a time against the real vblank grid, corrects its anchor from tagged pageflip feedback, and *learns* the display chain's present lead instead of rediscovering it; a **VRR/adaptive-sync-compatible** hybrid; and a **base-layer** path that composites HUD/cursor *after* generation so UI text stays crisp.
-- **Engineering** — generation runs on a **dedicated async-compute queue** so it can never stall the real frame; **zero-copy** history; **fp16** + vendor-aware shader dispatch; and a **deadline-driven degradation ladder** that measures its own GPU time and sheds quality *before* it misses a vblank.
+- **Engineering** — generation runs on a **dedicated async-compute queue** so it never queues ahead of the real frame (it still shares the silicon — the degradation ladder exists precisely because contention is real); **zero-copy** history; **fp16** + vendor-aware shader dispatch; and a **deadline-driven degradation ladder** that measures its own GPU time and sheds quality *before* it misses a vblank.
 
 ### How it maps to the state of the art
 
