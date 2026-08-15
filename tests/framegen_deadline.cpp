@@ -67,7 +67,7 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	};
 	const FramegenHudText_t text = format_framegen_hud( 2u, snapshot );
 
-	REQUIRE( text.lineCount == 6u );
+	REQUIRE( text.lineCount == 7u );
 	CHECK( text.lines[0].data() == std::string_view{
 		"gameslop 0.1.0+76e6d5         motion x2 . high . 120Hz fixed" } );
 	CHECK( text.lines[1].data() == std::string_view{
@@ -75,20 +75,22 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	CHECK( text.lines[2].data() == std::string_view{
 		"modes    bidir:off  base:off  net:online  adapt:on" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"rates    game 40fps  gen 78fps  repeat 2fps  fill 118/120" } );
+		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 118/120" } );
+	CHECK( text.lines[4].data() == std::string_view{
+		"ladder   high/motion rung 0/0  full" } );
 	std::string paceLine = "pace     hit 99%  ";
 	paceLine.append( k_nFramegenHudSparklineSamples, '\x08' );
 	paceLine += "   jitter +/-0.7ms  ";
 	paceLine.append( k_nFramegenHudSparklineSamples, '\x02' );
-	CHECK( text.lines[4].data() == paceLine );
-	CHECK( text.lines[5].data() == std::string_view{
+	CHECK( text.lines[5].data() == paceLine );
+	CHECK( text.lines[6].data() == std::string_view{
 		"net      online . 1.2k steps . profile loaded" } );
 	for ( uint32_t line = 0u; line < text.lineCount; line++ )
 		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
 
 	const FramegenHudUniform_t uniform = make_framegen_hud_uniform( text, true );
-	CHECK( uniform.lineCount == 6u );
-	CHECK( uniform.widthChars == 62u );
+	CHECK( uniform.lineCount == 7u );
+	CHECK( uniform.widthChars == 66u );
 	CHECK( uniform.hdr == 1u );
 	CHECK( ( uniform.text[0] & 0xffu ) == static_cast<uint32_t>( 'g' ) );
 	CHECK( uniform.font[static_cast<uint32_t>( 'A' ) * 2u]
@@ -111,7 +113,7 @@ TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hu
 	};
 	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
 
-	REQUIRE( text.lineCount == 4u );
+	REQUIRE( text.lineCount == 5u );
 	CHECK( text.lines[1].data() == std::string_view{
 		"present  AMD Radeon RX 5700   buffers local" } );
 	CHECK( text.lines[2].data() == std::string_view{
@@ -152,13 +154,52 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	};
 	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
 
-	REQUIRE( text.lineCount == 4u );
+	REQUIRE( text.lineCount == 5u );
 	CHECK( text.lines[1].data() == std::string_view{
 		"present  AMD Radeon 890M      buffers local" } );
 	CHECK( text.lines[2].data() == std::string_view{
 		"modes    bidir:off  base:off  net:off  adapt:off" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"rates    game 40fps  gen 78fps  repeat 2fps  fill 118/120" } );
+		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 118/120" } );
+	CHECK( text.lines[4].data() == std::string_view{
+		"ladder   high/motion rung 0/0  full" } );
+}
+
+TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
+{
+	FramegenHudSnapshot_t snapshot = {
+		.mode = GamescopeFramegenMode::Extrapolate,
+		.quality = GamescopeFramegenQuality::Medium,
+		.refreshMilliHz = 120'000u,
+		.real = 1'234u,
+		.generated = 56'789u,
+		.ladderSteps = 2u,
+		.ladderMaxSteps = 4u,
+		.ladderHold = 3u,
+		.ladderRecoveryBackoffDecisions = 90u,
+	};
+	FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
+	CHECK( text.lines[3].data() == std::string_view{
+		"rates    source 246fps[1.2k] gen 999fps[56.8k] repeat 0fps fill 999/120" } );
+	CHECK( text.lines[4].data() == std::string_view{
+		"ladder   medium/extrapolate rung 2/4  hold" } );
+
+	snapshot.ladderHold = 0u;
+	snapshot.ladderRecoveryProbationRemaining = 46u;
+	text = format_framegen_hud( 1u, snapshot );
+	CHECK( text.lines[4].data() == std::string_view{
+		"ladder   medium/extrapolate rung 2/4  probation 2s" } );
+
+	snapshot.ladderRecoveryProbationRemaining = 0u;
+	snapshot.ladderRecoveryDecisionsSinceClimb = 44u;
+	text = format_framegen_hud( 1u, snapshot );
+	CHECK( text.lines[4].data() == std::string_view{
+		"ladder   medium/extrapolate rung 2/4  recover in 2s" } );
+
+	snapshot.ladderRecoveryDecisionsSinceClimb = 90u;
+	text = format_framegen_hud( 1u, snapshot );
+	CHECK( text.lines[4].data() == std::string_view{
+		"ladder   medium/extrapolate rung 2/4  watching" } );
 }
 
 TEST_CASE( "framegen HUD sparkline mapping is monotone and saturated",
@@ -298,14 +339,14 @@ TEST_CASE( "flip feedback corrects future causal anchors", "[framegen][deadline]
 		.epoch = 3u,
 	};
 	const AnchorCorrection_t large = apply_flip_feedback(
-		anchor, matureBias, 9u, 2'301u, 300u );
+		anchor, matureBias, 9u, 2'301u, 300u, 1'000u );
 	REQUIRE( large.matched );
 	CHECK( large.discardProvisional );
 	REQUIRE( large.anchor.correctedFlipNs );
 	CHECK( *large.anchor.correctedFlipNs == 2'301u );
 
 	const AnchorCorrection_t small = apply_flip_feedback(
-		anchor, matureBias, 9u, 2'299u, 300u );
+		anchor, matureBias, 9u, 2'299u, 300u, 1'000u );
 	REQUIRE( small.matched );
 	CHECK_FALSE( small.discardProvisional );
 	const DisplayGrid_t grid = { .D0 = 2'000u, .W0 = 1'999u, .T = 500u };
@@ -327,14 +368,14 @@ TEST_CASE( "large anchor correction discards only matching provisional slots", "
 		.epoch = 1u,
 	};
 	const AnchorCorrection_t correction = apply_flip_feedback(
-		anchor, matureBias, 42u, 18'334u, 300u );
+		anchor, matureBias, 42u, 18'334u, 300u, 8'334u );
 	REQUIRE( correction.discardProvisional );
 	CHECK( discard_pending_provisional_slot( correction, 42u, true ) );
 	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, false ) );
 	CHECK_FALSE( discard_pending_provisional_slot( correction, 41u, true ) );
 
 	const AnchorCorrection_t small = apply_flip_feedback(
-		anchor, matureBias, 42u, 10'300u, 300u );
+		anchor, matureBias, 42u, 10'300u, 300u, 8'334u );
 	CHECK_FALSE( discard_pending_provisional_slot( small, 42u, true ) );
 }
 
@@ -365,7 +406,7 @@ TEST_CASE( "one-vblank late provisional anchor changes the generated phase", "[f
 			.samples = k_uPresentBiasWarmupSamples,
 			.consecutiveGuardExceeds = 1u,
 		},
-		7u, 100'000'000u, interval / 32u );
+		7u, 100'000'000u, interval / 32u, interval );
 	REQUIRE( correction.discardProvisional );
 	const CausalSlotPlan_t after = plan_next_causal_slot(
 		grid, correction.anchor, cadence,
@@ -392,7 +433,8 @@ TEST_CASE( "present bias converges during warmup without discarding pixels", "[f
 			.epoch = 1u,
 		};
 		const AnchorCorrection_t correction = apply_flip_feedback(
-			anchor, bias, frame, rawTargetNs + intervalNs, guardNs );
+			anchor, bias, frame, rawTargetNs + intervalNs, guardNs,
+			intervalNs );
 		REQUIRE( correction.matched );
 		CHECK_FALSE( correction.discardProvisional );
 		bias = correction.presentBias;
@@ -431,7 +473,7 @@ TEST_CASE( "present-bias outliers require two consecutive guard failures", "[fra
 		};
 		const AnchorCorrection_t correction = apply_flip_feedback(
 			anchor, bias, frame, rawTargetNs + baselineLeadNs + extraLeadNs,
-			guardNs );
+			guardNs, 10'000u );
 		bias = correction.presentBias;
 		frame++;
 		rawTargetNs += 10'000u;
@@ -443,6 +485,83 @@ TEST_CASE( "present-bias outliers require two consecutive guard failures", "[fra
 	CHECK( bias.consecutiveGuardExceeds == 0u );
 	CHECK_FALSE( feedback( spikeNs ).discardProvisional );
 	CHECK( feedback( spikeNs ).discardProvisional );
+}
+
+TEST_CASE( "mature present-bias outlier is not folded", "[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'333u;
+	constexpr PresentBiasState_t mature = {
+		.emaNs = 8'000,
+		.samples = k_uPresentBiasWarmupSamples,
+	};
+	constexpr uint64_t outlierNs = 8'000u + intervalNs;
+	constexpr PresentBiasUpdate_t update = update_present_bias(
+		mature, 100'000u, 100'000u + outlierNs, 300u,
+		intervalNs, false );
+	constexpr PresentBiasUpdate_t hitchUpdate = update_present_bias(
+		mature, 100'000u, 100'100u, 300u, intervalNs, true );
+
+	STATIC_REQUIRE( update.residualNs == static_cast<int64_t>( outlierNs ) );
+	STATIC_REQUIRE( update.state.emaNs == mature.emaNs );
+	STATIC_REQUIRE( update.state.samples == mature.samples );
+	STATIC_REQUIRE( update.state.consecutiveGuardExceeds == 1u );
+	STATIC_REQUIRE_FALSE( update.discardProvisional );
+	STATIC_REQUIRE( hitchUpdate.state.emaNs == mature.emaNs );
+	STATIC_REQUIRE( hitchUpdate.state.samples == mature.samples );
+}
+
+TEST_CASE( "normal present-bias residual still folds one eighth", "[framegen][deadline]" )
+{
+	constexpr PresentBiasState_t mature = {
+		.emaNs = 8'000,
+		.samples = k_uPresentBiasWarmupSamples,
+	};
+	constexpr PresentBiasUpdate_t update = update_present_bias(
+		mature, 100'000u, 100'800u, 1'000u, 8'333u, false );
+
+	STATIC_REQUIRE( update.state.emaNs == 8'100 );
+	STATIC_REQUIRE( update.state.samples == mature.samples + 1u );
+	STATIC_REQUIRE( update.state.consecutiveGuardExceeds == 0u );
+}
+
+TEST_CASE( "present-bias warmup still folds outlier and hitch samples", "[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'333u;
+	constexpr PresentBiasState_t warming = {
+		.emaNs = 8'000,
+		.samples = k_uPresentBiasWarmupSamples - 1u,
+	};
+	constexpr int64_t residualNs = 8'000 + static_cast<int64_t>( intervalNs );
+	constexpr PresentBiasUpdate_t update = update_present_bias(
+		warming, 100'000u,
+		100'000u + static_cast<uint64_t>( residualNs ),
+		300u, intervalNs, true );
+
+	STATIC_REQUIRE( update.state.emaNs == warming.emaNs + residualNs / 8 );
+	STATIC_REQUIRE( update.state.samples == k_uPresentBiasWarmupSamples );
+	STATIC_REQUIRE( update.state.consecutiveGuardExceeds == 0u );
+}
+
+TEST_CASE( "discard-only present-bias outliers retain the two-strike guard",
+	"[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'333u;
+	constexpr PresentBiasState_t mature = {
+		.emaNs = 8'000,
+		.samples = k_uPresentBiasWarmupSamples,
+	};
+	constexpr uint64_t outlierNs = 8'000u + intervalNs;
+	constexpr PresentBiasUpdate_t first = update_present_bias(
+		mature, 100'000u, 100'000u + outlierNs, 300u,
+		intervalNs, false );
+	constexpr PresentBiasUpdate_t second = update_present_bias(
+		first.state, 200'000u, 200'000u + outlierNs, 300u,
+		intervalNs, false );
+
+	STATIC_REQUIRE_FALSE( first.discardProvisional );
+	STATIC_REQUIRE( second.discardProvisional );
+	STATIC_REQUIRE( second.state.emaNs == mature.emaNs );
+	STATIC_REQUIRE( second.state.samples == mature.samples );
 }
 
 TEST_CASE( "deadline hit arithmetic uses the biased target", "[framegen][deadline]" )
@@ -1132,4 +1251,227 @@ TEST_CASE( "slot budget applies 0.85 to actual remaining time", "[framegen][dead
 	CHECK( deadline_cost_fits( 4'250u, 20'000u, 10'000u, 15'000u ) );
 	CHECK_FALSE( deadline_cost_fits( 4'251u, 20'000u, 10'000u, 15'000u ) );
 	CHECK_FALSE( deadline_cost_fits( 1u, 20'000u, 10'000u, 20'000u ) );
+}
+
+TEST_CASE( "deadline ladder recovers after sustained measured headroom",
+	"[framegen][deadline][recovery]" )
+{
+	RecoveryState_t state;
+	LadderRecoveryEvaluation_t evaluation;
+	for ( uint32_t decision = 1u;
+		decision <= k_uDeadlineRecoveryHeadroomDecisions; decision++ )
+	{
+		evaluation = evaluate_ladder_recovery(
+			state, 3u, 0u,
+			5'000u, k_uDeadlineMinSamples,
+			9'000u, k_uDeadlineMinSamples,
+			10'000u );
+		state = evaluation.state;
+		CHECK( evaluation.tryRecover
+			== ( decision == k_uDeadlineRecoveryHeadroomDecisions ) );
+	}
+	CHECK( state.streak == k_uDeadlineRecoveryHeadroomDecisions );
+
+	state = commit_ladder_recovery( state );
+	CHECK( state.streak == 0u );
+	CHECK( state.decisionsSinceClimb == 0u );
+	CHECK( state.probationRemaining
+		== k_uDeadlineRecoveryProbationDecisions );
+	for ( uint32_t decision = 0u;
+		decision < k_uDeadlineRecoveryHeadroomDecisions; decision++ )
+	{
+		const LadderRecoveryEvaluation_t probation =
+			evaluate_ladder_recovery(
+				state, 2u, 0u,
+				5'000u, k_uDeadlineMinSamples,
+				9'000u, k_uDeadlineMinSamples,
+				10'000u );
+		state = probation.state;
+		CHECK_FALSE( probation.tryRecover );
+	}
+}
+
+TEST_CASE( "deadline ladder recovery requires large current-rung headroom",
+	"[framegen][deadline][recovery]" )
+{
+	RecoveryState_t knownState;
+	RecoveryState_t coldState;
+	for ( uint32_t decision = 0u;
+		decision < k_uDeadlineRecoveryHeadroomDecisions * 2u; decision++ )
+	{
+		const LadderRecoveryEvaluation_t known = evaluate_ladder_recovery(
+			knownState, 2u, 0u,
+			5'001u, k_uDeadlineMinSamples,
+			9'000u, k_uDeadlineMinSamples,
+			10'000u );
+		knownState = known.state;
+		CHECK_FALSE( known.tryRecover );
+
+		const LadderRecoveryEvaluation_t cold = evaluate_ladder_recovery(
+			coldState, 2u, 0u,
+			3'501u, k_uDeadlineMinSamples,
+			0u, 0u, 10'000u );
+		coldState = cold.state;
+		CHECK_FALSE( cold.tryRecover );
+	}
+
+	CHECK( deadline_recovery_headroom(
+		3'500u, k_uDeadlineMinSamples, 0u, 0u, 10'000u ) );
+	CHECK_FALSE( deadline_recovery_headroom(
+		5'000u, k_uDeadlineMinSamples,
+		10'001u, k_uDeadlineMinSamples, 10'000u ) );
+}
+
+TEST_CASE( "deadline ladder miss resets the recovery streak",
+	"[framegen][deadline][recovery]" )
+{
+	RecoveryState_t state;
+	for ( uint32_t decision = 1u;
+		decision < k_uDeadlineRecoveryHeadroomDecisions; decision++ )
+	{
+		const LadderRecoveryEvaluation_t evaluation =
+			evaluate_ladder_recovery(
+				state, 1u, 0u,
+				5'000u, k_uDeadlineMinSamples,
+				9'000u, k_uDeadlineMinSamples,
+				10'000u );
+		state = evaluation.state;
+		CHECK_FALSE( evaluation.tryRecover );
+	}
+	CHECK( state.streak == k_uDeadlineRecoveryHeadroomDecisions - 1u );
+
+	state = note_ladder_recovery_failure( state );
+	CHECK( state.streak == 0u );
+	for ( uint32_t decision = 1u;
+		decision < k_uDeadlineRecoveryHeadroomDecisions; decision++ )
+	{
+		const LadderRecoveryEvaluation_t evaluation =
+			evaluate_ladder_recovery(
+				state, 1u, 0u,
+				5'000u, k_uDeadlineMinSamples,
+				9'000u, k_uDeadlineMinSamples,
+				10'000u );
+		state = evaluation.state;
+		CHECK_FALSE( evaluation.tryRecover );
+	}
+	const LadderRecoveryEvaluation_t recovered = evaluate_ladder_recovery(
+		state, 1u, 0u,
+		5'000u, k_uDeadlineMinSamples,
+		9'000u, k_uDeadlineMinSamples,
+		10'000u );
+	CHECK( recovered.tryRecover );
+}
+
+TEST_CASE( "deadline ladder recovery doubles backoff after a flap",
+	"[framegen][deadline][recovery]" )
+{
+	RecoveryState_t state = commit_ladder_recovery( RecoveryState_t{} );
+	state = note_ladder_recovery_degradation( state );
+	CHECK( state.backoffDecisions
+		== k_uDeadlineRecoveryBaseBackoffDecisions * 2u );
+	CHECK( state.decisionsSinceClimb == 0u );
+
+	for ( uint32_t decision = 1u;
+		decision < state.backoffDecisions; decision++ )
+	{
+		const LadderRecoveryEvaluation_t evaluation =
+			evaluate_ladder_recovery(
+				state, 1u, 0u,
+				5'000u, k_uDeadlineMinSamples,
+				9'000u, k_uDeadlineMinSamples,
+				10'000u );
+		state = evaluation.state;
+		CHECK_FALSE( evaluation.tryRecover );
+	}
+	const LadderRecoveryEvaluation_t recovered = evaluate_ladder_recovery(
+		state, 1u, 0u,
+		5'000u, k_uDeadlineMinSamples,
+		9'000u, k_uDeadlineMinSamples,
+		10'000u );
+	CHECK( recovered.tryRecover );
+}
+
+TEST_CASE( "deadline ladder reports a blocked recovery threshold once per backoff",
+	"[framegen][deadline][recovery]" )
+{
+	RecoveryState_t state = {
+		.backoffDecisions = k_uDeadlineRecoveryHeadroomDecisions * 2u,
+	};
+	for ( uint32_t decision = 1u;
+		decision < k_uDeadlineRecoveryHeadroomDecisions; decision++ )
+	{
+		const LadderRecoveryEvaluation_t evaluation =
+			evaluate_ladder_recovery(
+				state, 1u, 0u,
+				5'000u, k_uDeadlineMinSamples,
+				9'000u, k_uDeadlineMinSamples,
+				10'000u );
+		state = evaluation.state;
+		CHECK_FALSE( evaluation.reportBlockedThreshold );
+	}
+
+	LadderRecoveryEvaluation_t blocked = evaluate_ladder_recovery(
+		state, 1u, 0u,
+		5'000u, k_uDeadlineMinSamples,
+		9'000u, k_uDeadlineMinSamples,
+		10'000u );
+	state = blocked.state;
+	CHECK_FALSE( blocked.tryRecover );
+	CHECK( blocked.reportBlockedThreshold );
+
+	state = reset_ladder_recovery_streak( state );
+	for ( uint32_t decision = 0u;
+		decision < k_uDeadlineRecoveryHeadroomDecisions; decision++ )
+	{
+		blocked = evaluate_ladder_recovery(
+			state, 1u, 1u,
+			5'000u, k_uDeadlineMinSamples,
+			9'000u, k_uDeadlineMinSamples,
+			10'000u );
+		state = blocked.state;
+		CHECK_FALSE( blocked.reportBlockedThreshold );
+	}
+
+	state = note_ladder_recovery_degradation( state );
+	CHECK_FALSE( state.blockedThresholdReported );
+}
+
+TEST_CASE( "deadline ladder recovery backoff caps and relaxes on probation",
+	"[framegen][deadline][recovery]" )
+{
+	RecoveryState_t state = {
+		.backoffDecisions = 1'440u,
+		.probationRemaining = 1u,
+	};
+	state = note_ladder_recovery_degradation( state );
+	CHECK( state.backoffDecisions
+		== k_uDeadlineRecoveryMaxBackoffDecisions );
+	state = commit_ladder_recovery( state );
+	state = note_ladder_recovery_degradation( state );
+	CHECK( state.backoffDecisions
+		== k_uDeadlineRecoveryMaxBackoffDecisions );
+
+	state.backoffDecisions = k_uDeadlineRecoveryBaseBackoffDecisions * 2u;
+	state.probationRemaining = 1u;
+	state = advance_ladder_recovery_decision( state, true );
+	CHECK( state.backoffDecisions
+		== k_uDeadlineRecoveryBaseBackoffDecisions );
+	CHECK( state.probationRemaining == 0u );
+}
+
+TEST_CASE( "deadline ladder scene reset restores base recovery backoff",
+	"[framegen][deadline][recovery]" )
+{
+	RecoveryState_t state = {
+		.streak = 47u,
+		.backoffDecisions = k_uDeadlineRecoveryMaxBackoffDecisions,
+		.probationRemaining = 12u,
+		.decisionsSinceClimb = 400u,
+	};
+	state = {};
+	CHECK( state.streak == 0u );
+	CHECK( state.backoffDecisions
+		== k_uDeadlineRecoveryBaseBackoffDecisions );
+	CHECK( state.probationRemaining == 0u );
+	CHECK( state.decisionsSinceClimb == 0u );
 }

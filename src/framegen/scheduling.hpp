@@ -22,6 +22,16 @@ inline constexpr uint64_t k_uDeadlinePercent = 85u;
 inline constexpr uint32_t k_uDeadlineMinSamples = 3u;
 inline constexpr uint32_t k_uDeadlineHoldFrames = 4u;
 
+// Recovery is deliberately much slower than degradation. At the real-game
+// reference cadence of 45 decisions/s these are approximately two seconds of
+// evidence, five seconds of probation, and a one-minute maximum back-off.
+inline constexpr uint32_t k_uDeadlineRecoveryHeadroomDecisions = 90u;
+inline constexpr uint32_t k_uDeadlineRecoveryBaseBackoffDecisions = 90u;
+inline constexpr uint32_t k_uDeadlineRecoveryProbationDecisions = 225u;
+inline constexpr uint32_t k_uDeadlineRecoveryMaxBackoffDecisions = 2'700u;
+inline constexpr uint64_t k_uDeadlineRecoveryKnownHeadroomPercent = 50u;
+inline constexpr uint64_t k_uDeadlineRecoveryColdHeadroomPercent = 35u;
+
 // One-slot deadline pacing measures the two materially different causal
 // submission shapes independently.
 enum class DeadlineWorkClass_t : uint8_t
@@ -267,6 +277,175 @@ struct DeadlineLadderEvaluation
 	DeadlineLadderState state;
 	bool tryDegrade;
 };
+
+// Scene-local recovery state. decisionsSinceClimb also measures from the last
+// failed recovery (a degradation), so every new climb is separated from that
+// transition by the current back-off. Default construction is the scene reset.
+struct RecoveryState_t
+{
+	uint32_t streak = 0u;
+	uint32_t backoffDecisions = k_uDeadlineRecoveryBaseBackoffDecisions;
+	uint32_t probationRemaining = 0u;
+	uint32_t decisionsSinceClimb = 0u;
+	bool blockedThresholdReported = false;
+};
+
+struct LadderRecoveryEvaluation_t
+{
+	RecoveryState_t state;
+	bool tryRecover = false;
+	bool reportBlockedThreshold = false;
+};
+
+[[nodiscard]] constexpr uint32_t saturating_increment_decisions(
+	uint32_t decisions )
+{
+	return decisions == UINT32_MAX ? decisions : decisions + 1u;
+}
+
+// Advance time for one admission/generation decision. Probation is successful
+// when the recovered rung survives its whole window without degrading again.
+// Measured-cost admission failures reset evidence but do not themselves
+// increase back-off; the existing degradation decision does that if the
+// failure forces a step.
+[[nodiscard]] constexpr RecoveryState_t advance_ladder_recovery_decision(
+	RecoveryState_t state, bool admittedGenerated )
+{
+	state.decisionsSinceClimb = saturating_increment_decisions(
+		state.decisionsSinceClimb );
+	if ( state.probationRemaining > 0u )
+	{
+		state.probationRemaining--;
+		if ( state.probationRemaining == 0u && admittedGenerated )
+		{
+			state.backoffDecisions = std::max(
+				k_uDeadlineRecoveryBaseBackoffDecisions,
+				state.backoffDecisions / 2u );
+		}
+	}
+	return state;
+}
+
+// A causal miss or measured-cost admission failure breaks consecutiveness.
+// This form advances the controller's decision clocks;
+// reset_ladder_recovery_streak is for a generation-too-slow outcome belonging
+// to a decision that was already counted.
+[[nodiscard]] constexpr RecoveryState_t note_ladder_recovery_failure(
+	RecoveryState_t state )
+{
+	state = advance_ladder_recovery_decision( state, false );
+	state.streak = 0u;
+	return state;
+}
+
+[[nodiscard]] constexpr RecoveryState_t reset_ladder_recovery_streak(
+	RecoveryState_t state )
+{
+	state.streak = 0u;
+	return state;
+}
+
+// A degradation during probation is a failed recovery probe. Double the wait
+// for the rest of the scene (saturating at one minute), then measure the next
+// back-off from this fallback rather than from the preceding climb.
+[[nodiscard]] constexpr RecoveryState_t note_ladder_recovery_degradation(
+	RecoveryState_t state )
+{
+	if ( state.probationRemaining > 0u )
+	{
+		state.backoffDecisions = state.backoffDecisions
+			>= k_uDeadlineRecoveryMaxBackoffDecisions / 2u
+			? k_uDeadlineRecoveryMaxBackoffDecisions
+			: std::min( k_uDeadlineRecoveryMaxBackoffDecisions,
+				state.backoffDecisions * 2u );
+	}
+	state.streak = 0u;
+	state.probationRemaining = 0u;
+	state.decisionsSinceClimb = 0u;
+	state.blockedThresholdReported = false;
+	return state;
+}
+
+[[nodiscard]] constexpr RecoveryState_t commit_ladder_recovery(
+	RecoveryState_t state )
+{
+	state.streak = 0u;
+	state.probationRemaining = k_uDeadlineRecoveryProbationDecisions;
+	state.decisionsSinceClimb = 0u;
+	state.blockedThresholdReported = false;
+	return state;
+}
+
+[[nodiscard]] constexpr uint64_t deadline_budget_ns( uint64_t availableNs )
+{
+	return ( availableNs / 100u ) * k_uDeadlinePercent
+		+ ( ( availableNs % 100u ) * k_uDeadlinePercent ) / 100u;
+}
+
+[[nodiscard]] constexpr bool deadline_recovery_headroom(
+	uint64_t currentRungCostNs, uint32_t currentRungSamples,
+	uint64_t richerRungCostNs, uint32_t richerRungSamples,
+	uint64_t budgetNs )
+{
+	if ( currentRungCostNs == 0u
+		|| currentRungSamples < k_uDeadlineMinSamples
+		|| budgetNs == 0u )
+		return false;
+
+	const bool richerMature = richerRungCostNs != 0u
+		&& richerRungSamples >= k_uDeadlineMinSamples;
+	if ( richerMature )
+	{
+		return richerRungCostNs <= budgetNs
+			&& currentRungCostNs <=
+				( budgetNs / 100u )
+					* k_uDeadlineRecoveryKnownHeadroomPercent
+				+ ( ( budgetNs % 100u )
+					* k_uDeadlineRecoveryKnownHeadroomPercent ) / 100u;
+	}
+
+	return currentRungCostNs <=
+		( budgetNs / 100u ) * k_uDeadlineRecoveryColdHeadroomPercent
+		+ ( ( budgetNs % 100u )
+			* k_uDeadlineRecoveryColdHeadroomPercent ) / 100u;
+}
+
+// Observe exactly one admitted/generated decision. The renderer supplies the
+// current decision's already-margin-adjusted budget and commits at most the
+// adjacent richer rung when tryRecover is true.
+[[nodiscard]] constexpr LadderRecoveryEvaluation_t evaluate_ladder_recovery(
+	RecoveryState_t state, uint32_t currentDegradeSteps,
+	uint32_t degradeHoldFrames, uint64_t currentRungCostNs,
+	uint32_t currentRungSamples, uint64_t richerRungCostNs,
+	uint32_t richerRungSamples, uint64_t budgetNs )
+{
+	state = advance_ladder_recovery_decision( state, true );
+	if ( currentDegradeSteps == 0u
+		|| !deadline_recovery_headroom(
+			currentRungCostNs, currentRungSamples,
+			richerRungCostNs, richerRungSamples, budgetNs ) )
+	{
+		state.streak = 0u;
+		return { state, false };
+	}
+
+	state.streak = saturating_increment_decisions( state.streak );
+	const bool backoffElapsed = state.decisionsSinceClimb
+		>= state.backoffDecisions;
+	const bool thresholdReached = state.streak
+		>= k_uDeadlineRecoveryHeadroomDecisions;
+	const bool blocked = degradeHoldFrames != 0u
+		|| state.probationRemaining != 0u || !backoffElapsed;
+	const bool reportBlockedThreshold = thresholdReached && blocked
+		&& !state.blockedThresholdReported;
+	if ( reportBlockedThreshold )
+		state.blockedThresholdReported = true;
+	return {
+		state,
+		thresholdReached && !blocked,
+		reportBlockedThreshold,
+	};
+}
 
 // Evaluate timestamp maturity, cooldown, and budget without selecting a rung.
 // The renderer computes the next rung only when tryDegrade is true, preserving

@@ -329,10 +329,12 @@ and learning lines. `GAMESCOPE_FRAMEGEN_HUD_SCALE=1..6` sizes it,
 | `net: off / blob / online` | learned refiner: disabled / offline weights / training while you play |
 | `adapt` | self-supervised adaptation grading each prediction against reality |
 | `requested(OFF)` | you set the env var but the mode is NOT running — check the terminal for why (fallback or incompatible combination) |
-| `game 40fps -> screen 118/120 slots` | real game rate vs display refresh slots actually filled |
+| `source 40fps[200] gen 78fps[390] repeat 2fps fill 118/120` | source/game and generated frame rates with cumulative counts, repeated slots, and display slots filled |
+| `ladder high/motion rung 0/4 full` | effective quality/mode, current degradation rung, and recovery state |
 | `gen / repeat` | compositor-generated frames per second / refresh slots that showed a repeat |
 | `pace: 99% on-target ±0.7ms` | share of generated frames flipped within half a refresh of their planned time, and the flip-time spread (jitter) |
 | `bias` | learned display-chain delay the scheduler compensates automatically |
+| `resets_chain` | display-chain learner resets caused by backend, connector, refresh interval, VRR, or timestamp-provenance changes |
 | `resets (ring N)` | pacing/history re-primes (scene cuts, hitches); `ring` counts emergency queue flushes — nonzero means overload |
 | `steps / profile` | net training steps this session / whether a per-game profile was loaded |
 

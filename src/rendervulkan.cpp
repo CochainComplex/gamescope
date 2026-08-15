@@ -181,7 +181,7 @@ static constexpr size_t k_nFramegenHudPersistentBytes =
 	k_nFramegenHudUploadSlots * sizeof( gamescope::framegen::FramegenHudUniform_t );
 static constexpr size_t k_nFramegenHudPersistentPad =
 	( ( k_nFramegenHudPersistentBytes + 4095u ) / 4096u ) * 4096u;
-static_assert( k_nFramegenHudPersistentBytes == 3'008u );
+static_assert( k_nFramegenHudPersistentBytes == 3'168u );
 static_assert( k_nFramegenHudPersistentPad == 4'096u );
 static_assert( CVulkanDevice::upload_buffer_persistent_pad
 	>= k_nFramegenHudPersistentPad );
@@ -5293,6 +5293,9 @@ struct FramegenPresentState_t
 	// invalid, keep this display-chain session on the always-available composite
 	// clock instead of changing clock provenance on every subsequent sample.
 	bool bSourceTimestampFallbackLatched = false;
+	// A >250 ms content stall preserves the display-chain learner, but the first
+	// correlated flip after it is discard-only evidence for the bias EMA.
+	bool bPresentBiasHitchEpisode = false;
 	gamescope::FramegenPresentTag_t pendingTag = {};
 	bool bTagPending = false;
 };
@@ -5374,7 +5377,7 @@ struct FramegenMetricsWindow_t
 	uint64_t real = 0, generated = 0, delayedReal = 0, repeats = 0;
 	uint64_t discards = 0, slowDrops = 0, admissionSkips = 0, resets = 0;
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
-	uint64_t resetsRing = 0;
+	uint64_t resetsRing = 0, resetsChain = 0;
 	// Feedback that arrived as "discarded" (window hidden/occluded at the host):
 	// nonzero here with near-zero presented counts means the measurement
 	// environment is invalid, not that the compositor idled.
@@ -5389,7 +5392,7 @@ struct FramegenMetricsPendingEvents_t
 {
 	uint64_t repeats = 0, discards = 0, slowDrops = 0, admissionSkips = 0, resets = 0;
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
-	uint64_t resetsRing = 0;
+	uint64_t resetsRing = 0, resetsChain = 0;
 };
 static FramegenMetricsPendingEvents_t g_framegenMetricsPendingEvents;
 
@@ -5432,6 +5435,7 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	window.resetsProvenance += events.resetsProvenance;
 	window.resetsHitch += events.resetsHitch;
 	window.resetsRing += events.resetsRing;
+	window.resetsChain += events.resetsChain;
 }
 
 static void framegen_metrics_flush_events()
@@ -5455,7 +5459,7 @@ static void framegen_metrics_log( const char *pszLabel,
 		" resets=%" PRIu64 " fbdisc=%" PRIu64
 		" resets_cut=%" PRIu64 " resets_grid=%" PRIu64
 		" resets_prov=%" PRIu64 " resets_hitch=%" PRIu64
-		" resets_ring=%" PRIu64,
+		" resets_ring=%" PRIu64 " resets_chain=%" PRIu64,
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -5466,7 +5470,8 @@ static void framegen_metrics_log( const char *pszLabel,
 		deadline.p95(), deadline.max, window.discards, window.slowDrops,
 		window.admissionSkips, window.resets,
 		window.feedbackDiscarded, window.resetsCut, window.resetsGrid,
-		window.resetsProvenance, window.resetsHitch, window.resetsRing );
+		window.resetsProvenance, window.resetsHitch, window.resetsRing,
+		window.resetsChain );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
@@ -5582,6 +5587,12 @@ static void framegen_metrics_note_reset( FramegenResetReason_t reason )
 	}
 }
 
+static void framegen_metrics_note_chain_reset( FramegenResetReason_t reason )
+{
+	framegen_metrics_note_reset( reason );
+	g_framegenMetricsPendingEvents.resetsChain++;
+}
+
 static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback );
 static void framegen_apply_bidir_flip_feedback( const DisplayFeedback_t &feedback );
 static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback );
@@ -5638,7 +5649,7 @@ static bool framegen_observe_display_chain( uint64_t ulIntervalNs,
 		.intervalNs = ulIntervalNs,
 		.vrrActive = pConnector != nullptr && pConnector->IsVRRActive(),
 	};
-	const gamescope::framegen::DisplayChainKey_t &oldKey =
+	const gamescope::framegen::DisplayChainKey_t oldKey =
 		g_framegenPresentState.displayTiming.key;
 	const bool bPhysicalChainChanged =
 		g_framegenPresentState.displayTiming.initialized
@@ -5662,6 +5673,32 @@ static bool framegen_observe_display_chain( uint64_t ulIntervalNs,
 	if ( !transition.displayChainChanged )
 		return bSourceTimestampsReliable;
 
+	std::string changedFields;
+	const auto noteChanged = [&]( bool changed, const char *field )
+	{
+		if ( !changed )
+			return;
+		if ( !changedFields.empty() )
+			changedFields += ',';
+		changedFields += field;
+	};
+	noteChanged( oldKey.backendId != key.backendId, "backend" );
+	noteChanged( oldKey.connectorId != key.connectorId, "connector" );
+	noteChanged( oldKey.intervalNs != key.intervalNs, "interval" );
+	noteChanged( oldKey.vrrActive != key.vrrActive, "vrr" );
+	noteChanged( oldKey.sourceTimestampsReliable
+		!= key.sourceTimestampsReliable, "source_ts" );
+	vk_log.infof(
+		"framegen: display-chain change fields=%s backend=%" PRIu64 "->%" PRIu64
+		" connector=%" PRIu64 "->%" PRIu64 " interval_ns=%" PRIu64 "->%" PRIu64
+		" vrr=%u->%u source_ts=%u->%u",
+		changedFields.c_str(), oldKey.backendId, key.backendId,
+		oldKey.connectorId, key.connectorId, oldKey.intervalNs, key.intervalNs,
+		static_cast<unsigned>( oldKey.vrrActive ),
+		static_cast<unsigned>( key.vrrActive ),
+		static_cast<unsigned>( oldKey.sourceTimestampsReliable ),
+		static_cast<unsigned>( key.sourceTimestampsReliable ) );
+
 	// Feedback already queued by the old connector/provenance must not warm the
 	// freshly reset learners. The compositor is the sole mailbox consumer.
 	{
@@ -5669,7 +5706,7 @@ static bool framegen_observe_display_chain( uint64_t ulIntervalNs,
 		g_displayFeedbackMailbox.nRead = 0;
 		g_displayFeedbackMailbox.nCount = 0;
 	}
-	framegen_metrics_note_reset( bPhysicalChainChanged
+	framegen_metrics_note_chain_reset( bPhysicalChainChanged
 		? FramegenResetReason_t::Grid
 		: FramegenResetReason_t::Provenance );
 	return bSourceTimestampsReliable;
@@ -5860,7 +5897,9 @@ void vulkan_framegen_drain_present_feedback()
 				g_framegenDeadlineShadow.presentBias,
 				feedback.tag.ulRealFrameId,
 				feedback.ulActualFlipNs,
-				ulArrivalGuardNs );
+				ulArrivalGuardNs,
+				g_framegenDeadlineShadow.ulGridIntervalNs,
+				g_framegenPresentState.bPresentBiasHitchEpisode );
 		if ( correction.matched )
 		{
 			g_framegenDeadlineShadow.anchor = correction.anchor;
@@ -6040,11 +6079,13 @@ struct FramegenHistory_t
 	// each step sheds work (motion quality tiers, then extrapolate, then a
 	// multiplier notch). Never
 	// reaches "stop generating" — that is left to the reactive pacing gate below.
-	// Monotonic within a scene (only ever increases); reset to 0 on a scene change.
 	// nDegradeHold is a post-step cooldown so the new rung's cost folds into the
-	// measurement before the next step decision.
+	// measurement before the next step decision. Recovery is scene-local, climbs
+	// one adjacent rung only after sustained headroom, and exponentially backs off
+	// when a probe falls back during probation.
 	uint32_t nDegradeSteps = 0;
 	uint32_t nDegradeHold = 0;
+	gamescope::framegen::RecoveryState_t recovery;
 	// Bidir (B3): set by framegen_record_real_frame when the composite that is
 	// being presented right now queued its real frame behind interpolation
 	// slots; consumed by vulkan_framegen_bidir_flip_texture to substitute the
@@ -6435,13 +6476,77 @@ bool vulkan_framegen_is_enabled()
 }
 
 // Deadline-driven degradation ladder (#04). The startup mode/quality/multiplier are the
-// quality CEILING; under GPU-time pressure the ladder sheds work one rung at a
-// time. It is monotonic within a scene (only ever degrades); quality is re-probed
-// from this ceiling only on a scene change (invalidate_history). It NEVER mutates
+// quality CEILING; under GPU-time pressure the ladder sheds work immediately.
+// Slow evidence-gated recovery may re-probe one adjacent richer rung. It NEVER mutates
 // the base globals (g_eFramegenMode / g_nFramegenMultiplier): those gate the whole
 // feature (vulkan_framegen_is_enabled) and size the output pool, so the ladder only
 // ever degrades within them and reads its result through framegen_effective_config.
 using FramegenEffective_t = gamescope::framegen::EffectiveConfig;
+
+static bool framegen_recovery_enabled()
+{
+	static const bool s_bEnabled = []()
+	{
+		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RECOVER" );
+		return pszEnv == nullptr || env_to_bool( pszEnv );
+	}();
+	return s_bEnabled;
+}
+
+static bool framegen_recovery_active_for_path()
+{
+	return framegen_recovery_enabled()
+		&& !vulkan_framegen_vrr_hybrid_active()
+		&& !vulkan_framegen_bidir_active();
+}
+
+static void framegen_recovery_reset_streak()
+{
+	if ( !framegen_recovery_active_for_path() )
+		return;
+	g_framegenHistory.recovery =
+		gamescope::framegen::reset_ladder_recovery_streak(
+			g_framegenHistory.recovery );
+}
+
+static void framegen_recovery_note_capacity_failure()
+{
+	if ( !framegen_recovery_active_for_path() )
+		return;
+	g_framegenHistory.recovery =
+		gamescope::framegen::note_ladder_recovery_failure(
+			g_framegenHistory.recovery );
+}
+
+static void framegen_recovery_note_degradation()
+{
+	if ( !framegen_recovery_active_for_path() )
+		return;
+	g_framegenHistory.recovery =
+		gamescope::framegen::note_ladder_recovery_degradation(
+			g_framegenHistory.recovery );
+}
+
+static void framegen_log_ladder_recovery( uint32_t nMaxDegradeSteps,
+	uint32_t uEvidenceDecisions )
+{
+	vk_log.infof(
+		"framegen: ladder recovered to rung %u/%u after %u decisions (backoff %u)",
+		g_framegenHistory.nDegradeSteps, nMaxDegradeSteps,
+		uEvidenceDecisions, g_framegenHistory.recovery.backoffDecisions );
+}
+
+static void framegen_log_ladder_recovery_blocked( uint32_t nMaxDegradeSteps,
+	uint32_t nDegradeHold )
+{
+	vk_log.infof(
+		"framegen: ladder recovery threshold reached at rung %u/%u but blocked"
+		" (hold %u, probation %u, backoff %u/%u)",
+		g_framegenHistory.nDegradeSteps, nMaxDegradeSteps, nDegradeHold,
+		g_framegenHistory.recovery.probationRemaining,
+		g_framegenHistory.recovery.decisionsSinceClimb,
+		g_framegenHistory.recovery.backoffDecisions );
+}
 
 // Total number of rungs available from the startup config: motion walks through
 // every lower quality tier and then to extrapolate, followed by one rung per
@@ -6507,6 +6612,11 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	// batch deliberately keeps its pins until its timeline point signals.
 	framegen_release_completed_read_pins();
 
+	const bool bHitch = reason != nullptr
+		&& ( strcmp( reason, "frame_gap" ) == 0
+			|| strcmp( reason, "idle_frame_gap" ) == 0 );
+	if ( bHitch )
+		g_framegenPresentState.bPresentBiasHitchEpisode = true;
 	const bool bRing = reason != nullptr
 		&& strcmp( reason, "real_output_ring_pressure" ) == 0;
 	if ( ( !bRing || !vulkan_framegen_bidir_active() )
@@ -6519,9 +6629,6 @@ void vulkan_framegen_invalidate_history( const char *reason )
 		&& ( strcmp( reason, "base_colorspace_change" ) == 0
 			|| strcmp( reason, "output_eotf_change" ) == 0
 			|| strcmp( reason, "layer_count_change" ) == 0 );
-	const bool bHitch = reason != nullptr
-		&& ( strcmp( reason, "frame_gap" ) == 0
-			|| strcmp( reason, "idle_frame_gap" ) == 0 );
 	framegen_metrics_note_reset( bCut ? FramegenResetReason_t::Cut
 		: bHitch ? FramegenResetReason_t::Hitch
 		: bRing ? FramegenResetReason_t::Ring
@@ -6613,10 +6720,11 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.lastCompositeSeqNo = 0;
 	g_framegenHistory.nLastGeneratedSlot = 0;
 	g_framegenHistory.nLastGenerationGapVblanks = 0;
-	// Re-probe quality from the top on a fresh scene: the ladder is monotonic
-	// within a scene, so a scene change is the only place quality is restored.
+	// Re-probe quality from the top on a fresh scene and restore the base recovery
+	// delay; neither stale rung costs nor a prior scene's failed probes carry over.
 	g_framegenHistory.nDegradeSteps = 0;
 	g_framegenHistory.nDegradeHold = 0;
+	g_framegenHistory.recovery = {};
 	// Forget learned per-rung costs so the new scene is measured afresh rather than
 	// inheriting the old scene's "this rung overruns" verdicts.
 	g_device.framegenResetRungCosts();
@@ -6687,7 +6795,7 @@ void vulkan_framegen_reset( const char *reason )
 	// observation resets both timing EMAs only if its display-chain key differs.
 	framegen_invalidate_deadline_shadow_content();
 	// The per-rung costs live on g_device and survive the history reset; forget
-	// them too (as invalidate_history does) so the monotonic ladder re-probes the
+	// them too (as invalidate_history does) so the ladder re-probes the
 	// new workload from full quality instead of stepping on the old scene's stale
 	// over-deadline measurements.
 	g_device.framegenResetRungCosts();
@@ -6808,6 +6916,7 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 	{
 		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
 		framegen_metrics_note_slow_drop( 1 );
+		framegen_recovery_reset_streak();
 		g_framegenHistory.bCausalDeadlineMissed |=
 			front.ulAnchorRealFrameId != 0u;
 		static uint64_t s_uTooSlowDebugLogCounter = 0;
@@ -6919,6 +7028,9 @@ void vulkan_framegen_discard_generated_frame( const char *reason )
 		framegen_clear_vrr_midpoint_state( false );
 
 	const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
+	if ( nDiscarded > 0u && reason != nullptr
+		&& strcmp( reason, "generation_too_slow" ) == 0 )
+		framegen_recovery_reset_streak();
 	if ( reason != nullptr && strcmp( reason, "generation_too_slow" ) == 0 )
 		framegen_metrics_note_slow_drop( nDiscarded );
 	static uint64_t s_uDiscardDebugLogCounter = 0;
@@ -7947,6 +8059,17 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 		.delayedReal = window.delayedReal,
 		.generated = window.generated,
 		.repeats = window.repeats,
+		.ladderSteps = g_framegenHistory.nDegradeSteps,
+		.ladderMaxSteps = gamescope::framegen::max_degrade_steps(
+			g_eFramegenMode, g_eFramegenQuality, 2 ),
+		.ladderHold = g_framegenHistory.nDegradeHold,
+		.ladderRecoveryStreak = g_framegenHistory.recovery.streak,
+		.ladderRecoveryBackoffDecisions =
+			g_framegenHistory.recovery.backoffDecisions,
+		.ladderRecoveryProbationRemaining =
+			g_framegenHistory.recovery.probationRemaining,
+		.ladderRecoveryDecisionsSinceClimb =
+			g_framegenHistory.recovery.decisionsSinceClimb,
 		.biasTenthsMs = static_cast<int32_t>( std::llround( flBiasTenths ) ),
 		.deadlineHitPercent = uHitPercent,
 		.pacingSdTenthsMs = static_cast<uint32_t>( std::llround( flPacingSdTenths ) ),
@@ -10153,6 +10276,44 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	if ( !bPriorDeadlineMiss && sampleFits( result ) )
 	{
 		result.bAdmit = true;
+		if ( framegen_recovery_active_for_path() )
+		{
+			FramegenCausalRungSelection_t richer;
+			if ( nCurrentRung > 0u )
+				richer = sampleRung( nCurrentRung - 1u );
+			const uint64_t ulDecisionStartNs = std::max(
+				ulNowNs, ulStartEstimateNs );
+			const uint64_t ulRecoveryBudgetNs = plan.wakeNs
+				> ulDecisionStartNs
+				? gamescope::framegen::deadline_budget_ns(
+					plan.wakeNs - ulDecisionStartNs )
+				: 0u;
+			const gamescope::framegen::LadderRecoveryEvaluation_t recovery =
+				gamescope::framegen::evaluate_ladder_recovery(
+					g_framegenHistory.recovery, nCurrentRung,
+					g_framegenHistory.nDegradeHold,
+					result.ulCostNs, result.uSamples,
+					richer.ulCostNs, richer.uSamples,
+					ulRecoveryBudgetNs );
+			g_framegenHistory.recovery = recovery.state;
+			if ( recovery.reportBlockedThreshold )
+				framegen_log_ladder_recovery_blocked(
+					nMaxCausalDegradeSteps,
+					g_framegenHistory.nDegradeHold );
+			if ( recovery.tryRecover && nCurrentRung > 0u )
+			{
+				const uint32_t uEvidenceDecisions = recovery.state.streak;
+				g_framegenHistory.nDegradeSteps = nCurrentRung - 1u;
+				g_framegenHistory.recovery =
+					gamescope::framegen::commit_ladder_recovery(
+						g_framegenHistory.recovery );
+				framegen_log_ladder_recovery(
+					nMaxCausalDegradeSteps, uEvidenceDecisions );
+				richer.bAdmit = true;
+				richer.bCommittedRung = true;
+				return richer;
+			}
+		}
 		return result;
 	}
 
@@ -10163,6 +10324,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	if ( !bPriorDeadlineMiss && g_framegenHistory.nDegradeHold > 0u )
 	{
 		g_framegenHistory.nDegradeHold--;
+		framegen_recovery_note_capacity_failure();
 		return result;
 	}
 
@@ -10181,6 +10343,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 			candidate.bCommittedRung = true;
 			g_framegenHistory.nDegradeSteps = nRung;
 			g_framegenHistory.nDegradeHold = gamescope::framegen::k_uDeadlineHoldFrames;
+			framegen_recovery_note_degradation();
 			return candidate;
 		}
 		if ( !bMature )
@@ -10188,8 +10351,13 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 		result = candidate;
 	}
 
+	const bool bDegraded = nCurrentRung < nMaxCausalDegradeSteps;
 	g_framegenHistory.nDegradeSteps = nMaxCausalDegradeSteps;
 	g_framegenHistory.nDegradeHold = 0u;
+	if ( bDegraded )
+		framegen_recovery_note_degradation();
+	else
+		framegen_recovery_note_capacity_failure();
 	return result;
 }
 
@@ -10360,12 +10528,15 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 			g_framegenPresentState.displayTiming.presentBias,
 			feedback.tag.ulRealFrameId,
 			feedback.ulActualFlipNs,
-			ulArrivalGuardNs );
+			ulArrivalGuardNs,
+			g_framegenHistory.ulDeadlineGridIntervalNs,
+			g_framegenPresentState.bPresentBiasHitchEpisode );
 	if ( !correction.matched )
 		return;
 
 	g_framegenHistory.causalAnchor = correction.anchor;
 	g_framegenPresentState.displayTiming.presentBias = correction.presentBias;
+	g_framegenPresentState.bPresentBiasHitchEpisode = false;
 	g_framegenHistory.ulCurrentRealVblankNs = feedback.ulActualFlipNs;
 	if ( correction.discardProvisional )
 	{
@@ -10381,7 +10552,8 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 		// authoritative. Re-enter from the corrected anchor so an exact one-vblank
 		// correction can move the next generated phase by that full interval.
 		g_framegenHistory.ulLastPlannedTargetNs = 0u;
-		framegen_metrics_note_discard( nBefore - g_framegenHistory.pending.size() );
+		const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
+		framegen_metrics_note_discard( nDiscarded );
 		static uint64_t s_uFeedbackDiscardDebugLogCounter = 0;
 		if ( nBefore != g_framegenHistory.pending.size()
 			&& FramegenDebugShouldLog( s_uFeedbackDiscardDebugLogCounter ) )
@@ -11906,15 +12078,11 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// only here, on frames we actually generate, so the rung it settles on is a rung
 	// that was really measured and an idle/dormant stretch never moves it.
 	//
-	// Deliberately MONOTONIC within a scene: it only ever degrades, never restores
-	// quality mid-scene. Restoring means re-probing a richer config that may not fit
-	// and then dropping it again — a visible toggle of the generated-frame look, i.e.
-	// exactly the micro-stutter this feature exists to avoid. Quality is re-probed
-	// from full on the next scene change (framegenResetRungCosts + nDegradeSteps = 0
-	// in vulkan_framegen_invalidate_history), which is the natural "the workload may
-	// have changed" signal (focus change, layer/EOTF change, long stall). When no
-	// measurement is available the current rung's cost is 0 and the ladder stays at
-	// full quality, leaving the existing reactive discard as the only safety net.
+	// Recovery remains at this same decision site and may only select the adjacent
+	// richer rung after a long run of measured headroom. Degradation and its hold
+	// retain precedence; a failed recovery probe increases the scene-local back-off.
+	// When no measurement is available, neither direction moves and the existing
+	// reactive discard remains the safety net.
 	const FramegenEffective_t curEffForLadder = framegen_effective_config( g_framegenHistory.nDegradeSteps );
 	const uint32_t nLadderGapVblanks = gamescope::framegen::expanded_gap_vblanks(
 		nMeasuredGapVblanks, curEffForLadder.multiplier, bCanSpeculate );
@@ -11929,12 +12097,14 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		nGapSlots, curEffForLadder.multiplier, bSingleSlotPacing );
 	const uint64_t ulCurRungCostNs = g_device.framegenRungCostNs( g_framegenHistory.nDegradeSteps, nCurGenForLadder );
 	const uint32_t uCurRungSamples = g_device.framegenRungSampleCount( g_framegenHistory.nDegradeSteps, nCurGenForLadder );
+	const uint32_t nRecoveryHold = g_framegenHistory.nDegradeHold;
 	gamescope::framegen::DeadlineLadderEvaluation ladderEvaluation =
 		gamescope::framegen::evaluate_deadline_ladder(
 			{ g_framegenHistory.nDegradeSteps, g_framegenHistory.nDegradeHold },
 			nMaxDegradeSteps, ulCurRungCostNs, uCurRungSamples, ulVblankIntervalNs );
 	if ( ladderEvaluation.state.holdFrames != g_framegenHistory.nDegradeHold )
 		g_framegenHistory.nDegradeHold = ladderEvaluation.state.holdFrames;
+	bool bDegradedThisDecision = false;
 	if ( ladderEvaluation.tryDegrade )
 	{
 		// Over budget at the current rung. Only take the step if it actually
@@ -11952,6 +12122,57 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				ladderEvaluation.state );
 			g_framegenHistory.nDegradeSteps = ladderEvaluation.state.degradeSteps;
 			g_framegenHistory.nDegradeHold = ladderEvaluation.state.holdFrames;
+			bDegradedThisDecision = true;
+			framegen_recovery_note_degradation();
+		}
+	}
+	if ( !bDegradedThisDecision && framegen_recovery_active_for_path() )
+	{
+		uint64_t ulRicherRungCostNs = 0u;
+		uint32_t uRicherRungSamples = 0u;
+		if ( g_framegenHistory.nDegradeSteps > 0u )
+		{
+			const uint32_t nRicherRung =
+				g_framegenHistory.nDegradeSteps - 1u;
+			const FramegenEffective_t richerEff =
+				framegen_effective_config( nRicherRung );
+			const uint32_t nRicherGapVblanks =
+				gamescope::framegen::expanded_gap_vblanks(
+					nMeasuredGapVblanks, richerEff.multiplier,
+					bCanSpeculate );
+			const uint32_t nRicherGapSlots = nRicherGapVblanks > 1u
+				? nRicherGapVblanks - 1u : 0u;
+			const uint32_t nRicherGen =
+				gamescope::framegen::ladder_generated_count(
+					nRicherGapSlots, richerEff.multiplier,
+					bSingleSlotPacing );
+			ulRicherRungCostNs = g_device.framegenRungCostNs(
+				nRicherRung, nRicherGen );
+			uRicherRungSamples = g_device.framegenRungSampleCount(
+				nRicherRung, nRicherGen );
+		}
+
+		const gamescope::framegen::LadderRecoveryEvaluation_t recovery =
+			gamescope::framegen::evaluate_ladder_recovery(
+				g_framegenHistory.recovery,
+				g_framegenHistory.nDegradeSteps, nRecoveryHold,
+				ulCurRungCostNs, uCurRungSamples,
+				ulRicherRungCostNs, uRicherRungSamples,
+				gamescope::framegen::deadline_budget_ns(
+					ulVblankIntervalNs ) );
+		g_framegenHistory.recovery = recovery.state;
+		if ( recovery.reportBlockedThreshold )
+			framegen_log_ladder_recovery_blocked(
+				nMaxDegradeSteps, nRecoveryHold );
+		if ( recovery.tryRecover && g_framegenHistory.nDegradeSteps > 0u )
+		{
+			const uint32_t uEvidenceDecisions = recovery.state.streak;
+			g_framegenHistory.nDegradeSteps--;
+			g_framegenHistory.recovery =
+				gamescope::framegen::commit_ladder_recovery(
+					g_framegenHistory.recovery );
+			framegen_log_ladder_recovery(
+				nMaxDegradeSteps, uEvidenceDecisions );
 		}
 	}
 
@@ -12014,7 +12235,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// Any leftover pending frames belong to an older prediction; drop them before
 	// queuing this interval's batch (normally already done by the supersede path
 	// in the present decision).
-	framegen_submit_batch( 1, nGapVblanks, nGenerate, eff, ulCompositeSeqNo, nMaxDegradeSteps, true );
+	framegen_submit_batch( 1, nGapVblanks, nGenerate, eff,
+		ulCompositeSeqNo, nMaxDegradeSteps, true );
 }
 
 static bool frame_has_non_device_local_base_import( const struct FrameInfo_t *pFrameInfo )

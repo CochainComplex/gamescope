@@ -12,7 +12,7 @@
 namespace gamescope::framegen
 {
 
-inline constexpr uint32_t k_uFramegenHudMaxLines = 6u;
+inline constexpr uint32_t k_uFramegenHudMaxLines = 7u;
 inline constexpr uint32_t k_uFramegenHudMaxColumns = 72u;
 inline constexpr uint32_t k_uFramegenHudPackedTextWords =
 	( k_uFramegenHudMaxLines * k_uFramegenHudMaxColumns ) / 4u;
@@ -188,6 +188,13 @@ struct FramegenHudSnapshot_t
 	uint64_t delayedReal = 0u;
 	uint64_t generated = 0u;
 	uint64_t repeats = 0u;
+	uint32_t ladderSteps = 0u;
+	uint32_t ladderMaxSteps = 0u;
+	uint32_t ladderHold = 0u;
+	uint32_t ladderRecoveryStreak = 0u;
+	uint32_t ladderRecoveryBackoffDecisions = 0u;
+	uint32_t ladderRecoveryProbationRemaining = 0u;
+	uint32_t ladderRecoveryDecisionsSinceClimb = 0u;
 	int32_t biasTenthsMs = 0;
 	uint32_t deadlineHitPercent = 0u;
 	uint32_t pacingSdTenthsMs = 0u;
@@ -267,6 +274,32 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	}
 }
 
+[[nodiscard]] inline const char *framegen_hud_ladder_state(
+	char *dst, size_t capacity, const FramegenHudSnapshot_t &snapshot )
+{
+	if ( snapshot.ladderSteps == 0u )
+		return "full";
+	if ( snapshot.ladderHold > 0u )
+		return "hold";
+	if ( snapshot.ladderRecoveryProbationRemaining > 0u )
+	{
+		const uint32_t seconds =
+			( snapshot.ladderRecoveryProbationRemaining + 44u ) / 45u;
+		std::snprintf( dst, capacity, "probation %us", seconds );
+		return dst;
+	}
+	if ( snapshot.ladderRecoveryDecisionsSinceClimb
+		< snapshot.ladderRecoveryBackoffDecisions )
+	{
+		const uint32_t decisions = snapshot.ladderRecoveryBackoffDecisions
+			- snapshot.ladderRecoveryDecisionsSinceClimb;
+		const uint32_t seconds = ( decisions + 44u ) / 45u;
+		std::snprintf( dst, capacity, "recover in %us", seconds );
+		return dst;
+	}
+	return "watching";
+}
+
 [[nodiscard]] inline FramegenHudText_t format_framegen_hud(
 	uint32_t level, const FramegenHudSnapshot_t &snapshot )
 {
@@ -329,9 +362,24 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	}
 	framegen_hud_add_line( result, line );
 
+	char realSteps[24] = {};
+	char generatedSteps[24] = {};
+	framegen_hud_format_steps( realSteps, sizeof( realSteps ), snapshot.real );
+	framegen_hud_format_steps(
+		generatedSteps, sizeof( generatedSteps ), snapshot.generated );
 	std::snprintf( line, sizeof( line ),
-		"%-8s game %ufps  gen %ufps  repeat %ufps  fill %u/%u", "rates",
-		gameRate, generatedRate, repeatRate, fillRate, refreshHz );
+		"%-8s source %ufps[%s] gen %ufps[%s] repeat %ufps fill %u/%u",
+		"rates", gameRate, realSteps, generatedRate, generatedSteps,
+		repeatRate, fillRate, refreshHz );
+	framegen_hud_add_line( result, line );
+
+	char ladderState[24] = {};
+	const char *ladderMode = snapshot.mode == GamescopeFramegenMode::Motion
+		? "motion" : "extrapolate";
+	std::snprintf( line, sizeof( line ), "%-8s %s/%s rung %u/%u  %s", "ladder",
+		quality_name( snapshot.quality ), ladderMode,
+		snapshot.ladderSteps, snapshot.ladderMaxSteps,
+		framegen_hud_ladder_state( ladderState, sizeof( ladderState ), snapshot ) );
 	framegen_hud_add_line( result, line );
 
 	if ( level < 2u )
@@ -381,9 +429,9 @@ struct alignas( 16 ) FramegenHudUniform_t
 };
 
 static_assert( offsetof( FramegenHudUniform_t, lineLengths ) == 16u );
-static_assert( offsetof( FramegenHudUniform_t, text ) == 40u );
-static_assert( offsetof( FramegenHudUniform_t, font ) == 472u );
-static_assert( sizeof( FramegenHudUniform_t ) == 1'504u );
+static_assert( offsetof( FramegenHudUniform_t, text ) == 44u );
+static_assert( offsetof( FramegenHudUniform_t, font ) == 548u );
+static_assert( sizeof( FramegenHudUniform_t ) == 1'584u );
 
 struct FramegenHudPush_t
 {

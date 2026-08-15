@@ -16,8 +16,8 @@ uniform framegen_hud_t {
     uint u_widthChars;
     uint u_hdr;
     uint u_reserved;
-    uint u_lineLengths[6];
-    uint u_text[108];
+    uint u_lineLengths[7];
+    uint u_text[126];
     uint u_font[256];
 };
 

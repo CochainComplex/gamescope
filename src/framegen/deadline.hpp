@@ -15,6 +15,7 @@ namespace gamescope::framegen
 {
 
 inline constexpr uint32_t k_uPresentBiasWarmupSamples = 4u;
+inline constexpr uint32_t k_uPresentBiasOutlierVblankIntervals = 1u;
 inline constexpr uint32_t k_uPresentLeadWarmupSamples = 4u;
 
 [[nodiscard]] constexpr uint64_t signed_ns_magnitude( int64_t valueNs )
@@ -386,13 +387,33 @@ struct PresentBiasUpdate_t
 	bool discardProvisional = false;
 };
 
+// A mature display-chain bias is intentionally slow to replace. A feedback
+// residual becomes discard-only evidence once it lies at least one whole
+// vblank beyond the magnitude of the correction already learned. Saturate the
+// bound so an extreme signed bias cannot wrap it back into the ordinary range.
+[[nodiscard]] constexpr uint64_t present_bias_outlier_bound_ns(
+	const PresentBiasState_t &state, uint64_t vblankIntervalNs )
+{
+	const uint64_t biasMagnitudeNs = signed_ns_magnitude( state.emaNs );
+	const uint64_t intervalMarginNs = vblankIntervalNs
+		> std::numeric_limits<uint64_t>::max()
+			/ k_uPresentBiasOutlierVblankIntervals
+		? std::numeric_limits<uint64_t>::max()
+		: vblankIntervalNs * k_uPresentBiasOutlierVblankIntervals;
+	return intervalMarginNs
+		> std::numeric_limits<uint64_t>::max() - biasMagnitudeNs
+		? std::numeric_limits<uint64_t>::max()
+		: biasMagnitudeNs + intervalMarginNs;
+}
+
 // Treat the target error as the residual of the bias already applied to this
 // provisional anchor. Adding 1/8 of that residual is algebraically the same as
 // a 1/8 EMA of (actual flip - raw grid target), while allowing the anchor to
 // carry the exact biased target that the scheduler believed.
 [[nodiscard]] constexpr PresentBiasUpdate_t update_present_bias(
 	PresentBiasState_t state, uint64_t provisionalTargetNs,
-	uint64_t actualFlipNs, uint64_t arrivalGuardNs )
+	uint64_t actualFlipNs, uint64_t arrivalGuardNs,
+	uint64_t vblankIntervalNs, bool hitchEpisode )
 {
 	PresentBiasUpdate_t result = { .state = state };
 	if ( provisionalTargetNs == 0u || actualFlipNs == 0u )
@@ -414,15 +435,25 @@ struct PresentBiasUpdate_t
 		result.state.consecutiveGuardExceeds = 0u;
 	}
 
-	result.state = update_present_timing_ema_residual(
-		result.state, result.residualNs );
+	const bool discardEmaSample = mature
+		&& ( hitchEpisode
+			|| ( vblankIntervalNs != 0u
+				&& signed_ns_magnitude( result.residualNs )
+					>= present_bias_outlier_bound_ns(
+						state, vblankIntervalNs ) ) );
+	if ( !discardEmaSample )
+	{
+		result.state = update_present_timing_ema_residual(
+			result.state, result.residualNs );
+	}
 	return result;
 }
 
 [[nodiscard]] constexpr AnchorCorrection_t apply_flip_feedback(
 	const RealAnchorState_t &anchor, PresentBiasState_t presentBias,
 	uint64_t realFrameId,
-	uint64_t actualFlipNs, uint64_t arrivalGuardNs )
+	uint64_t actualFlipNs, uint64_t arrivalGuardNs,
+	uint64_t vblankIntervalNs, bool hitchEpisode = false )
 {
 	AnchorCorrection_t result = {
 		.anchor = anchor,
@@ -436,7 +467,8 @@ struct PresentBiasUpdate_t
 	{
 		const PresentBiasUpdate_t update = update_present_bias(
 			presentBias, anchor.provisionalTargetNs,
-			actualFlipNs, arrivalGuardNs );
+			actualFlipNs, arrivalGuardNs,
+			vblankIntervalNs, hitchEpisode );
 		result.presentBias = update.state;
 		result.residualNs = update.residualNs;
 		result.discardProvisional = update.discardProvisional;
