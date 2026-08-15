@@ -16,10 +16,11 @@ survey:
 [quick reference](#quick-reference-enabling-each-feature) below **exists in the
 tree today** — the master switch, the motion-quality stack, bidirectional
 interpolation, the learned refiner + in-situ training, and the #04 degradation
-ladder all ship (the alternative placement modes — base-layer, VRR-hybrid, JIT —
-as env-gated prototypes). The numbered [proposals](#proposals) are the roadmap and
-carry their own authoritative `Status:` lines: **#04 implemented**; **#01 / #02 /
-#06** env-gated prototypes; **#03 / #05** design-only; **#07** a
+ladder all ship (#06 JIT is now the default causal pacing; base-layer and
+VRR-hybrid remain env-gated alternative placement modes). The numbered
+[proposals](#proposals) are the roadmap and carry their own authoritative
+`Status:` lines: **#04 / #06 implemented**; **#01 / #02** env-gated prototypes;
+**#03 / #05** design-only; **#07** a
 research-to-implementation map (E1/E2 plus bounded frames-only Gaps A/B/D are built). Each design doc
 specifies motivation, the Vulkan mechanisms, concrete integration points, a
 latency/throughput analysis, an adversarial risk table, and a testing plan.
@@ -51,25 +52,26 @@ on top of it.
 | `GAMESCOPE_FRAMEGEN_SHADING` | on in causal `extreme` with ML | Fourth-head causal shading-persistence supervision plus bounded color-trend correction; `=0` disables only these for an otherwise-identical net/queue A/B. |
 | `GAMESCOPE_FRAMEGEN_FB_TOL` | `0.75` | FB round-trip tolerance (texels); **setting it pins the value** against `GAMESCOPE_FRAMEGEN_ADAPT`'s auto-calibration. |
 
-### Opt-in modes — off by default
+### Optional modes and compatibility toggles
 
 | Variable | Requires | Effect |
 |---|---|---|
-| `GAMESCOPE_FRAMEGEN_BIDIR=1` | `--framegen-mode motion`; **excludes** `GAMESCOPE_FRAMEGEN_JIT`, `GAMESCOPE_FRAMEGEN_VRR_HYBRID`, `GAMESCOPE_FRAMEGEN_BASE` | Bidirectional interpolation — smoothest motion, but real frames present **one interval late**. |
+| `GAMESCOPE_FRAMEGEN_BIDIR=1` | `--framegen-mode motion`; **excludes** `GAMESCOPE_FRAMEGEN_VRR_HYBRID`, `GAMESCOPE_FRAMEGEN_BASE` | Bidirectional interpolation — smoothest motion, but real frames present **one interval late**. |
 | `GAMESCOPE_FRAMEGEN_NET=<blob>` | `--framegen-mode motion --framegen-quality high|ultra|extreme` | Learned causal flow/confidence refiner; value is a `GSFR` weights blob. In bidir it defaults to confidence-veto-only: checked flow is preserved and confidence can only decrease. Empty / unreadable → disabled, not fatal. |
 | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | motion `high`/`ultra`/`extreme`; `NET` blob optional | In-situ learning (C2): causal mode trains flow+confidence; bidir trains only the conservative confidence output row and freezes geometry/trunk. Without a `NET` blob it starts from a neutral prior; without `NET_PROFILE` the model is **ephemeral — nothing is written to disk**. |
 | `GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Persistent per-game learning: loaded as the prior when the file exists (a malformed file is rejected loudly → neutral prior), checkpointed on an owned worker every 1024 trained steps and joined before the exit/reset flush, so short sessions persist without a detached-writer race. A unique same-directory staging file, checked close, and atomic rename keep crashes, full disks, and concurrent instances from publishing a partial profile. |
 | `GAMESCOPE_FRAMEGEN_NET_LR` / `GAMESCOPE_FRAMEGEN_NET_EVERY` | `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` | Learning rate (default `3e-4`) / train every *N*th real frame (default `1` — raise on weak present GPUs). |
 | `GAMESCOPE_FRAMEGEN_RECORD=<dir>` | `--framegen-mode motion` | Capture training tensors (one `GSFD` file per real frame, ≈1.2 MB at 1440p) into `<dir>`; bidir is not required. |
 | `GAMESCOPE_FRAMEGEN_RECORD_MAX` | `GAMESCOPE_FRAMEGEN_RECORD` set | Cap on captured frames (default `1000`). |
-| `GAMESCOPE_FRAMEGEN_JIT=1` | **dedicated framegen queue**; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #06 causal fixed-cadence JIT: predict the next acquire-ready time, generate a disposable one-slot backup only when it may miss the exact compositor wake deadline, and let a real frame preempt it (a no-op without the dedicated queue). |
+| `GAMESCOPE_FRAMEGEN_JIT=1` | accepted but no-op; causal JIT pacing is the default with the **dedicated framegen queue** | #06 causal fixed-cadence JIT: plan one exact display slot at a time, generate a disposable one-slot backup only when the real frame may miss the exact compositor wake deadline, and let a real frame preempt it. |
 | `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` | **dedicated queue + connector actually in VRR**; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #01 VRR hybrid — real frames present VRR-style, the generated frame flips mid-interval on a timer (falls back to fixed-refresh **live** when VRR isn't active). |
 | `GAMESCOPE_FRAMEGEN_BASE=1` | any mode; per-frame scene check; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #02 base-layer generation — generate pre-upscale, late-composite fresh overlays/cursor (falls back to output-space **per frame** on unsupported scenes). |
 
-`GAMESCOPE_FRAMEGEN_BIDIR`, `GAMESCOPE_FRAMEGEN_JIT`, `GAMESCOPE_FRAMEGEN_VRR_HYBRID`
-and `GAMESCOPE_FRAMEGEN_BASE` are alternative pacing/placement strategies —
-`GAMESCOPE_FRAMEGEN_BIDIR` is mutually exclusive with the other three (it is
-silently ignored if any of them is set); combining the remaining three is
+`GAMESCOPE_FRAMEGEN_BIDIR`, `GAMESCOPE_FRAMEGEN_VRR_HYBRID`, and
+`GAMESCOPE_FRAMEGEN_BASE` are alternative pacing/placement strategies;
+causal JIT pacing is the default dedicated-queue fixed-refresh path.
+`GAMESCOPE_FRAMEGEN_BIDIR` is mutually exclusive with VRR-hybrid and base-layer
+(it is silently ignored if either is set); combining the remaining two is
 untested, so enable one at a time.
 
 ### Development / debugging
@@ -77,7 +79,7 @@ untested, so enable one at a time.
 | Variable | Effect |
 |---|---|
 | `GAMESCOPE_FRAMEGEN_DEBUG_EVERY` | Log every *N*th framegen event (default `60`; needs `--framegen-debug`). |
-| `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE=1` | Force the shared-queue regime (disables the dedicated-queue features `GAMESCOPE_FRAMEGEN_JIT` / `GAMESCOPE_FRAMEGEN_VRR_HYBRID`). |
+| `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE=1` | Force the shared-queue regime (disables the dedicated-queue regime, including default causal JIT pacing, and `GAMESCOPE_FRAMEGEN_VRR_HYBRID`). |
 | `GAMESCOPE_FRAMEGEN_BENCHMARK` | Run the shader microbenchmark, then exit before output creation (**presence-only** — even `=0` triggers it). |
 | `GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW=1` | Restore experimental endpoint-trained flow correction/confidence raises in bidir for A/B only. Default off because it produced heavy intermediate-frame artifacts in live x4 testing. |
 | `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS=0…1` | Experimental low-latency bidir cadence A/B. Blends generated phases from the sharp/snappy `k/gap` baseline toward uniform multiplier spacing without changing flip timing. Default `0`; full display-grid pacing was rejected as blurrier, more edge-torn, and less responsive. |
@@ -317,7 +319,7 @@ build on top of that foundation.
    disposable generated backup only when the next real frame may miss the exact
    compositor wake deadline. The resulting generated ratio varies with available
    real frames while real-over-generated arbitration remains exact.
-   **Prototype implemented** (`GAMESCOPE_FRAMEGEN_JIT=1`, dedicated queue only).
+   **Shipped as the default causal pacing** (dedicated queue).
 7. [Frames-only SOTA alignment: what we have, what's missing](07-frames-only-sota-alignment.md)
    — maps the [frame-generation research survey](../research-framegen.md) onto
    the shipped pipeline and proposals #01–#06: which SOTA ideas are already in

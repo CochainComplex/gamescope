@@ -126,6 +126,7 @@ GAMESCOPE_FRAMEGEN_HUD=2 GAMESCOPE_FRAMEGEN_NET_ONLINE=1 GAMESCOPE_FRAMEGEN_NET_
 - Default to causal/forward `--framegen-mode motion`, `--framegen-multiplier 2`, `--framegen-quality high`; try `3` only if the present GPU has headroom. Measured 2026-08-15 on the POC laptop with a real Proton game, AMD 890M present GPU, NVIDIA render GPU.
 - Raise quality to `ultra`/`extreme` only if the HUD ladder row stays full; the ladder auto-degrades and now auto-recovers.
 - Keep the learned net online with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`; adaptation is on by default at `high` and above. This path adds no frame of latency.
+- JIT display-clock pacing is on by default in the causal path; no flag is needed. It plans one exact display slot at a time, reducing wasted generation passes and placing generated frames closer to their slot with fresher real-frame prediction.
 - Tune with `GAMESCOPE_FRAMEGEN_HUD=2` (`rates`, `ladder`, `pace` rows); add `GAMESCOPE_FRAMEGEN_METRICS=1` for a log summary.
 - `GAMESCOPE_FRAMEGEN_BIDIR=1` is a quality experiment for video-like content or benchmarks; it delays every real frame by one interval and felt clearly laggy in play.
 - Nested Wayland is fine for trying it, but heavy scenes compete with the desktop compositor; native/DRM from a VT or session-compositor use is the real test. x3/x4 only helps when source fps is at most refresh/3; otherwise the scheduler goes dormant.
