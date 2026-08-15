@@ -95,6 +95,7 @@
 #include "Script/Script.h"
 #include "refresh_rate.h"
 #include "commit.h"
+#include "framegen/deadline.hpp"
 #include "reshade_effect_manager.hpp"
 #include "BufferMemo.h"
 #include "Utils/Process.h"
@@ -138,6 +139,7 @@ bool ShouldDrawCursor();
 // Step 3 generalizes the former JIT-only repeat hook without expanding the
 // public renderer header surface during the temporary classic A/B window.
 void vulkan_framegen_causal_tick();
+uint64_t vulkan_framegen_fixed_refresh_commit_deadline_ns();
 
 std::atomic<uint32_t> g_unCurrentVRSceneAppId;
 std::atomic<uint64_t> g_FocusedVROverlayMouse;
@@ -8364,23 +8366,23 @@ static gamescope::CTimerFunction g_FPSLimitVRRTimer{ []
 	g_FPSLimitVRRTimer.DisarmTimer();
 }};
 
-// One-shot absolute timer used by the non-grid deadline policy. VRR supplies
-// W_mid from correlated feedback; timerfd and presentation timestamps share
+// One-shot absolute timer used by generated-present commit deadlines. VRR
+// supplies W_mid from correlated feedback; mature fixed-refresh causal slots
+// supply D - presentLead - margin. Timerfd and presentation timestamps share
 // CLOCK_MONOTONIC. The callback runs on this thread inside PollEvents (no
 // atomics needed), and the flag persists until the arbiter acts on it.
-static bool g_bFramegenMidDeadline = false;
-static bool g_bFramegenMidArmPending = false;
+static bool g_bFramegenCommitDeadline = false;
 // The absolute time the timer is currently armed for. Disarming a timerfd does
 // not retract a fire already delivered to the epoll, so a superseded slot's
 // fire can slip past its DisarmTimer and re-set the deadline flag on the next
 // poll — right after a NEW slot was planned. An absolute timer can never fire
 // early, so any deadline observed before the currently armed target is
 // provably that stale carry-over and is dropped.
-static uint64_t g_ulFramegenMidTargetNs = 0;
-static gamescope::CTimerFunction g_FramegenMidTimer{ []
+static uint64_t g_ulFramegenCommitDeadlineNs = 0;
+static gamescope::CTimerFunction g_FramegenCommitTimer{ []
 {
-	g_FramegenMidTimer.DisarmTimer();
-	g_bFramegenMidDeadline = true;
+	g_FramegenCommitTimer.DisarmTimer();
+	g_bFramegenCommitDeadline = true;
 }};
 
 void
@@ -8529,7 +8531,7 @@ steamcompmgr_main(int argc, char **argv)
 
 	g_SteamCompMgrWaiter.AddWaitable( &GetVBlankTimer() );
 	g_SteamCompMgrWaiter.AddWaitable( &g_FPSLimitVRRTimer );
-	g_SteamCompMgrWaiter.AddWaitable( &g_FramegenMidTimer );
+	g_SteamCompMgrWaiter.AddWaitable( &g_FramegenCommitTimer );
 	GetVBlankTimer().ArmNextVBlank( true );
 
 	{
@@ -8623,14 +8625,20 @@ steamcompmgr_main(int argc, char **argv)
 		// so a pending generated frame must NOT present on the vblank signal —
 		// it would flip immediately after the real frame. The mid-interval
 		// timer is the present trigger instead. When VRR drops at runtime the
-		// hybrid deactivates live and any leftover timer state is cleared here.
+		// hybrid deactivates live. A fixed-refresh native-KMS deadline may retain
+		// ownership of the shared timer; a zero fixed deadline takes the exact
+		// pre-existing cleanup path.
 		const bool bVrrHybridActive = bVRR && vulkan_framegen_vrr_hybrid_active();
+		uint64_t ulFixedCommitDeadlineNs = !bVrrHybridActive
+			? vulkan_framegen_fixed_refresh_commit_deadline_ns() : 0u;
 		if ( !bVrrHybridActive )
 		{
-			g_bFramegenMidDeadline = false;
-			g_bFramegenMidArmPending = false;
-			g_ulFramegenMidTargetNs = 0;
-			g_FramegenMidTimer.DisarmTimer();
+			if ( ulFixedCommitDeadlineNs == 0u )
+			{
+				g_bFramegenCommitDeadline = false;
+				g_ulFramegenCommitDeadlineNs = 0;
+				g_FramegenCommitTimer.DisarmTimer();
+			}
 			vulkan_framegen_cancel_vrr_hybrid_slot( "vrr_deactivated" );
 		}
 
@@ -9227,6 +9235,10 @@ steamcompmgr_main(int argc, char **argv)
 				bShouldPaint = false;
 			}
 
+			// State processed above can invalidate or replace the queue after the
+			// loop-entry cleanup check, so arbitrate only on a fresh deadline.
+			ulFixedCommitDeadlineNs = !bVrrHybridActive
+				? vulkan_framegen_fixed_refresh_commit_deadline_ns() : 0u;
 			if ( vulkan_framegen_has_pending_generated_frame() )
 			{
 				// Real frames always take priority over generated ones: the
@@ -9236,87 +9248,105 @@ steamcompmgr_main(int argc, char **argv)
 				// rather than letting it displace that content and add a vblank
 				// of latency. Generated frames only fill vblanks the game left
 				// empty.
-				//
-				// VRR hybrid (#01): a flip still in flight means the real
-				// frame's scanout hasn't completed — presenting now would race
-				// two flips into one scan-out. Keep the deadline pending; the
-				// flip-completion nudge re-enters here within a scanout.
-				const bool bHybridInFlight = bVrrHybridActive
-					&& GetBackend()->GetCurrentConnector()
-					&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0;
-				// Drop a stale carry-over fire (see g_ulFramegenMidTargetNs):
-				// the genuinely armed timer will re-set the flag at its target.
-				if ( bVrrHybridActive && g_bFramegenMidDeadline && get_time_in_nanos() < g_ulFramegenMidTargetNs )
-					g_bFramegenMidDeadline = false;
-				if ( hasRepaint )
+				// A nonzero native fixed-refresh deadline gets its own arbiter.
+				// Keeping the old arbiter in the else branch below makes a zero
+				// deadline take the pre-fix control flow without evaluating any of
+				// the fixed-refresh timer, in-flight, or retry conditions.
+				if ( ulFixedCommitDeadlineNs != 0u )
 				{
-					// Real BASE/game content always wins the vblank: a new game
-					// frame supersedes the stale predictions, so drop them.
-					//
-					// Bidir (B3) inverts this: pending entries PRECEDE the new
-					// real frame on the presentation timeline (they interpolate
-					// up to it, and the real frame itself joins the queue), so
-					// nothing is stale — the composite records the new frame and
-					// the backend's flip substitution presents the queue front.
-					if ( !vulkan_framegen_bidir_active() )
+					if ( hasRepaint )
+					{
+						// Test this before all generated-commit state: queued real
+						// work has absolute priority and reaches the normal paint path.
+						g_bFramegenCommitDeadline = false;
 						vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
-					if ( bVrrHybridActive )
-					{
-						// The mid-interval flip this timer was armed for no
-						// longer exists; the new real frame re-plans and re-arms.
-						g_bFramegenMidDeadline = false;
-						g_FramegenMidTimer.DisarmTimer();
-						vulkan_framegen_cancel_vrr_hybrid_slot(
-							"superseded_by_real_frame" );
-					}
-				}
-				else if ( ( bVrrHybridActive ? g_bFramegenMidDeadline : vblank )
-					&& !bHybridInFlight
-					&& vulkan_framegen_generated_frame_due() )
-				{
-					if ( bVrrHybridActive )
-						g_bFramegenMidDeadline = false;
-					// No new base content. Present the generated frame only if
-					// its GPU work has actually finished — otherwise leave the
-					// vblank as a hardware repeat instead of paying a full
-					// recomposite of unchanged content (the backends present a
-					// pending generated frame ahead of the composite, and a
-					// too-slow one drops to a full composite there).
-					const bool bReady = vulkan_framegen_generated_frame_ready();
-
-					// A pure overlay/notification update (no base change) used to
-					// discard the generated frame and force a full recomposite
-					// every interval — with an FPS overlay updating each frame
-					// that starved framegen to ~zero presented frames. Instead
-					// defer the overlay one vblank so the generated frame fills
-					// the empty slot; the overlay rides the next real composite,
-					// which redraws every layer anyway. Bounded so a steadily
-					// updating overlay can't be starved the other way.
-					//
-					// Base-layer mode (#02): no deferral needed at all — the
-					// late composite renders the CURRENT overlay stack onto
-					// every generated frame, so the overlay update is shown by
-					// the generated present itself, fresher than the deferred
-					// real composite would have shown it.
-					const bool bOverlayOnly = hasRepaintNonBasePlane;
-					const bool bLateOverlayComposite = vulkan_framegen_base_layer_active();
-					if ( bReady && ( !bOverlayOnly || bLateOverlayComposite || nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay ) )
-					{
-						bShouldPaint = true;
-						if ( bOverlayOnly && !bLateOverlayComposite )
-						{
-							bFramegenDeferOverlay = true;
-							nFramegenDeferredOverlay++;
-						}
 					}
 					else
 					{
-						// Not ready, or the overlay deferral budget is spent.
-						// Drop the stale slot; if only an overlay changed, fall
-						// through and composite it now, otherwise repeat.
-						vulkan_framegen_discard_generated_frame( bReady ? "overlay_defer_budget" : "generation_too_slow" );
-						if ( !bOverlayOnly )
-							bShouldPaint = false;
+						// Drop a stale carry-over fire. The genuinely armed timer
+						// will re-set the flag at its current target.
+						if ( g_ulFramegenCommitDeadlineNs != ulFixedCommitDeadlineNs )
+							g_bFramegenCommitDeadline = false;
+						else if ( g_bFramegenCommitDeadline
+							&& get_time_in_nanos() < ulFixedCommitDeadlineNs )
+							g_bFramegenCommitDeadline = false;
+						// A generated commit must not overtake the preceding real
+						// present. Its flip-completion nudge re-enters this arbiter.
+						const bool bPresentInFlight =
+							GetBackend()->GetCurrentConnector()
+							&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0;
+						if ( gamescope::framegen::can_start_early_generated_commit(
+								g_bFramegenCommitDeadline, false,
+								bPresentInFlight )
+							&& vulkan_framegen_generated_frame_due() )
+						{
+							g_bFramegenCommitDeadline = false;
+							const bool bReady = vulkan_framegen_generated_frame_ready();
+							const bool bOverlayOnly = hasRepaintNonBasePlane;
+							const bool bLateOverlayComposite = vulkan_framegen_base_layer_active();
+							if ( bReady && ( !bOverlayOnly || bLateOverlayComposite || nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay ) )
+							{
+								bShouldPaint = true;
+								if ( bOverlayOnly && !bLateOverlayComposite )
+								{
+									bFramegenDeferOverlay = true;
+									nFramegenDeferredOverlay++;
+								}
+							}
+							else
+							{
+								vulkan_framegen_discard_generated_frame( bReady ? "overlay_defer_budget" : "generation_too_slow" );
+								if ( !bOverlayOnly )
+									bShouldPaint = false;
+							}
+						}
+					}
+				}
+				else
+				{
+					// This is the pre-fix VRR/vblank arbiter. Keep it intact: the
+					// fixed-refresh deadline is known to be zero in this branch.
+					const bool bHybridInFlight = bVrrHybridActive
+						&& GetBackend()->GetCurrentConnector()
+						&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0;
+					if ( bVrrHybridActive && g_bFramegenCommitDeadline && get_time_in_nanos() < g_ulFramegenCommitDeadlineNs )
+						g_bFramegenCommitDeadline = false;
+					if ( hasRepaint )
+					{
+						if ( !vulkan_framegen_bidir_active() )
+							vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
+						if ( bVrrHybridActive )
+						{
+							g_bFramegenCommitDeadline = false;
+							g_FramegenCommitTimer.DisarmTimer();
+							vulkan_framegen_cancel_vrr_hybrid_slot(
+								"superseded_by_real_frame" );
+						}
+					}
+					else if ( ( bVrrHybridActive ? g_bFramegenCommitDeadline : vblank )
+						&& !bHybridInFlight
+						&& vulkan_framegen_generated_frame_due() )
+					{
+						if ( bVrrHybridActive )
+							g_bFramegenCommitDeadline = false;
+						const bool bReady = vulkan_framegen_generated_frame_ready();
+						const bool bOverlayOnly = hasRepaintNonBasePlane;
+						const bool bLateOverlayComposite = vulkan_framegen_base_layer_active();
+						if ( bReady && ( !bOverlayOnly || bLateOverlayComposite || nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay ) )
+						{
+							bShouldPaint = true;
+							if ( bOverlayOnly && !bLateOverlayComposite )
+							{
+								bFramegenDeferOverlay = true;
+								nFramegenDeferredOverlay++;
+							}
+						}
+						else
+						{
+							vulkan_framegen_discard_generated_frame( bReady ? "overlay_defer_budget" : "generation_too_slow" );
+							if ( !bOverlayOnly )
+								bShouldPaint = false;
+						}
 					}
 				}
 			}
@@ -9324,7 +9354,7 @@ steamcompmgr_main(int argc, char **argv)
 			{
 				// Nothing pending (discarded or invalidated since the timer was
 				// armed) — a stale mid-interval deadline has nothing to show.
-				g_bFramegenMidDeadline = false;
+				g_bFramegenCommitDeadline = false;
 			}
 
 			static uint64_t s_uFramegenVblankDebugLogCounter = 0;
@@ -9384,14 +9414,14 @@ steamcompmgr_main(int argc, char **argv)
 			}
 		}
 
-		// The feedback handler has already correlated the exact Real flip and
-		// planned W_mid = D_mid - presentLead - margin. The timer is now a
-		// generic absolute wake/commit deadline and never samples LastVBlank.
+		// Keep the established VRR timer path independent of the native fixed-
+		// refresh extension. In particular, a zero fixed deadline never reaches
+		// clock sampling, timer arming, or passed-deadline retry below.
 		if ( bVrrHybridActive )
 		{
 			uint64_t ulWakeDeadlineNs =
 				vulkan_framegen_vrr_hybrid_wake_deadline_ns();
-			if ( ulWakeDeadlineNs != 0u && !g_bFramegenMidDeadline
+			if ( ulWakeDeadlineNs != 0u && !g_bFramegenCommitDeadline
 				&& get_time_in_nanos() >= ulWakeDeadlineNs )
 			{
 				vulkan_framegen_cancel_vrr_hybrid_slot(
@@ -9399,16 +9429,57 @@ steamcompmgr_main(int argc, char **argv)
 				ulWakeDeadlineNs = 0u;
 			}
 			if ( ulWakeDeadlineNs != 0u
-				&& ulWakeDeadlineNs != g_ulFramegenMidTargetNs )
+				&& ulWakeDeadlineNs != g_ulFramegenCommitDeadlineNs )
 			{
-				g_bFramegenMidDeadline = false;
-				g_ulFramegenMidTargetNs = ulWakeDeadlineNs;
-				g_FramegenMidTimer.ArmTimer( ulWakeDeadlineNs );
+				g_bFramegenCommitDeadline = false;
+				g_ulFramegenCommitDeadlineNs = ulWakeDeadlineNs;
+				g_FramegenCommitTimer.ArmTimer( ulWakeDeadlineNs );
 			}
 			else if ( ulWakeDeadlineNs == 0u )
 			{
-				g_ulFramegenMidTargetNs = 0u;
-				g_FramegenMidTimer.DisarmTimer();
+				g_ulFramegenCommitDeadlineNs = 0u;
+				g_FramegenCommitTimer.DisarmTimer();
+			}
+		}
+		else
+		{
+			// Work above may consume, replace, or create the native causal slot.
+			// Re-read it only after real work has had absolute priority.
+			ulFixedCommitDeadlineNs =
+				vulkan_framegen_fixed_refresh_commit_deadline_ns();
+			if ( ulFixedCommitDeadlineNs != 0u )
+			{
+				const uint64_t ulCommitArmNowNs = get_time_in_nanos();
+				if ( ulCommitArmNowNs >= ulFixedCommitDeadlineNs )
+				{
+					// A fixed-grid slot can be created only after the preceding
+					// real commit returns. Re-enter once after that real work; if
+					// its flip is still in flight, flip completion is the only
+					// subsequent retry wake.
+					if ( g_ulFramegenCommitDeadlineNs != ulFixedCommitDeadlineNs )
+						g_bFramegenCommitDeadline = false;
+					if ( !g_bFramegenCommitDeadline )
+					{
+						g_ulFramegenCommitDeadlineNs = ulFixedCommitDeadlineNs;
+						g_FramegenCommitTimer.DisarmTimer();
+						g_bFramegenCommitDeadline = true;
+						g_SteamCompMgrWaiter.Nudge();
+					}
+				}
+				else if ( ulFixedCommitDeadlineNs != g_ulFramegenCommitDeadlineNs )
+				{
+					g_bFramegenCommitDeadline = false;
+					g_ulFramegenCommitDeadlineNs = ulFixedCommitDeadlineNs;
+					g_FramegenCommitTimer.ArmTimer( ulFixedCommitDeadlineNs );
+				}
+			}
+			else if ( g_ulFramegenCommitDeadlineNs != 0u )
+			{
+				// A deadline owned earlier in this iteration was superseded by
+				// real work. Cancel it after the real commit, never before it.
+				g_bFramegenCommitDeadline = false;
+				g_ulFramegenCommitDeadlineNs = 0u;
+				g_FramegenCommitTimer.DisarmTimer();
 			}
 		}
 

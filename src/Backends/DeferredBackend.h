@@ -226,6 +226,12 @@ namespace gamescope
 			return m_pChild->SupportsFramegen();
 		}
 
+		virtual bool OwnsKMSPresentTiming() const override
+		{
+            // Doesn't need to be 'initted' for this check.
+			return m_pChild->OwnsKMSPresentTiming();
+		}
+
 		virtual bool UsesVulkanSwapchain() const override
 		{
             // Doesn't need to be 'initted' for this check.

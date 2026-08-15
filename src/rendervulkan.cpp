@@ -6702,6 +6702,40 @@ bool vulkan_framegen_has_pending_generated_frame()
 	return vulkan_framegen_is_enabled() && !g_framegenHistory.pending.empty();
 }
 
+uint64_t vulkan_framegen_fixed_refresh_commit_deadline_ns()
+{
+	// Early commits exist to catch the KMS latch on direct scanout. A nested
+	// parent compositor owns latch timing itself - the one-vblank defect never
+	// occurs there, and committing ahead of the parent's frame callbacks only
+	// disturbs its pacing. Native DRM only.
+	if ( GetBackend() == nullptr || !GetBackend()->OwnsKMSPresentTiming() )
+		return 0u;
+	if ( !framegen_causal_deadline_enabled()
+		|| vulkan_framegen_vrr_hybrid_active()
+		|| vulkan_framegen_bidir_active()
+		|| g_framegenHistory.ulDeadlineGridIntervalNs == 0u
+		|| !vulkan_framegen_has_pending_generated_frame() )
+		return 0u;
+
+	const FramegenHistory_t::PendingGenerated_t &front =
+		g_framegenHistory.pending.front();
+	if ( front.bReal || front.ulAnchorRealFrameId == 0u
+		|| front.ulTargetFlipNs == 0u )
+		return 0u;
+
+	// Match the established VRR compensation margin. This is presentation
+	// scheduling headroom only: generation admission continues to use the
+	// planner's immutable W(D).
+	const uint64_t ulMarginNs =
+		g_framegenHistory.ulDeadlineGridIntervalNs / 10u;
+	const gamescope::framegen::FixedRefreshCommitPlan_t plan =
+		gamescope::framegen::plan_fixed_refresh_commit(
+			front.ulTargetFlipNs,
+			g_framegenPresentState.displayTiming.presentLead,
+			ulMarginNs );
+	return plan.earlyCommit ? plan.commitDeadlineNs : 0u;
+}
+
 bool vulkan_framegen_generated_frame_due()
 {
 	if ( !vulkan_framegen_has_pending_generated_frame() )

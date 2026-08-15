@@ -389,6 +389,11 @@ namespace gamescope
         // no-VRR tax — where the generated frames would just be discarded.
         virtual bool SupportsFramegen() const { return false; }
 
+        // Whether this backend owns the KMS commit/flip timing used to schedule
+        // native-display presents. Nested backends leave this false because the
+        // parent compositor owns the final display latch.
+        virtual bool OwnsKMSPresentTiming() const { return false; }
+
         virtual bool UsesVulkanSwapchain() const = 0;
         virtual bool IsSessionBased() const = 0;
 

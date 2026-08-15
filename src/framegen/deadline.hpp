@@ -15,6 +15,7 @@ namespace gamescope::framegen
 {
 
 inline constexpr uint32_t k_uPresentBiasWarmupSamples = 4u;
+inline constexpr uint32_t k_uPresentLeadWarmupSamples = 4u;
 
 [[nodiscard]] constexpr uint64_t signed_ns_magnitude( int64_t valueNs )
 {
@@ -833,6 +834,50 @@ struct DeadlineFeedbackSample_t
 	// representable in the signed timestamp range.
 	const int64_t residualNs = sampleNs - state.emaNs;
 	return update_present_timing_ema_residual( state, residualNs );
+}
+
+struct FixedRefreshCommitPlan_t
+{
+	uint64_t commitDeadlineNs = 0;
+	bool earlyCommit = false;
+};
+
+// Fixed-refresh content remains attached to its display-grid target D. Once the
+// display-chain learner is warm, move only the commit wake to
+// D - commit-to-flip lead - margin. During warmup the arbiter retains its normal
+// vblank opportunity, so a zero deadline explicitly means "no early commit".
+[[nodiscard]] constexpr FixedRefreshCommitPlan_t plan_fixed_refresh_commit(
+	uint64_t targetFlipNs, PresentLeadState_t presentLead,
+	uint64_t presentMarginNs )
+{
+	FixedRefreshCommitPlan_t result;
+	if ( targetFlipNs == 0u
+		|| presentLead.samples < k_uPresentLeadWarmupSamples )
+		return result;
+
+	const uint64_t leadNs = static_cast<uint64_t>(
+		std::max<int64_t>( 0, presentLead.emaNs ) );
+	const uint64_t advanceNs = saturating_add_ns(
+		leadNs, presentMarginNs );
+	if ( advanceNs == 0u || advanceNs >= targetFlipNs )
+		return result;
+
+	result.commitDeadlineNs = targetFlipNs - advanceNs;
+	result.earlyCommit = true;
+	return result;
+}
+
+// A generated early commit may block until scanout on native KMS. Only start it
+// after its deadline when the compositor has no real frame ready to paint and
+// no earlier present is still in flight; the next real composite then keeps
+// absolute priority at the arbiter.
+[[nodiscard]] constexpr bool can_start_early_generated_commit(
+	bool commitDeadlineReached, bool realCompositePending,
+	bool presentInFlight )
+{
+	return commitDeadlineReached
+		&& !realCompositePending
+		&& !presentInFlight;
 }
 
 struct VrrMidpointPlan_t

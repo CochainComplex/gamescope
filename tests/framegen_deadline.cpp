@@ -1084,6 +1084,47 @@ TEST_CASE( "VRR midpoint wake compensates tagged backend present lead", "[frameg
 	CHECK( late.wakeDeadlineNs == plan.wakeDeadlineNs );
 }
 
+TEST_CASE( "fixed-refresh commit wake uses mature present lead and margin", "[framegen][deadline]" )
+{
+	const PresentLeadState_t warming = {
+		.emaNs = 3'000u,
+		.samples = k_uPresentLeadWarmupSamples - 1u,
+	};
+	const FixedRefreshCommitPlan_t warmup =
+		plan_fixed_refresh_commit( 20'000u, warming, 1'000u );
+	CHECK_FALSE( warmup.earlyCommit );
+	CHECK( warmup.commitDeadlineNs == 0u );
+
+	PresentLeadState_t mature = warming;
+	mature.samples = k_uPresentLeadWarmupSamples;
+	const FixedRefreshCommitPlan_t plan =
+		plan_fixed_refresh_commit( 20'000u, mature, 1'000u );
+	REQUIRE( plan.earlyCommit );
+	CHECK( plan.commitDeadlineNs == 16'000u );
+
+	// The margin remains part of the advance even at a zero learned lead.
+	mature.emaNs = 0;
+	const FixedRefreshCommitPlan_t marginOnly =
+		plan_fixed_refresh_commit( 20'000u, mature, 1'000u );
+	REQUIRE( marginOnly.earlyCommit );
+	CHECK( marginOnly.commitDeadlineNs == 19'000u );
+
+	mature.emaNs = 3'000u;
+	const FixedRefreshCommitPlan_t underflow =
+		plan_fixed_refresh_commit( 3'000u, mature, 1'000u );
+	CHECK_FALSE( underflow.earlyCommit );
+	CHECK( underflow.commitDeadlineNs == 0u );
+}
+
+TEST_CASE( "generated commit never races a real present", "[framegen][deadline]" )
+{
+	CHECK( can_start_early_generated_commit( true, false, false ) );
+	CHECK_FALSE( can_start_early_generated_commit( false, false, false ) );
+	CHECK_FALSE( can_start_early_generated_commit( true, true, false ) );
+	CHECK_FALSE( can_start_early_generated_commit( true, false, true ) );
+	CHECK_FALSE( can_start_early_generated_commit( true, true, true ) );
+}
+
 TEST_CASE( "slot budget applies 0.85 to actual remaining time", "[framegen][deadline]" )
 {
 	CHECK( deadline_cost_fits( 8'500u, 20'000u, 10'000u, 0u ) );
