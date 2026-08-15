@@ -6762,7 +6762,8 @@ bool vulkan_framegen_is_enabled()
 
 // Deadline-driven degradation ladder (#04). The startup mode/quality/multiplier are the
 // quality CEILING; under GPU-time pressure the ladder sheds work immediately.
-// Slow evidence-gated recovery may re-probe one adjacent richer rung. It NEVER mutates
+// Slow evidence-gated recovery may jump to the richest measured fitting rung,
+// or re-probe one adjacent cold rung. It NEVER mutates
 // the base globals (g_eFramegenMode / g_nFramegenMultiplier): those gate the whole
 // feature (vulkan_framegen_is_enabled) and size the output pool, so the ladder only
 // ever degrades within them and reads its result through framegen_effective_config.
@@ -6822,12 +6823,12 @@ static void framegen_recovery_note_degradation()
 }
 
 static void framegen_log_ladder_recovery( uint32_t nMaxDegradeSteps,
-	uint32_t uEvidenceDecisions )
+	uint32_t nPreviousRung, uint32_t uEvidenceDecisions )
 {
 	vk_log.infof(
-		"framegen: ladder recovered to rung %u/%u after %u decisions (backoff %u)",
+		"framegen: ladder recovered to rung %u/%u (from %u) after %u decisions",
 		g_framegenHistory.nDegradeSteps, nMaxDegradeSteps,
-		uEvidenceDecisions, g_framegenHistory.recovery.backoffDecisions );
+		nPreviousRung, uEvidenceDecisions );
 }
 
 static void framegen_log_ladder_recovery_blocked( uint32_t nMaxDegradeSteps,
@@ -10627,9 +10628,6 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 		result.bAdmit = true;
 		if ( framegen_recovery_active_for_path() )
 		{
-			FramegenCausalRungSelection_t richer;
-			if ( nCurrentRung > 0u )
-				richer = sampleRung( nCurrentRung - 1u );
 			const uint64_t ulDecisionStartNs = std::max(
 				ulNowNs, ulStartEstimateNs );
 			const uint64_t ulRecoveryBudgetNs = ulNativeSlotBudgetNs != 0u
@@ -10638,27 +10636,41 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 					? gamescope::framegen::deadline_budget_ns(
 						plan.wakeNs - ulDecisionStartNs )
 					: 0u );
+			std::array<gamescope::framegen::LadderRungCost_t,
+				CVulkanDevice::kFramegenLadderSlots> rungCosts = {};
+			for ( uint32_t nRung = 0u; nRung < nCurrentRung; nRung++ )
+			{
+				const FramegenCausalRungSelection_t sample = sampleRung( nRung );
+				rungCosts[ nRung ] = { sample.ulCostNs, sample.uSamples };
+			}
+			const gamescope::framegen::LadderRecoveryTarget_t recoveryTarget =
+				gamescope::framegen::select_ladder_recovery_target(
+					rungCosts, nCurrentRung, ulRecoveryBudgetNs );
 			const gamescope::framegen::LadderRecoveryEvaluation_t recovery =
 				gamescope::framegen::evaluate_ladder_recovery(
 					g_framegenHistory.recovery, nCurrentRung,
 					g_framegenHistory.nDegradeHold,
 					result.ulCostNs, result.uSamples,
-					richer.ulCostNs, richer.uSamples,
+					recoveryTarget.evidence.costNs,
+					recoveryTarget.evidence.samples,
 					ulRecoveryBudgetNs );
 			g_framegenHistory.recovery = recovery.state;
 			if ( recovery.reportBlockedThreshold )
 				framegen_log_ladder_recovery_blocked(
 					nMaxCausalDegradeSteps,
 					g_framegenHistory.nDegradeHold );
-			if ( recovery.tryRecover && nCurrentRung > 0u )
+			if ( recovery.tryRecover && recoveryTarget.rung < nCurrentRung )
 			{
 				const uint32_t uEvidenceDecisions = recovery.state.streak;
-				g_framegenHistory.nDegradeSteps = nCurrentRung - 1u;
+				g_framegenHistory.nDegradeSteps = recoveryTarget.rung;
 				g_framegenHistory.recovery =
 					gamescope::framegen::commit_ladder_recovery(
 						g_framegenHistory.recovery );
 				framegen_log_ladder_recovery(
-					nMaxCausalDegradeSteps, uEvidenceDecisions );
+					nMaxCausalDegradeSteps, nCurrentRung,
+					uEvidenceDecisions );
+				FramegenCausalRungSelection_t richer = sampleRung(
+					recoveryTarget.rung );
 				richer.bAdmit = true;
 				richer.bCommittedRung = true;
 				return richer;
@@ -12564,12 +12576,14 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	}
 	if ( !bDegradedThisDecision && framegen_recovery_active_for_path() )
 	{
-		uint64_t ulRicherRungCostNs = 0u;
-		uint32_t uRicherRungSamples = 0u;
-		if ( g_framegenHistory.nDegradeSteps > 0u )
+		const uint32_t nCurrentRung = g_framegenHistory.nDegradeSteps;
+		const uint64_t ulRecoveryBudgetNs =
+			gamescope::framegen::deadline_budget_ns( ulVblankIntervalNs );
+		std::array<gamescope::framegen::LadderRungCost_t,
+			CVulkanDevice::kFramegenLadderSlots> rungCosts = {};
+		for ( uint32_t nRicherRung = 0u;
+			nRicherRung < nCurrentRung; nRicherRung++ )
 		{
-			const uint32_t nRicherRung =
-				g_framegenHistory.nDegradeSteps - 1u;
 			const FramegenEffective_t richerEff =
 				framegen_effective_config( nRicherRung );
 			const uint32_t nRicherGapVblanks =
@@ -12582,33 +12596,36 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				gamescope::framegen::ladder_generated_count(
 					nRicherGapSlots, richerEff.multiplier,
 					bSingleSlotPacing );
-			ulRicherRungCostNs = g_device.framegenRungCostNs(
-				nRicherRung, nRicherGen );
-			uRicherRungSamples = g_device.framegenRungSampleCount(
-				nRicherRung, nRicherGen );
+			rungCosts[ nRicherRung ] = {
+				g_device.framegenRungCostNs( nRicherRung, nRicherGen ),
+				g_device.framegenRungSampleCount( nRicherRung, nRicherGen ),
+			};
 		}
+		const gamescope::framegen::LadderRecoveryTarget_t recoveryTarget =
+			gamescope::framegen::select_ladder_recovery_target(
+				rungCosts, nCurrentRung, ulRecoveryBudgetNs );
 
 		const gamescope::framegen::LadderRecoveryEvaluation_t recovery =
 			gamescope::framegen::evaluate_ladder_recovery(
 				g_framegenHistory.recovery,
-				g_framegenHistory.nDegradeSteps, nRecoveryHold,
+				nCurrentRung, nRecoveryHold,
 				ulCurRungCostNs, uCurRungSamples,
-				ulRicherRungCostNs, uRicherRungSamples,
-				gamescope::framegen::deadline_budget_ns(
-					ulVblankIntervalNs ) );
+				recoveryTarget.evidence.costNs,
+				recoveryTarget.evidence.samples,
+				ulRecoveryBudgetNs );
 		g_framegenHistory.recovery = recovery.state;
 		if ( recovery.reportBlockedThreshold )
 			framegen_log_ladder_recovery_blocked(
 				nMaxDegradeSteps, nRecoveryHold );
-		if ( recovery.tryRecover && g_framegenHistory.nDegradeSteps > 0u )
+		if ( recovery.tryRecover && recoveryTarget.rung < nCurrentRung )
 		{
 			const uint32_t uEvidenceDecisions = recovery.state.streak;
-			g_framegenHistory.nDegradeSteps--;
+			g_framegenHistory.nDegradeSteps = recoveryTarget.rung;
 			g_framegenHistory.recovery =
 				gamescope::framegen::commit_ladder_recovery(
 					g_framegenHistory.recovery );
 			framegen_log_ladder_recovery(
-				nMaxDegradeSteps, uEvidenceDecisions );
+				nMaxDegradeSteps, nCurrentRung, uEvidenceDecisions );
 		}
 	}
 

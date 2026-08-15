@@ -1686,6 +1686,85 @@ TEST_CASE( "deadline ladder recovers after sustained measured headroom",
 	}
 }
 
+TEST_CASE( "deadline recovery target uses the richest fitting evidence",
+	"[framegen][deadline][recovery]" )
+{
+	constexpr std::array<LadderRungCost_t, 5> costs = {{
+		{ 7'000u, k_uDeadlineMinSamples },
+		{ 6'000u, k_uDeadlineMinSamples },
+		{ 0u, 0u },
+		{ 4'000u, k_uDeadlineMinSamples },
+		{ 3'000u, k_uDeadlineMinSamples },
+	}};
+	constexpr LadderRecoveryTarget_t target =
+		select_ladder_recovery_target( costs, 4u, 10'000u );
+	STATIC_REQUIRE( target.rung == 0u );
+	STATIC_REQUIRE( target.evidence.costNs == 7'000u );
+}
+
+TEST_CASE( "deadline recovery target skips immature richer rungs",
+	"[framegen][deadline][recovery]" )
+{
+	constexpr std::array<LadderRungCost_t, 4> costs = {{
+		{ 2'000u, k_uDeadlineMinSamples - 1u },
+		{ 4'000u, k_uDeadlineMinSamples },
+		{ 3'000u, k_uDeadlineMinSamples },
+		{ 2'000u, k_uDeadlineMinSamples },
+	}};
+	constexpr LadderRecoveryTarget_t target =
+		select_ladder_recovery_target( costs, 3u, 5'000u );
+	STATIC_REQUIRE( target.rung == 1u );
+	STATIC_REQUIRE( target.evidence.samples == k_uDeadlineMinSamples );
+}
+
+TEST_CASE( "deadline recovery target falls back to one cold rung",
+	"[framegen][deadline][recovery]" )
+{
+	constexpr std::array<LadderRungCost_t, 4> costs = {{
+		{ 0u, 0u },
+		{ 2'000u, k_uDeadlineMinSamples - 1u },
+		{ 1'000u, 1u },
+		{ 900u, k_uDeadlineMinSamples },
+	}};
+	constexpr LadderRecoveryTarget_t target =
+		select_ladder_recovery_target( costs, 3u, 5'000u );
+	STATIC_REQUIRE( target.rung == 2u );
+	STATIC_REQUIRE( target.evidence.samples == 1u );
+	STATIC_REQUIRE( deadline_recovery_headroom(
+		2'500u, k_uDeadlineMinSamples,
+		target.evidence.costNs, target.evidence.samples, 5'000u ) );
+}
+
+TEST_CASE( "deadline recovery uses mature non-adjacent native evidence",
+	"[framegen][deadline][recovery]" )
+{
+	constexpr uint64_t currentCostNs = 1'780'000u;
+	constexpr uint64_t budgetNs = 4'900'000u;
+	constexpr std::array<LadderRungCost_t, 5> costs = {{
+		{ 2'500'000u, k_uDeadlineMinSamples },
+		{ 0u, 0u },
+		{ 0u, 0u },
+		{ 0u, 0u },
+		{ currentCostNs, k_uDeadlineMinSamples },
+	}};
+	constexpr LadderRecoveryTarget_t target =
+		select_ladder_recovery_target( costs, 4u, budgetNs );
+	STATIC_REQUIRE( target.rung == 0u );
+
+	RecoveryState_t state;
+	LadderRecoveryEvaluation_t recovery;
+	for ( uint32_t decision = 0u;
+		decision < k_uDeadlineRecoveryHeadroomDecisions; decision++ )
+	{
+		recovery = evaluate_ladder_recovery(
+			state, 4u, 0u, currentCostNs, k_uDeadlineMinSamples,
+			target.evidence.costNs, target.evidence.samples, budgetNs );
+		state = recovery.state;
+	}
+	CHECK( recovery.tryRecover );
+	CHECK( ( recovery.tryRecover ? target.rung : 4u ) == 0u );
+}
+
 TEST_CASE( "deadline ladder recovery requires large current-rung headroom",
 	"[framegen][deadline][recovery]" )
 {
@@ -1696,7 +1775,7 @@ TEST_CASE( "deadline ladder recovery requires large current-rung headroom",
 	{
 		const LadderRecoveryEvaluation_t known = evaluate_ladder_recovery(
 			knownState, 2u, 0u,
-			5'001u, k_uDeadlineMinSamples,
+			7'001u, k_uDeadlineMinSamples,
 			9'000u, k_uDeadlineMinSamples,
 			10'000u );
 		knownState = known.state;
@@ -1704,14 +1783,14 @@ TEST_CASE( "deadline ladder recovery requires large current-rung headroom",
 
 		const LadderRecoveryEvaluation_t cold = evaluate_ladder_recovery(
 			coldState, 2u, 0u,
-			3'501u, k_uDeadlineMinSamples,
+			5'001u, k_uDeadlineMinSamples,
 			0u, 0u, 10'000u );
 		coldState = cold.state;
 		CHECK_FALSE( cold.tryRecover );
 	}
 
 	CHECK( deadline_recovery_headroom(
-		3'500u, k_uDeadlineMinSamples, 0u, 0u, 10'000u ) );
+		5'000u, k_uDeadlineMinSamples, 0u, 0u, 10'000u ) );
 	CHECK_FALSE( deadline_recovery_headroom(
 		5'000u, k_uDeadlineMinSamples,
 		10'001u, k_uDeadlineMinSamples, 10'000u ) );

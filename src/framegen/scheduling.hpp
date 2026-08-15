@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <span>
 
 namespace gamescope::framegen
 {
@@ -32,8 +33,8 @@ inline constexpr uint32_t k_uDeadlineRecoveryHeadroomDecisions = 90u;
 inline constexpr uint32_t k_uDeadlineRecoveryBaseBackoffDecisions = 90u;
 inline constexpr uint32_t k_uDeadlineRecoveryProbationDecisions = 225u;
 inline constexpr uint32_t k_uDeadlineRecoveryMaxBackoffDecisions = 2'700u;
-inline constexpr uint64_t k_uDeadlineRecoveryKnownHeadroomPercent = 50u;
-inline constexpr uint64_t k_uDeadlineRecoveryColdHeadroomPercent = 35u;
+inline constexpr uint64_t k_uDeadlineRecoveryKnownHeadroomPercent = 70u;
+inline constexpr uint64_t k_uDeadlineRecoveryColdHeadroomPercent = 50u;
 
 // One-slot deadline pacing measures the two materially different causal
 // submission shapes independently.
@@ -300,6 +301,18 @@ struct LadderRecoveryEvaluation_t
 	bool reportBlockedThreshold = false;
 };
 
+struct LadderRungCost_t
+{
+	uint64_t costNs = 0u;
+	uint32_t samples = 0u;
+};
+
+struct LadderRecoveryTarget_t
+{
+	uint32_t rung = 0u;
+	LadderRungCost_t evidence;
+};
+
 struct DeadlineMissState_t
 {
 	uint32_t recentMisses = 0u;
@@ -486,9 +499,44 @@ evaluate_deadline_miss_hysteresis(
 			* k_uDeadlineRecoveryColdHeadroomPercent ) / 100u;
 }
 
+// Prefer the richest measured rung which fits the full recovery budget. If no
+// richer rung is mature, preserve the adjacent one-rung cold probe. A mature
+// but non-fitting rung is returned only as blocking evidence, with no target.
+[[nodiscard]] constexpr LadderRecoveryTarget_t select_ladder_recovery_target(
+	std::span<const LadderRungCost_t> rungs, uint32_t currentRung,
+	uint64_t budgetNs )
+{
+	LadderRecoveryTarget_t result = { currentRung, {} };
+	bool foundMature = false;
+	const uint32_t end = std::min<uint32_t>(
+		currentRung, static_cast<uint32_t>( rungs.size() ) );
+	for ( uint32_t rung = 0u; rung < end; rung++ )
+	{
+		const LadderRungCost_t sample = rungs[ rung ];
+		if ( sample.costNs == 0u || sample.samples < k_uDeadlineMinSamples )
+			continue;
+
+		if ( !foundMature )
+		{
+			foundMature = true;
+			result.evidence = sample;
+		}
+		if ( sample.costNs <= budgetNs )
+			return { rung, sample };
+	}
+
+	if ( !foundMature && currentRung > 0u )
+	{
+		result.rung = currentRung - 1u;
+		if ( result.rung < rungs.size() )
+			result.evidence = rungs[ result.rung ];
+	}
+	return result;
+}
+
 // Observe exactly one admitted/generated decision. The renderer supplies the
-// current decision's already-margin-adjusted budget and commits at most the
-// adjacent richer rung when tryRecover is true.
+// current decision's already-margin-adjusted budget and commits the target
+// chosen from the available richer-rung evidence when tryRecover is true.
 [[nodiscard]] constexpr LadderRecoveryEvaluation_t evaluate_ladder_recovery(
 	RecoveryState_t state, uint32_t currentDegradeSteps,
 	uint32_t degradeHoldFrames, uint64_t currentRungCostNs,
