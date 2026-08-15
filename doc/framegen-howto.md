@@ -19,6 +19,7 @@ GAMESCOPE_FRAMEGEN_HUD=2 GAMESCOPE_FRAMEGEN_NET_ONLINE=1 GAMESCOPE_FRAMEGEN_NET_
 - Use `--framegen-mode motion`, `--framegen-multiplier 2`, `--framegen-quality high`; try multiplier `3` only if the present GPU has headroom. Measured 2026-08-15 on the POC laptop with a real Proton game, AMD 890M present GPU, NVIDIA render GPU.
 - Raise quality to `ultra` or `extreme` only while the HUD `ladder` row stays full; the ladder auto-degrades and now auto-recovers.
 - Keep `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`; adaptation is on by default at `high` and above.
+- On an iGPU-class present GPU (e.g. an 890M) set `GAMESCOPE_FRAMEGEN_NET_EVERY=2` (train every 2nd frame): pacing stays equal and it played best in our real-game test; `1` on a desktop card.
 - Tune with `GAMESCOPE_FRAMEGEN_HUD=2`: `rates` shows source/generated fps, `ladder` shows effective tier/recovery, and `pace` shows hit-rate/jitter sparklines. Add `GAMESCOPE_FRAMEGEN_METRICS=1` for a log summary.
 - Use `GAMESCOPE_FRAMEGEN_BIDIR=1` only when latency does not matter, such as video-like content or benchmarks. It delays every real frame by one interval and felt clearly laggy in play.
 - Nested Wayland is fine for trying it, but heavy scenes make the desktop compositor compete for the present GPU. Native/DRM from a VT, or running as the session compositor, is the real test. x3/x4 only helps when source fps is at most refresh/3; otherwise the scheduler goes dormant.
