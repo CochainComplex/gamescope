@@ -331,16 +331,17 @@ for lines like `framegen: generated 1 frame(s) …`.
 
 `GAMESCOPE_FRAMEGEN_HUD=1` draws a one-line status block on screen; `=2` adds pacing
 and learning lines. `GAMESCOPE_FRAMEGEN_HUD_SCALE=1..6` sizes it,
-`GAMESCOPE_FRAMEGEN_HUD_CORNER=tl|tr|bl|br` places it. Legend:
+`GAMESCOPE_FRAMEGEN_HUD_CORNER=bc|tl|tr|bl|br` places it; bottom-center (`bc`) is
+the default. Legend:
 
 | Term | Meaning |
 |---|---|
 | `motion x2 quality:high` | active mode, frame multiplier, quality tier |
 | `120Hz fixed` / `120Hz VRR` | display refresh and whether VRR is actually driving it |
 | `present:` | the GPU that generates and drives the display |
-| `render` | vendor of the client dma-buf from its DRM modifier; linear (cross-vendor) buffers show other-GPU when they had to be staged into present-GPU memory, present-GPU otherwise |
-| `client buffers: local` | game frames arrive on the same GPU — zero-copy |
-| `client buffers: staged(xGPU)` | dual-GPU path active: frames are copied once into present-GPU memory |
+| `render` | vendor of the client dma-buf from its DRM modifier; linear staged buffers show the single other Vulkan device name when known, otherwise other-GPU; linear local buffers show present-GPU |
+| `buffers local` | game frames arrive on the same GPU — zero-copy |
+| `buffers xGPU` | dual-GPU path active: frames are copied once into present-GPU memory |
 | `bidir` | bidirectional interpolation (real frames shown one interval late) |
 | `base` | base-layer mode: HUD/cursor composited *after* generation |
 | `net: off / blob / online` | learned refiner: disabled / offline weights / training while you play |

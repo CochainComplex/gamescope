@@ -145,6 +145,7 @@ enum class FramegenHudCorner : uint32_t
 	TopRight,
 	BottomLeft,
 	BottomRight,
+	BottomCenter,
 };
 
 static uint32_t framegen_hud_scale( uint32_t uOutputHeight )
@@ -165,13 +166,15 @@ static FramegenHudCorner framegen_hud_corner()
 	static const FramegenHudCorner s_eCorner = []()
 	{
 		const char *pszCorner = getenv( "GAMESCOPE_FRAMEGEN_HUD_CORNER" );
+		if ( pszCorner != nullptr && strcmp( pszCorner, "tl" ) == 0 )
+			return FramegenHudCorner::TopLeft;
 		if ( pszCorner != nullptr && strcmp( pszCorner, "tr" ) == 0 )
 			return FramegenHudCorner::TopRight;
 		if ( pszCorner != nullptr && strcmp( pszCorner, "bl" ) == 0 )
 			return FramegenHudCorner::BottomLeft;
 		if ( pszCorner != nullptr && strcmp( pszCorner, "br" ) == 0 )
 			return FramegenHudCorner::BottomRight;
-		return FramegenHudCorner::TopLeft;
+		return FramegenHudCorner::BottomCenter;
 	}();
 	return s_eCorner;
 }
@@ -729,6 +732,26 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 	vk.GetPhysicalDeviceProperties( m_physDev, &props );
 	m_uMaxComputeSharedMemorySize = props.limits.maxComputeSharedMemorySize;
 	vk_log.infof( "selecting physical device '%s': queue family %x (general queue family %x)", props.deviceName, m_queueFamily, m_generalQueueFamily );
+
+	m_uFramegenOtherDeviceCount = 0u;
+	m_framegenOtherDeviceName = {};
+	for ( auto cphysDev : physDevs )
+	{
+		if ( cphysDev == m_physDev )
+			continue;
+
+		VkPhysicalDeviceProperties otherProperties;
+		vk.GetPhysicalDeviceProperties( cphysDev, &otherProperties );
+		if ( otherProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU )
+			continue;
+
+		m_uFramegenOtherDeviceCount++;
+		if ( m_uFramegenOtherDeviceCount == 1u )
+		{
+			std::snprintf( m_framegenOtherDeviceName.data(),
+				m_framegenOtherDeviceName.size(), "%s", otherProperties.deviceName );
+		}
+	}
 
 	// Record how many queues the chosen compositor family exposes, so
 	// createDevice can request a second (frame-generation) queue when the
@@ -2993,6 +3016,11 @@ static std::array<char, 16> dmabuf_render_origin( const wlr_dmabuf_attributes *p
 	return result;
 }
 
+void CVulkanTexture::setRenderOrigin( const char *origin )
+{
+	copy_render_origin( m_renderOrigin, origin );
+}
+
 bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
 {
 	m_pBackendFb = std::move( pBackendFb );
@@ -3750,6 +3778,7 @@ gamescope::Rc<CVulkanTexture> CVulkanTexture::AcquireDeviceLocalStagingImage()
 	}
 
 	pTexture->setStreamColorspace( m_streamColorspace );
+	pTexture->setRenderOrigin( renderOrigin() );
 	pTexture->m_bDeviceLocalStagingImage = true;
 	m_deviceLocalStagingImages.emplace_back( std::move( pTexture ) );
 	m_uDeviceLocalStagingCursor = 0;
@@ -8197,6 +8226,7 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 	return {
 		.version = gamescope::k_szGamescopeHudVersion,
 		.deviceName = framegen_hud_device_name(),
+		.otherDeviceName = g_device.framegenOtherDeviceName(),
 		.renderOrigin = pBaseClientTexture != nullptr
 			? pBaseClientTexture->renderOrigin() : nullptr,
 		.mode = effective.mode,
@@ -8322,11 +8352,15 @@ static int framegen_hud_record( CVulkanCmdBuffer *pCmdBuffer,
 	const bool bRight = eCorner == FramegenHudCorner::TopRight
 		|| eCorner == FramegenHudCorner::BottomRight;
 	const bool bBottom = eCorner == FramegenHudCorner::BottomLeft
-		|| eCorner == FramegenHudCorner::BottomRight;
-	const uint32_t uOffsetX = bRight
-		? ( pTarget->width() > uWidthPixels + uMargin
-			? pTarget->width() - uWidthPixels - uMargin : 0u )
-		: ( pTarget->width() > uWidthPixels + uMargin ? uMargin : 0u );
+		|| eCorner == FramegenHudCorner::BottomRight
+		|| eCorner == FramegenHudCorner::BottomCenter;
+	uint32_t uOffsetX = pTarget->width() > uWidthPixels + uMargin ? uMargin : 0u;
+	if ( eCorner == FramegenHudCorner::BottomCenter )
+		uOffsetX = pTarget->width() > uWidthPixels
+			? ( pTarget->width() - uWidthPixels ) / 2u : 0u;
+	else if ( bRight )
+		uOffsetX = pTarget->width() > uWidthPixels + uMargin
+			? pTarget->width() - uWidthPixels - uMargin : 0u;
 	const uint32_t uOffsetY = bBottom
 		? ( pTarget->height() > uHeightPixels + uMargin
 			? pTarget->height() - uHeightPixels - uMargin : 0u )

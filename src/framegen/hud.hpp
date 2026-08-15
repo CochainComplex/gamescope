@@ -170,6 +170,7 @@ struct FramegenHudSnapshot_t
 {
 	const char *version = "unknown";
 	const char *deviceName = "unknown";
+	const char *otherDeviceName = nullptr;
 	const char *renderOrigin = nullptr;
 	GamescopeFramegenMode mode = GamescopeFramegenMode::Extrapolate;
 	GamescopeFramegenQuality quality = GamescopeFramegenQuality::Low;
@@ -328,18 +329,25 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		snapshot.vrrActive ? "VRR" : "fixed" );
 	framegen_hud_add_line( result, line );
 
-	char deviceName[k_uFramegenHudDeviceNameColumns + 1u] = {};
+	constexpr size_t k_nFramegenHudDeviceColumnWidth = 19u;
+	char deviceName[k_nFramegenHudDeviceColumnWidth + 1u] = {};
 	framegen_hud_trim_device_name( deviceName, sizeof( deviceName ), snapshot.deviceName );
+	char otherDeviceName[k_nFramegenHudDeviceColumnWidth + 1u] = {};
+	framegen_hud_trim_device_name( otherDeviceName, sizeof( otherDeviceName ),
+		snapshot.otherDeviceName );
 	const char *renderOrigin = "n/a";
 	if ( snapshot.renderOrigin != nullptr && snapshot.renderOrigin[0] != '\0' )
 	{
-		renderOrigin = std::strcmp( snapshot.renderOrigin, "linear" ) == 0
-			? ( snapshot.clientBuffersStaged ? "other-GPU" : "present-GPU" )
-			: snapshot.renderOrigin;
+		if ( std::strcmp( snapshot.renderOrigin, "linear" ) == 0 )
+			renderOrigin = snapshot.clientBuffersStaged
+				? ( snapshot.otherDeviceName != nullptr ? otherDeviceName : "other-GPU" )
+				: "present-GPU";
+		else
+			renderOrigin = snapshot.renderOrigin;
 	}
 	std::snprintf( line, sizeof( line ),
-		"%-8s %-21srender %-11.11s buffers %s", "present", deviceName,
-		renderOrigin, snapshot.clientBuffersStaged ? "staged(xGPU)" : "local" );
+		"%-8s %-19s render %-19.19s buffers %s", "present", deviceName,
+		renderOrigin, snapshot.clientBuffersStaged ? "xGPU" : "local" );
 	framegen_hud_add_line( result, line );
 
 	const char *bidirState = snapshot.bidirActive ? "on"

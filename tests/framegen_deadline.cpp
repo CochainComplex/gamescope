@@ -43,6 +43,7 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	const FramegenHudSnapshot_t snapshot = {
 		.version = "0.1.0+76e6d5",
 		.deviceName = "  AMD Radeon Graphics  ",
+		.otherDeviceName = "NVIDIA GeForce RTX 3070",
 		.renderOrigin = "linear",
 		.mode = GamescopeFramegenMode::Motion,
 		.quality = GamescopeFramegenQuality::High,
@@ -72,7 +73,7 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	CHECK( text.lines[0].data() == std::string_view{
 		"gameslop 0.1.0+76e6d5         motion x2 . high . 120Hz fixed" } );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present  AMD Radeon Graphics  render other-GPU   buffers staged(xGPU)" } );
+		"present  AMD Radeon Graphics render NVIDIA GeForce RTX  buffers xGPU" } );
 	CHECK( text.lines[2].data() == std::string_view{
 		"modes    bidir:off  base:off  net:online  adapt:on" } );
 	CHECK( text.lines[3].data() == std::string_view{
@@ -91,7 +92,7 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 
 	const FramegenHudUniform_t uniform = make_framegen_hud_uniform( text, true );
 	CHECK( uniform.lineCount == 7u );
-	CHECK( uniform.widthChars == 69u );
+	CHECK( uniform.widthChars == 68u );
 	CHECK( uniform.hdr == 1u );
 	CHECK( ( uniform.text[0] & 0xffu ) == static_cast<uint32_t>( 'g' ) );
 	CHECK( uniform.font[static_cast<uint32_t>( 'A' ) * 2u]
@@ -101,7 +102,14 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	tiledSnapshot.renderOrigin = "NVIDIA";
 	const FramegenHudText_t tiledText = format_framegen_hud( 2u, tiledSnapshot );
 	CHECK( tiledText.lines[1].data() == std::string_view{
-		"present  AMD Radeon Graphics  render NVIDIA      buffers staged(xGPU)" } );
+		"present  AMD Radeon Graphics render NVIDIA              buffers xGPU" } );
+
+	auto ambiguousLinearSnapshot = snapshot;
+	ambiguousLinearSnapshot.otherDeviceName = nullptr;
+	const FramegenHudText_t ambiguousLinearText =
+		format_framegen_hud( 2u, ambiguousLinearSnapshot );
+	CHECK( ambiguousLinearText.lines[1].data() == std::string_view{
+		"present  AMD Radeon Graphics render other-GPU           buffers xGPU" } );
 }
 
 TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hud]" )
@@ -123,7 +131,7 @@ TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hu
 
 	REQUIRE( text.lineCount == 5u );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present  AMD Radeon RX 5700   render n/a         buffers local" } );
+		"present  AMD Radeon RX 5700  render n/a                 buffers local" } );
 	CHECK( text.lines[2].data() == std::string_view{
 		"modes    bidir:requested(OFF)  base:off  net:off  adapt:off" } );
 	auto netOnly = snapshot;
@@ -164,7 +172,7 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 
 	REQUIRE( text.lineCount == 5u );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present  AMD Radeon 890M      render n/a         buffers local" } );
+		"present  AMD Radeon 890M     render n/a                 buffers local" } );
 	CHECK( text.lines[2].data() == std::string_view{
 		"modes    bidir:off  base:off  net:off  adapt:off" } );
 	CHECK( text.lines[3].data() == std::string_view{

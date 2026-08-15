@@ -186,6 +186,7 @@ public:
 	inline bool deviceLocal() const { return m_bDeviceLocal; }
 	inline bool deviceLocalStagingImage() const { return m_bDeviceLocalStagingImage; }
 	inline const char *renderOrigin() const { return m_renderOrigin.data(); }
+	void setRenderOrigin( const char *origin );
 	inline VkDeviceSize totalSize() const { return m_size; }
 	inline uint32_t drmFormat() const { return m_drmFormat; }
 
@@ -1040,6 +1041,11 @@ public:
 	inline bool supportsStorageImageExtendedFormats() { return m_bSupportsStorageImageExtendedFormats; }
 	inline bool supportsSync2() { return m_bSupportsSync2; }
 	inline uint32_t maxComputeSharedMemorySize() const { return m_uMaxComputeSharedMemorySize; }
+	inline const char *framegenOtherDeviceName() const
+	{
+		return m_uFramegenOtherDeviceCount == 1u
+			? m_framegenOtherDeviceName.data() : nullptr;
+	}
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
 	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size, uint32_t alignment = 16)
@@ -1133,6 +1139,8 @@ protected:
 	bool m_bSupportsModifiers = false;
 	bool m_bSupportsGlobalPriority = false;
 	bool m_bInitialized = false;
+	uint32_t m_uFramegenOtherDeviceCount = 0u;
+	std::array<char, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE> m_framegenOtherDeviceName = {};
 	uint32_t m_uMaxComputeSharedMemorySize = 0;
 
 
