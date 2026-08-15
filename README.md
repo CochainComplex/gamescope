@@ -123,7 +123,7 @@ It's **experimental**. Expect shimmer on fine detail, ghost trails on fast motio
 GAMESCOPE_FRAMEGEN_HUD=2 GAMESCOPE_FRAMEGEN_NET_ONLINE=1 GAMESCOPE_FRAMEGEN_NET_PROFILE=~/.cache/gamescope-fg-mygame.bin gamescope --expose-wayland --backend wayland --prefer-vk-device <present vendor:device> -W 2560 -H 1440 -r 120 -f --experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-quality high -- env MESA_VK_DEVICE_SELECT='<render vendor:device>!' <game>
 ```
 
-- Default to causal/forward `--framegen-mode motion`, `--framegen-multiplier 2`, `--framegen-quality high`; try `3` only if the present GPU has headroom. Measured 2026-08-15 on the POC laptop with a real Proton game, AMD 890M present GPU, NVIDIA render GPU.
+- Default to causal/forward `--framegen-mode motion`, `--framegen-multiplier 2`, `--framegen-quality high`; try `3` only if the present GPU has headroom. Measured 2026-08-15 on the POC laptop with a real Proton game running single-GPU on the AMD 890M (game, generation and scanout on one iGPU); the dual-GPU re-baseline is pending.
 - Raise quality to `ultra`/`extreme` only if the HUD ladder row stays full; the ladder auto-degrades and now auto-recovers.
 - Keep the learned net online with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`; adaptation is on by default at `high` and above. This path adds no frame of latency.
 - On an iGPU-class present GPU (e.g. an 890M) set `GAMESCOPE_FRAMEGEN_NET_EVERY=2` (train every 2nd frame): pacing stays equal and it played best in our real-game test; `1` on a desktop card.
