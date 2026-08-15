@@ -5853,11 +5853,33 @@ void vulkan_framegen_drain_present_feedback()
 
 		if ( feedback.bPresented && feedback.bTimestampValid )
 		{
-			g_framegenPresentState.displayTiming.presentLead =
-				gamescope::framegen::update_present_lead(
-					g_framegenPresentState.displayTiming.presentLead,
-					feedback.tag.ulCommitSubmitNs,
-					feedback.ulActualFlipNs );
+			gamescope::IBackend *pBackend = GetBackend();
+			if ( pBackend != nullptr && pBackend->OwnsKMSPresentTiming() )
+			{
+				// An early generated commit is scheduled from this estimate, so
+				// feeding that controlled lead back into the learner would teach
+				// it its own margin. Native KMS learns only from real commits and
+				// rejects the first post-hitch/outlier observation.
+				if ( feedback.tag.eKind != gamescope::FramegenPresentKind_t::Generated )
+				{
+					g_framegenPresentState.displayTiming.presentLead =
+						gamescope::framegen::update_present_lead(
+							g_framegenPresentState.displayTiming.presentLead,
+							feedback.tag.ulCommitSubmitNs,
+							feedback.ulActualFlipNs,
+							g_framegenPresentState.displayTiming.key.intervalNs,
+							g_framegenPresentState.bPresentBiasHitchEpisode );
+				}
+			}
+			else
+			{
+				// Preserve the established nested/host-compositor learner exactly.
+				g_framegenPresentState.displayTiming.presentLead =
+					gamescope::framegen::update_present_lead(
+						g_framegenPresentState.displayTiming.presentLead,
+						feedback.tag.ulCommitSubmitNs,
+						feedback.ulActualFlipNs );
+			}
 		}
 
 		if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::DelayedReal )
@@ -6831,16 +6853,17 @@ uint64_t vulkan_framegen_fixed_refresh_commit_deadline_ns()
 		|| front.ulTargetFlipNs == 0u )
 		return 0u;
 
-	// Match the established VRR compensation margin. This is presentation
-	// scheduling headroom only: generation admission continues to use the
-	// planner's immutable W(D).
+	// Match the established VRR compensation margin. The causal planner uses
+	// this same bounded deadline for native generation admission, so the work
+	// gate and the commit timer describe one immutable D.
 	const uint64_t ulMarginNs =
 		g_framegenHistory.ulDeadlineGridIntervalNs / 10u;
 	const gamescope::framegen::FixedRefreshCommitPlan_t plan =
 		gamescope::framegen::plan_fixed_refresh_commit(
 			front.ulTargetFlipNs,
 			g_framegenPresentState.displayTiming.presentLead,
-			ulMarginNs );
+			ulMarginNs,
+			g_framegenHistory.ulDeadlineGridIntervalNs );
 	return plan.earlyCommit ? plan.commitDeadlineNs : 0u;
 }
 
@@ -10234,10 +10257,12 @@ struct FramegenCausalRungSelection_t
 	uint32_t uSamples = 0;
 	bool bAdmit = false;
 	bool bCommittedRung = false;
+	bool bCommitReservationShortfall = false;
 };
 
 static FramegenCausalRungSelection_t framegen_select_causal_rung(
-	const gamescope::framegen::CausalSlotPlan_t &plan, uint64_t ulNowNs )
+	const gamescope::framegen::CausalSlotPlan_t &plan, uint64_t ulNowNs,
+	uint64_t ulPlainWakeNs, bool bNativeCommitDeadline )
 {
 	FramegenCausalRungSelection_t result;
 	// A multiplier notch cannot reduce a one-slot submission. Stop this ladder
@@ -10261,18 +10286,37 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 		sample.uSamples = g_device.framegenRungSampleCount( nRung, nCostKey );
 		return sample;
 	};
-	const auto sampleFits = [&]( const FramegenCausalRungSelection_t &sample )
+	const auto sampleFitsAt = [&]( const FramegenCausalRungSelection_t &sample,
+		uint64_t ulWakeNs )
 	{
 		const bool bMature = sample.ulCostNs != 0u
 			&& sample.uSamples >= gamescope::framegen::k_uDeadlineMinSamples;
 		return !bMature || gamescope::framegen::deadline_cost_fits(
-			sample.ulCostNs, plan.wakeNs, ulNowNs, ulStartEstimateNs );
+			sample.ulCostNs, ulWakeNs, ulNowNs, ulStartEstimateNs );
+	};
+	const auto sampleFits = [&]( const FramegenCausalRungSelection_t &sample )
+	{
+		return sampleFitsAt( sample, plan.wakeNs );
 	};
 
 	const uint32_t nCurrentRung = g_framegenHistory.nDegradeSteps;
 	const bool bPriorDeadlineMiss = g_framegenHistory.bCausalDeadlineMissed;
 	g_framegenHistory.bCausalDeadlineMissed = false;
 	result = sampleRung( nCurrentRung );
+	// When the KMS commit reservation is earlier than the ordinary compositor
+	// wake, it may make this one slot unavailable even though the current rung
+	// still fits the plain display-grid opportunity. Skip that slot without
+	// teaching the quality ladder that the rung itself is too expensive.
+	const bool bCurrentCostMature = result.ulCostNs != 0u
+		&& result.uSamples >= gamescope::framegen::k_uDeadlineMinSamples;
+	if ( !bPriorDeadlineMiss && bNativeCommitDeadline && bCurrentCostMature
+		&& gamescope::framegen::commit_reservation_only_shortfall(
+			result.ulCostNs, plan.wakeNs, ulPlainWakeNs,
+			ulNowNs, ulStartEstimateNs ) )
+	{
+		result.bCommitReservationShortfall = true;
+		return result;
+	}
 	if ( !bPriorDeadlineMiss && sampleFits( result ) )
 	{
 		result.bAdmit = true;
@@ -10436,10 +10480,27 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 		.W0 = schedule.ulScheduledWakeupPoint,
 		.T = ulVblankIntervalNs,
 	};
-	const gamescope::framegen::DisplayGrid_t grid =
+	const gamescope::framegen::DisplayGrid_t plainGrid =
 		gamescope::framegen::apply_present_bias(
 			rawGrid,
 			g_framegenPresentState.displayTiming.presentBias.emaNs );
+	// The ordinary grid wake reserves enough time to render a full compositor
+	// frame. A native generated-only present instead has to finish by its actual
+	// KMS commit deadline. Use that deadline for both slot selection and cost
+	// admission; nested backends retain the byte-for-byte plain-grid path.
+	gamescope::framegen::DisplayGrid_t grid = plainGrid;
+	const bool bNativeKmsTiming = GetBackend() != nullptr
+		&& GetBackend()->OwnsKMSPresentTiming();
+	const uint64_t ulPresentMarginNs = ulVblankIntervalNs / 10u;
+	const gamescope::framegen::FixedRefreshCommitPlan_t gridCommitPlan =
+		bNativeKmsTiming
+			? gamescope::framegen::plan_fixed_refresh_commit(
+				plainGrid.D0,
+				g_framegenPresentState.displayTiming.presentLead,
+				ulPresentMarginNs, ulVblankIntervalNs )
+			: gamescope::framegen::FixedRefreshCommitPlan_t{};
+	if ( gridCommitPlan.earlyCommit )
+		grid.W0 = gridCommitPlan.commitDeadlineNs;
 	const gamescope::framegen::CausalSlotPlan_t plan =
 		gamescope::framegen::plan_next_causal_slot(
 			grid, g_framegenHistory.causalAnchor, g_framegenHistory.cadence, {
@@ -10465,9 +10526,47 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 	if ( std::max( now, ulStartEstimateNs ) >= plan.wakeNs )
 		return false;
 
-	FramegenCausalRungSelection_t rung = framegen_select_causal_rung( plan, now );
+	const uint64_t ulGridIndex = gamescope::framegen::grid_index_at_or_after(
+		plainGrid, plan.targetNs );
+	const uint64_t ulPlainWakeNs = plainGrid.wake( ulGridIndex );
+	const gamescope::framegen::FixedRefreshCommitPlan_t commitPlan =
+		gridCommitPlan.earlyCommit
+			? gamescope::framegen::plan_fixed_refresh_commit(
+				plan.targetNs,
+				g_framegenPresentState.displayTiming.presentLead,
+				ulPresentMarginNs, ulVblankIntervalNs )
+			: gamescope::framegen::FixedRefreshCommitPlan_t{};
+	FramegenCausalRungSelection_t rung = framegen_select_causal_rung(
+		plan, now, ulPlainWakeNs, commitPlan.earlyCommit );
 	if ( !rung.bAdmit )
+	{
+		const uint64_t ulDecisionStartNs = std::max( now, ulStartEstimateNs );
+		const uint64_t ulRemainingNs = plan.wakeNs > ulDecisionStartNs
+			? plan.wakeNs - ulDecisionStartNs : 0u;
+		const uint64_t ulPlainRemainingNs = ulPlainWakeNs > ulDecisionStartNs
+			? ulPlainWakeNs - ulDecisionStartNs : 0u;
+		static uint64_t s_uCausalBudgetSkipDebugLogCounter = 0;
+		if ( commitPlan.earlyCommit && g_bFramegenDebug
+			&& FramegenDebugShouldLog( s_uCausalBudgetSkipDebugLogCounter ) )
+		{
+			const double flCommitDeltaMs = commitPlan.earlyCommit
+				? static_cast<double>( static_cast<long double>(
+					commitPlan.commitDeadlineNs ) - static_cast<long double>( now ) )
+					/ 1.0e6
+				: 0.0;
+			vk_log.infof( "framegen: causal skip remaining=%.2fms budget=%.2fms plain=%.2fms cost=%.2fms lead=%.2fms commit=%+.2fms reservation_only=%d",
+				ulRemainingNs / 1.0e6,
+				gamescope::framegen::deadline_budget_ns( ulRemainingNs ) / 1.0e6,
+				ulPlainRemainingNs / 1.0e6,
+				rung.ulCostNs / 1.0e6,
+				commitPlan.presentLeadNs / 1.0e6,
+				flCommitDeltaMs,
+				rung.bCommitReservationShortfall ? 1 : 0 );
+		}
+		if ( rung.bCommitReservationShortfall )
+			g_framegenHistory.ulLastPlannedTargetNs = plan.targetNs;
 		return false;
+	}
 
 	const uint64_t ulAnchorNs = g_framegenHistory.causalAnchor.display_time();
 	const uint64_t ulTargetDeltaNs = plan.targetNs - ulAnchorNs;

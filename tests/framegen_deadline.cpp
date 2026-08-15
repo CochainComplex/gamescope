@@ -1203,36 +1203,129 @@ TEST_CASE( "VRR midpoint wake compensates tagged backend present lead", "[frameg
 	CHECK( late.wakeDeadlineNs == plan.wakeDeadlineNs );
 }
 
+TEST_CASE( "native present-lead warmup rejects hitches and multi-vblank samples",
+	"[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'333u;
+	constexpr PresentLeadState_t empty;
+	constexpr PresentLeadState_t hitch = update_present_lead(
+		empty, 10'000u, 14'000u, intervalNs, true );
+	constexpr PresentLeadState_t loadingOutlier = update_present_lead(
+		empty, 10'000u, 10'000u + intervalNs + 1u,
+		intervalNs, false );
+	constexpr PresentLeadState_t missingInterval = update_present_lead(
+		empty, 10'000u, 14'000u, 0u, false );
+	constexpr PresentLeadState_t oneVblank = update_present_lead(
+		empty, 10'000u, 10'000u + intervalNs, intervalNs, false );
+
+	STATIC_REQUIRE( hitch.samples == 0u );
+	STATIC_REQUIRE( hitch.emaNs == 0 );
+	STATIC_REQUIRE( loadingOutlier.samples == 0u );
+	STATIC_REQUIRE( loadingOutlier.emaNs == 0 );
+	STATIC_REQUIRE( missingInterval.samples == 0u );
+	STATIC_REQUIRE( missingInterval.emaNs == 0 );
+	STATIC_REQUIRE( oneVblank.samples == 1u );
+	STATIC_REQUIRE( oneVblank.emaNs == static_cast<int64_t>( intervalNs ) );
+}
+
+TEST_CASE( "mature native present-lead learner rejects guarded outliers",
+	"[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'333u;
+	constexpr PresentLeadState_t mature = {
+		.emaNs = 2'000,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr PresentLeadState_t ordinary = update_present_lead(
+		mature, 10'000u, 13'000u, intervalNs, false );
+	constexpr PresentLeadState_t outlier = update_present_lead(
+		mature, 20'000u, 20'000u + 2'000u + intervalNs,
+		intervalNs, false );
+
+	STATIC_REQUIRE( ordinary.emaNs == 2'125 );
+	STATIC_REQUIRE( ordinary.samples == mature.samples + 1u );
+	STATIC_REQUIRE( outlier.emaNs == mature.emaNs );
+	STATIC_REQUIRE( outlier.samples == mature.samples );
+}
+
 TEST_CASE( "fixed-refresh commit wake uses mature present lead and margin", "[framegen][deadline]" )
 {
+	constexpr uint64_t intervalNs = 8'000u;
 	const PresentLeadState_t warming = {
 		.emaNs = 3'000u,
 		.samples = k_uPresentLeadWarmupSamples - 1u,
 	};
 	const FixedRefreshCommitPlan_t warmup =
-		plan_fixed_refresh_commit( 20'000u, warming, 1'000u );
+		plan_fixed_refresh_commit( 20'000u, warming, 1'000u, intervalNs );
 	CHECK_FALSE( warmup.earlyCommit );
 	CHECK( warmup.commitDeadlineNs == 0u );
 
 	PresentLeadState_t mature = warming;
 	mature.samples = k_uPresentLeadWarmupSamples;
 	const FixedRefreshCommitPlan_t plan =
-		plan_fixed_refresh_commit( 20'000u, mature, 1'000u );
+		plan_fixed_refresh_commit( 20'000u, mature, 1'000u, intervalNs );
 	REQUIRE( plan.earlyCommit );
 	CHECK( plan.commitDeadlineNs == 16'000u );
+	CHECK( plan.presentLeadNs == 3'000u );
+	CHECK( plan.advanceNs == 4'000u );
 
 	// The margin remains part of the advance even at a zero learned lead.
 	mature.emaNs = 0;
 	const FixedRefreshCommitPlan_t marginOnly =
-		plan_fixed_refresh_commit( 20'000u, mature, 1'000u );
+		plan_fixed_refresh_commit( 20'000u, mature, 1'000u, intervalNs );
 	REQUIRE( marginOnly.earlyCommit );
 	CHECK( marginOnly.commitDeadlineNs == 19'000u );
+	CHECK( marginOnly.presentLeadNs == 0u );
 
 	mature.emaNs = 3'000u;
 	const FixedRefreshCommitPlan_t underflow =
-		plan_fixed_refresh_commit( 3'000u, mature, 1'000u );
+		plan_fixed_refresh_commit( 3'000u, mature, 1'000u, intervalNs );
 	CHECK_FALSE( underflow.earlyCommit );
 	CHECK( underflow.commitDeadlineNs == 0u );
+
+	const FixedRefreshCommitPlan_t noInterval =
+		plan_fixed_refresh_commit( 20'000u, mature, 1'000u, 0u );
+	CHECK_FALSE( noInterval.earlyCommit );
+}
+
+TEST_CASE( "fixed-refresh commit lead is clamped to one vblank",
+	"[framegen][deadline]" )
+{
+	constexpr PresentLeadState_t poisoned = {
+		.emaNs = 30'000,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr FixedRefreshCommitPlan_t plan =
+		plan_fixed_refresh_commit( 20'000u, poisoned, 1'000u, 8'000u );
+
+	STATIC_REQUIRE( plan.earlyCommit );
+	STATIC_REQUIRE( plan.presentLeadNs == 8'000u );
+	STATIC_REQUIRE( plan.advanceNs == 9'000u );
+	STATIC_REQUIRE( plan.commitDeadlineNs == 11'000u );
+}
+
+TEST_CASE( "fixed-refresh admission budgets work to the KMS commit",
+	"[framegen][deadline]" )
+{
+	constexpr PresentLeadState_t lead = {
+		.emaNs = 3'000,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr FixedRefreshCommitPlan_t plan =
+		plan_fixed_refresh_commit( 20'000u, lead, 1'000u, 8'000u );
+
+	// The full-compositor wake is needlessly early for a generated-only flip.
+	STATIC_REQUIRE_FALSE( deadline_cost_fits(
+		3'000u, 12'000u, 10'000u, 0u ) );
+	STATIC_REQUIRE( deadline_cost_fits(
+		3'000u, plan.commitDeadlineNs, 10'000u, 0u ) );
+
+	STATIC_REQUIRE( commit_reservation_only_shortfall(
+		2'000u, 12'000u, 14'000u, 10'000u, 0u ) );
+	STATIC_REQUIRE_FALSE( commit_reservation_only_shortfall(
+		1'000u, 12'000u, 14'000u, 10'000u, 0u ) );
+	STATIC_REQUIRE_FALSE( commit_reservation_only_shortfall(
+		4'000u, 12'000u, 14'000u, 10'000u, 0u ) );
 }
 
 TEST_CASE( "generated commit never races a real present", "[framegen][deadline]" )

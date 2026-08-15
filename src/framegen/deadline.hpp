@@ -830,6 +830,17 @@ struct BidirQueueShedPlan_t
 	return costNs <= jitterBudgetNs;
 }
 
+[[nodiscard]] constexpr bool commit_reservation_only_shortfall(
+	uint64_t costNs, uint64_t commitDeadlineNs, uint64_t plainWakeNs,
+	uint64_t nowNs, uint64_t startEstimateNs )
+{
+	return commitDeadlineNs < plainWakeNs
+		&& !deadline_cost_fits( costNs, commitDeadlineNs,
+			nowNs, startEstimateNs )
+		&& deadline_cost_fits( costNs, plainWakeNs,
+			nowNs, startEstimateNs );
+}
+
 struct DeadlineFeedbackSample_t
 {
 	int64_t signedErrorNs = 0;
@@ -854,7 +865,9 @@ struct DeadlineFeedbackSample_t
 }
 
 // A deliberately slow 1/8 EMA. Invalid/reordered timestamp pairs do not
-// contaminate the backend lead estimate.
+// contaminate the backend lead estimate. This unguarded overload is retained
+// for backends which do not own KMS timing, where changing the established
+// presentation learner would also change nested pacing.
 [[nodiscard]] constexpr PresentLeadState_t update_present_lead(
 	PresentLeadState_t state, uint64_t commitSubmitNs, uint64_t actualFlipNs )
 {
@@ -868,33 +881,64 @@ struct DeadlineFeedbackSample_t
 	return update_present_timing_ema_residual( state, residualNs );
 }
 
+// Native KMS commit-to-flip samples share the display-chain lifetime of the
+// present-bias learner. Do not seed a fresh EMA from a loading hitch, and once
+// mature reject the same "current estimate plus one vblank" class of outlier
+// used by the present-bias guard. During warmup, one vblank is the only safe
+// bound because there is no trustworthy estimate yet.
+[[nodiscard]] constexpr PresentLeadState_t update_present_lead(
+	PresentLeadState_t state, uint64_t commitSubmitNs, uint64_t actualFlipNs,
+	uint64_t vblankIntervalNs, bool hitchEpisode )
+{
+	if ( commitSubmitNs == 0u || actualFlipNs <= commitSubmitNs
+		|| vblankIntervalNs == 0u || hitchEpisode )
+		return state;
+
+	const uint64_t sampleNs = actualFlipNs - commitSubmitNs;
+	const bool mature = state.samples >= k_uPresentLeadWarmupSamples;
+	const uint64_t outlierBoundNs = mature
+		? present_bias_outlier_bound_ns(
+			PresentBiasState_t{ .emaNs = state.emaNs },
+			vblankIntervalNs )
+		: vblankIntervalNs;
+	if ( mature ? sampleNs >= outlierBoundNs
+		: sampleNs > outlierBoundNs )
+		return state;
+
+	return update_present_lead( state, commitSubmitNs, actualFlipNs );
+}
+
 struct FixedRefreshCommitPlan_t
 {
 	uint64_t commitDeadlineNs = 0;
+	uint64_t presentLeadNs = 0;
+	uint64_t advanceNs = 0;
 	bool earlyCommit = false;
 };
 
 // Fixed-refresh content remains attached to its display-grid target D. Once the
-// display-chain learner is warm, move only the commit wake to
+// display-chain learner is warm, its native generation/commit deadline is
 // D - commit-to-flip lead - margin. During warmup the arbiter retains its normal
 // vblank opportunity, so a zero deadline explicitly means "no early commit".
 [[nodiscard]] constexpr FixedRefreshCommitPlan_t plan_fixed_refresh_commit(
 	uint64_t targetFlipNs, PresentLeadState_t presentLead,
-	uint64_t presentMarginNs )
+	uint64_t presentMarginNs, uint64_t vblankIntervalNs )
 {
 	FixedRefreshCommitPlan_t result;
 	if ( targetFlipNs == 0u
+		|| vblankIntervalNs == 0u
 		|| presentLead.samples < k_uPresentLeadWarmupSamples )
 		return result;
 
-	const uint64_t leadNs = static_cast<uint64_t>(
-		std::max<int64_t>( 0, presentLead.emaNs ) );
-	const uint64_t advanceNs = saturating_add_ns(
-		leadNs, presentMarginNs );
-	if ( advanceNs == 0u || advanceNs >= targetFlipNs )
+	result.presentLeadNs = std::min<uint64_t>(
+		static_cast<uint64_t>( std::max<int64_t>( 0, presentLead.emaNs ) ),
+		vblankIntervalNs );
+	result.advanceNs = saturating_add_ns(
+		result.presentLeadNs, presentMarginNs );
+	if ( result.advanceNs == 0u || result.advanceNs >= targetFlipNs )
 		return result;
 
-	result.commitDeadlineNs = targetFlipNs - advanceNs;
+	result.commitDeadlineNs = targetFlipNs - result.advanceNs;
 	result.earlyCommit = true;
 	return result;
 }
