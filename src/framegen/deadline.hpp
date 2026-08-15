@@ -17,6 +17,9 @@ namespace gamescope::framegen
 inline constexpr uint32_t k_uPresentBiasWarmupSamples = 4u;
 inline constexpr uint32_t k_uPresentBiasOutlierVblankIntervals = 1u;
 inline constexpr uint32_t k_uPresentLeadWarmupSamples = 4u;
+inline constexpr uint64_t k_uMinimumViablePresentLeadFloorNs = 500'000u;
+inline constexpr uint64_t k_uMinimumViablePresentLeadRelaxDivisor = 64u;
+inline constexpr uint64_t k_uMinimumViablePresentLeadBackoffDivisor = 8u;
 
 [[nodiscard]] constexpr uint64_t signed_ns_magnitude( int64_t valueNs )
 {
@@ -307,6 +310,19 @@ struct PresentLeadState_t
 	uint32_t samples = 0;
 };
 
+// Native KMS can prove that a real commit latched in the same refresh whenever
+// its submit-to-flip lead is shorter than one vblank. Remember the lowest such
+// lead separately from the habitual-submit EMA: real commits are commonly sent
+// much earlier than required, so their average is not a useful latest-safe
+// commit point. lowWaterNs relaxes upward slowly; backoffFloorNs is raised by a
+// late generated flip and earned back down by subsequent proven real samples.
+struct MinimumViablePresentLeadState_t
+{
+	uint64_t lowWaterNs = 0;
+	uint64_t backoffFloorNs = 0;
+	uint32_t samples = 0;
+};
+
 // The presentation timing learners describe the display chain rather than the
 // content being scanned out. D0/W0 advance every refresh, so the stable grid
 // identity is its interval together with the backend/connector, VRR state, and
@@ -335,6 +351,7 @@ struct DisplayChainTimingState_t
 {
 	PresentBiasState_t presentBias;
 	PresentLeadState_t presentLead;
+	MinimumViablePresentLeadState_t minimumViablePresentLead;
 	DisplayChainKey_t key;
 	uint64_t generation = 0;
 	bool initialized = false;
@@ -348,7 +365,8 @@ struct DisplayChainTimingTransition_t
 
 // Re-observing the same key is also the content-invalidation/re-prime path: the
 // learning survives untouched. Only a genuine display-chain key transition
-// starts both EMAs over and advances the generation used by deadline epochs.
+// resets all display-chain timing learners and advances the generation used by
+// deadline epochs.
 [[nodiscard]] constexpr DisplayChainTimingTransition_t observe_display_chain(
 	DisplayChainTimingState_t state, const DisplayChainKey_t &key )
 {
@@ -359,6 +377,7 @@ struct DisplayChainTimingTransition_t
 	{
 		result.state.presentBias = {};
 		result.state.presentLead = {};
+		result.state.minimumViablePresentLead = {};
 	}
 	if ( !state.initialized || result.displayChainChanged )
 	{
@@ -926,6 +945,84 @@ struct PresentLeadSample_t
 	return update_present_lead( state, commitSubmitNs, actualFlipNs );
 }
 
+[[nodiscard]] constexpr uint64_t minimum_viable_present_lead_ns(
+	const MinimumViablePresentLeadState_t &state )
+{
+	return std::max( state.lowWaterNs, state.backoffFloorNs );
+}
+
+// Consume only the same valid, non-hitch real-commit observations as the
+// native habitual learner, and additionally require the strict sub-vblank
+// proof of a same-vblank latch. The minimum rises by at most 1/64 refresh per
+// proof, so an isolated unusually-low sample expires without a stall or an
+// early habitual commit destroying the useful evidence in one update.
+[[nodiscard]] constexpr MinimumViablePresentLeadState_t
+update_minimum_viable_present_lead(
+	MinimumViablePresentLeadState_t state, PresentLeadState_t habitualLead,
+	uint64_t commitSubmitNs, uint64_t actualFlipNs,
+	uint64_t vblankIntervalNs, bool hitchEpisode )
+{
+	const PresentLeadSample_t sample = present_lead_sample(
+		habitualLead, commitSubmitNs, actualFlipNs,
+		vblankIntervalNs, hitchEpisode );
+	if ( !sample.valid || sample.leadNs >= vblankIntervalNs )
+		return state;
+
+	const uint64_t relaxNs = std::max<uint64_t>(
+		1u, vblankIntervalNs / k_uMinimumViablePresentLeadRelaxDivisor );
+	if ( state.samples == 0u )
+	{
+		state.lowWaterNs = sample.leadNs;
+	}
+	else
+	{
+		const uint64_t relaxedLowWaterNs = state.lowWaterNs
+			> std::numeric_limits<uint64_t>::max() - relaxNs
+			? std::numeric_limits<uint64_t>::max()
+			: state.lowWaterNs + relaxNs;
+		state.lowWaterNs = std::min( sample.leadNs, relaxedLowWaterNs );
+	}
+
+	if ( state.backoffFloorNs != 0u )
+	{
+		const uint64_t relaxedBackoffNs = state.backoffFloorNs > relaxNs
+			? state.backoffFloorNs - relaxNs : 0u;
+		state.backoffFloorNs = relaxedBackoffNs > state.lowWaterNs
+			? relaxedBackoffNs : 0u;
+	}
+	if ( state.samples != UINT32_MAX )
+		state.samples++;
+	return state;
+}
+
+// A missed generated latch means the current probe was too late. Retreat by
+// 1/8 refresh, never earlier than the habitual real-commit EMA. Successful
+// real commits subsequently relax this floor by the slower 1/64 step above.
+[[nodiscard]] constexpr MinimumViablePresentLeadState_t
+back_off_minimum_viable_present_lead(
+	MinimumViablePresentLeadState_t state, PresentLeadState_t habitualLead,
+	uint64_t vblankIntervalNs )
+{
+	if ( state.samples < k_uPresentLeadWarmupSamples
+		|| habitualLead.samples < k_uPresentLeadWarmupSamples
+		|| vblankIntervalNs == 0u )
+		return state;
+
+	const uint64_t habitualNs = static_cast<uint64_t>(
+		std::max<int64_t>( 0, habitualLead.emaNs ) );
+	const uint64_t currentNs = minimum_viable_present_lead_ns( state );
+	if ( currentNs >= habitualNs )
+		return state;
+
+	const uint64_t stepNs = std::max<uint64_t>(
+		1u, vblankIntervalNs / k_uMinimumViablePresentLeadBackoffDivisor );
+	const uint64_t backedOffNs = stepNs > habitualNs - currentNs
+		? habitualNs : std::min( habitualNs, currentNs + stepNs );
+	state.backoffFloorNs = backedOffNs > state.lowWaterNs
+		? backedOffNs : 0u;
+	return state;
+}
+
 // Preserve the learner's warm-up gate while allowing a diagnostic lead to
 // replace only its mature value. Zero is the no-override sentinel.
 [[nodiscard]] constexpr PresentLeadState_t apply_present_lead_override(
@@ -947,12 +1044,110 @@ struct FixedRefreshCommitPlan_t
 	uint64_t presentLeadNs = 0;
 	uint64_t advanceNs = 0;
 	bool earlyCommit = false;
+	bool learnedLead = false;
+	bool overriddenLead = false;
 };
+
+struct FixedRefreshPresentLead_t
+{
+	uint64_t leadNs = 0;
+	bool ready = false;
+	bool learned = false;
+	bool overridden = false;
+};
+
+[[nodiscard]] constexpr FixedRefreshPresentLead_t
+select_fixed_refresh_present_lead(
+	PresentLeadState_t habitualLead,
+	MinimumViablePresentLeadState_t minimumViableLead,
+	uint64_t presentMarginNs, uint64_t vblankIntervalNs,
+	uint64_t overrideLeadNs = 0u,
+	uint64_t floorNs = k_uMinimumViablePresentLeadFloorNs )
+{
+	FixedRefreshPresentLead_t result;
+	if ( vblankIntervalNs == 0u
+		|| habitualLead.samples < k_uPresentLeadWarmupSamples )
+		return result;
+
+	const uint64_t latestSafeLeadNs = vblankIntervalNs > presentMarginNs
+		? vblankIntervalNs - presentMarginNs : 0u;
+	if ( overrideLeadNs != 0u )
+	{
+		result.leadNs = std::min( overrideLeadNs, latestSafeLeadNs );
+		result.ready = true;
+		result.overridden = true;
+		return result;
+	}
+
+	if ( minimumViableLead.samples >= k_uPresentLeadWarmupSamples )
+	{
+		const uint64_t habitualNs = static_cast<uint64_t>(
+			std::max<int64_t>( 0, habitualLead.emaNs ) );
+		result.leadNs = std::min(
+			std::max( minimum_viable_present_lead_ns(
+				minimumViableLead ), floorNs ),
+			habitualNs );
+		result.learned = true;
+	}
+	else
+	{
+		result.leadNs = static_cast<uint64_t>(
+			std::max<int64_t>( 0, habitualLead.emaNs ) );
+	}
+	result.leadNs = std::min( result.leadNs, latestSafeLeadNs );
+	result.ready = true;
+	return result;
+}
+
+[[nodiscard]] constexpr bool minimum_viable_present_lead_needs_backoff(
+	const FixedRefreshPresentLead_t &selectedLead,
+	uint64_t actualFlipNs, uint64_t targetFlipNs,
+	uint64_t vblankIntervalNs )
+{
+	if ( !selectedLead.learned || selectedLead.overridden )
+		return false;
+	const DeadlineFeedbackSample_t sample = deadline_feedback_sample(
+		actualFlipNs, targetFlipNs, vblankIntervalNs );
+	return sample.valid && sample.signedErrorNs
+		> static_cast<int64_t>( vblankIntervalNs / 2u );
+}
 
 // Fixed-refresh content remains attached to its display-grid target D. Once the
 // display-chain learner is warm, its native generation/commit deadline is
 // D - commit-to-flip lead - margin. During warmup the arbiter retains its normal
 // vblank opportunity, so a zero deadline explicitly means "no early commit".
+[[nodiscard]] constexpr FixedRefreshCommitPlan_t plan_fixed_refresh_commit(
+	uint64_t targetFlipNs, PresentLeadState_t habitualLead,
+	MinimumViablePresentLeadState_t minimumViableLead,
+	uint64_t presentMarginNs, uint64_t vblankIntervalNs,
+	uint64_t overrideLeadNs = 0u )
+{
+	FixedRefreshCommitPlan_t result;
+	if ( targetFlipNs == 0u )
+		return result;
+
+	const FixedRefreshPresentLead_t selected =
+		select_fixed_refresh_present_lead(
+			habitualLead, minimumViableLead,
+			presentMarginNs, vblankIntervalNs, overrideLeadNs );
+	if ( !selected.ready )
+		return result;
+	result.presentLeadNs = selected.leadNs;
+	result.learnedLead = selected.learned;
+	result.overriddenLead = selected.overridden;
+	result.advanceNs = saturating_add_ns(
+		result.presentLeadNs, presentMarginNs );
+	if ( result.advanceNs == 0u || result.advanceNs >= targetFlipNs )
+		return result;
+
+	result.commitDeadlineNs = targetFlipNs - result.advanceNs;
+	result.earlyCommit = true;
+	return result;
+}
+
+// Retain the established EMA-only form byte-for-byte for tests and policy
+// helpers outside native KMS. Native KMS uses the overload above with its
+// minimum-viable state and the stricter one-vblank-minus-margin cap.
 [[nodiscard]] constexpr FixedRefreshCommitPlan_t plan_fixed_refresh_commit(
 	uint64_t targetFlipNs, PresentLeadState_t presentLead,
 	uint64_t presentMarginNs, uint64_t vblankIntervalNs )

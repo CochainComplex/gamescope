@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 namespace gamescope::framegen
 {
@@ -21,6 +22,8 @@ inline constexpr uint32_t k_uCadenceConfidenceLeak = 1u;
 inline constexpr uint64_t k_uDeadlinePercent = 85u;
 inline constexpr uint32_t k_uDeadlineMinSamples = 3u;
 inline constexpr uint32_t k_uDeadlineHoldFrames = 4u;
+inline constexpr uint32_t k_uDeadlineMissWindowDecisions =
+	k_uDeadlineHoldFrames * 4u;
 
 // Recovery is deliberately much slower than degradation. At the real-game
 // reference cadence of 45 decisions/s these are approximately two seconds of
@@ -297,6 +300,18 @@ struct LadderRecoveryEvaluation_t
 	bool reportBlockedThreshold = false;
 };
 
+struct DeadlineMissState_t
+{
+	uint32_t recentMisses = 0u;
+};
+
+struct DeadlineMissEvaluation_t
+{
+	DeadlineMissState_t state;
+	bool degrade = false;
+	bool skip = false;
+};
+
 [[nodiscard]] constexpr uint32_t saturating_increment_decisions(
 	uint32_t decisions )
 {
@@ -380,6 +395,67 @@ struct LadderRecoveryEvaluation_t
 {
 	return ( availableNs / 100u ) * k_uDeadlinePercent
 		+ ( ( availableNs % 100u ) * k_uDeadlinePercent ) / 100u;
+}
+
+[[nodiscard]] constexpr uint64_t fixed_refresh_slot_budget_ns(
+	uint64_t vblankIntervalNs, uint64_t presentLeadNs,
+	uint64_t presentMarginNs )
+{
+	const uint64_t reservedNs = presentLeadNs
+		> std::numeric_limits<uint64_t>::max() - presentMarginNs
+		? std::numeric_limits<uint64_t>::max()
+		: presentLeadNs + presentMarginNs;
+	return deadline_budget_ns( vblankIntervalNs > reservedNs
+		? vblankIntervalNs - reservedNs : 0u );
+}
+
+// Distinguish a decision which happened late within an otherwise viable slot
+// from evidence that the rung itself exceeds fixed-refresh capacity. The
+// actual admission gate still uses remainingBudgetNs; this classification only
+// controls what the recovery/degradation learner is allowed to remember.
+[[nodiscard]] constexpr bool deadline_shortfall_is_phase_only(
+	uint64_t costNs, uint32_t samples,
+	uint64_t remainingBudgetNs, uint64_t slotBudgetNs )
+{
+	return costNs != 0u && samples >= k_uDeadlineMinSamples
+		&& costNs > remainingBudgetNs && costNs <= slotBudgetNs;
+}
+
+[[nodiscard]] constexpr uint32_t deadline_miss_count( uint32_t misses )
+{
+	uint32_t count = 0u;
+	while ( misses != 0u )
+	{
+		count += misses & 1u;
+		misses >>= 1u;
+	}
+	return count;
+}
+
+// One isolated present miss is an honest skipped decision, not proof that the
+// selected quality rung is too expensive. A mature cost which cannot fit the
+// full slot is direct capacity evidence; otherwise require two misses in the
+// small rolling window. Hitch-tagged misses are excluded from both verdict and
+// history because the display learner has already classified their cause.
+[[nodiscard]] constexpr DeadlineMissEvaluation_t
+evaluate_deadline_miss_hysteresis(
+	DeadlineMissState_t state, bool missed, bool hitchEpisode,
+	uint64_t currentRungCostNs, uint32_t currentRungSamples,
+	uint64_t slotBudgetNs )
+{
+	static_assert( k_uDeadlineMissWindowDecisions > 0u
+		&& k_uDeadlineMissWindowDecisions < 32u );
+	constexpr uint32_t uWindowMask =
+		( uint32_t{ 1u } << k_uDeadlineMissWindowDecisions ) - 1u;
+	const bool countMiss = missed && !hitchEpisode;
+	state.recentMisses = ( ( state.recentMisses << 1u )
+		| static_cast<uint32_t>( countMiss ) ) & uWindowMask;
+	const bool matureCostDoesNotFit = currentRungCostNs != 0u
+		&& currentRungSamples >= k_uDeadlineMinSamples
+		&& currentRungCostNs > slotBudgetNs;
+	const bool degrade = countMiss && ( matureCostDoesNotFit
+		|| deadline_miss_count( state.recentMisses ) >= 2u );
+	return { state, degrade, missed && !degrade };
 }
 
 [[nodiscard]] constexpr bool deadline_recovery_headroom(

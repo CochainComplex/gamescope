@@ -5373,10 +5373,17 @@ struct FramegenPresentState_t
 	// A >250 ms content stall preserves the display-chain learner, but the first
 	// correlated flip after it is discard-only evidence for the bias EMA.
 	bool bPresentBiasHitchEpisode = false;
+	bool bLoggedMinimumViableLeadActive = false;
 	gamescope::FramegenPresentTag_t pendingTag = {};
 	bool bTagPending = false;
 };
 static FramegenPresentState_t g_framegenPresentState;
+
+static uint64_t framegen_commit_lead_override_ns();
+static bool framegen_causal_deadline_enabled();
+static gamescope::framegen::FixedRefreshPresentLead_t
+framegen_native_present_lead( uint64_t ulPresentMarginNs,
+	uint64_t ulVblankIntervalNs );
 
 struct DisplayFeedback_t
 {
@@ -5530,6 +5537,11 @@ static void framegen_metrics_log( const char *pszLabel,
 	const FramegenMetricsDistribution_t &flip = window.flipIntervals;
 	const FramegenMetricsDistribution_t &deadline = window.deadlineErrors;
 	const FramegenMetricsDistribution_t &lead = window.realCommitLeads;
+	const uint64_t ulVblankIntervalNs =
+		g_framegenPresentState.displayTiming.key.intervalNs;
+	const gamescope::framegen::FixedRefreshPresentLead_t viableLead =
+		framegen_native_present_lead(
+			ulVblankIntervalNs / 10u, ulVblankIntervalNs );
 	vk_log.infof( "framegen-metrics: %s real=%" PRIu64 " gen=%" PRIu64
 		" dreal=%" PRIu64 " rep=%" PRIu64
 		" flip_ms_avg=%.3f flip_ms_min=%.3f flip_ms_max=%.3f"
@@ -5541,7 +5553,7 @@ static void framegen_metrics_log( const char *pszLabel,
 		" resets_prov=%" PRIu64 " resets_hitch=%" PRIu64
 		" resets_ring=%" PRIu64 " resets_chain=%" PRIu64
 		" lead_ms_min=%.3f lead_ms_avg=%.3f lead_ms_max=%.3f"
-		" lead_ema=%.3f gen_late=%u",
+		" lead_ema=%.3f gen_late=%u lead_viable=%.3f",
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -5556,7 +5568,8 @@ static void framegen_metrics_log( const char *pszLabel,
 		window.resetsChain,
 		lead.n != 0 ? lead.min : 0.0, lead.average(), lead.max,
 		g_framegenPresentState.displayTiming.presentLead.emaNs / 1.0e6,
-		window.generatedLate );
+		window.generatedLate,
+		viableLead.ready ? viableLead.leadNs / 1.0e6 : 0.0 );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
@@ -5784,6 +5797,7 @@ static bool framegen_observe_display_chain( uint64_t ulIntervalNs,
 	g_framegenPresentState.displayTiming = transition.state;
 	if ( !transition.displayChainChanged )
 		return bSourceTimestampsReliable;
+	g_framegenPresentState.bLoggedMinimumViableLeadActive = false;
 
 	std::string changedFields;
 	const auto noteChanged = [&]( bool changed, const char *field )
@@ -5978,6 +5992,9 @@ void vulkan_framegen_drain_present_feedback()
 						gamescope::framegen::deadline_feedback_sample(
 							feedback.ulActualFlipNs,
 							feedback.tag.ulTargetFlipNs, ulVblankNs );
+					const bool bLate = sample.valid
+						&& sample.signedErrorNs
+							> static_cast<int64_t>( ulVblankNs / 2u );
 					static uint64_t s_uGeneratedCommitFeedbackDebugLogCounter = 0;
 					if ( sample.valid && FramegenDebugShouldLog(
 						s_uGeneratedCommitFeedbackDebugLogCounter ) )
@@ -5988,8 +6005,44 @@ void vulkan_framegen_drain_present_feedback()
 								feedback.tag.ulCommitSubmitNs ) ) / 1.0e6;
 						vk_log.infof( "framegen: gen commit lead=%.2fms target_err=%+.2fms late=%d",
 							flLeadMs, sample.signedErrorNs / 1.0e6,
-							sample.signedErrorNs
-								> static_cast<int64_t>( ulVblankNs / 2u ) ? 1 : 0 );
+							bLate ? 1 : 0 );
+					}
+
+					const uint64_t ulPresentMarginNs = ulVblankNs / 10u;
+					const gamescope::framegen::FixedRefreshPresentLead_t before =
+						framegen_native_present_lead(
+							ulPresentMarginNs, ulVblankNs );
+					if ( gamescope::framegen::minimum_viable_present_lead_needs_backoff(
+						before, feedback.ulActualFlipNs,
+						feedback.tag.ulTargetFlipNs, ulVblankNs )
+						&& framegen_causal_deadline_enabled()
+						&& !vulkan_framegen_vrr_hybrid_active()
+						&& !vulkan_framegen_bidir_active() )
+					{
+						gamescope::framegen::DisplayChainTimingState_t &timing =
+							g_framegenPresentState.displayTiming;
+						timing.minimumViablePresentLead =
+							gamescope::framegen::back_off_minimum_viable_present_lead(
+								timing.minimumViablePresentLead,
+								timing.presentLead, ulVblankNs );
+						const gamescope::framegen::FixedRefreshPresentLead_t after =
+							framegen_native_present_lead(
+								ulPresentMarginNs, ulVblankNs );
+						if ( after.leadNs > before.leadNs )
+						{
+							static uint64_t s_ulLastViableLeadBackoffLogNs = 0u;
+							const uint64_t ulNowNs = get_time_in_nanos();
+							if ( s_ulLastViableLeadBackoffLogNs == 0u
+								|| ulNowNs - s_ulLastViableLeadBackoffLogNs
+									>= 1'000'000'000u )
+							{
+								vk_log.infof(
+									"framegen: minimum viable commit lead backed off %.3fms->%.3fms after late generated flip",
+									before.leadNs / 1.0e6,
+									after.leadNs / 1.0e6 );
+								s_ulLastViableLeadBackoffLogNs = ulNowNs;
+							}
+						}
 					}
 				}
 
@@ -5999,13 +6052,43 @@ void vulkan_framegen_drain_present_feedback()
 				// rejects the first post-hitch/outlier observation.
 				if ( feedback.tag.eKind != gamescope::FramegenPresentKind_t::Generated )
 				{
-					g_framegenPresentState.displayTiming.presentLead =
+					gamescope::framegen::DisplayChainTimingState_t &timing =
+						g_framegenPresentState.displayTiming;
+					const bool bWasActive = timing.minimumViablePresentLead.samples
+						>= gamescope::framegen::k_uPresentLeadWarmupSamples;
+					if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real )
+					{
+						timing.minimumViablePresentLead =
+							gamescope::framegen::update_minimum_viable_present_lead(
+								timing.minimumViablePresentLead,
+								timing.presentLead,
+								feedback.tag.ulCommitSubmitNs,
+								feedback.ulActualFlipNs,
+								timing.key.intervalNs,
+								g_framegenPresentState.bPresentBiasHitchEpisode );
+					}
+					timing.presentLead =
 						gamescope::framegen::update_present_lead(
-							g_framegenPresentState.displayTiming.presentLead,
+							timing.presentLead,
 							feedback.tag.ulCommitSubmitNs,
 							feedback.ulActualFlipNs,
-							g_framegenPresentState.displayTiming.key.intervalNs,
+							timing.key.intervalNs,
 							g_framegenPresentState.bPresentBiasHitchEpisode );
+					const gamescope::framegen::FixedRefreshPresentLead_t viable =
+						framegen_native_present_lead(
+							timing.key.intervalNs / 10u,
+							timing.key.intervalNs );
+					if ( !bWasActive && viable.learned
+						&& !g_framegenPresentState.bLoggedMinimumViableLeadActive )
+					{
+						vk_log.infof(
+							"framegen: learned minimum viable commit lead active lead=%.3fms low=%.3fms habitual=%.3fms samples=%u",
+							viable.leadNs / 1.0e6,
+							timing.minimumViablePresentLead.lowWaterNs / 1.0e6,
+							timing.presentLead.emaNs / 1.0e6,
+							timing.minimumViablePresentLead.samples );
+						g_framegenPresentState.bLoggedMinimumViableLeadActive = true;
+					}
 				}
 			}
 			else
@@ -6159,6 +6242,7 @@ struct FramegenHistory_t
 	bool bDeadlineProvenanceInitialized = false;
 	bool bDeadlineSourceTimestampsReliable = false;
 	bool bCausalDeadlineMissed = false;
+	gamescope::framegen::DeadlineMissState_t causalDeadlineMisses;
 	// Fixed-delay bidirectional timeline. Epoch feedback mutates only this
 	// mapping; queued slot targets remain immutable values. Source records are
 	// retained until their tagged delayed-real completion can correct the epoch.
@@ -6368,16 +6452,27 @@ static uint64_t framegen_commit_lead_override_ns()
 	return s_ulOverrideNs;
 }
 
+static gamescope::framegen::FixedRefreshPresentLead_t
+framegen_native_present_lead( uint64_t ulPresentMarginNs,
+	uint64_t ulVblankIntervalNs )
+{
+	return gamescope::framegen::select_fixed_refresh_present_lead(
+		g_framegenPresentState.displayTiming.presentLead,
+		g_framegenPresentState.displayTiming.minimumViablePresentLead,
+		ulPresentMarginNs, ulVblankIntervalNs,
+		framegen_commit_lead_override_ns() );
+}
+
 static gamescope::framegen::FixedRefreshCommitPlan_t
 framegen_plan_fixed_refresh_commit( uint64_t ulTargetFlipNs,
 	uint64_t ulPresentMarginNs, uint64_t ulVblankIntervalNs )
 {
-	const gamescope::framegen::PresentLeadState_t presentLead =
-		gamescope::framegen::apply_present_lead_override(
-			g_framegenPresentState.displayTiming.presentLead,
-			framegen_commit_lead_override_ns() );
 	return gamescope::framegen::plan_fixed_refresh_commit(
-		ulTargetFlipNs, presentLead, ulPresentMarginNs, ulVblankIntervalNs );
+		ulTargetFlipNs,
+		g_framegenPresentState.displayTiming.presentLead,
+		g_framegenPresentState.displayTiming.minimumViablePresentLead,
+		ulPresentMarginNs, ulVblankIntervalNs,
+		framegen_commit_lead_override_ns() );
 }
 
 static uint64_t framegen_predicted_interval_ns()
@@ -6690,6 +6785,15 @@ static bool framegen_recovery_active_for_path()
 		&& !vulkan_framegen_bidir_active();
 }
 
+static bool framegen_native_causal_deadline_path()
+{
+	gamescope::IBackend *pBackend = GetBackend();
+	return framegen_causal_deadline_enabled()
+		&& !vulkan_framegen_vrr_hybrid_active()
+		&& !vulkan_framegen_bidir_active()
+		&& pBackend != nullptr && pBackend->OwnsKMSPresentTiming();
+}
+
 static void framegen_recovery_reset_streak()
 {
 	if ( !framegen_recovery_active_for_path() )
@@ -6885,6 +6989,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.bDeadlineProvenanceInitialized = false;
 	g_framegenHistory.bDeadlineSourceTimestampsReliable = false;
 	g_framegenHistory.bCausalDeadlineMissed = false;
+	g_framegenHistory.causalDeadlineMisses = {};
 	// deadline bias and VRR present lead live in displayTiming and intentionally
 	// survive this content reset. The shadow retains its independent bias while
 	// dropping only anchors/decisions derived from the invalidated content.
@@ -6982,7 +7087,7 @@ void vulkan_framegen_reset( const char *reason )
 
 	g_framegenHistory = {};
 	// Resource/history rebuilds are not display-chain changes. The next real
-	// observation resets both timing EMAs only if its display-chain key differs.
+	// observation resets the timing learners only if its display-chain key differs.
 	framegen_invalidate_deadline_shadow_content();
 	// The per-rung costs live on g_device and survive the history reset; forget
 	// them too (as invalidate_history does) so the ladder re-probes the
@@ -7106,7 +7211,10 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 	{
 		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
 		framegen_metrics_note_slow_drop( 1 );
-		framegen_recovery_reset_streak();
+		// Native causal scheduling applies miss hysteresis at the next rung
+		// decision. Other paths retain their established immediate reset.
+		if ( !framegen_native_causal_deadline_path() )
+			framegen_recovery_reset_streak();
 		g_framegenHistory.bCausalDeadlineMissed |=
 			front.ulAnchorRealFrameId != 0u;
 		static uint64_t s_uTooSlowDebugLogCounter = 0;
@@ -7219,7 +7327,8 @@ void vulkan_framegen_discard_generated_frame( const char *reason )
 
 	const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
 	if ( nDiscarded > 0u && reason != nullptr
-		&& strcmp( reason, "generation_too_slow" ) == 0 )
+		&& strcmp( reason, "generation_too_slow" ) == 0
+		&& !framegen_native_causal_deadline_path() )
 		framegen_recovery_reset_streak();
 	if ( reason != nullptr && strcmp( reason, "generation_too_slow" ) == 0 )
 		framegen_metrics_note_slow_drop( nDiscarded );
@@ -10431,11 +10540,13 @@ struct FramegenCausalRungSelection_t
 	bool bAdmit = false;
 	bool bCommittedRung = false;
 	bool bCommitReservationShortfall = false;
+	bool bDeadlineMissSkip = false;
 };
 
 static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const gamescope::framegen::CausalSlotPlan_t &plan, uint64_t ulNowNs,
-	uint64_t ulPlainWakeNs, bool bNativeCommitDeadline )
+	uint64_t ulPlainWakeNs, bool bNativeCommitDeadline,
+	uint64_t ulNativeSlotBudgetNs )
 {
 	FramegenCausalRungSelection_t result;
 	// A multiplier notch cannot reduce a one-slot submission. Stop this ladder
@@ -10476,13 +10587,34 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const bool bPriorDeadlineMiss = g_framegenHistory.bCausalDeadlineMissed;
 	g_framegenHistory.bCausalDeadlineMissed = false;
 	result = sampleRung( nCurrentRung );
+	bool bDegradeForPriorMiss = bPriorDeadlineMiss;
+	if ( ulNativeSlotBudgetNs != 0u )
+	{
+		const gamescope::framegen::DeadlineMissEvaluation_t miss =
+			gamescope::framegen::evaluate_deadline_miss_hysteresis(
+				g_framegenHistory.causalDeadlineMisses,
+				bPriorDeadlineMiss,
+				g_framegenPresentState.bPresentBiasHitchEpisode,
+				result.ulCostNs, result.uSamples,
+				ulNativeSlotBudgetNs );
+		g_framegenHistory.causalDeadlineMisses = miss.state;
+		bDegradeForPriorMiss = miss.degrade;
+		// A hitch or one isolated miss consumes this opportunity honestly. It
+		// does not move the rung or erase recovery evidence here; repeated misses
+		// (or a measured slot-capacity failure) take the normal degradation path.
+		if ( miss.skip )
+		{
+			result.bDeadlineMissSkip = true;
+			return result;
+		}
+	}
 	// When the KMS commit reservation is earlier than the ordinary compositor
 	// wake, it may make this one slot unavailable even though the current rung
 	// still fits the plain display-grid opportunity. Skip that slot without
 	// teaching the quality ladder that the rung itself is too expensive.
 	const bool bCurrentCostMature = result.ulCostNs != 0u
 		&& result.uSamples >= gamescope::framegen::k_uDeadlineMinSamples;
-	if ( !bPriorDeadlineMiss && bNativeCommitDeadline && bCurrentCostMature
+	if ( !bDegradeForPriorMiss && bNativeCommitDeadline && bCurrentCostMature
 		&& gamescope::framegen::commit_reservation_only_shortfall(
 			result.ulCostNs, plan.wakeNs, ulPlainWakeNs,
 			ulNowNs, ulStartEstimateNs ) )
@@ -10490,7 +10622,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 		result.bCommitReservationShortfall = true;
 		return result;
 	}
-	if ( !bPriorDeadlineMiss && sampleFits( result ) )
+	if ( !bDegradeForPriorMiss && sampleFits( result ) )
 	{
 		result.bAdmit = true;
 		if ( framegen_recovery_active_for_path() )
@@ -10500,11 +10632,12 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 				richer = sampleRung( nCurrentRung - 1u );
 			const uint64_t ulDecisionStartNs = std::max(
 				ulNowNs, ulStartEstimateNs );
-			const uint64_t ulRecoveryBudgetNs = plan.wakeNs
-				> ulDecisionStartNs
-				? gamescope::framegen::deadline_budget_ns(
-					plan.wakeNs - ulDecisionStartNs )
-				: 0u;
+			const uint64_t ulRecoveryBudgetNs = ulNativeSlotBudgetNs != 0u
+				? ulNativeSlotBudgetNs
+				: ( plan.wakeNs > ulDecisionStartNs
+					? gamescope::framegen::deadline_budget_ns(
+						plan.wakeNs - ulDecisionStartNs )
+					: 0u );
 			const gamescope::framegen::LadderRecoveryEvaluation_t recovery =
 				gamescope::framegen::evaluate_ladder_recovery(
 					g_framegenHistory.recovery, nCurrentRung,
@@ -10534,11 +10667,27 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 		return result;
 	}
 
+	// The admission gate above remains tied to this decision's actual remaining
+	// time. If the mature rung fits a normally planned native slot, a late-phase
+	// decision is not capacity evidence: skip it without degrading or resetting
+	// the recovery streak, and try again at the normal phase.
+	const uint64_t ulDecisionStartNs = std::max(
+		ulNowNs, ulStartEstimateNs );
+	const uint64_t ulRemainingBudgetNs = plan.wakeNs > ulDecisionStartNs
+		? gamescope::framegen::deadline_budget_ns(
+			plan.wakeNs - ulDecisionStartNs )
+		: 0u;
+	if ( !bDegradeForPriorMiss && ulNativeSlotBudgetNs != 0u
+		&& gamescope::framegen::deadline_shortfall_is_phase_only(
+			result.ulCostNs, result.uSamples,
+			ulRemainingBudgetNs, ulNativeSlotBudgetNs ) )
+		return result;
+
 	// Retain the existing post-degradation hold. Known work that misses this
 	// slot's actual remaining budget is skipped rather than submitted late; each
 	// such decision still advances the hold just as the old per-frame evaluator
 	// did, so the ladder cannot deadlock at an over-budget rung.
-	if ( !bPriorDeadlineMiss && g_framegenHistory.nDegradeHold > 0u )
+	if ( !bDegradeForPriorMiss && g_framegenHistory.nDegradeHold > 0u )
 	{
 		g_framegenHistory.nDegradeHold--;
 		framegen_recovery_note_capacity_failure();
@@ -10707,8 +10856,19 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 				plan.targetNs,
 				ulPresentMarginNs, ulVblankIntervalNs )
 			: gamescope::framegen::FixedRefreshCommitPlan_t{};
+	const uint64_t ulNativeSlotBudgetNs = !bNativeKmsTiming
+		? 0u
+		: commitPlan.earlyCommit
+			? gamescope::framegen::fixed_refresh_slot_budget_ns(
+				ulVblankIntervalNs, commitPlan.presentLeadNs,
+				ulPresentMarginNs )
+			// Before commit-lead warm-up there is no viable reservation to
+			// subtract. Keep native miss hysteresis active against the maximum
+			// refresh-slot budget; warm-up is far shorter than recovery evidence.
+			: gamescope::framegen::deadline_budget_ns( ulVblankIntervalNs );
 	FramegenCausalRungSelection_t rung = framegen_select_causal_rung(
-		plan, now, ulPlainWakeNs, commitPlan.earlyCommit );
+		plan, now, ulPlainWakeNs, commitPlan.earlyCommit,
+		ulNativeSlotBudgetNs );
 	if ( !rung.bAdmit )
 	{
 		const uint64_t ulDecisionStartNs = std::max( now, ulStartEstimateNs );
@@ -10734,7 +10894,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 				flCommitDeltaMs,
 				rung.bCommitReservationShortfall ? 1 : 0 );
 		}
-		if ( rung.bCommitReservationShortfall )
+		if ( rung.bCommitReservationShortfall || rung.bDeadlineMissSkip )
 			g_framegenHistory.ulLastPlannedTargetNs = plan.targetNs;
 		return false;
 	}

@@ -408,8 +408,8 @@ Two consumers, two latencies:
   flashes, particle chaos, stroboscopic content). Low trust slides the whole frame toward the safe
   fallback (crossfade in bidir, bounded extrapolation forward) — smoothly, with zero latency, and
   self-recovering the moment the field predicts again. This is deliberately how quality-driven
-  degradation ships WITHOUT touching #04's monotonic ladder: a discrete quality rung would either
-  oscillate or, held monotonic, let one bad interval degrade the whole scene. Perf note: baking
+  degradation ships without forcing #04's discrete ladder to react: rung changes are held and
+  recovery requires long capacity evidence, while per-frame trust can move smoothly. Perf note: baking
   trust into the field (which the warps already fetch per pixel) is load-bearing — reading the
   stats image from the full-res warps, even once per workgroup, measured ~10% of the warp on
   NVIDIA (repeated surface loads of one texel serialize on the cache).
@@ -607,7 +607,7 @@ This is the single biggest newcomer trap. There are **two control regimes**:
 - **SHARED queue** (single-queue family, or `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE`) — the **leaky-bucket
    admission gate** (§4.2) requires a proven empty vblank + 2 stable frames; `nGenerate` is
   **hard-capped to 1** to bound head-of-line work in front of the next composite. It uses the same
-  timestamp query pool and monotonic ladder, keyed to the scratch timeline rather than the dedicated
+  timestamp query pool and deadline ladder, keyed to the scratch timeline rather than the dedicated
   framegen timeline; reactive supersede/discard remains the final safety net.
 
 ### 4.2 Per-frame generate/dormant gate
@@ -637,7 +637,7 @@ Per slot in the retained classic `framegen_submit_batch`: `phase = k/nGapVblanks
 classic x2 half-step. Production causal and bidir phases instead come directly from their exact
 display-target timestamps.
 
-### 4.4 Monotonic degradation ladder (#04)
+### 4.4 Deadline degradation and recovery ladder (#04)
 
 Evaluated **only on frames that actually generate** (after the dormant early-return), so an
 idle/dormant stretch never moves the rung.
@@ -664,10 +664,11 @@ the multiplier steps toward x2. `framegen_max_degrade_steps()` counts the select
 the final motion-to-extrapolate step and multiplier notches. There is deliberately **no "stop generating" rung** — the ladder always keeps
 generating (so its GPU-time input never starves); the genuine "even x2 overruns" case is left to the
 reactive pacing gate. It **never mutates** `g_eFramegenMode`/`g_eFramegenQuality`/`g_nFramegenMultiplier`
-(those are the user's ceiling and size the pool); it only reads an *effective* config. **Monotonic within a scene** — never
-restores mid-scene (restoring means re-probing a richer config that may not fit, then dropping it → a
-visible toggle, the exact micro-stutter this feature exists to avoid). Re-probed from full only on a
-scene change.
+(those are the user's ceiling and size the pool); it only reads an *effective* config. The selected
+rung remains monotonic throughout each post-step hold. Afterward, 90 consecutive large-headroom
+decisions may re-probe exactly one adjacent richer rung, followed by probation and scene-local
+back-off. Native fixed-refresh recovery measures that headroom against full slot capacity; a
+phase-late decision does not erase the streak, and one isolated miss does not degrade.
 
 ### 4.5 History invalidation and priming
 
@@ -873,7 +874,7 @@ cache hit.
 | **01** | VRR hybrid — present the real frame VRR-style for the full latency win, schedule the generated frame with a timer-armed mid-interval atomic flip | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_VRR_HYBRID=1`, dedicated queue + active VRR only). `steamcompmgr` keeps `allowVRR` enabled only while the hybrid is requested, and the DRM backend inherits the real frame's VRR state so the two flips agree. One generated frame at phase 0.5 is flipped by `g_FramegenMidTimer` and planned by `framegen_vrr_hybrid_submit`. Built on #06's source-cadence predictor. **Not yet validated on a VRR panel** (see the proposal status). |
 | **02** | Base-layer generation + late overlay/cursor composite — generate on the pre-upscale game layer, composite UI on top (no HUD ghosting) | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_BASE=1`, no dedicated-queue requirement). Generation runs on `layers[0].tex`; `framegen_base_present_composite` late-composites current overlays/cursor through `vulkan_composite`, so generated frames receive the full FSR and color-management pipeline. **Divergence:** the draft's bandwidth reduction no longer applies after zero-copy history; base mode adds a base-sized history copy per real frame and a full composite per presented generated frame. `framegen_base_layer_usable` falls back to output-space generation for video-underlay, YCbCr, ReShade, or unsupported storage formats. |
 | **03** | dGPU optical-flow donor — offload motion estimation to the render GPU's `VK_NV_optical_flow` OFA, ship a small flow field over PCIe | **Aspirational** (longest horizon). Zero OFA symbols; needs a second Vulkan device gamescope has never had; cross-vendor timeline interop rated unreliable. Motion mode is the shipped fallback. |
-| **04** | Timestamp-driven adaptive degradation | **IMPLEMENTED** (`a75bfbe`) but **divergent** from the proposal — shipped is *monotonic* (down-only, re-probe on scene change), rungs are motion-quality/mode/multiplier notches (not a pyramid table), 85% deadline (not 0.6 budget), 2D per-(rung,gen-count) 7/8-EMA (not one global EWMA), three-sample cold-start guard, fixed 4-frame cooldown, modular `timestampValidBits` wrap handling, and no tuning flags. `VK_EXT_calibrated_timestamps` is unused. |
+| **04** | Timestamp-driven adaptive degradation | **IMPLEMENTED** (`a75bfbe`) but **divergent** from the proposal — rungs are motion-quality/mode/multiplier notches (not a pyramid table), use an 85% budget (not 0.6), and have a 2D per-(rung,gen-count) 7/8-EMA, three-sample cold-start guard, fixed 4-frame hold, and slow evidence-gated one-rung recovery with probation/back-off. Native fixed-refresh recovery uses full slot capacity and two-miss hysteresis. `VK_EXT_calibrated_timestamps` is unused. |
 | **05** | Tile classification + `vkCmdDispatchIndirect` + SDMA static fill — generate only over moving tiles, fill static tiles on the transfer engine | **Aspirational** (deferred). No transfer-only queue discovery / classify shader exists; the doc admits it depends on transfer-queue discovery that isn't there yet. |
 | **06** | Causal fixed-cadence scheduling — treat each refresh as a deadline, present a real frame when ready, otherwise use a one-slot forward prediction | **DEFAULT BEHAVIOR** on the dedicated queue. `commit_t::present_time` supplies source-ready observations; `CadencePredictorState` learns bounded period/trend/late error; the deadline planner compares protected arrival with the exact display wake, carries target timestamps through submission, and replans after feedback or repeat. The multiplier is a resource/quality ceiling rather than a batch size. The shared-queue fallback remains conservative. |
 | **07** | Frames-only SOTA alignment and validation | **BOUNDED IMPLEMENTATIONS COMPLETE FOR E1, E2, B, A, D.** E2 now captures exact full-resolution held-out colour with paired candidates; optional LPIPS is available, while DISTS/FvVDP remain external evaluation work. The confidence-only bidir ML authority boundary remains the production contract. |

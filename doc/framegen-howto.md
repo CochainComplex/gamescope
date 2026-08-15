@@ -115,6 +115,12 @@ one disposable forward-predicted backup only when the next real frame is not
 confidently due before the compositor's exact wake deadline. At presentation,
 the order remains real frame, ready generated frame, then hardware repeat.
 
+On native DRM, the generated-only KMS commit deadline uses a learned minimum
+viable lead: successful real commits below one refresh interval establish a
+slowly decayed low-water mark, with a one-tenth-refresh safety margin. Warm-up
+keeps the habitual commit-lead EMA, and a late generated flip backs the learned
+lead off automatically. Nested backends keep their existing pacing.
+
 This is intentionally separate from the preferred bidirectional x4 baseline:
 causal mode is low latency; bidirectional mode waits for the next real frame and
 usually has better endpoint evidence. Select causal mode by leaving
@@ -355,7 +361,7 @@ the default. Legend:
 | `resets_chain` | display-chain learner resets caused by backend, connector, refresh interval, VRR, or timestamp-provenance changes |
 | `resets (ring N)` | pacing/history re-primes (scene cuts, hitches); `ring` counts emergency queue flushes — nonzero means overload |
 | `steps / profile` | net training steps this session / whether a per-game profile was loaded |
-| `GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS=<float>` | **Experiment/diagnostic (native DRM only):** replace the learned generated-frame commit lead after its normal warm-up; unset keeps automatic scheduling. |
+| `GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS=<float>` | **Experiment/diagnostic (native DRM only):** replace the learned minimum-viable generated-frame commit lead after its normal warm-up; unset keeps automatic scheduling. |
 
 ---
 
@@ -388,7 +394,12 @@ Choose the cost explicitly for the display/framegen GPU:
 | `extreme` | + color-guided motion-layer reconstruction and a three-real-frame disocclusion resolver | idle second GPU, maximum forward quality |
 
 Gamescope automatically walks downward through these levels if measured GPU
-time misses the display deadline. It never oscillates upward within a scene.
+time misses the display deadline. It recovers one adjacent level only after
+sustained measured headroom; native fixed-refresh recovery uses the whole
+generation slot's capacity, so a decision that merely arrived late within the
+slot does not erase the recovery streak. One isolated deadline miss skips a
+slot without lowering quality, while repeated misses or a mature cost that
+cannot fit the slot can degrade. Loading-hitch episodes do not degrade.
 The Extreme disocclusion search is on by default and never affects lower tiers;
 set `GAMESCOPE_FRAMEGEN_RESERVOIR=0` only for live A/B attribution.
 
@@ -529,9 +540,9 @@ the generation)
 - The performance tuning is automatic: on newer hardware it uses packed-fp16
   shaders, on others it falls back — you don't set this.
 - If quality drops because the card is overloaded, gamescope automatically
-  steps *down* (motion → simpler → fewer extra frames) to avoid stutter. The
-  step-down holds for the rest of the scene (it never oscillates back up
-  mid-scene); full quality is re-probed only at the next scene change.
+  steps *down* (motion → simpler → fewer extra frames) to avoid stutter. After
+  the post-step hold, sustained slot-capacity headroom can re-probe one adjacent
+  richer rung. A failed probe lengthens the next recovery back-off.
 
 ---
 

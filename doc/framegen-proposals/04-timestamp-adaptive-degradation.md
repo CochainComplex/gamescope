@@ -4,7 +4,11 @@ Status: **implemented with deliberate control-policy divergences**. The original
 retained as rationale. Production uses fast degradation plus slow evidence-gated one-rung recovery,
 an 85% vblank budget, per-`(rung, generated-count)` 7/8 EMA, a three-completed-sample warm-up, and a
 four-frame post-step hold. Recovery requires 90 consecutive large-headroom decisions and uses a
-5-second probation with exponential 2-second-to-60-second back-off. The dedicated-queue semaphore
+5-second probation with exponential 2-second-to-60-second back-off. Native fixed-refresh recovery
+tests the mature richer-rung cost against the full generation-slot budget rather than the accidental
+time remaining when a real frame triggers the decision; phase-only shortfalls preserve the streak.
+An isolated deadline miss skips without degrading, while two misses in the 16-decision window (or a
+mature current-rung cost that cannot fit the slot) can degrade; hitch-classified misses do not. The dedicated-queue semaphore
 wait covers `ALL_COMMANDS`, keeping the opening timestamp after
 the composite dependency; deltas are modular in `timestampValidBits`, so sub-64-bit counter wrap is
 valid. Single-queue devices key the same non-blocking query readback to the scratch timeline, so the
@@ -413,11 +417,11 @@ encodes this as the rung thresholds.
 | Timestamp measures duration, not slack-to-vblank | Rung too optimistic near deadline | Use the implemented 85% interval deadline and retain reactive not-ready discard as the final guard. |
 | Query pair not reset before reuse | Undefined or stale results | The depth-4 process-lifetime pool resets exactly the selected pair in the generation command buffer before its opening timestamp. The one-batch-in-flight gate prevents live reuse. |
 | EWMA lag after a workload spike | One overrun before adapting | Use a 7/8 EMA with a three-sample warm-up; the present path still drops a late result rather than waiting. |
-| Rung flapping around a boundary | Microstutter | Recovery climbs one rung after 90 consecutive large-headroom decisions. A fallback during its 225-decision probation doubles the scene-local back-off, capped at 2,700 decisions; successful probation halves it toward the 90-decision base. |
+| Rung flapping around a boundary | Microstutter | Recovery climbs one rung after 90 consecutive large-headroom decisions measured against slot capacity, not decision-phase remainder. A fallback during its 225-decision probation doubles the scene-local back-off, capped at 2,700 decisions; successful probation halves it toward the 90-decision base. |
 | Query pool tied to resize/format resources | Lifetime bugs or unnecessary churn | Keep the query pool at device/process lifetime. Resize and format resets clear scene associations and costs but do not destroy or recreate the pool. |
 | Motion-mode per-stage stamps inflate query count | Pool sizing | The implementation records only one opening and closing timestamp per full batch; attribution is by `(rung, generated-count)`. |
 | `calibrated_timestamps` drift between recalibrations | Slack miscomputed | The implemented policy does not use calibrated timestamps; it compares queue-family GPU duration to the conservative interval budget. |
-| A background load spike invalidates the selected rung | Wasted generation or a repeated scanout | Immediate quality reduction plus the non-blocking late-discard path bounds the effect; any failed recovery probe lengthens the next re-probe interval. |
+| A background load spike invalidates the selected rung | Wasted generation or a repeated scanout | The non-blocking late-discard path bounds the effect. One isolated miss is skipped; two misses inside the short rolling window, or mature proof that the rung exceeds slot capacity, can reduce quality. Hitch-classified misses never degrade, and any failed recovery probe lengthens the next re-probe interval. |
 
 ---
 

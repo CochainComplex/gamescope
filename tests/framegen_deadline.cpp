@@ -634,6 +634,11 @@ TEST_CASE( "display timing bias survives content invalidation and resets on grid
 		.emaNs = 1'250'000,
 		.samples = 23u,
 	};
+	timing.minimumViablePresentLead = {
+		.lowWaterNs = 750'000u,
+		.backoffFloorNs = 1'000'000u,
+		.samples = 17u,
+	};
 	const uint64_t generation = timing.generation;
 
 	// Content history can disappear and re-prime while the observed display
@@ -647,6 +652,9 @@ TEST_CASE( "display timing bias survives content invalidation and resets on grid
 	CHECK( contentReprime.state.presentBias.consecutiveGuardExceeds == 1u );
 	CHECK( contentReprime.state.presentLead.emaNs == 1'250'000 );
 	CHECK( contentReprime.state.presentLead.samples == 23u );
+	CHECK( contentReprime.state.minimumViablePresentLead.lowWaterNs == 750'000u );
+	CHECK( contentReprime.state.minimumViablePresentLead.backoffFloorNs == 1'000'000u );
+	CHECK( contentReprime.state.minimumViablePresentLead.samples == 17u );
 
 	DisplayChainKey_t changedGrid = chain;
 	changedGrid.intervalNs = 16'666'667u;
@@ -658,6 +666,7 @@ TEST_CASE( "display timing bias survives content invalidation and resets on grid
 	CHECK( gridChange.state.presentBias.emaNs == 0 );
 	CHECK( gridChange.state.presentLead.samples == 0u );
 	CHECK( gridChange.state.presentLead.emaNs == 0 );
+	CHECK( gridChange.state.minimumViablePresentLead.samples == 0u );
 
 	const auto checkChainReset = [&]( const DisplayChainKey_t &changedChain ) {
 		const DisplayChainTimingTransition_t changed =
@@ -665,6 +674,7 @@ TEST_CASE( "display timing bias survives content invalidation and resets on grid
 		REQUIRE( changed.displayChainChanged );
 		CHECK( changed.state.presentBias.samples == 0u );
 		CHECK( changed.state.presentLead.samples == 0u );
+		CHECK( changed.state.minimumViablePresentLead.samples == 0u );
 	};
 	DisplayChainKey_t changedBackend = chain;
 	changedBackend.backendId++;
@@ -1264,6 +1274,162 @@ TEST_CASE( "mature native present-lead learner rejects guarded outliers",
 	STATIC_REQUIRE( outlier.samples == mature.samples );
 }
 
+TEST_CASE( "native minimum viable lead learns only proven latches and decays upward",
+	"[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'000'000u;
+	PresentLeadState_t habitual;
+	MinimumViablePresentLeadState_t viable;
+	const auto observe = [&]( uint64_t submitNs, uint64_t flipNs,
+		bool hitch = false )
+	{
+		viable = update_minimum_viable_present_lead(
+			viable, habitual, submitNs, flipNs, intervalNs, hitch );
+		habitual = update_present_lead(
+			habitual, submitNs, flipNs, intervalNs, hitch );
+	};
+
+	observe( 1'000'000u, 1'000'000u + intervalNs, false );
+	observe( 20'000'000u, 24'000'000u, true );
+	observe( 30'000'000u, 30'000'000u + intervalNs + 1u, false );
+	CHECK( viable.samples == 0u );
+
+	observe( 40'000'000u, 44'000'000u );
+	observe( 50'000'000u, 52'000'000u );
+	observe( 60'000'000u, 61'000'000u );
+	observe( 70'000'000u, 75'000'000u );
+	REQUIRE( viable.samples == k_uPresentLeadWarmupSamples );
+	CHECK( viable.lowWaterNs == 1'125'000u );
+
+	const FixedRefreshPresentLead_t learned =
+		select_fixed_refresh_present_lead(
+			habitual, viable, intervalNs / 10u, intervalNs );
+	REQUIRE( learned.ready );
+	CHECK( learned.learned );
+	CHECK_FALSE( learned.overridden );
+	CHECK( learned.leadNs == 1'125'000u );
+
+	observe( 80'000'000u, 85'000'000u );
+	CHECK( viable.lowWaterNs == 1'250'000u );
+}
+
+TEST_CASE( "native minimum viable lead backs off on late generation and re-earns",
+	"[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'000'000u;
+	PresentLeadState_t habitual = {
+		.emaNs = 4'000'000,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	MinimumViablePresentLeadState_t viable = {
+		.lowWaterNs = 1'000'000u,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+
+	viable = back_off_minimum_viable_present_lead(
+		viable, habitual, intervalNs );
+	CHECK( viable.lowWaterNs == 1'000'000u );
+	CHECK( viable.backoffFloorNs == 2'000'000u );
+	CHECK( minimum_viable_present_lead_ns( viable ) == 2'000'000u );
+
+	viable = update_minimum_viable_present_lead(
+		viable, habitual, 10'000'000u, 15'000'000u,
+		intervalNs, false );
+	CHECK( viable.lowWaterNs == 1'125'000u );
+	CHECK( viable.backoffFloorNs == 1'875'000u );
+
+	for ( uint32_t miss = 0u; miss < 8u; miss++ )
+		viable = back_off_minimum_viable_present_lead(
+			viable, habitual, intervalNs );
+	CHECK( minimum_viable_present_lead_ns( viable )
+		== static_cast<uint64_t>( habitual.emaNs ) );
+}
+
+TEST_CASE( "native minimum viable lead backs off only for late learned presents",
+	"[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'000'000u;
+	constexpr uint64_t targetNs = 20'000'000u;
+	constexpr FixedRefreshPresentLead_t learned = {
+		.leadNs = 1'000'000u,
+		.ready = true,
+		.learned = true,
+	};
+	constexpr FixedRefreshPresentLead_t habitual = {
+		.leadNs = 4'000'000u,
+		.ready = true,
+	};
+	constexpr FixedRefreshPresentLead_t overridden = {
+		.leadNs = 3'000'000u,
+		.ready = true,
+		.overridden = true,
+	};
+
+	STATIC_REQUIRE_FALSE( minimum_viable_present_lead_needs_backoff(
+		learned, targetNs + intervalNs / 2u, targetNs, intervalNs ) );
+	STATIC_REQUIRE( minimum_viable_present_lead_needs_backoff(
+		learned, targetNs + intervalNs / 2u + 1u, targetNs, intervalNs ) );
+	STATIC_REQUIRE_FALSE( minimum_viable_present_lead_needs_backoff(
+		habitual, targetNs + intervalNs, targetNs, intervalNs ) );
+	STATIC_REQUIRE_FALSE( minimum_viable_present_lead_needs_backoff(
+		overridden, targetNs + intervalNs, targetNs, intervalNs ) );
+}
+
+TEST_CASE( "native commit lead keeps EMA warmup and lets override win",
+	"[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'000'000u;
+	constexpr uint64_t marginNs = intervalNs / 10u;
+	constexpr PresentLeadState_t habitual = {
+		.emaNs = 5'000'000,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr MinimumViablePresentLeadState_t warming = {
+		.lowWaterNs = 1'000'000u,
+		.samples = k_uPresentLeadWarmupSamples - 1u,
+	};
+	constexpr FixedRefreshPresentLead_t warmup =
+		select_fixed_refresh_present_lead(
+			habitual, warming, marginNs, intervalNs );
+	STATIC_REQUIRE( warmup.ready );
+	STATIC_REQUIRE_FALSE( warmup.learned );
+	STATIC_REQUIRE( warmup.leadNs == 5'000'000u );
+
+	constexpr MinimumViablePresentLeadState_t learned = {
+		.lowWaterNs = 1'000'000u,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr FixedRefreshCommitPlan_t overridden =
+		plan_fixed_refresh_commit(
+			20'000'000u, habitual, learned,
+			marginNs, intervalNs, 3'000'000u );
+	STATIC_REQUIRE( overridden.earlyCommit );
+	STATIC_REQUIRE( overridden.overriddenLead );
+	STATIC_REQUIRE_FALSE( overridden.learnedLead );
+	STATIC_REQUIRE( overridden.presentLeadNs == 3'000'000u );
+	STATIC_REQUIRE( overridden.advanceNs == 3'800'000u );
+
+	constexpr MinimumViablePresentLeadState_t belowFloor = {
+		.lowWaterNs = 200'000u,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr FixedRefreshPresentLead_t floored =
+		select_fixed_refresh_present_lead(
+			habitual, belowFloor, marginNs, intervalNs );
+	STATIC_REQUIRE( floored.leadNs
+		== k_uMinimumViablePresentLeadFloorNs );
+
+	constexpr MinimumViablePresentLeadState_t aboveHabitual = {
+		.lowWaterNs = 7'000'000u,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr FixedRefreshPresentLead_t capped =
+		select_fixed_refresh_present_lead(
+			habitual, aboveHabitual, marginNs, intervalNs );
+	STATIC_REQUIRE( capped.leadNs
+		== static_cast<uint64_t>( habitual.emaNs ) );
+}
+
 TEST_CASE( "fixed-refresh commit wake uses mature present lead and margin", "[framegen][deadline]" )
 {
 	constexpr uint64_t intervalNs = 8'000u;
@@ -1393,6 +1559,93 @@ TEST_CASE( "slot budget applies 0.85 to actual remaining time", "[framegen][dead
 	CHECK( deadline_cost_fits( 4'250u, 20'000u, 10'000u, 15'000u ) );
 	CHECK_FALSE( deadline_cost_fits( 4'251u, 20'000u, 10'000u, 15'000u ) );
 	CHECK_FALSE( deadline_cost_fits( 1u, 20'000u, 10'000u, 20'000u ) );
+}
+
+TEST_CASE( "native recovery preserves evidence across phase-short decisions",
+	"[framegen][deadline][recovery]" )
+{
+	constexpr uint64_t intervalNs = 8'000'000u;
+	constexpr uint64_t leadNs = 1'000'000u;
+	constexpr uint64_t marginNs = 800'000u;
+	constexpr uint64_t slotBudgetNs = fixed_refresh_slot_budget_ns(
+		intervalNs, leadNs, marginNs );
+	constexpr uint64_t shortRemainingBudgetNs = deadline_budget_ns( 2'000'000u );
+	constexpr uint64_t currentCostNs = 2'500'000u;
+	constexpr uint64_t richerCostNs = 4'500'000u;
+
+	STATIC_REQUIRE( currentCostNs > shortRemainingBudgetNs );
+	STATIC_REQUIRE( deadline_shortfall_is_phase_only(
+		currentCostNs, k_uDeadlineMinSamples,
+		shortRemainingBudgetNs, slotBudgetNs ) );
+	STATIC_REQUIRE( deadline_recovery_headroom(
+		currentCostNs, k_uDeadlineMinSamples,
+		richerCostNs, k_uDeadlineMinSamples, slotBudgetNs ) );
+
+	RecoveryState_t state;
+	for ( uint32_t decision = 1u;
+		decision < k_uDeadlineRecoveryHeadroomDecisions; decision++ )
+	{
+		const LadderRecoveryEvaluation_t evidence = evaluate_ladder_recovery(
+			state, 1u, 0u,
+			currentCostNs, k_uDeadlineMinSamples,
+			richerCostNs, k_uDeadlineMinSamples, slotBudgetNs );
+		state = evidence.state;
+		CHECK_FALSE( evidence.tryRecover );
+	}
+	REQUIRE( state.streak == k_uDeadlineRecoveryHeadroomDecisions - 1u );
+
+	// The renderer skips a phase-only shortfall without feeding it to the
+	// recovery controller. The next normal-phase decision completes the streak.
+	const RecoveryState_t afterShortDecision = state;
+	CHECK( afterShortDecision.streak == state.streak );
+	const LadderRecoveryEvaluation_t recovered = evaluate_ladder_recovery(
+		afterShortDecision, 1u, 0u,
+		currentCostNs, k_uDeadlineMinSamples,
+		richerCostNs, k_uDeadlineMinSamples, slotBudgetNs );
+	CHECK( recovered.tryRecover );
+}
+
+TEST_CASE( "native deadline misses use two-miss hysteresis",
+	"[framegen][deadline][recovery]" )
+{
+	constexpr uint64_t fittingCostNs = 3'000u;
+	constexpr uint64_t slotBudgetNs = 5'000u;
+	DeadlineMissState_t state;
+
+	const DeadlineMissEvaluation_t first = evaluate_deadline_miss_hysteresis(
+		state, true, false,
+		fittingCostNs, k_uDeadlineMinSamples, slotBudgetNs );
+	state = first.state;
+	CHECK_FALSE( first.degrade );
+	CHECK( first.skip );
+	CHECK( deadline_miss_count( state.recentMisses ) == 1u );
+
+	const DeadlineMissEvaluation_t clear = evaluate_deadline_miss_hysteresis(
+		state, false, false,
+		fittingCostNs, k_uDeadlineMinSamples, slotBudgetNs );
+	state = clear.state;
+	CHECK_FALSE( clear.degrade );
+	CHECK_FALSE( clear.skip );
+
+	const DeadlineMissEvaluation_t second = evaluate_deadline_miss_hysteresis(
+		state, true, false,
+		fittingCostNs, k_uDeadlineMinSamples, slotBudgetNs );
+	CHECK( second.degrade );
+	CHECK_FALSE( second.skip );
+
+	const DeadlineMissEvaluation_t capacityFailure =
+		evaluate_deadline_miss_hysteresis(
+			{}, true, false,
+			slotBudgetNs + 1u, k_uDeadlineMinSamples, slotBudgetNs );
+	CHECK( capacityFailure.degrade );
+	CHECK_FALSE( capacityFailure.skip );
+
+	const DeadlineMissEvaluation_t hitch = evaluate_deadline_miss_hysteresis(
+		{}, true, true,
+		slotBudgetNs + 1u, k_uDeadlineMinSamples, slotBudgetNs );
+	CHECK_FALSE( hitch.degrade );
+	CHECK( hitch.skip );
+	CHECK( hitch.state.recentMisses == 0u );
 }
 
 TEST_CASE( "deadline ladder recovers after sustained measured headroom",
