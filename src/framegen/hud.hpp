@@ -170,6 +170,7 @@ struct FramegenHudSnapshot_t
 {
 	const char *version = "unknown";
 	const char *deviceName = "unknown";
+	const char *renderOrigin = nullptr;
 	GamescopeFramegenMode mode = GamescopeFramegenMode::Extrapolate;
 	GamescopeFramegenQuality quality = GamescopeFramegenQuality::Low;
 	uint32_t multiplier = 2u;
@@ -329,9 +330,11 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 
 	char deviceName[k_uFramegenHudDeviceNameColumns + 1u] = {};
 	framegen_hud_trim_device_name( deviceName, sizeof( deviceName ), snapshot.deviceName );
+	const char *renderOrigin = snapshot.renderOrigin != nullptr
+		&& snapshot.renderOrigin[0] != '\0' ? snapshot.renderOrigin : "n/a";
 	std::snprintf( line, sizeof( line ),
-		"%-8s %-21sbuffers %s", "present", deviceName,
-		snapshot.clientBuffersStaged ? "staged(cross-GPU)" : "local" );
+		"%-8s %-21srender %-10.10s buffers %s", "present", deviceName,
+		renderOrigin, snapshot.clientBuffersStaged ? "staged(xGPU)" : "local" );
 	framegen_hud_add_line( result, line );
 
 	const char *bidirState = snapshot.bidirActive ? "on"

@@ -338,8 +338,9 @@ and learning lines. `GAMESCOPE_FRAMEGEN_HUD_SCALE=1..6` sizes it,
 | `motion x2 quality:high` | active mode, frame multiplier, quality tier |
 | `120Hz fixed` / `120Hz VRR` | display refresh and whether VRR is actually driving it |
 | `present:` | the GPU that generates and drives the display |
+| `render` | vendor of the client dma-buf, resolved from the modifier vendor or dma-buf exporter name; this resolves vendor only, so two cards of the same vendor cannot be told apart |
 | `client buffers: local` | game frames arrive on the same GPU — zero-copy |
-| `client buffers: staged(cross-GPU)` | dual-GPU path active: frames are copied once into present-GPU memory |
+| `client buffers: staged(xGPU)` | dual-GPU path active: frames are copied once into present-GPU memory |
 | `bidir` | bidirectional interpolation (real frames shown one interval late) |
 | `base` | base-layer mode: HUD/cursor composited *after* generation |
 | `net: off / blob / online` | learned refiner: disabled / offline weights / training while you play |

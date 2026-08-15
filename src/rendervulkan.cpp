@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <thread>
@@ -2946,10 +2947,110 @@ static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
 	}
 }
 
+static bool ascii_starts_with_case_insensitive( const char *text, const char *prefix )
+{
+	for ( ; *prefix != '\0'; text++, prefix++ )
+	{
+		const unsigned char a = static_cast<unsigned char>( *text );
+		const unsigned char b = static_cast<unsigned char>( *prefix );
+		if ( std::tolower( a ) != std::tolower( b ) )
+			return false;
+	}
+	return true;
+}
+
+static void copy_render_origin( std::array<char, 16> &dst, const char *origin )
+{
+	std::snprintf( dst.data(), dst.size(), "%s", origin != nullptr ? origin : "unknown" );
+}
+
+static const char *dmabuf_modifier_vendor_name( uint8_t vendor )
+{
+	switch ( vendor )
+	{
+		case 0x01: return "Intel";
+		case 0x02: return "AMD";
+		case 0x03: return "NVIDIA";
+		case 0x04: return "Samsung";
+		case 0x05: return "Qcom";
+		case 0x06: return "Vivante";
+		case 0x07: return "Broadcom";
+		case 0x08: return "ARM";
+		default: return nullptr;
+	}
+}
+
+static std::array<char, 16> dmabuf_render_origin( const wlr_dmabuf_attributes *pDMA )
+{
+	std::array<char, 16> result = {};
+	copy_render_origin( result, "unknown" );
+	if ( pDMA == nullptr )
+	{
+		copy_render_origin( result, "cpu" );
+		return result;
+	}
+
+	if ( pDMA->modifier != DRM_FORMAT_MOD_INVALID
+		&& pDMA->modifier != DRM_FORMAT_MOD_LINEAR )
+	{
+		const uint8_t vendor = static_cast<uint8_t>( pDMA->modifier >> 56u );
+		const char *pszVendor = dmabuf_modifier_vendor_name( vendor );
+		if ( pszVendor != nullptr )
+			std::snprintf( result.data(), result.size(), "%s/m", pszVendor );
+		else
+			std::snprintf( result.data(), result.size(), "vendor0x%02x/m", vendor );
+		return result;
+	}
+
+	if ( pDMA->n_planes <= 0 )
+		return result;
+
+	char path[64] = {};
+	std::snprintf( path, sizeof( path ), "/proc/self/fdinfo/%d", pDMA->fd[0] );
+	FILE *file = fopen( path, "r" );
+	if ( file == nullptr )
+		return result;
+
+	char line[256] = {};
+	while ( fgets( line, sizeof( line ), file ) != nullptr )
+	{
+		constexpr const char *pszPrefix = "exp_name:";
+		if ( std::strncmp( line, pszPrefix, std::strlen( pszPrefix ) ) != 0 )
+			continue;
+
+		char *name = line + std::strlen( pszPrefix );
+		while ( *name == ' ' || *name == '\t' )
+			name++;
+		char *end = name + std::strlen( name );
+		while ( end > name && ( end[-1] == '\n' || end[-1] == '\r'
+			|| end[-1] == ' ' || end[-1] == '\t' ) )
+		{
+			end--;
+		}
+		*end = '\0';
+
+		if ( ascii_starts_with_case_insensitive( name, "nvidia" ) )
+			copy_render_origin( result, "NVIDIA/x" );
+		else if ( ascii_starts_with_case_insensitive( name, "drm" )
+			|| ascii_starts_with_case_insensitive( name, "amdgpu" )
+			|| ascii_starts_with_case_insensitive( name, "i915" )
+			|| ascii_starts_with_case_insensitive( name, "xe" ) )
+		{
+			char exporter[11] = {};
+			std::snprintf( exporter, sizeof( exporter ), "%s", name );
+			std::snprintf( result.data(), result.size(), "%s/x", exporter );
+		}
+		break;
+	}
+	fclose( file );
+	return result;
+}
+
 bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
 {
 	m_pBackendFb = std::move( pBackendFb );
 	m_drmFormat = drmFormat;
+	m_renderOrigin = dmabuf_render_origin( pDMA );
 	VkResult res = VK_ERROR_INITIALIZATION_FAILED;
 
 	VkImageTiling tiling = (flags.bMappable || flags.bLinear) ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
@@ -8007,29 +8108,27 @@ static const char *framegen_hud_device_name()
 	return s_name.data();
 }
 
-static bool framegen_hud_client_buffers_staged( const struct FrameInfo_t *pFrameInfo )
+static const CVulkanTexture *framegen_hud_base_client_texture( const struct FrameInfo_t *pFrameInfo )
 {
 	if ( pFrameInfo == nullptr )
-		return false;
+		return nullptr;
 	for ( int i = 0; i < pFrameInfo->layerCount; i++ )
 	{
 		const FrameInfo_t::Layer_t &layer = pFrameInfo->layers[i];
 		if ( layer.zpos == g_zposBase && layer.pCommitTexture != nullptr )
 		{
 			const gamescope::Rc<CVulkanTexture> &pClientTexture = *layer.pCommitTexture;
-			if ( pClientTexture != nullptr
-				&& pClientTexture->deviceLocalStagingImage() )
-			{
-				return true;
-			}
+			if ( pClientTexture != nullptr )
+				return pClientTexture.get();
 		}
 	}
-	return false;
+	return nullptr;
 }
 
 static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 	const struct FrameInfo_t *pFrameInfo )
 {
+	const CVulkanTexture *pBaseClientTexture = framegen_hud_base_client_texture( pFrameInfo );
 	const FramegenMetricsWindow_t &window = framegen_metrics_last_closed_window();
 	const uint32_t uHitPercent = window.deadlineCount != 0u
 		? static_cast<uint32_t>( std::min<uint64_t>( 100u,
@@ -8061,6 +8160,8 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 	return {
 		.version = gamescope::k_szGamescopeHudVersion,
 		.deviceName = framegen_hud_device_name(),
+		.renderOrigin = pBaseClientTexture != nullptr
+			? pBaseClientTexture->renderOrigin() : nullptr,
 		.mode = effective.mode,
 		.quality = effective.quality,
 		.multiplier = effective.multiplier,
@@ -8071,7 +8172,8 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 		.bidirRequested = framegen_bidir_enabled(),
 		.bidirActive = vulkan_framegen_bidir_active(),
 		.baseLayer = vulkan_framegen_base_layer_active(),
-		.clientBuffersStaged = framegen_hud_client_buffers_staged( pFrameInfo ),
+		.clientBuffersStaged = pBaseClientTexture != nullptr
+			&& pBaseClientTexture->deviceLocalStagingImage(),
 		.netRequested = framegen_net_weights_path() != nullptr
 			|| framegen_net_online_enabled() || framegen_net_profile_path() != nullptr,
 		.netActive = bNetActive,

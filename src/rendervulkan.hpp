@@ -185,6 +185,7 @@ public:
 	inline bool externalImage() { return m_bExternal; }
 	inline bool deviceLocal() const { return m_bDeviceLocal; }
 	inline bool deviceLocalStagingImage() const { return m_bDeviceLocalStagingImage; }
+	inline const char *renderOrigin() const { return m_renderOrigin.data(); }
 	inline VkDeviceSize totalSize() const { return m_size; }
 	inline uint32_t drmFormat() const { return m_drmFormat; }
 
@@ -258,6 +259,7 @@ private:
 	EStreamColorspace m_streamColorspace = k_EStreamColorspace_Unknown;
 
 	struct wlr_dmabuf_attributes m_dmabuf = {};
+	std::array<char, 16> m_renderOrigin = { 'c', 'p', 'u', '\0' };
 
 	std::vector<gamescope::OwningRc<CVulkanTexture>> m_deviceLocalStagingImages;
 	size_t m_uDeviceLocalStagingCursor = 0;
