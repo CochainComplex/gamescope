@@ -5431,9 +5431,11 @@ struct FramegenMetricsWindow_t
 	// environment is invalid, not that the compositor idled.
 	uint64_t feedbackDiscarded = 0;
 	uint64_t deadlineCount = 0, deadlineHits = 0;
+	uint32_t generatedLate = 0;
 	double deadlineSignedSumMs = 0.0;
 	FramegenMetricsDistribution_t flipIntervals;
 	FramegenMetricsDistribution_t deadlineErrors;
+	FramegenMetricsDistribution_t realCommitLeads;
 };
 
 struct FramegenMetricsPendingEvents_t
@@ -5498,6 +5500,7 @@ static void framegen_metrics_log( const char *pszLabel,
 {
 	const FramegenMetricsDistribution_t &flip = window.flipIntervals;
 	const FramegenMetricsDistribution_t &deadline = window.deadlineErrors;
+	const FramegenMetricsDistribution_t &lead = window.realCommitLeads;
 	vk_log.infof( "framegen-metrics: %s real=%" PRIu64 " gen=%" PRIu64
 		" dreal=%" PRIu64 " rep=%" PRIu64
 		" flip_ms_avg=%.3f flip_ms_min=%.3f flip_ms_max=%.3f"
@@ -5507,7 +5510,9 @@ static void framegen_metrics_log( const char *pszLabel,
 		" resets=%" PRIu64 " fbdisc=%" PRIu64
 		" resets_cut=%" PRIu64 " resets_grid=%" PRIu64
 		" resets_prov=%" PRIu64 " resets_hitch=%" PRIu64
-		" resets_ring=%" PRIu64 " resets_chain=%" PRIu64,
+		" resets_ring=%" PRIu64 " resets_chain=%" PRIu64
+		" lead_ms_min=%.3f lead_ms_avg=%.3f lead_ms_max=%.3f"
+		" lead_ema=%.3f gen_late=%u",
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -5519,7 +5524,10 @@ static void framegen_metrics_log( const char *pszLabel,
 		window.admissionSkips, window.resets,
 		window.feedbackDiscarded, window.resetsCut, window.resetsGrid,
 		window.resetsProvenance, window.resetsHitch, window.resetsRing,
-		window.resetsChain );
+		window.resetsChain,
+		lead.n != 0 ? lead.min : 0.0, lead.average(), lead.max,
+		g_framegenPresentState.displayTiming.presentLead.emaNs / 1.0e6,
+		window.generatedLate );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
@@ -5564,6 +5572,25 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 	addKind( g_framegenMetrics.total );
 	if ( !feedback.bTimestampValid )
 		return;
+	if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real )
+	{
+		gamescope::IBackend *pBackend = GetBackend();
+		if ( pBackend != nullptr && pBackend->OwnsKMSPresentTiming() )
+		{
+			const gamescope::framegen::PresentLeadSample_t lead =
+				gamescope::framegen::present_lead_sample(
+					g_framegenPresentState.displayTiming.presentLead,
+					feedback.tag.ulCommitSubmitNs,
+					feedback.ulActualFlipNs,
+					g_framegenPresentState.displayTiming.key.intervalNs,
+					g_framegenPresentState.bPresentBiasHitchEpisode );
+			if ( lead.valid )
+			{
+				g_framegenMetrics.current.realCommitLeads.add( lead.leadNs );
+				g_framegenMetrics.total.realCommitLeads.add( lead.leadNs );
+			}
+		}
+	}
 	if ( g_framegenMetrics.ulLastFlipNs != 0
 		&& feedback.ulActualFlipNs > g_framegenMetrics.ulLastFlipNs )
 	{
@@ -5594,6 +5621,14 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 	};
 	addDeadline( g_framegenMetrics.current );
 	addDeadline( g_framegenMetrics.total );
+	if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Generated
+		&& sample.signedErrorNs > static_cast<int64_t>( ulVblankNs / 2u ) )
+	{
+		if ( g_framegenMetrics.current.generatedLate != UINT32_MAX )
+			g_framegenMetrics.current.generatedLate++;
+		if ( g_framegenMetrics.total.generatedLate != UINT32_MAX )
+			g_framegenMetrics.total.generatedLate++;
+	}
 }
 
 static void framegen_metrics_shutdown()
@@ -5904,6 +5939,31 @@ void vulkan_framegen_drain_present_feedback()
 			gamescope::IBackend *pBackend = GetBackend();
 			if ( pBackend != nullptr && pBackend->OwnsKMSPresentTiming() )
 			{
+				if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Generated
+					&& feedback.tag.ulTargetFlipNs != 0u
+					&& feedback.tag.ulCommitSubmitNs != 0u )
+				{
+					const uint64_t ulVblankNs =
+						g_framegenPresentState.displayTiming.key.intervalNs;
+					const gamescope::framegen::DeadlineFeedbackSample_t sample =
+						gamescope::framegen::deadline_feedback_sample(
+							feedback.ulActualFlipNs,
+							feedback.tag.ulTargetFlipNs, ulVblankNs );
+					static uint64_t s_uGeneratedCommitFeedbackDebugLogCounter = 0;
+					if ( sample.valid && FramegenDebugShouldLog(
+						s_uGeneratedCommitFeedbackDebugLogCounter ) )
+					{
+						const double flLeadMs = static_cast<double>(
+							gamescope::framegen::signed_ns_delta(
+								feedback.ulActualFlipNs,
+								feedback.tag.ulCommitSubmitNs ) ) / 1.0e6;
+						vk_log.infof( "framegen: gen commit lead=%.2fms target_err=%+.2fms late=%d",
+							flLeadMs, sample.signedErrorNs / 1.0e6,
+							sample.signedErrorNs
+								> static_cast<int64_t>( ulVblankNs / 2u ) ? 1 : 0 );
+					}
+				}
+
 				// An early generated commit is scheduled from this estimate, so
 				// feeding that controlled lead back into the learner would teach
 				// it its own margin. Native KMS learns only from real commits and
@@ -6259,6 +6319,37 @@ static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = 250'000'000ull;
 // not run prediction unbounded; after this point additional refills converge
 // toward the capped prediction instead of accelerating away from real content.
 static constexpr float k_flFramegenMaxForwardStrength = 1.5f;
+
+static uint64_t framegen_commit_lead_override_ns()
+{
+	static const uint64_t s_ulOverrideNs = []()
+	{
+		const auto value = gamescope::framegen::parse_finite_float_setting(
+			getenv( "GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS" ) );
+		if ( !value.has_value() || *value <= 0.0f )
+			return uint64_t{ 0u };
+
+		constexpr double k_flNsPerMs = 1.0e6;
+		const double flMs = *value;
+		if ( flMs >= std::numeric_limits<uint64_t>::max() / k_flNsPerMs )
+			return std::numeric_limits<uint64_t>::max();
+		return std::max<uint64_t>( 1u,
+			static_cast<uint64_t>( flMs * k_flNsPerMs + 0.5 ) );
+	}();
+	return s_ulOverrideNs;
+}
+
+static gamescope::framegen::FixedRefreshCommitPlan_t
+framegen_plan_fixed_refresh_commit( uint64_t ulTargetFlipNs,
+	uint64_t ulPresentMarginNs, uint64_t ulVblankIntervalNs )
+{
+	const gamescope::framegen::PresentLeadState_t presentLead =
+		gamescope::framegen::apply_present_lead_override(
+			g_framegenPresentState.displayTiming.presentLead,
+			framegen_commit_lead_override_ns() );
+	return gamescope::framegen::plan_fixed_refresh_commit(
+		ulTargetFlipNs, presentLead, ulPresentMarginNs, ulVblankIntervalNs );
+}
 
 static uint64_t framegen_predicted_interval_ns()
 {
@@ -6907,9 +6998,8 @@ uint64_t vulkan_framegen_fixed_refresh_commit_deadline_ns()
 	const uint64_t ulMarginNs =
 		g_framegenHistory.ulDeadlineGridIntervalNs / 10u;
 	const gamescope::framegen::FixedRefreshCommitPlan_t plan =
-		gamescope::framegen::plan_fixed_refresh_commit(
+		framegen_plan_fixed_refresh_commit(
 			front.ulTargetFlipNs,
-			g_framegenPresentState.displayTiming.presentLead,
 			ulMarginNs,
 			g_framegenHistory.ulDeadlineGridIntervalNs );
 	return plan.earlyCommit ? plan.commitDeadlineNs : 0u;
@@ -10543,9 +10633,8 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 	const uint64_t ulPresentMarginNs = ulVblankIntervalNs / 10u;
 	const gamescope::framegen::FixedRefreshCommitPlan_t gridCommitPlan =
 		bNativeKmsTiming
-			? gamescope::framegen::plan_fixed_refresh_commit(
+			? framegen_plan_fixed_refresh_commit(
 				plainGrid.D0,
-				g_framegenPresentState.displayTiming.presentLead,
 				ulPresentMarginNs, ulVblankIntervalNs )
 			: gamescope::framegen::FixedRefreshCommitPlan_t{};
 	if ( gridCommitPlan.earlyCommit )
@@ -10580,9 +10669,8 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 	const uint64_t ulPlainWakeNs = plainGrid.wake( ulGridIndex );
 	const gamescope::framegen::FixedRefreshCommitPlan_t commitPlan =
 		gridCommitPlan.earlyCommit
-			? gamescope::framegen::plan_fixed_refresh_commit(
+			? framegen_plan_fixed_refresh_commit(
 				plan.targetNs,
-				g_framegenPresentState.displayTiming.presentLead,
 				ulPresentMarginNs, ulVblankIntervalNs )
 			: gamescope::framegen::FixedRefreshCommitPlan_t{};
 	FramegenCausalRungSelection_t rung = framegen_select_causal_rung(
@@ -11774,6 +11862,12 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			gamescope::framegen::mode_name( g_eFramegenMode ),
 			gamescope::framegen::quality_name( g_eFramegenQuality ), g_nFramegenMultiplier,
 			g_device.hasFramegenQueue() ? " (dedicated queue)" : "" );
+		if ( GetBackend() != nullptr && GetBackend()->OwnsKMSPresentTiming()
+			&& framegen_commit_lead_override_ns() != 0u )
+		{
+			vk_log.infof( "framegen: commit lead override %.2fms (experiment)",
+				framegen_commit_lead_override_ns() / 1.0e6 );
+		}
 		vk_log.infof( "framegen: forcing composite path" );
 		if ( vulkan_framegen_vrr_hybrid_requested() )
 			vk_log.infof( "framegen: VRR hybrid requested — adaptive sync stays active, generated frames flip mid-interval; tearing remains suppressed" );

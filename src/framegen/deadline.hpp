@@ -864,6 +864,35 @@ struct DeadlineFeedbackSample_t
 	return result;
 }
 
+struct PresentLeadSample_t
+{
+	uint64_t leadNs = 0;
+	bool valid = false;
+};
+
+// Apply the native KMS learner's exact admission rules separately so metrics
+// can describe precisely the observations which are allowed to update it.
+[[nodiscard]] constexpr PresentLeadSample_t present_lead_sample(
+	PresentLeadState_t state, uint64_t commitSubmitNs, uint64_t actualFlipNs,
+	uint64_t vblankIntervalNs, bool hitchEpisode )
+{
+	PresentLeadSample_t result;
+	if ( commitSubmitNs == 0u || actualFlipNs <= commitSubmitNs
+		|| vblankIntervalNs == 0u || hitchEpisode )
+		return result;
+
+	result.leadNs = actualFlipNs - commitSubmitNs;
+	const bool mature = state.samples >= k_uPresentLeadWarmupSamples;
+	const uint64_t outlierBoundNs = mature
+		? present_bias_outlier_bound_ns(
+			PresentBiasState_t{ .emaNs = state.emaNs },
+			vblankIntervalNs )
+		: vblankIntervalNs;
+	result.valid = mature ? result.leadNs < outlierBoundNs
+		: result.leadNs <= outlierBoundNs;
+	return result;
+}
+
 // A deliberately slow 1/8 EMA. Invalid/reordered timestamp pairs do not
 // contaminate the backend lead estimate. This unguarded overload is retained
 // for backends which do not own KMS timing, where changing the established
@@ -890,22 +919,26 @@ struct DeadlineFeedbackSample_t
 	PresentLeadState_t state, uint64_t commitSubmitNs, uint64_t actualFlipNs,
 	uint64_t vblankIntervalNs, bool hitchEpisode )
 {
-	if ( commitSubmitNs == 0u || actualFlipNs <= commitSubmitNs
-		|| vblankIntervalNs == 0u || hitchEpisode )
-		return state;
-
-	const uint64_t sampleNs = actualFlipNs - commitSubmitNs;
-	const bool mature = state.samples >= k_uPresentLeadWarmupSamples;
-	const uint64_t outlierBoundNs = mature
-		? present_bias_outlier_bound_ns(
-			PresentBiasState_t{ .emaNs = state.emaNs },
-			vblankIntervalNs )
-		: vblankIntervalNs;
-	if ( mature ? sampleNs >= outlierBoundNs
-		: sampleNs > outlierBoundNs )
+	if ( !present_lead_sample( state, commitSubmitNs, actualFlipNs,
+		vblankIntervalNs, hitchEpisode ).valid )
 		return state;
 
 	return update_present_lead( state, commitSubmitNs, actualFlipNs );
+}
+
+// Preserve the learner's warm-up gate while allowing a diagnostic lead to
+// replace only its mature value. Zero is the no-override sentinel.
+[[nodiscard]] constexpr PresentLeadState_t apply_present_lead_override(
+	PresentLeadState_t presentLead, uint64_t overrideLeadNs )
+{
+	if ( overrideLeadNs != 0u
+		&& presentLead.samples >= k_uPresentLeadWarmupSamples )
+	{
+		presentLead.emaNs = static_cast<int64_t>( std::min<uint64_t>(
+			overrideLeadNs,
+			static_cast<uint64_t>( std::numeric_limits<int64_t>::max() ) ) );
+	}
+	return presentLead;
 }
 
 struct FixedRefreshCommitPlan_t

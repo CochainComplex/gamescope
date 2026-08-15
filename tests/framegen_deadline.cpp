@@ -1312,6 +1312,39 @@ TEST_CASE( "fixed-refresh commit lead is clamped to one vblank",
 	STATIC_REQUIRE( plan.commitDeadlineNs == 11'000u );
 }
 
+TEST_CASE( "fixed-refresh commit lead override waits for learner warmup",
+	"[framegen][deadline]" )
+{
+	constexpr uint64_t intervalNs = 8'000u;
+	constexpr uint64_t overrideLeadNs = 2'000u;
+	constexpr PresentLeadState_t warming = {
+		.emaNs = 6'000,
+		.samples = k_uPresentLeadWarmupSamples - 1u,
+	};
+	constexpr FixedRefreshCommitPlan_t warmup = plan_fixed_refresh_commit(
+		20'000u,
+		apply_present_lead_override( warming, overrideLeadNs ),
+		1'000u, intervalNs );
+	STATIC_REQUIRE_FALSE( warmup.earlyCommit );
+
+	constexpr PresentLeadState_t mature = {
+		.emaNs = 6'000,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr FixedRefreshCommitPlan_t overridden = plan_fixed_refresh_commit(
+		20'000u,
+		apply_present_lead_override( mature, overrideLeadNs ),
+		1'000u, intervalNs );
+	STATIC_REQUIRE( overridden.earlyCommit );
+	STATIC_REQUIRE( overridden.presentLeadNs == overrideLeadNs );
+	STATIC_REQUIRE( overridden.commitDeadlineNs == 17'000u );
+
+	constexpr FixedRefreshCommitPlan_t unchanged = plan_fixed_refresh_commit(
+		20'000u, apply_present_lead_override( mature, 0u ),
+		1'000u, intervalNs );
+	STATIC_REQUIRE( unchanged.presentLeadNs == 6'000u );
+}
+
 TEST_CASE( "fixed-refresh admission budgets work to the KMS commit",
 	"[framegen][deadline]" )
 {

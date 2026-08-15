@@ -354,6 +354,7 @@ and learning lines. `GAMESCOPE_FRAMEGEN_HUD_SCALE=1..6` sizes it,
 | `resets_chain` | display-chain learner resets caused by backend, connector, refresh interval, VRR, or timestamp-provenance changes |
 | `resets (ring N)` | pacing/history re-primes (scene cuts, hitches); `ring` counts emergency queue flushes — nonzero means overload |
 | `steps / profile` | net training steps this session / whether a per-game profile was loaded |
+| `GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS=<float>` | **Experiment/diagnostic (native DRM only):** replace the learned generated-frame commit lead after its normal warm-up; unset keeps automatic scheduling. |
 
 ---
 
