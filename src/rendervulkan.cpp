@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
-#include <cctype>
 #include <cmath>
 #include <limits>
 #include <thread>
@@ -2947,18 +2946,6 @@ static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
 	}
 }
 
-static bool ascii_starts_with_case_insensitive( const char *text, const char *prefix )
-{
-	for ( ; *prefix != '\0'; text++, prefix++ )
-	{
-		const unsigned char a = static_cast<unsigned char>( *text );
-		const unsigned char b = static_cast<unsigned char>( *prefix );
-		if ( std::tolower( a ) != std::tolower( b ) )
-			return false;
-	}
-	return true;
-}
-
 static void copy_render_origin( std::array<char, 16> &dst, const char *origin )
 {
 	std::snprintf( dst.data(), dst.size(), "%s", origin != nullptr ? origin : "unknown" );
@@ -2996,53 +2983,13 @@ static std::array<char, 16> dmabuf_render_origin( const wlr_dmabuf_attributes *p
 		const uint8_t vendor = static_cast<uint8_t>( pDMA->modifier >> 56u );
 		const char *pszVendor = dmabuf_modifier_vendor_name( vendor );
 		if ( pszVendor != nullptr )
-			std::snprintf( result.data(), result.size(), "%s/m", pszVendor );
+			std::snprintf( result.data(), result.size(), "%s", pszVendor );
 		else
-			std::snprintf( result.data(), result.size(), "vendor0x%02x/m", vendor );
+			std::snprintf( result.data(), result.size(), "vendor0x%02x", vendor );
 		return result;
 	}
 
-	if ( pDMA->n_planes <= 0 )
-		return result;
-
-	char path[64] = {};
-	std::snprintf( path, sizeof( path ), "/proc/self/fdinfo/%d", pDMA->fd[0] );
-	FILE *file = fopen( path, "r" );
-	if ( file == nullptr )
-		return result;
-
-	char line[256] = {};
-	while ( fgets( line, sizeof( line ), file ) != nullptr )
-	{
-		constexpr const char *pszPrefix = "exp_name:";
-		if ( std::strncmp( line, pszPrefix, std::strlen( pszPrefix ) ) != 0 )
-			continue;
-
-		char *name = line + std::strlen( pszPrefix );
-		while ( *name == ' ' || *name == '\t' )
-			name++;
-		char *end = name + std::strlen( name );
-		while ( end > name && ( end[-1] == '\n' || end[-1] == '\r'
-			|| end[-1] == ' ' || end[-1] == '\t' ) )
-		{
-			end--;
-		}
-		*end = '\0';
-
-		if ( ascii_starts_with_case_insensitive( name, "nvidia" ) )
-			copy_render_origin( result, "NVIDIA/x" );
-		else if ( ascii_starts_with_case_insensitive( name, "drm" )
-			|| ascii_starts_with_case_insensitive( name, "amdgpu" )
-			|| ascii_starts_with_case_insensitive( name, "i915" )
-			|| ascii_starts_with_case_insensitive( name, "xe" ) )
-		{
-			char exporter[11] = {};
-			std::snprintf( exporter, sizeof( exporter ), "%s", name );
-			std::snprintf( result.data(), result.size(), "%s/x", exporter );
-		}
-		break;
-	}
-	fclose( file );
+	copy_render_origin( result, "linear" );
 	return result;
 }
 

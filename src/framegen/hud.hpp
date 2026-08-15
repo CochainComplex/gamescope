@@ -330,10 +330,15 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 
 	char deviceName[k_uFramegenHudDeviceNameColumns + 1u] = {};
 	framegen_hud_trim_device_name( deviceName, sizeof( deviceName ), snapshot.deviceName );
-	const char *renderOrigin = snapshot.renderOrigin != nullptr
-		&& snapshot.renderOrigin[0] != '\0' ? snapshot.renderOrigin : "n/a";
+	const char *renderOrigin = "n/a";
+	if ( snapshot.renderOrigin != nullptr && snapshot.renderOrigin[0] != '\0' )
+	{
+		renderOrigin = std::strcmp( snapshot.renderOrigin, "linear" ) == 0
+			? ( snapshot.clientBuffersStaged ? "other-GPU" : "present-GPU" )
+			: snapshot.renderOrigin;
+	}
 	std::snprintf( line, sizeof( line ),
-		"%-8s %-21srender %-10.10s buffers %s", "present", deviceName,
+		"%-8s %-21srender %-11.11s buffers %s", "present", deviceName,
 		renderOrigin, snapshot.clientBuffersStaged ? "staged(xGPU)" : "local" );
 	framegen_hud_add_line( result, line );
 
