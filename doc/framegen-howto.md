@@ -16,7 +16,7 @@ For a first real game test, start with the zero-added-frame-latency causal path:
 GAMESCOPE_FRAMEGEN_HUD=2 gamescope --expose-wayland --backend wayland --prefer-vk-device <present vendor:device> -W 2560 -H 1440 -r 120 -f --experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline checked -- env MESA_VK_DEVICE_SELECT='<render vendor:device>!' <game>
 ```
 
-- `warp` is the cheapest default. Use `--framegen-mode motion`, `--framegen-multiplier 2`, and the recommended step-up `--framegen-pipeline checked`; try multiplier `3` only if the present GPU has headroom. Measured 2026-08-15 on the POC laptop with a real Proton game running single-GPU on the AMD 890M (game, generation and scanout on one iGPU); the dual-GPU re-baseline is pending.
+- `warp` is the cheapest default. Use `--framegen-mode motion`, `--framegen-multiplier 2`, and the recommended step-up `--framegen-pipeline checked`; try multiplier `3` only if the present GPU has headroom. An earlier 2026-08-15 measurement on the POC laptop ran single-GPU on the AMD 890M (game, generation and scanout on one iGPU). The later native dual-GPU run on the same day validated motion x3 with a Proton game rendering on the NVIDIA laptop GPU and generation on the AMD 890M at 2560x1600@120, with `dl_hit` 1.000 in steady windows, on the pipeline then named `extreme` and since renamed `guided`.
 - `learned`, `predict`, and `guided` are experimental pipelines that add passes and can smear more; the ladder auto-degrades and now auto-recovers.
 - When testing `learned` or later, use `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`.
 - On an iGPU-class present GPU (e.g. an 890M) set `GAMESCOPE_FRAMEGEN_NET_EVERY=2` (train every 2nd frame): pacing stays equal and it played best in our real-game test; `1` on a desktop card.
@@ -349,7 +349,7 @@ the default. Legend:
 | `buffers local` | game frames arrive on the same GPU — zero-copy |
 | `buffers xGPU` | dual-GPU path active: frames are copied once into present-GPU memory |
 | `bidir` | bidirectional interpolation (real frames shown one interval late) |
-| `base` | base-layer mode: HUD/cursor composited *after* generation |
+| `base` | base-layer mode: compositor overlays and the gamescope cursor composited *after* generation; in-game UI is not separated |
 | `net: off / blob / online` | learned refiner: disabled / offline weights / training while you play |
 | `adapt` | self-supervised adaptation grading each prediction against reality |
 | `requested(OFF)` | you set the env var but the mode is NOT running — check the terminal for why (fallback or incompatible combination) |
@@ -361,6 +361,7 @@ the default. Legend:
 | `resets_chain` | display-chain learner resets caused by backend, connector, refresh interval, VRR, or timestamp-provenance changes |
 | `resets (ring N)` | pacing/history re-primes (scene cuts, hitches); `ring` counts emergency queue flushes — nonzero means overload |
 | `steps / profile` | net training steps this session / whether a per-game profile was loaded |
+| `GAMESCOPE_FRAMEGEN_RECOVER=0` | Disable the degradation ladder's automatic recovery, so a rung that was stepped down is held until the history is invalidated. Default on. |
 | `GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS=<float>` | **Experiment/diagnostic (native DRM only):** replace the learned minimum-viable generated-frame commit lead after its normal warm-up; unset keeps automatic scheduling. |
 
 ---
@@ -436,13 +437,15 @@ the optional work out. It does not alter estimation, learning, queues, phases,
 or flips. Keep it separate from the frozen baseline until it has broader live
 validation.
 
-### d) Base-layer — fixes blurry menus / HUD
+### d) Base-layer — keeps compositor overlays and the cursor crisp
 ```bash
 GAMESCOPE_FRAMEGEN_BASE=1 gamescope --prefer-vk-device "$PRESENT_DEV" …
 ```
-Generates the game picture *before* the on-screen menus/health bars/cursor are
-added, so text and HUD stay crisp instead of smearing. Use this if your HUD
-looks ghosted. (Can't be combined with bidirectional.)
+Generates on the game layer *before* gamescope composites its own overlays and
+cursor on top, so those stay crisp instead of smearing. It cannot help with a
+game's own HUD or menus: those are drawn by the game into the frame gamescope
+receives, so they are generated along with everything else. (Can't be combined
+with bidirectional.)
 
 ### e) VRR / FreeSync / G-Sync monitors
 ```bash
@@ -486,7 +489,7 @@ before use (`scripts/framegen-net-train.py` then `scripts/framegen-net-eval.py`)
 | Weak display/framegen GPU | **Motion warp, x2** |
 | The smoothest single-player experience | **Bidirectional** (c) |
 | Competitive / fast shooter (lowest lag) | **Simple** (a), *not* bidirectional |
-| Crisp menus and HUD | add **Base-layer** (d) |
+| Crisp compositor overlays and cursor | add **Base-layer** (d) |
 | You own a FreeSync/G-Sync monitor | add **VRR** (e) |
 | Try every causal reconstruction pass | **Motion guided + AI** (f), experimental and potentially smearier |
 | Smoothest output, one-frame latency acceptable | **Bidirectional + AI** |
@@ -565,7 +568,7 @@ Add `--framegen-debug` and watch the terminal:
 | Black screen / won't start | Monitor not on the present card, or wrong `--prefer-vk-device`. |
 | No `generated` lines | Game is already hitting your refresh rate (no gaps to fill) — it only generates when the game runs *below* the screen's rate. |
 | Lots of little stutters | Present card can't keep up — lower the multiplier / mode / resolution. |
-| Ghosted menus / HUD | Add **base-layer** mode (d). |
+| Ghosted compositor overlay or cursor | Add **base-layer** mode (d). A ghosted in-game HUD cannot be fixed this way. |
 | Feels laggy | You're on **bidirectional** — switch to simple/motion for lower lag. |
 | Crash with "out of memory" | The **game** is too heavy for the render card — lower its settings. |
 

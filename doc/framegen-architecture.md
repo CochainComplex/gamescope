@@ -36,7 +36,9 @@ dispatch selection may choose a bit-identical implementation variant by vendor.
 
 **Four invariants the whole design upholds** (enforcement points in §5) — the default forward-extrapolation
 path; the opt-in **bidir** mode (`GAMESCOPE_FRAMEGEN_BIDIR=1`, §3.3) deliberately relaxes #1 and #4:
-1. Real frames are **never** delayed by generation. *(Bidir is the exception: it presents each real
+1. Real frames are **never queued behind** generated work. *(On native KMS a real frame that arrives
+   after a generated atomic commit was submitted, but before its page-flip lands, is presented at the
+   next vblank. Bidir is the larger exception: it presents each real
    frame one interval late — the intrinsic cost of interpolating between two reals, hence opt-in.)*
 2. Generated frames are **never** waited on or presented late.
 3. A real frame latching **always** discards any pending generated frame (latency safety).
@@ -692,8 +694,13 @@ resume.
     ▲   ▲                                                              │  │
     │   └──(shared queue) nStableFrames leaks < 4 ────────────────────┘  │ every generating frame:
     │                                                                     │   ladder may step DOWN
-    └──(!bGpuHasHeadroom: prior batch in flight)── BUSY ──────────────────┤   (motion→extrap→x3→x2)
-                                                                          │   never UP until scene change
+    └──(!bGpuHasHeadroom: prior batch in flight)── BUSY ──────────────────┤   (guided→predict→learned→
+                                                                          │    checked→warp→extrapolate
+                                                                          │    →x3→x2; no dormant rung)
+                                                                          │   ladder may also step UP:
+                                                                          │   hysteretic recovery to the
+                                                                          │   richest rung whose measured
+                                                                          │   cost fits the slot budget
   Dedicated causal queue: source prediction + absolute target admission  │
   → at most one disposable slot; feedback/consume/repeat replans          ▼
   Classic A/B only: refill_idle extends one gap-rounded slot on drain
@@ -906,7 +913,9 @@ cache hit.
   `GAMESCOPE_FRAMEGEN_BENCHMARK` is presence-only, `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE` /
   `_VRR_HYBRID` / `_BASE` / `_BIDIR` need a truthy int, and the Stage-B knobs `_FB` / `_AGREE` / `_ADAPT` are default-on
   (`=0` to disable) with `_FB_TOL`/`_NET_LR` floats, `_NET`/`_RECORD`/`_NET_PROFILE` paths and `_RECORD_MAX`/`_NET_EVERY` uints. The `GAMESCOPE_FRAMEGEN_*` env vars are undocumented in `--help`.
-- **Backend nuances.** The ring 3↔5 size is fixed at allocation — a mid-session framegen enable/disable
+- **Backend nuances.** The composite ring size is fixed at allocation — **3** slots without framegen
+  (`k_uOutputRingSizeDefault`), **8/10/12** at x2/x3/x4 with it (`output_ring_size_for_multiplier`,
+  `4 + 2·multiplier`) — a mid-session framegen enable/disable
   requires a full `vulkan_remake_output_images` (`waitIdle` + reset), *not* a live adjustment. The
   Wayland generated-frame present hard-nulls planes 1..7 (overlays/cursor dropped for a generated
   slot). `force_repaint`'s load-bearing effect for the generated case is the `Nudge()` (the
@@ -920,7 +929,10 @@ cache hit.
 - **`nMaxDegradeSteps`** is threaded into `framegen_submit_batch` but used only for a debug log.
 - **Idle-refill runaway** is bounded only by the 1.5 strength clamp + `nMaxSlots` cap + the 250 ms
   `idle_frame_gap` invalidation.
-- **sRGB-view vs threshold comment** — history is bound `setTextureSrgb(true)` (hardware-linearizes
-  UNORM sRGB on read), yet the shader comments describe the 0.08/0.40 suppression thresholds as
-  "gamma-encoded [0,1]" — a comment/behavior mismatch worth auditing (self-cancels for pure-float
-  targets).
+- **sRGB-view naming** — history is bound with `setTextureSrgb(true)`, which selects
+  `CVulkanTexture::srgbView()`. Despite the name that view is created with the **non-sRGB** Vulkan
+  format (`DRMFormatToVulkan(drmFormat, false)`), so the sample returns raw output code values with
+  no hardware transfer-function decode; `linearView()` is the one built with the `_SRGB` format.
+  The contract is therefore: for integer formats the motion estimator and its 0.08/0.40 suppression
+  thresholds operate on **output code values**, matching the shader comments' "gamma-encoded [0,1]";
+  for float scRGB targets the samples are linear.

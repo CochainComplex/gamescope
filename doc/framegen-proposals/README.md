@@ -65,7 +65,7 @@ on top of it.
 | `GAMESCOPE_FRAMEGEN_RECORD_MAX` | `GAMESCOPE_FRAMEGEN_RECORD` set | Cap on captured frames (default `1000`). |
 | `GAMESCOPE_FRAMEGEN_JIT=1` | accepted but no-op; causal JIT pacing is the default with the **dedicated framegen queue** | #06 causal fixed-cadence JIT: plan one exact display slot at a time, generate a disposable one-slot backup only when the real frame may miss the exact compositor wake deadline, and let a real frame preempt it. |
 | `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` | **dedicated queue + connector actually in VRR**; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #01 VRR hybrid — real frames present VRR-style, the generated frame flips mid-interval on a timer (falls back to fixed-refresh **live** when VRR isn't active). |
-| `GAMESCOPE_FRAMEGEN_BASE=1` | any mode; per-frame scene check; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #02 base-layer generation — generate pre-upscale, late-composite fresh overlays/cursor (falls back to output-space **per frame** on unsupported scenes). |
+| `GAMESCOPE_FRAMEGEN_BASE=1` | any mode; per-frame scene check; excludes `GAMESCOPE_FRAMEGEN_BIDIR` | #02 base-layer generation — generate pre-upscale, late-composite fresh compositor overlays and the gamescope cursor. In-game UI is part of the game frame and is not separated. Falls back to output-space **per frame** on unsupported scenes. |
 
 `GAMESCOPE_FRAMEGEN_BIDIR`, `GAMESCOPE_FRAMEGEN_VRR_HYBRID`, and
 `GAMESCOPE_FRAMEGEN_BASE` are alternative pacing/placement strategies;
@@ -81,8 +81,8 @@ untested, so enable one at a time.
 | `GAMESCOPE_FRAMEGEN_DEBUG_EVERY` | Log every *N*th framegen event (default `60`; needs `--framegen-debug`). |
 | `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE=1` | Force the shared-queue regime (disables the dedicated-queue regime, including default causal JIT pacing, and `GAMESCOPE_FRAMEGEN_VRR_HYBRID`). |
 | `GAMESCOPE_FRAMEGEN_BENCHMARK` | Run the shader microbenchmark, then exit before output creation (**presence-only** — even `=0` triggers it). |
-| `GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW=1` | Restore experimental endpoint-trained flow correction/confidence raises in bidir for A/B only. Default off because it produced heavy intermediate-frame artifacts in live x4 testing. |
-| `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS=0…1` | Experimental low-latency bidir cadence A/B. Blends generated phases from the sharp/snappy `k/gap` baseline toward uniform multiplier spacing without changing flip timing. Default `0`; full display-grid pacing was rejected as blurrier, more edge-torn, and less responsive. |
+| `GAMESCOPE_FRAMEGEN_RECOVER=0` | Disable the degradation ladder's automatic hysteretic recovery; a rung stepped down is then held until history invalidation. Default on; ignored on the VRR-hybrid and bidir paths. |
+| `GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS=<float>` | Experiment/diagnostic, native DRM only: override the learned minimum-viable commit lead for generated frames after warm-up. Unset keeps automatic scheduling. |
 | `GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0…1` | Experimental one-sided occlusion authority. When one checked direction is strong and the other is clearly rejected, smoothly retains more of the surviving warped side instead of phase-diluting it into the unwarped crossfade. Both-valid/both-killed pixels and queue timing are unchanged; default `0`. |
 | `GAMESCOPE_FRAMEGEN_BIDIR_TRACE=0…1` | Experimental Guided-only endpoint-grid correction. Performs one symmetric fixed-point resample and accepts it only with checked confidence, forward/reverse closure, and in-bounds endpoints. A nonzero value selects a specialized pipeline; trace `0` compiles out the extra work. Adds no pass/resource or scheduling state; cheaper pipelines stay on the baseline path. Default `0`; use `0.5` for the measured A/B candidate. |
 | `GAMESCOPE_FRAMEGEN_RECORD_COLOR=<dir>` | E2 held-out full-colour validation. Requires motion+bidir, the dedicated queue, and base-layer mode off. Presents real A/B/C normally, hides B from estimation, and records three paired invisible B candidates beside exact B. Generated candidates never scan out. |
@@ -105,8 +105,9 @@ untested, so enable one at a time.
    scalar training residual misses (proposal #07, Gap E1). Grades the *field*, at
    field-resolution luma; colour-domain LPIPS/FvVDP need the E2 capture extension.
 4. **Use** it: `GAMESCOPE_FRAMEGEN_NET=weights.bin gamescope --experimental-framegen --framegen-mode motion … `
-   Add `_BIDIR=1` for confidence-veto-only interpolation; the blob's learned flow
-   remains causal unless the explicit `_NET_BIDIR_FLOW=1` debug A/B is set.
+   Add `_BIDIR=1` for confidence-veto-only interpolation; in bidir the blob's
+   learned flow is not applied — checked flow is preserved and the net can only
+   lower confidence.
 
 Or skip the offline steps entirely: `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` trains
 in-situ on the framegen GPU while serving — by itself this is the fully
@@ -189,8 +190,9 @@ along with these validation/reconstruction passes:
   coefficient is derived from the measured real-frame gap, and up to
   `multiplier-1` frames are inserted per interval via a pending-frame FIFO.
 - **Dedicated framegen queue** — generation runs on a second same-family compute
-  queue with its own timeline, so it can never block the next composite on the
-  realtime queue (falls back to the shared queue when unavailable).
+  queue with its own timeline, which removes queue-order head-of-line blocking
+  against the realtime queue. GPU contention is not isolated: both queues share
+  the device. Falls back to the shared queue when unavailable.
 - **Ownership-safe generated pools** — output selection observes both Vulkan
   command-buffer refs and backend framebuffer ownership. KMS/Wayland retention
   shortens or skips a batch instead of letting the compute queue rewrite an
@@ -303,9 +305,12 @@ build on top of that foundation.
    pass. Opt-in and vendor-specific, with the on-GPU estimator as fallback.
 4. [Timestamp-driven adaptive degradation ladder](04-timestamp-adaptive-degradation.md)
    — measure generation GPU time with timestamp queries and step pipeline/rate
-   down *before* deadlines are missed (motion → extrapolate → lower multiplier →
-   dormant), instead of only reacting after a late frame. **Implemented** (as a
-   monotonic degrade-once-and-hold ladder; see the doc for divergences).
+   down *before* deadlines are missed, instead of only reacting after a late
+   frame. **Implemented.** The rungs shed motion pipeline passes first
+   (`guided → predict → learned → checked → warp`), then fall back to
+   extrapolation, then reduce the multiplier. There is no dormant rung.
+   Recovery is automatic and hysteretic: it climbs back to the richest rung
+   whose measured cost fits the slot budget (see the doc for divergences).
 5. [Tile classification + indirect dispatch + SDMA static fill](05-tile-classification-indirect-sdma.md)
    — a cheap change-detection pass drives `vkCmdDispatchIndirect` so generation
    runs only over moving tiles, with static tiles filled on the transfer (SDMA)
@@ -329,5 +334,7 @@ build on top of that foundation.
    disocclusion reservoir, and an optional color-domain shading-correction net
    head. **Design map / gap analysis**; Gap E1's structural/temporal evaluator
    (`scripts/framegen-net-eval.py`), Gap B's GPU content scene-cut guard, Gap
-   A's bounded Guided resolver, and Gap D's bounded causal shading-focus form
-   are implemented. E2 full-color perceptual capture remains open.
+   A's bounded Guided resolver, Gap D's bounded causal shading-focus form, and
+   Gap E2's paired full-colour capture/evaluator
+   (`GAMESCOPE_FRAMEGEN_RECORD_COLOR`) are implemented. Broad E2 corpus capture
+   and external DISTS/FvVDP grading remain open.

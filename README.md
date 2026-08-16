@@ -27,7 +27,8 @@ To keep latency low, the default path extrapolates: each generated frame is
 predicted forward from the last real frame and its motion, so no real frame is
 held back to interpolate between two. The causal scheduler uses deadline-based,
 just-in-time slot planning. In the default forward path, a real frame is never
-delayed behind generated work. Late
+queued behind generated work. On native KMS a real frame that arrives inside an
+already-committed generated slot lands at the next vblank. Late
 generation is dropped instead of waited for, so the display repeats the last
 frame for that slot. Bidirectional interpolation is also available. It uses both
 real endpoints and deliberately adds one real-frame interval of latency.
@@ -47,7 +48,7 @@ repeated frames delivered to the display.
 
 ## Requirements
 
-- Two Vulkan GPUs visible to the compositor are recommended. Any vendor mix is usable when the devices can share dma-bufs. NVIDIA-render/AMD-present is the validated pair.
+- Two Vulkan GPUs visible to the compositor are recommended. Any pair that can share dma-bufs should work. Validated: NVIDIA (proprietary) render to AMD (RADV) present. Intel, and NVIDIA as the present GPU, are untested.
 - The display must be connected to the present GPU. That GPU runs gamescope, frame generation, composition, and scanout.
 - Native operation requires Linux DRM/KMS. A nested window in an existing X11 or Wayland session is sufficient for initial testing.
 - Xwayland and Proton games can be assigned to the render GPU with `MESA_VK_DEVICE_SELECT`.
@@ -125,7 +126,7 @@ environment-controlled presentation variants.
 | Motion | `--framegen-mode motion` | Motion-compensated forward prediction; recommended |
 | Blend | `--framegen-mode blend` | Frame average retained as a debug aid |
 | Bidirectional interpolation | `GAMESCOPE_FRAMEGEN_BIDIR=1` with motion | Uses two real endpoints; adds one frame interval of latency |
-| Base layer | `GAMESCOPE_FRAMEGEN_BASE=1` | Generates below overlays and cursor; cannot combine with bidirectional mode |
+| Base layer | `GAMESCOPE_FRAMEGEN_BASE=1` | Generates below compositor overlays and the gamescope cursor, which are composited late; in-game UI is part of the game frame and is not separated; cannot combine with bidirectional mode |
 | VRR hybrid | `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` with `--adaptive-sync` | Experimental causal path for a VRR display; not yet validated on a VRR panel |
 
 The multiplier is x2, x3, or x4. x2 and x3 are the useful starting points. x4
@@ -190,7 +191,7 @@ and visual checks. Native DRM/KMS is the relevant test for scanout pacing.
 | Field | Meaning |
 |---|---|
 | `real` / `gen` / `rep` | Real frames, generated frames, and repeated refresh slots |
-| `dl_hit` | Fraction of generated presents that met their planned deadline |
+| `dl_hit` | Fraction of generated and delayed-real presents that met their planned deadline. It says nothing about how many slots were filled; read `rep` and the HUD `rates` row for that |
 | `bias_ms` | Display-chain timing bias learned by the scheduler |
 | `lead_viable` | Learned minimum viable native KMS commit lead, in milliseconds |
 
@@ -210,6 +211,11 @@ check.
 - Single-GPU use competes with the game and is not recommended for a saturated
   render GPU.
 - The VRR hybrid path exists but has not been validated on a VRR panel.
+- Cursor motion does not advance on generated frames in the default output-space
+  path: the cursor moves with real composites. Base-layer mode composites the
+  cursor late, so it does advance there.
+- An overlay-only repaint can be held back up to four vblanks so a ready
+  generated frame can fill the slot instead.
 - A late generated frame is dropped. Overload appears as repeated display slots,
   not a delayed real frame in the default causal path.
 - The feature is experimental. Native DRM/KMS, HDR, unusual dma-buf modifier

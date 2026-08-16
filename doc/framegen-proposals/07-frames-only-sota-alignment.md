@@ -164,9 +164,8 @@ confidence veto: negative confidence corrections survive, positive corrections
 and the flow/shading outputs are scaled to zero. Online learning remains in
 situ, but recomputes its loss on the raw checked field and writes gradients only
 for W3's confidence row/bias. The flow rows, shading row, and shared trunk are
-frozen, so the endpoint objective cannot reshape geometry indirectly. The old
-path is retained only as `GAMESCOPE_FRAMEGEN_NET_BIDIR_FLOW=1` for controlled
-attribution.
+frozen, so the endpoint objective cannot reshape geometry indirectly. The old path was removed rather than kept behind a
+knob.
 
 Live ordering was unambiguous: persisted full-flow profile (artifact-heavy) <
 no net (very good) < neutral net (better) < confidence-only learned profile
@@ -185,11 +184,9 @@ edge-tear behavior, while holding the real endpoint for the full grid felt
 clearly less responsive. The implementation was removed rather than hidden
 behind a default.
 
-The conservative follow-up is `GAMESCOPE_FRAMEGEN_BIDIR_PHASE_BIAS` (default
-`0`). It preserves the accepted queue timing and endpoint latency exactly, and
-only blends generated phases part-way from `k/gap` toward uniform multiplier
-spacing. This is an A/B control, not a claimed quality default; any promotion
-requires the live result to retain baseline sharpness and responsiveness.
+A conservative follow-up would blend generated phases part-way from `k/gap`
+toward uniform multiplier spacing while preserving queue timing and endpoint
+latency exactly. It is not implemented; the code has no phase-bias control.
 
 ### Experimental implementation — symmetric endpoint-grid correction
 
