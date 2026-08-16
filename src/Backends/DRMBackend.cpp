@@ -1584,6 +1584,26 @@ void finish_drm(struct drm_t *drm)
 	}
 	drmModeAtomicFree(req);
 
+	// Signal the page-flip handler thread to exit and join it BEFORE any of
+	// the state below is torn down: page_flip_handler dereferences g_DRM.pCRTC
+	// and the FB vectors, all of which the teardown below frees. Joining
+	// afterwards let the handler run against freed CRTC/plane/connector
+	// objects — a cross-thread use-after-free that surfaces as glibc heap
+	// corruption at exit. The disabling commit above is blocking and takes no
+	// event, so it does not need the handler thread. Closing the pipe write end
+	// causes the read end to get POLLHUP, waking the thread.
+	if ( g_page_flip_handler_thread.joinable() ) {
+		g_page_flip_handler_thread_should_exit.store( true, std::memory_order_release );
+
+		close( g_page_flip_pipe_fds[1] );
+		g_page_flip_pipe_fds[1] = -1;
+
+		g_page_flip_handler_thread.join();
+
+		close( g_page_flip_pipe_fds[0] );
+		g_page_flip_pipe_fds[0] = -1;
+	}
+
 	free(drm->device_name);
 
 	wlr_drm_format_set_finish( &drm->formats );
@@ -1604,21 +1624,6 @@ void finish_drm(struct drm_t *drm)
 	drm->crtcs.clear();
 	drm->connectors.clear();
 
-
-	// Signal the page-flip handler thread to exit and join it so it won't be
-	// using the DRM fd while we clean it up. Closing the pipe write end
-	// causes the read end to get POLLHUP, waking the thread.
-	if ( g_page_flip_handler_thread.joinable() ) {
-		g_page_flip_handler_thread_should_exit.store( true, std::memory_order_release );
-
-		close( g_page_flip_pipe_fds[1] );
-		g_page_flip_pipe_fds[1] = -1;
-
-		g_page_flip_handler_thread.join();
-
-		close( g_page_flip_pipe_fds[0] );
-		g_page_flip_pipe_fds[0] = -1;
-	}
 
 	wlsession_close_kms();
 	g_DRM.fd = -1;
@@ -2631,7 +2636,13 @@ namespace gamescope
 	CDRMFb::~CDRMFb()
 	{
 		// I own the fbid.
-		if ( drmModeRmFB( g_DRM.fd, m_uFbId ) != 0 )
+		//
+		// Framegen-owned output/present images and other long-lived textures can
+		// outlive finish_drm(), which closes KMS and sets g_DRM.fd = -1. The KMS
+		// fd being gone already released every fb it owned, so there is nothing
+		// left to remove and nothing to report: an RmFB here would only spam
+		// "drmModeRmFB failed: Bad file descriptor".
+		if ( g_DRM.fd >= 0 && drmModeRmFB( g_DRM.fd, m_uFbId ) != 0 )
 			drm_log.errorf_errno( "drmModeRmFB failed" );
 		m_uFbId = 0;
 	}

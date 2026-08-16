@@ -1552,6 +1552,63 @@ TEST_CASE( "generated commit never races a real present", "[framegen][deadline]"
 	CHECK_FALSE( can_start_early_generated_commit( true, true, true ) );
 }
 
+TEST_CASE( "early generated commit yields to an imminent real frame", "[framegen][deadline]" )
+{
+	// now = 100'000; commit lead = 2'000.
+	constexpr uint64_t kNow = 100'000u;
+	constexpr uint64_t kLead = 2'000u;
+
+	// Real predicted inside the lead window: skip.
+	STATIC_REQUIRE( real_arrival_blocks_early_generated_commit(
+		kNow + 1u, kNow, kLead, true ) );
+	STATIC_REQUIRE( real_arrival_blocks_early_generated_commit(
+		kNow + kLead, kNow, kLead, true ) );
+	// Just outside it: generate.
+	STATIC_REQUIRE_FALSE( real_arrival_blocks_early_generated_commit(
+		kNow + kLead + 1u, kNow, kLead, true ) );
+
+	// An overdue prediction is the empty vblank generation exists to fill and
+	// must never suppress it.
+	STATIC_REQUIRE_FALSE( real_arrival_blocks_early_generated_commit(
+		kNow, kNow, kLead, true ) );
+	STATIC_REQUIRE_FALSE( real_arrival_blocks_early_generated_commit(
+		kNow - 50'000u, kNow, kLead, true ) );
+
+	// Conservative: untrained cadence or any missing input never skips.
+	STATIC_REQUIRE_FALSE( real_arrival_blocks_early_generated_commit(
+		kNow + 1u, kNow, kLead, false ) );
+	STATIC_REQUIRE_FALSE( real_arrival_blocks_early_generated_commit(
+		0u, kNow, kLead, true ) );
+	STATIC_REQUIRE_FALSE( real_arrival_blocks_early_generated_commit(
+		kNow + 1u, 0u, kLead, true ) );
+	STATIC_REQUIRE_FALSE( real_arrival_blocks_early_generated_commit(
+		kNow + 1u, kNow, 0u, true ) );
+}
+
+TEST_CASE( "real-frame identity follows the commit id", "[framegen][deadline]" )
+{
+	int texA = 0, texB = 0;
+
+	// Same texture object, new commit: this IS new content. Pointer identity
+	// alone would have missed it (the reacquired-buffer case).
+	STATIC_REQUIRE( is_new_real_frame_content( { 7u, &texA }, { 8u, &texA } ) );
+	// Overlay-only repaint: same base commit re-presented, not a real frame.
+	STATIC_REQUIRE_FALSE( is_new_real_frame_content( { 7u, &texA }, { 7u, &texA } ) );
+	// Commit id wins over the pointer in both directions.
+	STATIC_REQUIRE_FALSE( is_new_real_frame_content( { 7u, &texA }, { 7u, &texB } ) );
+	STATIC_REQUIRE( is_new_real_frame_content( { 7u, &texA }, { 8u, &texB } ) );
+
+	// Fallback to pointer identity when either side carries no commit id
+	// (compositor-owned layers), including the first-ever record.
+	STATIC_REQUIRE( is_new_real_frame_content( { 0u, nullptr }, { 0u, &texA } ) );
+	STATIC_REQUIRE_FALSE( is_new_real_frame_content( { 0u, &texA }, { 0u, &texA } ) );
+	STATIC_REQUIRE( is_new_real_frame_content( { 0u, &texA }, { 0u, &texB } ) );
+	STATIC_REQUIRE( is_new_real_frame_content( { 7u, &texA }, { 0u, &texB } ) );
+
+	// No base texture at all is never new content.
+	STATIC_REQUIRE_FALSE( is_new_real_frame_content( { 7u, &texA }, { 9u, nullptr } ) );
+}
+
 TEST_CASE( "slot budget applies 0.85 to actual remaining time", "[framegen][deadline]" )
 {
 	CHECK( deadline_cost_fits( 8'500u, 20'000u, 10'000u, 0u ) );

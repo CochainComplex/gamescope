@@ -5408,6 +5408,10 @@ static constexpr float k_flFramegenSuppressHi = 0.40f;
 struct FramegenPresentState_t
 {
 	const CVulkanTexture *pLastBaseTexture = nullptr;
+	// steamcompmgr's commit id for that base layer. Authoritative for content
+	// identity; the pointer above only covers compositor-owned layers that
+	// carry no commit id.
+	uint64_t ulLastBaseCommitID = 0;
 	uint64_t ulLastPresentToken = 0;
 	uint64_t ulLastSlotId = 0;
 	uint64_t ulPreviousRealFrameId = 0;
@@ -5517,6 +5521,11 @@ struct FramegenMetricsWindow_t
 	uint64_t feedbackDiscarded = 0;
 	uint64_t deadlineCount = 0, deadlineHits = 0;
 	uint32_t generatedLate = 0;
+	// Real commits that became ready while an early generated commit was still
+	// in flight on native KMS. Such a real frame cannot replace the reserved
+	// atomic state and lands one vblank later than it would have without the
+	// generated commit. Nonzero here means the early-commit lead is too long.
+	uint32_t realWaitDuringGenerated = 0;
 	double deadlineSignedSumMs = 0.0;
 	FramegenMetricsDistribution_t flipIntervals;
 	FramegenMetricsDistribution_t deadlineErrors;
@@ -5528,6 +5537,7 @@ struct FramegenMetricsPendingEvents_t
 	uint64_t repeats = 0, discards = 0, slowDrops = 0, admissionSkips = 0, resets = 0;
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 	uint64_t resetsRing = 0, resetsChain = 0;
+	uint64_t realWaits = 0;
 };
 static FramegenMetricsPendingEvents_t g_framegenMetricsPendingEvents;
 
@@ -5571,6 +5581,9 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	window.resetsHitch += events.resetsHitch;
 	window.resetsRing += events.resetsRing;
 	window.resetsChain += events.resetsChain;
+	if ( events.realWaits != 0
+		&& window.realWaitDuringGenerated < UINT32_MAX - events.realWaits )
+		window.realWaitDuringGenerated += (uint32_t)events.realWaits;
 }
 
 static void framegen_metrics_flush_events()
@@ -5602,7 +5615,7 @@ static void framegen_metrics_log( const char *pszLabel,
 		" resets_prov=%" PRIu64 " resets_hitch=%" PRIu64
 		" resets_ring=%" PRIu64 " resets_chain=%" PRIu64
 		" lead_ms_min=%.3f lead_ms_avg=%.3f lead_ms_max=%.3f"
-		" lead_ema=%.3f gen_late=%u lead_viable=%.3f",
+		" lead_ema=%.3f gen_late=%u lead_viable=%.3f real_wait=%u",
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -5618,7 +5631,8 @@ static void framegen_metrics_log( const char *pszLabel,
 		lead.n != 0 ? lead.min : 0.0, lead.average(), lead.max,
 		g_framegenPresentState.displayTiming.presentLead.emaNs / 1.0e6,
 		window.generatedLate,
-		viableLead.ready ? viableLead.leadNs / 1.0e6 : 0.0 );
+		viableLead.ready ? viableLead.leadNs / 1.0e6 : 0.0,
+		window.realWaitDuringGenerated );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
@@ -5734,6 +5748,11 @@ static void framegen_metrics_shutdown()
 void vulkan_framegen_metrics_note_repeat()
 {
 	g_framegenMetricsPendingEvents.repeats++;
+}
+
+void vulkan_framegen_metrics_note_real_wait()
+{
+	g_framegenMetricsPendingEvents.realWaits++;
 }
 
 static void framegen_metrics_note_discard( uint64_t n ) { g_framegenMetricsPendingEvents.discards += n; }
@@ -5924,8 +5943,15 @@ void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
 {
 	const CVulkanTexture *pBaseTexture = pFrameInfo != nullptr && pFrameInfo->layerCount > 0
 		? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
+	const gamescope::framegen::RealFrameIdentity_t identity = {
+		.commitId = pFrameInfo != nullptr && pFrameInfo->layerCount > 0
+			? pFrameInfo->layers[ 0 ].ulCommitID : 0u,
+		.pTexture = pBaseTexture,
+	};
 	if ( g_framegenPresentState.ulCurrentRealFrameId == 0
-		|| ( pBaseTexture != nullptr && pBaseTexture != g_framegenPresentState.pLastBaseTexture ) )
+		|| gamescope::framegen::is_new_real_frame_content(
+			{ g_framegenPresentState.ulLastBaseCommitID,
+				g_framegenPresentState.pLastBaseTexture }, identity ) )
 	{
 		g_framegenPresentState.ulPreviousRealFrameId = g_framegenPresentState.ulCurrentRealFrameId;
 		g_framegenPresentState.ulPreviousRealCompositeSeqNo =
@@ -5934,7 +5960,10 @@ void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
 		g_framegenPresentState.ulCurrentRealCompositeSeqNo = 0;
 	}
 	if ( pBaseTexture != nullptr )
+	{
 		g_framegenPresentState.pLastBaseTexture = pBaseTexture;
+		g_framegenPresentState.ulLastBaseCommitID = identity.commitId;
+	}
 
 	g_framegenPresentState.pendingTag = {
 		.ulPresentToken = ++g_framegenPresentState.ulLastPresentToken,
@@ -6344,6 +6373,7 @@ struct FramegenHistory_t
 	// new base-layer commit counts as a real frame; overlay-only repaints
 	// re-composite the same game content and must not disturb pacing.
 	const CVulkanTexture *pLastBaseTexture = nullptr;
+	uint64_t ulLastBaseCommitID = 0;
 	// Base-layer mode (#02): history and generation run on the pre-upscale
 	// game layer; previousReal/currentReal then point into baseHistory[] —
 	// two internally-owned base-sized copies — instead of the output ring.
@@ -7101,6 +7131,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenColorProbe.referenceTimeNs = 0;
 	g_framegenColorProbe.lastRealTimeNs = 0;
 	g_framegenHistory.pLastBaseTexture = nullptr;
+	g_framegenHistory.ulLastBaseCommitID = 0;
 	// Release the retained output-ring slots so a ring rebuild is never blocked
 	// by history holding a reference to an old image, and so the next real frame
 	// re-primes cleanly.
@@ -7150,6 +7181,34 @@ void vulkan_framegen_reset( const char *reason )
 	g_framegenColorProbe = {};
 }
 
+void vulkan_framegen_shutdown()
+{
+	if ( !vulkan_framegen_is_enabled() )
+		return;
+
+	// Framegen owns output/present ring images, history copies and pending
+	// generated presents. Their CVulkanTexture destructors release backend FBs
+	// (drmModeRmFB on native KMS). As file-scope statics they would otherwise
+	// outlive the backend, which steamcompmgr_exit destroys — so drop them here,
+	// while the backend and its KMS fd are still valid.
+	//
+	// This also joins the net-profile writer thread before any Vulkan/DRM
+	// teardown instead of leaving it to the atexit flush, which runs after.
+	if ( g_framegenHistory.lastFramegenWorkSeqNo != 0
+		&& !g_device.hasCompletedFramegen( g_framegenHistory.lastFramegenWorkSeqNo ) )
+		g_device.waitFramegen( g_framegenHistory.lastFramegenWorkSeqNo );
+	framegen_net_profile_consume();
+	framegen_net_profile_flush();
+	framegen_color_probe_consume();
+
+	g_framegenHistory = {};
+	g_framegenMotion = {};
+	g_framegenColorProbe = {};
+	g_output.framegenOutputImages.clear();
+	g_output.framegenPresentImages.clear();
+	g_device.framegenGarbageCollect();
+}
+
 bool vulkan_framegen_has_pending_generated_frame()
 {
 	return vulkan_framegen_is_enabled() && !g_framegenHistory.pending.empty();
@@ -7187,6 +7246,57 @@ uint64_t vulkan_framegen_fixed_refresh_commit_deadline_ns()
 			ulMarginNs,
 			g_framegenHistory.ulDeadlineGridIntervalNs );
 	return plan.earlyCommit ? plan.commitDeadlineNs : 0u;
+}
+
+bool vulkan_framegen_real_arrival_blocks_early_commit()
+{
+	// Native KMS only, and only where an early commit would actually be taken.
+	// The generated atomic commit reserves KMS state and then blocks until its
+	// page flip; a real client frame becoming ready inside that window cannot
+	// replace the reservation and lands a vblank late. Conservative by
+	// construction: no cadence model, no prediction, or an overdue prediction
+	// all leave generation alone.
+	if ( GetBackend() == nullptr || !GetBackend()->OwnsKMSPresentTiming() )
+		return false;
+	if ( !vulkan_framegen_has_pending_generated_frame()
+		|| g_framegenHistory.ulDeadlineGridIntervalNs == 0u )
+		return false;
+
+	const FramegenHistory_t::PendingGenerated_t &front =
+		g_framegenHistory.pending.front();
+	if ( front.bReal || front.ulTargetFlipNs == 0u )
+		return false;
+
+	const uint64_t ulMarginNs =
+		g_framegenHistory.ulDeadlineGridIntervalNs / 10u;
+	const gamescope::framegen::FixedRefreshCommitPlan_t plan =
+		framegen_plan_fixed_refresh_commit(
+			front.ulTargetFlipNs, ulMarginNs,
+			g_framegenHistory.ulDeadlineGridIntervalNs );
+	if ( !plan.earlyCommit )
+		return false;
+
+	const uint64_t ulSourceReadyNs = g_framegenHistory.causalAnchor.sourceReadyNs;
+	const uint64_t ulPredictedIntervalNs = framegen_predicted_interval_ns();
+	if ( ulSourceReadyNs == 0u || ulPredictedIntervalNs == 0u )
+		return false;
+
+	const uint64_t ulNowNs = get_time_in_nanos();
+	const uint64_t ulPredictedRealReadyNs = gamescope::framegen::saturating_add_ns(
+		ulSourceReadyNs, ulPredictedIntervalNs );
+	const bool bBlocked = gamescope::framegen::real_arrival_blocks_early_generated_commit(
+		ulPredictedRealReadyNs, ulNowNs, plan.advanceNs,
+		g_framegenHistory.cadence.samples
+			>= gamescope::framegen::k_uCadencePredictorMinSamples );
+	if ( bBlocked )
+	{
+		static uint64_t s_uRealArrivalSkipDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uRealArrivalSkipDebugLogCounter ) )
+			vk_log.infof( "framegen: skipping early generated commit — next real predicted in %.3f ms, commit lead %.3f ms",
+				( ulPredictedRealReadyNs - ulNowNs ) / 1.0e6,
+				plan.advanceNs / 1.0e6 );
+	}
+	return bBlocked;
 }
 
 bool vulkan_framegen_generated_frame_due()
@@ -12226,10 +12336,16 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// Only a new base-layer commit counts as a real frame. Overlay-only
 	// repaints (a MangoHud tick, a notification fading) re-composite the same
 	// game content: recording them would poison the pacing measurement and
-	// pay for a duplicate history copy. Pointer identity is sufficient here —
-	// a recycled allocation would at worst skip one record and self-heals.
+	// pay for a duplicate history copy. Identity keys on steamcompmgr's commit
+	// id, so a client that reacquires and recommits a buffer mapping to the
+	// same texture object is still recognised as new content; pointer identity
+	// only backs layers that carry no commit id.
 	const CVulkanTexture *pBaseTexture = pFrameInfo->layerCount > 0 ? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
-	if ( pBaseTexture && pBaseTexture == g_framegenHistory.pLastBaseTexture )
+	const uint64_t ulBaseCommitID = pFrameInfo->layerCount > 0
+		? pFrameInfo->layers[ 0 ].ulCommitID : 0u;
+	if ( pBaseTexture && !gamescope::framegen::is_new_real_frame_content(
+			{ g_framegenHistory.ulLastBaseCommitID, g_framegenHistory.pLastBaseTexture },
+			{ ulBaseCommitID, pBaseTexture } ) )
 	{
 		g_framegenHistory.bBidirSameBaseComposite = true;
 		static uint64_t s_uOverlayOnlyDebugLogCounter = 0;
@@ -12238,6 +12354,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		return;
 	}
 	g_framegenHistory.pLastBaseTexture = pBaseTexture;
+	g_framegenHistory.ulLastBaseCommitID = ulBaseCommitID;
 	if ( framegen_record_color_probe_real( pRealFrame, pFrameInfo, ulCompositeSeqNo ) )
 		return;
 

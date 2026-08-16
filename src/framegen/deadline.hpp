@@ -1184,6 +1184,49 @@ select_fixed_refresh_present_lead(
 		&& !presentInFlight;
 }
 
+// An early generated commit reserves KMS state and then blocks until its page
+// flip. A real client frame that becomes ready inside that reservation cannot
+// replace the reserved state, so it lands one vblank later than it would have
+// without the generated commit. Skip the early commit when the learned source
+// cadence predicts the next real frame inside that commit-to-flip window.
+//
+// A prediction already in the past is deliberately NOT a reason to skip: an
+// overdue real frame is exactly the empty vblank generation exists to fill.
+// Untrained cadence, or any missing input, also never suppresses generation.
+[[nodiscard]] constexpr bool real_arrival_blocks_early_generated_commit(
+	uint64_t predictedRealReadyNs, uint64_t nowNs, uint64_t commitLeadNs,
+	bool cadenceTrained )
+{
+	if ( !cadenceTrained || predictedRealReadyNs == 0u || nowNs == 0u
+		|| commitLeadNs == 0u )
+		return false;
+	if ( predictedRealReadyNs <= nowNs )
+		return false;
+	return predictedRealReadyNs - nowNs <= commitLeadNs;
+}
+
+// Real-frame content identity. A client can reacquire and recommit a buffer
+// that maps to the same CVulkanTexture object, so pointer identity alone misses
+// the new content. steamcompmgr's per-commit id is a monotonic sequence and is
+// authoritative whenever both sides carry one; pointer identity remains as the
+// fallback for compositor-owned layers that have no commit id. An overlay-only
+// repaint re-presents the same base commit and is therefore not new content.
+struct RealFrameIdentity_t
+{
+	uint64_t commitId = 0;
+	const void *pTexture = nullptr;
+};
+
+[[nodiscard]] constexpr bool is_new_real_frame_content(
+	const RealFrameIdentity_t &last, const RealFrameIdentity_t &current )
+{
+	if ( current.pTexture == nullptr )
+		return false;
+	if ( last.commitId != 0u && current.commitId != 0u )
+		return last.commitId != current.commitId;
+	return last.pTexture != current.pTexture;
+}
+
 struct VrrMidpointPlan_t
 {
 	uint64_t targetFlipNs = 0;

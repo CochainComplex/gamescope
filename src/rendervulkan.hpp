@@ -326,6 +326,13 @@ struct FrameInfo_t
 		// source-cadence observation; it is never forwarded as presentation
 		// feedback and generated layers leave it at zero.
 		uint64_t acquireReadyTimeNs = 0;
+		// steamcompmgr's monotonic per-commit id for the client commit this
+		// layer was built from (zero for compositor-owned layers). Framegen
+		// keys real-frame identity on this: a reacquired buffer can be
+		// recommitted with the same CVulkanTexture object, which pointer
+		// identity alone would miss. Overlay-only repaints re-present the same
+		// base commit and therefore keep the same id.
+		uint64_t ulCommitID = 0;
 		int zpos;
 
 		vec2_t offset;
@@ -494,6 +501,9 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<
 void vulkan_framegen_discard_generated_frame( const char *reason );
 void vulkan_framegen_invalidate_history( const char *reason );
 void vulkan_framegen_reset( const char *reason );
+// Releases every framegen-owned GPU resource and joins the profile writer.
+// Must run before the backend is destroyed: framegen textures own backend FBs.
+void vulkan_framegen_shutdown();
 // Default display-clock pacing (#06, dedicated queue): reactive fill hook for
 // the present decision. Call on a vblank that is going to a hardware repeat
 // while framegen is active; plans one generated frame for the next vblank with
@@ -502,6 +512,13 @@ void vulkan_framegen_jit_tick();
 // Cheap compositor-thread counter hook used by the repeat arbiter. Aggregation
 // and reporting remain in vulkan_framegen_drain_present_feedback().
 void vulkan_framegen_metrics_note_repeat();
+// Counts a real commit that became ready while an early generated commit was
+// still in flight (reported as real_wait= in framegen-metrics).
+void vulkan_framegen_metrics_note_real_wait();
+// True when the learned source cadence predicts the next real client frame
+// inside the early generated commit's blocking commit-to-flip window. Native
+// KMS only; conservative — any missing/untrained input returns false.
+bool vulkan_framegen_real_arrival_blocks_early_commit();
 // VRR hybrid (#01, GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 + dedicated queue): keep
 // adaptive sync active while framegen runs — real frames flip immediately,
 // the generated frame flips mid-interval on a timer. "Requested" (env + queue)
