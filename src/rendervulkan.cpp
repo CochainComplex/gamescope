@@ -1966,7 +1966,12 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	{
 		pWaitSemaphores[i] = externalWaits[i].pTimelineSemaphore->pVkSemaphore;
 		pWaitPoints[i] = externalWaits[i].ulPoint;
-		pWaitStageFlags[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		// TRANSFER is required as well as the shading stages: a non-device-local
+		// client import is first read by vkCmdCopyImage in the dual-gpu staging
+		// path (and in the ReShade pre-stage submission), so without it the
+		// transfer read may legally run before the client's acquire point is
+		// signalled and copy a stale or partially written image.
+		pWaitStageFlags[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
 	}
 
 	VkTimelineSemaphoreSubmitInfo timelineInfo = {
@@ -3200,11 +3205,24 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			return false;
 		}
 	}
-	else if ( g_bDebugDualGpuRoute && pDMA && pDMA->modifier != DRM_FORMAT_MOD_INVALID )
+	else if ( pDMA && pDMA->modifier != DRM_FORMAT_MOD_INVALID )
 	{
-		vk_log.infof( "dual-gpu-route: client dma-buf has modifier 0x%" PRIX64 " but compositor Vulkan modifier support is %s",
-			pDMA->modifier,
-			g_device.supportsModifiers() ? "enabled" : "disabled" );
+		if ( g_bDebugDualGpuRoute )
+		{
+			vk_log.infof( "dual-gpu-route: client dma-buf has modifier 0x%" PRIX64 " but compositor Vulkan modifier support is %s",
+				pDMA->modifier,
+				g_device.supportsModifiers() ? "enabled" : "disabled" );
+		}
+
+		// Without modifier support we can only create a plain (implicitly tiled)
+		// image, which would interpret a tiled buffer as if it were linear.
+		// Fail the import instead of silently sampling garbage.
+		if ( pDMA->modifier != DRM_FORMAT_MOD_LINEAR )
+		{
+			vk_log.errorf( "dma-buf modifier 0x%" PRIX64 " cannot be imported without Vulkan DRM format modifier support",
+				pDMA->modifier );
+			return false;
+		}
 	}
 
 	std::vector<uint64_t> modifiers = {};
@@ -3327,7 +3345,8 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	if ( pExistingImageToReuseMemory == nullptr )
 	{
 		// Possible pNexts
-		VkImportMemoryFdInfoKHR importMemoryInfo = {};
+		// fd = -1 so the failure path below can tell "never imported" from a real FD.
+		VkImportMemoryFdInfoKHR importMemoryInfo = { .fd = -1 };
 		VkExportMemoryAllocateInfo memory_export_info = {};
 		VkMemoryDedicatedAllocateInfo memory_dedicated_info = {};
 		struct wsi_memory_allocate_info memory_wsi_info = {};
@@ -3363,7 +3382,14 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		{
 			// TODO: multi-planar DISTINCT DMA-BUFs support (see vkBindImageMemory2
 			// and VkBindImagePlaneMemoryInfo)
-			assert( allDMABUFsEqual( pDMA ) );
+			// Only fd[0] is imported and bound to the whole image, so all planes
+			// must live in the same dma-buf. In release builds the assert is gone,
+			// hence the runtime check.
+			if ( !allDMABUFsEqual( pDMA ) )
+			{
+				vk_log.errorf( "multi-fd dma-buf import unsupported" );
+				return false;
+			}
 
 			// Importing memory from a FD transfers ownership of the FD
 			int fd = dup( pDMA->fd[0] );
@@ -3425,6 +3451,9 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		if ( res != VK_SUCCESS )
 		{
 			vk_errorf( res, "vkAllocateMemory failed" );
+			// Ownership of the dup'd FD only transfers on a successful import.
+			if ( importMemoryInfo.fd >= 0 )
+				close( importMemoryInfo.fd );
 			return false;
 		}
 
@@ -4734,6 +4763,10 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 	// A legal cross-device import can reside in host-visible memory. Give
 	// composited client buffers a transfer-source usage so their one-time
 	// device-local staging copy can use vkCmdCopyImage without changing pixels.
+	// That usage is only needed on the staging path though, and some sampleable
+	// modifiers do not support TRANSFER_SRC, so a rejected import is retried
+	// without it. Such a texture is simply not stageable and the staging code
+	// (AcquireDeviceLocalStagingImage) skips it.
 	texCreateFlags.bTransferSrc = true;
 
 	//fprintf(stderr, "pDMA->width: %d pDMA->height: %d pDMA->format: 0x%x pDMA->modifier: 0x%lx pDMA->n_planes: %d\n",
@@ -4743,15 +4776,31 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 	{
 		if ( g_bDebugDualGpuRoute )
 		{
-			vk_log.errorf( "dual-gpu-route: client dma-buf Vulkan import failed %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d backend fb %s",
+			vk_log.infof( "dual-gpu-route: client dma-buf Vulkan import with transfer-src failed %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d, retrying sampled-only",
 				pDMA->width,
 				pDMA->height,
 				pDMA->format,
 				pDMA->modifier,
-				pDMA->n_planes,
-				pBackendFb ? "yes" : "no" );
+				pDMA->n_planes );
 		}
-		return nullptr;
+
+		texCreateFlags.bTransferSrc = false;
+		pTex = new CVulkanTexture();
+
+		if ( pTex->BInit( pDMA->width, pDMA->height, 1u, pDMA->format, texCreateFlags, pDMA, 0, 0, nullptr, pBackendFb ) == false )
+		{
+			if ( g_bDebugDualGpuRoute )
+			{
+				vk_log.errorf( "dual-gpu-route: client dma-buf Vulkan import failed %dx%d format 0x%" PRIX32 " modifier 0x%" PRIX64 " planes %d backend fb %s",
+					pDMA->width,
+					pDMA->height,
+					pDMA->format,
+					pDMA->modifier,
+					pDMA->n_planes,
+					pBackendFb ? "yes" : "no" );
+			}
+			return nullptr;
+		}
 	}
 
 	if ( g_bDebugDualGpuRoute )
