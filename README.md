@@ -151,10 +151,10 @@ GPU time no longer fits a slot. It probes upward again after sustained headroom.
 ## Recommended settings (start with these)
 
 Start with motion, `checked`, and x2. Try x3 after the HUD shows stable deadline
-hits. This combination was validated natively on 2026-08-15 with a Proton game
-rendering on an NVIDIA laptop GPU and generation on the AMD iGPU at 2560x1600@120
-(x3, dl_hit 1.000 in steady windows). Use `warp` if the present GPU cannot sustain `checked`. The `learned`,
-`predict`, and `guided` pipelines add passes and should be treated as experiments.
+hits. This combination was validated natively on 2026-08-16 (build 1533e44) with a Proton game
+rendering on an NVIDIA laptop GPU and generation on the AMD 890M at 2560x1600@120, x3
+checked, 15 minutes: dl_hit 0.998, fill 0.96–0.97 in steady windows (0.94 including
+loading screens), source-ready-to-flip p50 8.75 ms / p95 12.25 ms, clean shutdown.
 
 ```sh
 PRESENT_DEV=1002:5678
