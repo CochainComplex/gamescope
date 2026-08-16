@@ -23,8 +23,11 @@ VRR bends the display clock to the game's frame times. gamescope-gameslop bends
 the content stream onto the display's fixed refresh grid. Each generated frame is
 planned against a real vblank deadline.
 
-The causal scheduler uses deadline-based, just-in-time slot planning. In the
-default forward path, a real frame is never delayed behind generated work. Late
+To keep latency low, the default path extrapolates: each generated frame is
+predicted forward from the last real frame and its motion, so no real frame is
+held back to interpolate between two. The causal scheduler uses deadline-based,
+just-in-time slot planning. In the default forward path, a real frame is never
+delayed behind generated work. Late
 generation is dropped instead of waited for, so the display repeats the last
 frame for that slot. Bidirectional interpolation is also available. It uses both
 real endpoints and deliberately adds one real-frame interval of latency.
