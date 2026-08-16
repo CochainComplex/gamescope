@@ -956,7 +956,10 @@ public:
 	VkSampler sampler(SamplerState key);
 	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false);
 	int32_t findMemoryType( VkMemoryPropertyFlags properties, uint32_t requiredTypeBits );
-	std::unique_ptr<CVulkanCmdBuffer> commandBuffer();
+	// bFramegen picks the framegen family's command pool + recycle list when the
+	// framegen queue is on a different family; otherwise identical to the
+	// compositor path (byte-for-byte the same buffers as before).
+	std::unique_ptr<CVulkanCmdBuffer> commandBuffer( bool bFramegenQueue = false );
 	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf);
 	uint64_t submitInternal( CVulkanCmdBuffer* cmdBuf );
 	void wait(uint64_t sequence, bool reset = true);
@@ -1047,6 +1050,18 @@ public:
 	inline VkCommandPool generalCommandPool() {return m_generalCommandPool;}
 	inline uint32_t queueFamily() {return m_queueFamily;}
 	inline uint32_t generalQueueFamily() {return m_generalQueueFamily;}
+	// Queue family the dedicated frame-generation queue lives on. Equal to
+	// queueFamily() in the common case (queue index 1 of the compositor family);
+	// a different, compute-capable family when the compositor family exposes
+	// only one queue (e.g. Intel ANV/Xe, which is additionally quirked off the
+	// compute-only family for imported-image interop - see
+	// vulkan_queue_family_quirk_force_general).
+	inline uint32_t framegenQueueFamily() {return m_framegenQueueFamily;}
+	// True when framegen runs on a queue from a *different* family than the
+	// compositor. On this path framegen-internal images are created
+	// VK_SHARING_MODE_CONCURRENT across both families (no ownership transfers),
+	// and client-imported dma-bufs are never touched on the framegen queue.
+	inline bool framegenFamilySplit() const {return m_bHasFramegenQueue && m_framegenQueueFamily != m_queueFamily;}
 	inline VkBuffer uploadBuffer() {return m_uploadBuffer;}
 	inline VkPipelineLayout pipelineLayout() {return m_pipelineLayout;}
 	inline int drmRenderFd() {return m_drmRendererFd;}
@@ -1141,9 +1156,13 @@ protected:
 	VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
 	VkCommandPool m_commandPool = VK_NULL_HANDLE;
 	VkCommandPool m_generalCommandPool = VK_NULL_HANDLE;
+	// Only created when framegenFamilySplit(); VK_NULL_HANDLE otherwise.
+	VkCommandPool m_framegenCommandPool = VK_NULL_HANDLE;
 
 	uint32_t m_queueFamily = -1;
 	uint32_t m_generalQueueFamily = -1;
+	uint32_t m_framegenQueueFamily = -1;
+	uint32_t m_framegenQueueIndex = 0;
 
 	int m_drmRendererFd = -1;
 	dev_t m_drmPrimaryDevId = 0;
@@ -1217,6 +1236,9 @@ protected:
 	std::atomic<uint64_t> m_framegenSeqNo = { 0 };
 	std::atomic<uint64_t> m_framegenCompletedSeqNo = { 0 };
 	std::vector<std::pair<uint64_t, std::unique_ptr<CVulkanCmdBuffer>>> m_pendingFramegenCmdBufs;
+	// Separate recycle list for command buffers allocated from
+	// m_framegenCommandPool; unused (empty) unless framegenFamilySplit().
+	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedFramegenCmdBufs;
 
 	// Timestamp query-pool ring for live framegen GPU-time measurement. Ring depth
 	// covers the worst-case in-flight batches; available on dedicated and shared

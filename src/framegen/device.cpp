@@ -219,7 +219,11 @@ void CVulkanDevice::framegenGarbageCollect()
 			&& completedEnd->first <= currentSeqNo )
 		{
 			completedEnd->second->reset();
-			m_unusedCmdBufs.push_back( std::move( completedEnd->second ) );
+			// Recycle into the list matching the pool the buffer came from.
+			if ( framegenFamilySplit() )
+				m_unusedFramegenCmdBufs.push_back( std::move( completedEnd->second ) );
+			else
+				m_unusedCmdBufs.push_back( std::move( completedEnd->second ) );
 			++completedEnd;
 		}
 		m_pendingFramegenCmdBufs.erase( m_pendingFramegenCmdBufs.begin(), completedEnd );

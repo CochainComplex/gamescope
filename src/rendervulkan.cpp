@@ -763,6 +763,54 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 		vk.GetPhysicalDeviceQueueFamilyProperties( m_physDev, &nQueueFamilies, queueFamilyProperties.data() );
 		if ( m_queueFamily < nQueueFamilies )
 			m_queueCount = queueFamilyProperties[ m_queueFamily ].queueCount;
+
+		// Pick the family the dedicated frame-generation queue will live on.
+		// Preference order, so nothing changes on hardware that already had a
+		// dedicated queue (AMD/NVIDIA: the compute family exposes many queues):
+		//  1. queue index 1 of the compositor family, when it exposes >= 2.
+		//  2. queue index 0 of a *different* compute-capable family, preferring a
+		//     compute-only one. This is the case that unlocks Intel ANV/Xe, whose
+		//     general family commonly exposes a single queue and which is quirked
+		//     away from the compute-only family for imported-image interop.
+		//  3. queue index 1 of the general family, if it has a spare queue.
+		if ( m_queueCount >= 2 )
+		{
+			m_framegenQueueFamily = m_queueFamily;
+			m_framegenQueueIndex = 1;
+		}
+		else
+		{
+			uint32_t nComputeOnly = ~0u;
+			uint32_t nComputeAny = ~0u;
+			for ( uint32_t i = 0; i < nQueueFamilies; ++i )
+			{
+				if ( i == m_queueFamily || i == m_generalQueueFamily )
+					continue;
+				if ( !( queueFamilyProperties[ i ].queueFlags & VK_QUEUE_COMPUTE_BIT ) )
+					continue;
+				if ( queueFamilyProperties[ i ].queueCount == 0 )
+					continue;
+
+				if ( !( queueFamilyProperties[ i ].queueFlags & VK_QUEUE_GRAPHICS_BIT ) )
+					nComputeOnly = std::min( nComputeOnly, i );
+				else
+					nComputeAny = std::min( nComputeAny, i );
+			}
+
+			const uint32_t nOther = nComputeOnly != ~0u ? nComputeOnly : nComputeAny;
+			if ( nOther != ~0u )
+			{
+				m_framegenQueueFamily = nOther;
+				m_framegenQueueIndex = 0;
+			}
+			else if ( m_generalQueueFamily != m_queueFamily
+				&& m_generalQueueFamily < nQueueFamilies
+				&& queueFamilyProperties[ m_generalQueueFamily ].queueCount >= 2 )
+			{
+				m_framegenQueueFamily = m_generalQueueFamily;
+				m_framegenQueueIndex = 1;
+			}
+		}
 	}
 
 	if ( g_bDebugDualGpuRoute )
@@ -956,10 +1004,25 @@ bool CVulkanDevice::createDevice()
 	// FIFO head-of-line blocking. Gated on framegen so a session that never uses
 	// it requests exactly the single REALTIME queue it did before.
 	const bool bWantFramegenQueue = g_bExperimentalFramegen && framegen_backend_supported()
-		&& m_queueCount >= 2 && !env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_SINGLE_QUEUE" ) );
-	const uint32_t nComputeQueues = bWantFramegenQueue ? 2u : 1u;
+		&& m_framegenQueueFamily != ~0u && !env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_SINGLE_QUEUE" ) );
+	if ( !bWantFramegenQueue )
+	{
+		m_framegenQueueFamily = ~0u;
+		m_framegenQueueIndex = 0;
+	}
 
-	VkDeviceQueueCreateInfo queueCreateInfos[2] =
+	// The framegen queue is normally index 1 of one of the two families we
+	// already create; when it lives on a third, compute-capable family (the
+	// compositor family only exposed one queue) that family gets its own
+	// create-info with a single low-priority queue.
+	const bool bFramegenOwnFamily = bWantFramegenQueue
+		&& m_framegenQueueFamily != m_queueFamily
+		&& m_framegenQueueFamily != m_generalQueueFamily;
+	const uint32_t nComputeQueues = bWantFramegenQueue && m_framegenQueueFamily == m_queueFamily ? 2u : 1u;
+	const uint32_t nGeneralQueues = bWantFramegenQueue && m_framegenQueueFamily == m_generalQueueFamily
+		&& m_generalQueueFamily != m_queueFamily ? 2u : 1u;
+
+	VkDeviceQueueCreateInfo queueCreateInfos[3] =
 	{
 		{
 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -972,8 +1035,17 @@ bool CVulkanDevice::createDevice()
 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
 			.pNext = gamescope::Process::HasCapSysNice() && m_bSupportsGlobalPriority ? &queueCreateInfoEXT : nullptr,
 			.queueFamilyIndex = m_generalQueueFamily,
-			.queueCount = 1,
+			.queueCount = nGeneralQueues,
 			.pQueuePriorities = queuePriorities
+		},
+		{
+			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+			.pNext = gamescope::Process::HasCapSysNice() && m_bSupportsGlobalPriority ? &queueCreateInfoEXT : nullptr,
+			.queueFamilyIndex = bFramegenOwnFamily ? m_framegenQueueFamily : 0u,
+			.queueCount = 1,
+			// Speculative work: lowest relative priority, like queue index 1 of
+			// the compositor family in the same-family case.
+			.pQueuePriorities = &queuePriorities[1]
 		},
 	};
 
@@ -1075,7 +1147,7 @@ bool CVulkanDevice::createDevice()
 	VkDeviceCreateInfo deviceCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
 		.pNext = &features2,
-		.queueCreateInfoCount = m_queueFamily == m_generalQueueFamily ? 1u : 2u,
+		.queueCreateInfoCount = ( m_queueFamily == m_generalQueueFamily ? 1u : 2u ) + ( bFramegenOwnFamily ? 1u : 0u ),
 		.pQueueCreateInfos = queueCreateInfos,
 		.enabledExtensionCount = (uint32_t)enabledExtensions.size(),
 		.ppEnabledExtensionNames = enabledExtensions.data(),
@@ -1101,6 +1173,12 @@ bool CVulkanDevice::createDevice()
 		.nullDescriptor = VK_TRUE,
 	};
 
+	// queueCreateInfoCount above counts a contiguous prefix; when the compositor
+	// and general families are the same we only submit entry [0], so move the
+	// framegen family's create-info into slot [1].
+	if ( bFramegenOwnFamily && m_queueFamily == m_generalQueueFamily )
+		queueCreateInfos[1] = queueCreateInfos[2];
+
 	VkResult res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
 	if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() && m_bSupportsGlobalPriority )
 	{
@@ -1113,6 +1191,7 @@ bool CVulkanDevice::createDevice()
 		{
 			fprintf(stderr, "vkCreateDevice failed with a high-priority queue (compute). Falling back to regular priority (all).\n");
 			queueCreateInfos[0].pNext = nullptr;
+			queueCreateInfos[2].pNext = nullptr;
 			res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
 		}
 	}
@@ -1135,10 +1214,22 @@ bool CVulkanDevice::createDevice()
 
 	if ( bWantFramegenQueue )
 	{
-		vk.GetDeviceQueue( device(), m_queueFamily, 1, &m_framegenQueue );
+		vk.GetDeviceQueue( device(), m_framegenQueueFamily, m_framegenQueueIndex, &m_framegenQueue );
 		m_bHasFramegenQueue = m_framegenQueue != VK_NULL_HANDLE;
 		if ( m_bHasFramegenQueue )
-			vk_log.infof( "frame generation: using dedicated compute queue (family %u, index 1)", m_queueFamily );
+		{
+			vk_log.infof( "framegen: dedicated queue family %u index %u (compositor family %u)",
+				m_framegenQueueFamily, m_framegenQueueIndex, m_queueFamily );
+		}
+		else
+		{
+			m_framegenQueueFamily = ~0u;
+		}
+	}
+	else if ( g_bExperimentalFramegen && framegen_backend_supported() )
+	{
+		vk_log.infof( "framegen: no dedicated queue (compositor family %u exposes %u queue(s), no other compute-capable family usable); generation shares the composite queue",
+			m_queueFamily, m_queueCount );
 	}
 
 	return true;
@@ -1339,6 +1430,25 @@ bool CVulkanDevice::createPools()
 	{
 		vk_errorf( res, "vkCreateCommandPool failed" );
 		return false;
+	}
+
+	// Command buffers are family-scoped: when the framegen queue lives on a
+	// different family it needs its own pool (and its own recycle list, see
+	// commandBuffer()/framegenGarbageCollect()).
+	if ( framegenFamilySplit() )
+	{
+		VkCommandPoolCreateInfo framegenCommandPoolCreateInfo = {
+			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+			.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+			.queueFamilyIndex = m_framegenQueueFamily,
+		};
+
+		res = vk.CreateCommandPool(device(), &framegenCommandPoolCreateInfo, nullptr, &m_framegenCommandPool);
+		if ( res != VK_SUCCESS )
+		{
+			vk_errorf( res, "vkCreateCommandPool failed (framegen family)" );
+			return false;
+		}
 	}
 
 	VkPhysicalDeviceImageFormatInfo2 imageFormatInfo = {
@@ -1609,8 +1719,10 @@ bool CVulkanDevice::createScratchResources()
 		VkPhysicalDeviceProperties physProps = {};
 		vk.GetPhysicalDeviceProperties( physDev(), &physProps );
 
-		const bool bTimestampsUsable = m_queueFamily < nQueueFamilyCount
-			&& queueFamilyProps[ m_queueFamily ].timestampValidBits > 0
+		// Timestamps are written on whichever queue records the framegen batch.
+		const uint32_t nTimestampFamily = m_bHasFramegenQueue ? m_framegenQueueFamily : m_queueFamily;
+		const bool bTimestampsUsable = nTimestampFamily < nQueueFamilyCount
+			&& queueFamilyProps[ nTimestampFamily ].timestampValidBits > 0
 			&& physProps.limits.timestampPeriod != 0.0f;
 
 		if ( bTimestampsUsable )
@@ -1626,7 +1738,7 @@ bool CVulkanDevice::createScratchResources()
 			};
 			if ( vk.CreateQueryPool( device(), &queryPoolInfo, nullptr, &m_framegenQueryPool ) == VK_SUCCESS )
 			{
-				m_uFramegenTimestampValidBits = queueFamilyProps[ m_queueFamily ].timestampValidBits;
+				m_uFramegenTimestampValidBits = queueFamilyProps[ nTimestampFamily ].timestampValidBits;
 				m_flFramegenTimestampPeriodNs = physProps.limits.timestampPeriod;
 				vk_log.infof( "frame generation: measuring GPU time via timestamp queries (period %.2f ns, %u valid bits, %s queue)",
 					m_flFramegenTimestampPeriodNs, m_uFramegenTimestampValidBits,
@@ -1895,15 +2007,21 @@ int32_t CVulkanDevice::findMemoryType( VkMemoryPropertyFlags properties, uint32_
 	return -1;
 }
 
-std::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer()
+std::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer( bool bFramegenQueue )
 {
+	// Only a cross-family framegen queue needs its own pool/recycle list; in the
+	// common same-family case this is the exact same path as before.
+	const bool bSplit = bFramegenQueue && framegenFamilySplit();
+	std::vector<std::unique_ptr<CVulkanCmdBuffer>> &unusedCmdBufs =
+		bSplit ? m_unusedFramegenCmdBufs : m_unusedCmdBufs;
+
 	std::unique_ptr<CVulkanCmdBuffer> cmdBuffer;
-	if (m_unusedCmdBufs.empty())
+	if (unusedCmdBufs.empty())
 	{
 		VkCommandBuffer rawCmdBuffer;
 		VkCommandBufferAllocateInfo commandBufferAllocateInfo = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-			.commandPool = m_commandPool,
+			.commandPool = bSplit ? m_framegenCommandPool : m_commandPool,
 			.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 			.commandBufferCount = 1
 		};
@@ -1915,12 +2033,14 @@ std::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer()
 			return nullptr;
 		}
 
-		cmdBuffer = std::make_unique<CVulkanCmdBuffer>(this, rawCmdBuffer, queue(), queueFamily());
+		cmdBuffer = std::make_unique<CVulkanCmdBuffer>(this, rawCmdBuffer,
+			bSplit ? m_framegenQueue : queue(),
+			bSplit ? m_framegenQueueFamily : queueFamily());
 	}
 	else
 	{
-		cmdBuffer = std::move(m_unusedCmdBufs.back());
-		m_unusedCmdBufs.pop_back();
+		cmdBuffer = std::move(unusedCmdBufs.back());
+		unusedCmdBufs.pop_back();
 	}
 
 	cmdBuffer->begin();
@@ -3091,6 +3211,40 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	VkSubresourceLayout modifierPlaneLayouts[4] = {};
 	VkImageDrmFormatModifierListCreateInfoEXT modifierListInfo = {};
 	
+	// Cross-family framegen (framegenFamilySplit(): the framegen queue lives on
+	// a different queue family than the compositor) reads and writes
+	// gamescope-owned images that the composite queue also touches - framegen
+	// history/output/present rings, motion fields, and the composited output
+	// images used as history in output-space mode. Rather than thread explicit
+	// queue-family ownership-transfer barrier pairs through every one of those
+	// hand-offs (the barrier emitters use VK_QUEUE_FAMILY_IGNORED throughout),
+	// declare those images VK_SHARING_MODE_CONCURRENT over the families
+	// involved: correct by construction, at the cost of losing some drivers'
+	// compressed layouts on this path only. Client-imported dma-bufs (pDMA) keep
+	// VK_SHARING_MODE_EXCLUSIVE and are never accessed on the framegen family -
+	// their FOREIGN acquire barriers only ever transfer ownership to the
+	// compositor family, and imported-image interop on a secondary family is
+	// exactly what the Intel quirk above is about.
+	uint32_t nSharedQueueFamilies[3] = {};
+	uint32_t nSharedQueueFamilyCount = 0;
+	if ( pDMA == nullptr && g_device.framegenFamilySplit() )
+	{
+		const auto addFamily = [&]( uint32_t nFamily )
+		{
+			for ( uint32_t i = 0; i < nSharedQueueFamilyCount; i++ )
+			{
+				if ( nSharedQueueFamilies[i] == nFamily )
+					return;
+			}
+			nSharedQueueFamilies[ nSharedQueueFamilyCount++ ] = nFamily;
+		};
+		addFamily( g_device.queueFamily() );
+		addFamily( g_device.generalQueueFamily() );
+		addFamily( g_device.framegenQueueFamily() );
+		if ( nSharedQueueFamilyCount < 2 )
+			nSharedQueueFamilyCount = 0;
+	}
+
 	VkImageCreateInfo imageInfo = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.imageType = flags.imageType,
@@ -3105,7 +3259,9 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.samples = VK_SAMPLE_COUNT_1_BIT,
 		.tiling = tiling,
 		.usage = usage,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.sharingMode = nSharedQueueFamilyCount != 0 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = nSharedQueueFamilyCount,
+		.pQueueFamilyIndices = nSharedQueueFamilyCount != 0 ? nSharedQueueFamilies : nullptr,
 	};
 
 	assert( imageInfo.format != VK_FORMAT_UNDEFINED );
@@ -6436,6 +6592,10 @@ struct FramegenHistory_t
 	// base-history copies. Reset paths wait for this token before releasing pools
 	// or history; lastGeneratedSeqNo remains generation-only for the headroom gate.
 	uint64_t lastFramegenWorkSeqNo = 0;
+	// Split-family path only: the base-history ingest copy runs on the COMPOSITE
+	// queue (it reads the client's imported dma-buf), so its token lives on the
+	// composite timeline and must be waited on separately.
+	uint64_t lastBaseIngestSeqNo = 0;
 	// Seq no (on the framegen timeline) of the most recent generation batch, for
 	// the oversubscription guard: skip new generation while the previous batch
 	// is still running rather than queue work in front of real frames.
@@ -7236,6 +7396,9 @@ void vulkan_framegen_reset( const char *reason )
 	if ( g_framegenHistory.lastFramegenWorkSeqNo != 0
 		&& !g_device.hasCompletedFramegen( g_framegenHistory.lastFramegenWorkSeqNo ) )
 		g_device.waitFramegen( g_framegenHistory.lastFramegenWorkSeqNo );
+	if ( g_framegenHistory.lastBaseIngestSeqNo != 0
+		&& !g_device.hasCompleted( g_framegenHistory.lastBaseIngestSeqNo ) )
+		g_device.wait( g_framegenHistory.lastBaseIngestSeqNo );
 	g_device.framegenGarbageCollect();
 
 	// C2: persist unsaved learning before the state textures go away. The latest
@@ -7276,6 +7439,9 @@ void vulkan_framegen_shutdown()
 	if ( g_framegenHistory.lastFramegenWorkSeqNo != 0
 		&& !g_device.hasCompletedFramegen( g_framegenHistory.lastFramegenWorkSeqNo ) )
 		g_device.waitFramegen( g_framegenHistory.lastFramegenWorkSeqNo );
+	if ( g_framegenHistory.lastBaseIngestSeqNo != 0
+		&& !g_device.hasCompleted( g_framegenHistory.lastBaseIngestSeqNo ) )
+		g_device.wait( g_framegenHistory.lastBaseIngestSeqNo );
 	framegen_net_profile_consume();
 	framegen_net_profile_flush();
 	framegen_color_probe_consume();
@@ -7917,15 +8083,30 @@ static bool framegen_base_record_copy( gamescope::Rc<CVulkanTexture> pBaseFrame,
 	if ( pTarget == nullptr )
 		return false;
 
-	auto pCmdBuffer = g_device.commandBuffer();
-	pCmdBuffer->markFramegen();
+	// pBaseFrame is the CLIENT's imported dma-buf. On the split-family path the
+	// framegen queue lives on a family that must never touch imported images
+	// (that is exactly what the Intel interop quirk is about, and the FOREIGN
+	// acquire barriers only ever transfer ownership to the compositor family),
+	// so record the ingest copy on the composite queue instead. Only the
+	// gamescope-owned baseHistory target is then read cross-family, and that one
+	// is VK_SHARING_MODE_CONCURRENT. The cost is one copy back on the composite
+	// queue; the generation batch itself still runs on the framegen queue.
+	const bool bSplitFamily = g_device.framegenFamilySplit();
+
+	auto pCmdBuffer = g_device.commandBuffer( !bSplitFamily );
+	if ( !bSplitFamily )
+		pCmdBuffer->markFramegen();
 	pCmdBuffer->copyImage( std::move( pBaseFrame ), pTarget );
 	// The real composite carries the client's acquire dependency. Waiting for
 	// its timeline point makes that readiness chain visible to this queue before
 	// it reads the same client image, and also orders the composite's image-state
-	// transitions ahead of the copy.
-	g_framegenHistory.lastFramegenWorkSeqNo =
-		g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo, -1, 0, 0 );
+	// transitions ahead of the copy. On the composite queue that ordering is
+	// implicit (in-order submission on the same queue).
+	if ( bSplitFamily )
+		g_framegenHistory.lastBaseIngestSeqNo = g_device.submit( std::move( pCmdBuffer ) );
+	else
+		g_framegenHistory.lastFramegenWorkSeqNo =
+			g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo, -1, 0, 0 );
 
 	g_framegenHistory.nBaseHistoryNext = nTarget ^ 1u;
 	g_framegenHistory.previousReal = g_framegenHistory.currentReal;
@@ -10427,7 +10608,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// once: the shared motion intermediates are serialized by the per-command-
 	// buffer barrier tracking, all slots share a single framegen seqNo, and the
 	// batch draws from the isolated framegen descriptor ring (see markFramegen).
-	std::unique_ptr<CVulkanCmdBuffer> pCmdBuffer = g_device.commandBuffer();
+	std::unique_ptr<CVulkanCmdBuffer> pCmdBuffer = g_device.commandBuffer( true );
 	pCmdBuffer->markFramegen();
 	const FramegenDispatch_t &dispatch = framegen_dispatch_for_format( g_framegenHistory.drmFormat );
 	const bool bBidir = vulkan_framegen_bidir_active();
