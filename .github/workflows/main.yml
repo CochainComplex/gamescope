@@ -51,6 +51,16 @@ jobs:
             echo 'Machine-specific home path found in a published framegen file.' >&2
             exit 1
           fi
+          # Secret scan over tracked files. Vendored trees are excluded: they are
+          # upstream code we do not author, and their test fixtures trip the
+          # patterns without being our credentials.
+          secret_patterns='glpat-|ghp_|AKIA[0-9A-Z]{16}|PERSONAL_ACCESS_TOKEN=|-----BEGIN (RSA|OPENSSH|EC) PRIVATE KEY-----'
+          if git grep -nIE "$secret_patterns" -- \
+            . ':(exclude)thirdparty/*' ':(exclude)subprojects/*' \
+            ':(exclude)src/reshade/*' ':(exclude).github/workflows/main.yml'; then
+            echo 'Possible secret found in a tracked file.' >&2
+            exit 1
+          fi
       - name: Build with gcc
         run: |
           export CC=gcc CXX=g++

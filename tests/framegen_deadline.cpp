@@ -77,7 +77,7 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	CHECK( text.lines[2].data() == std::string_view{
 		"modes    bidir:off  base:off  net:online  adapt:on" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 118/120" } );
+		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 98%" } );
 	CHECK( text.lines[4].data() == std::string_view{
 		"ladder   learned/motion rung 0/0  full" } );
 	std::string paceLine = "pace     hit 99%  ";
@@ -176,7 +176,7 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	CHECK( text.lines[2].data() == std::string_view{
 		"modes    bidir:off  base:off  net:off  adapt:off" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 118/120" } );
+		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 98%" } );
 	CHECK( text.lines[4].data() == std::string_view{
 		"ladder   learned/motion rung 0/0  full" } );
 }
@@ -196,7 +196,7 @@ TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
 	};
 	FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
 	CHECK( text.lines[3].data() == std::string_view{
-		"rates    source 246fps[1.2k] gen 999fps[56.8k] repeat 0fps fill 999/120" } );
+		"rates    source 246fps[1.2k] gen 999fps[56.8k] repeat 0fps fill 100%" } );
 	CHECK( text.lines[4].data() == std::string_view{
 		"ladder   checked/extrapolate rung 2/4  hold" } );
 

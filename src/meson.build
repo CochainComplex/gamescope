@@ -199,24 +199,39 @@ cc = meson.get_compiler('c')
 compiler_name = cc.get_id()
 compiler_version = cc.version()
 
+# Build id. run_command() only runs at configure time, so a header produced by
+# configure_file() alone keeps reporting the commit that was checked out when
+# meson setup ran - a rebuild after new commits would ship a stale id and the
+# logs would misattribute the evidence. vcs_tag() re-runs the describe command
+# on every build (and only rewrites the header when the string changed), so the
+# id always matches the tree that was compiled. The '+' dirty marker is kept.
 vcs_tag_cmd = ['git', 'describe', '--always', '--tags', '--dirty=+']
-vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
-version_tag = vcs_tag + ' (' + compiler_name + ' ' + compiler_version + ')'
-vcs_sha_cmd = ['git', 'rev-parse', '--short=6', 'HEAD']
-vcs_sha = run_command(vcs_sha_cmd, check: false).stdout().strip()
-if vcs_sha == ''
-  vcs_sha = 'unknown'
+vcs_tag_fallback = run_command(vcs_tag_cmd, check: false).stdout().strip()
+if vcs_tag_fallback == ''
+  vcs_tag_fallback = 'unknown'
 endif
-hud_version = meson.project_version() + '+' + vcs_sha
 
+# Everything that is genuinely fixed at configure time (compiler identity, the
+# project version) is substituted first; '@VCS_TAG@' is deliberately left in
+# place for vcs_tag() to fill in at build time.
 gamescope_version_conf = configuration_data()
-gamescope_version_conf.set('VCS_TAG', version_tag)
-gamescope_version_conf.set('HUD_VERSION', hud_version)
+# Re-emit the token itself so configure_file() does not blank out the
+# placeholder that vcs_tag() is going to fill in at build time.
+gamescope_version_conf.set('VCS_TAG', '@VCS_TAG@')
+gamescope_version_conf.set('COMPILER_TAG', compiler_name + ' ' + compiler_version)
+gamescope_version_conf.set('PROJECT_VERSION', meson.project_version())
 
-gamescope_version = configure_file(
+gamescope_version_template = configure_file(
   input : 'GamescopeVersion.h.in',
-  output : 'GamescopeVersion.h',
+  output : 'GamescopeVersion.h.tmpl',
   configuration : gamescope_version_conf
+)
+
+gamescope_version = vcs_tag(
+  command : vcs_tag_cmd,
+  fallback : vcs_tag_fallback,
+  input : gamescope_version_template,
+  output : 'GamescopeVersion.h',
 )
 
   executable(

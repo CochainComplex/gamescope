@@ -5493,11 +5493,11 @@ struct FramegenMetricsDistribution_t
 		return n != 0 ? std::sqrt( std::max( 0.0,
 			sumSquares / n - average() * average() ) ) : 0.0;
 	}
-	double p95() const
+	double percentile( uint32_t nPercent ) const
 	{
 		if ( n == 0 )
 			return 0.0;
-		const uint64_t nRank = ( n * 95u + 99u ) / 100u;
+		const uint64_t nRank = ( n * nPercent + 99u ) / 100u;
 		uint64_t nSeen = 0;
 		for ( size_t i = 0; i < histogram.size(); i++ )
 		{
@@ -5507,6 +5507,8 @@ struct FramegenMetricsDistribution_t
 		}
 		return 16.0;
 	}
+	double p50() const { return percentile( 50u ); }
+	double p95() const { return percentile( 95u ); }
 };
 
 struct FramegenMetricsWindow_t
@@ -5527,9 +5529,16 @@ struct FramegenMetricsWindow_t
 	// generated commit. Nonzero here means the early-commit lead is too long.
 	uint32_t realWaitDuringGenerated = 0;
 	double deadlineSignedSumMs = 0.0;
+	// Dual-GPU staging traffic: bytes copied from the client's imported (non
+	// device-local) base buffer into a device-local staging image, counted where
+	// the copy is recorded. This is the throughput cost of the cross-GPU route.
+	uint64_t copyBytes = 0;
 	FramegenMetricsDistribution_t flipIntervals;
 	FramegenMetricsDistribution_t deadlineErrors;
 	FramegenMetricsDistribution_t realCommitLeads;
+	// Source-ready -> actual-flip latency of REAL presents: how long a client
+	// frame waited between being acquirable and actually reaching the screen.
+	FramegenMetricsDistribution_t realSourceToFlip;
 };
 
 struct FramegenMetricsPendingEvents_t
@@ -5538,6 +5547,7 @@ struct FramegenMetricsPendingEvents_t
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 	uint64_t resetsRing = 0, resetsChain = 0;
 	uint64_t realWaits = 0;
+	uint64_t copyBytes = 0;
 };
 static FramegenMetricsPendingEvents_t g_framegenMetricsPendingEvents;
 
@@ -5584,6 +5594,7 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	if ( events.realWaits != 0
 		&& window.realWaitDuringGenerated < UINT32_MAX - events.realWaits )
 		window.realWaitDuringGenerated += (uint32_t)events.realWaits;
+	window.copyBytes += events.copyBytes;
 }
 
 static void framegen_metrics_flush_events()
@@ -5593,12 +5604,52 @@ static void framegen_metrics_flush_events()
 	g_framegenMetricsPendingEvents = {};
 }
 
+// Source-ready timestamps of in-flight real frames, keyed by the present tag's
+// real frame id. The tag itself is a backend ABI struct, so the timestamp is
+// carried alongside it here instead. Written from the compositor thread when a
+// real present begins and read when its flip feedback is drained on the same
+// thread; the ring is sized well past the display feedback mailbox depth so a
+// late flip still finds its entry.
+static constexpr size_t k_nFramegenSourceReadyRing = 64;
+struct FramegenSourceReadyEntry_t
+{
+	uint64_t ulRealFrameId = 0;
+	uint64_t ulSourceReadyNs = 0;
+};
+static std::array<FramegenSourceReadyEntry_t, k_nFramegenSourceReadyRing>
+	g_framegenSourceReadyRing;
+
+static void framegen_metrics_note_source_ready( uint64_t ulRealFrameId, uint64_t ulSourceReadyNs )
+{
+	if ( ulRealFrameId == 0 || ulSourceReadyNs == 0 )
+		return;
+	g_framegenSourceReadyRing[ ulRealFrameId % k_nFramegenSourceReadyRing ] =
+		{ ulRealFrameId, ulSourceReadyNs };
+}
+
+static uint64_t framegen_metrics_find_source_ready( uint64_t ulRealFrameId )
+{
+	const FramegenSourceReadyEntry_t &entry =
+		g_framegenSourceReadyRing[ ulRealFrameId % k_nFramegenSourceReadyRing ];
+	return entry.ulRealFrameId == ulRealFrameId ? entry.ulSourceReadyNs : 0u;
+}
+
+// Share of presents that carried fresh content rather than repeating the
+// previous scanout. Same definition as the HUD's "fill NN%".
+static double framegen_metrics_fill_rate( const FramegenMetricsWindow_t &window )
+{
+	const uint64_t ulFresh = window.real + window.delayedReal + window.generated;
+	const uint64_t ulPresented = ulFresh + window.repeats;
+	return ulPresented != 0 ? (double)ulFresh / (double)ulPresented : 0.0;
+}
+
 static void framegen_metrics_log( const char *pszLabel,
 	const FramegenMetricsWindow_t &window )
 {
 	const FramegenMetricsDistribution_t &flip = window.flipIntervals;
 	const FramegenMetricsDistribution_t &deadline = window.deadlineErrors;
 	const FramegenMetricsDistribution_t &lead = window.realCommitLeads;
+	const FramegenMetricsDistribution_t &srcFlip = window.realSourceToFlip;
 	const uint64_t ulVblankIntervalNs =
 		g_framegenPresentState.displayTiming.key.intervalNs;
 	const gamescope::framegen::FixedRefreshPresentLead_t viableLead =
@@ -5615,7 +5666,11 @@ static void framegen_metrics_log( const char *pszLabel,
 		" resets_prov=%" PRIu64 " resets_hitch=%" PRIu64
 		" resets_ring=%" PRIu64 " resets_chain=%" PRIu64
 		" lead_ms_min=%.3f lead_ms_avg=%.3f lead_ms_max=%.3f"
-		" lead_ema=%.3f gen_late=%u lead_viable=%.3f real_wait=%u",
+		" lead_ema=%.3f gen_late=%u lead_viable=%.3f real_wait=%u"
+		// Appended fields. New fields go at the END of this line so existing
+		// log parsers keep working; never reorder the ones above.
+		" fill=%.3f copy_bytes=%" PRIu64 " copy_ms_avg=%.3f copy_ms_max=%.3f"
+		" src_flip_ms_p50=%.3f src_flip_ms_p95=%.3f",
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -5632,7 +5687,15 @@ static void framegen_metrics_log( const char *pszLabel,
 		g_framegenPresentState.displayTiming.presentLead.emaNs / 1.0e6,
 		window.generatedLate,
 		viableLead.ready ? viableLead.leadNs / 1.0e6 : 0.0,
-		window.realWaitDuringGenerated );
+		window.realWaitDuringGenerated,
+		framegen_metrics_fill_rate( window ), window.copyBytes,
+		// The staging copies are recorded into the composite command buffer,
+		// which has no timestamp query-pool ring (only the framegen submission
+		// path does). Measuring them would mean adding a pool plus a completion
+		// harvest to the composite submit path, so the GPU time is reported as
+		// zero rather than estimated: copy_ms_* is "not measured", not "free".
+		0.0, 0.0,
+		srcFlip.p50(), srcFlip.p95() );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
@@ -5679,6 +5742,16 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 		return;
 	if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real )
 	{
+		// Latency of the real frame the client actually produced: from the
+		// moment its buffer was acquirable to the moment it lit up the display.
+		const uint64_t ulSourceReadyNs =
+			framegen_metrics_find_source_ready( feedback.tag.ulRealFrameId );
+		if ( ulSourceReadyNs != 0 && feedback.ulActualFlipNs > ulSourceReadyNs )
+		{
+			const uint64_t ulLatencyNs = feedback.ulActualFlipNs - ulSourceReadyNs;
+			g_framegenMetrics.current.realSourceToFlip.add( ulLatencyNs );
+			g_framegenMetrics.total.realSourceToFlip.add( ulLatencyNs );
+		}
 		gamescope::IBackend *pBackend = GetBackend();
 		if ( pBackend != nullptr && pBackend->OwnsKMSPresentTiming() )
 		{
@@ -5963,6 +6036,12 @@ void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
 	{
 		g_framegenPresentState.pLastBaseTexture = pBaseTexture;
 		g_framegenPresentState.ulLastBaseCommitID = identity.commitId;
+	}
+
+	if ( framegen_metrics_enabled() && pFrameInfo != nullptr && pFrameInfo->layerCount > 0 )
+	{
+		framegen_metrics_note_source_ready( g_framegenPresentState.ulCurrentRealFrameId,
+			pFrameInfo->layers[ 0 ].acquireReadyTimeNs );
 	}
 
 	g_framegenPresentState.pendingTag = {
@@ -12913,6 +12992,13 @@ static bool stage_non_device_local_base_imports( struct FrameInfo_t *pFrameInfo,
 		if ( !pStaging )
 			continue;
 
+		if ( framegen_metrics_enabled() )
+		{
+			// s_DRMVKFormatTable's bpp column is bytes per pixel, not bits.
+			const uint32_t uBytesPerPixel = DRMFormatGetBPP( pStaging->drmFormat() );
+			g_framegenMetricsPendingEvents.copyBytes +=
+				(uint64_t)pStaging->width() * pStaging->height() * uBytesPerPixel;
+		}
 		pCmdBuffer->copyImage( pSource, pStaging );
 		layer.tex = pStaging;
 		*layer.pCommitTexture = std::move( pStaging );

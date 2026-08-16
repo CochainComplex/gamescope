@@ -2,6 +2,6 @@
 
 namespace gamescope
 {
-    static constexpr const char k_szGamescopeVersion[] = "@VCS_TAG@";
-    static constexpr const char k_szGamescopeHudVersion[] = "@HUD_VERSION@";
+    static constexpr const char k_szGamescopeVersion[] = "@VCS_TAG@ (@COMPILER_TAG@)";
+    static constexpr const char k_szGamescopeHudVersion[] = "@PROJECT_VERSION@+@VCS_TAG@";
 }

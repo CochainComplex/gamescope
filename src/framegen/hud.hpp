@@ -317,8 +317,14 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		999u, snapshot.generated / 5u ) );
 	const uint32_t repeatRate = static_cast<uint32_t>( std::min<uint64_t>(
 		999u, snapshot.repeats / 5u ) );
-	const uint32_t fillRate = static_cast<uint32_t>( std::min<uint64_t>(
-		999u, ( snapshot.real + snapshot.delayedReal + snapshot.generated ) / 5u ) );
+	// Fill rate: the share of presents that carried fresh content (real,
+	// delayed-real or generated) rather than a repeat of the previous scanout.
+	// Identical definition to the framegen-metrics "fill=" field so the HUD and
+	// the log can be cross-checked against each other.
+	const uint64_t fresh = snapshot.real + snapshot.delayedReal + snapshot.generated;
+	const uint64_t presented = fresh + snapshot.repeats;
+	const uint32_t fillPercent = presented != 0u
+		? static_cast<uint32_t>( ( fresh * 100u + presented / 2u ) / presented ) : 0u;
 
 	char line[128] = {};
 	std::snprintf( line, sizeof( line ),
@@ -384,9 +390,9 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	framegen_hud_format_steps(
 		generatedSteps, sizeof( generatedSteps ), snapshot.generated );
 	std::snprintf( line, sizeof( line ),
-		"%-8s source %ufps[%s] gen %ufps[%s] repeat %ufps fill %u/%u",
+		"%-8s source %ufps[%s] gen %ufps[%s] repeat %ufps fill %u%%",
 		"rates", gameRate, realSteps, generatedRate, generatedSteps,
-		repeatRate, fillRate, refreshHz );
+		repeatRate, fillPercent );
 	framegen_hud_add_line( result, line );
 
 	char ladderState[24] = {};
