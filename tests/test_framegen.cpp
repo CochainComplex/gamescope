@@ -59,26 +59,26 @@ static void test_degradation_policy()
 
 	for ( const GamescopeFramegenMode mode : modes )
 	{
-		for ( uint32_t q = 0; q <= static_cast<uint32_t>( GamescopeFramegenQuality::Extreme ); q++ )
+		for ( uint32_t q = 0; q <= static_cast<uint32_t>( GamescopeFramegenPipeline::Guided ); q++ )
 		{
-			const auto quality = static_cast<GamescopeFramegenQuality>( q );
+			const auto pipeline = static_cast<GamescopeFramegenPipeline>( q );
 			for ( int multiplier = 2; multiplier <= 4; multiplier++ )
 			{
 				const uint32_t motionRungs = mode == GamescopeFramegenMode::Motion ? q + 1u : 0u;
 				const uint32_t expectedMax = motionRungs + static_cast<uint32_t>( multiplier - 2 );
-				CHECK( max_degrade_steps( mode, quality, multiplier ) == expectedMax );
+				CHECK( max_degrade_steps( mode, pipeline, multiplier ) == expectedMax );
 
 				for ( uint32_t step = 0; step <= expectedMax + 2u; step++ )
 				{
-					const EffectiveConfig config = effective_config( mode, quality, multiplier, step );
-					const uint32_t qualitySteps = mode == GamescopeFramegenMode::Motion
+					const EffectiveConfig config = effective_config( mode, pipeline, multiplier, step );
+					const uint32_t pipelineSteps = mode == GamescopeFramegenMode::Motion
 						? std::min( step, q ) : 0u;
 					const bool fellBack = mode == GamescopeFramegenMode::Motion && step > q;
 					const uint32_t multiplierSteps = step > motionRungs
 						? step - motionRungs : 0u;
 
 					CHECK( config.mode == ( fellBack ? GamescopeFramegenMode::Extrapolate : mode ) );
-					CHECK( config.quality == static_cast<GamescopeFramegenQuality>( q - qualitySteps ) );
+					CHECK( config.pipeline == static_cast<GamescopeFramegenPipeline>( q - pipelineSteps ) );
 					CHECK( config.multiplier == static_cast<uint32_t>(
 						std::max( 2, multiplier - static_cast<int>( multiplierSteps ) ) ) );
 				}
@@ -110,18 +110,18 @@ static void test_learned_net_layout()
 static void test_names()
 {
 	using gamescope::framegen::mode_name;
-	using gamescope::framegen::quality_name;
+	using gamescope::framegen::pipeline_name;
 
 	CHECK( std::string_view( mode_name( GamescopeFramegenMode::Extrapolate ) ) == "extrapolate" );
 	CHECK( std::string_view( mode_name( GamescopeFramegenMode::Blend ) ) == "blend" );
 	CHECK( std::string_view( mode_name( GamescopeFramegenMode::Motion ) ) == "motion" );
 	CHECK( std::string_view( mode_name( static_cast<GamescopeFramegenMode>( 99u ) ) ) == "unknown" );
-	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::Low ) ) == "low" );
-	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::Medium ) ) == "medium" );
-	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::High ) ) == "high" );
-	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::Ultra ) ) == "ultra" );
-	CHECK( std::string_view( quality_name( GamescopeFramegenQuality::Extreme ) ) == "extreme" );
-	CHECK( std::string_view( quality_name( static_cast<GamescopeFramegenQuality>( 99u ) ) ) == "unknown" );
+	CHECK( std::string_view( pipeline_name( GamescopeFramegenPipeline::Warp ) ) == "warp" );
+	CHECK( std::string_view( pipeline_name( GamescopeFramegenPipeline::Checked ) ) == "checked" );
+	CHECK( std::string_view( pipeline_name( GamescopeFramegenPipeline::Learned ) ) == "learned" );
+	CHECK( std::string_view( pipeline_name( GamescopeFramegenPipeline::Predict ) ) == "predict" );
+	CHECK( std::string_view( pipeline_name( GamescopeFramegenPipeline::Guided ) ) == "guided" );
+	CHECK( std::string_view( pipeline_name( static_cast<GamescopeFramegenPipeline>( 99u ) ) ) == "unknown" );
 }
 
 static void test_net_profile_contract()
@@ -621,16 +621,16 @@ static void test_scheduling_policy()
 	CHECK( committed.degradeSteps == 3u );
 	CHECK( committed.holdFrames == k_uDeadlineHoldFrames );
 
-	const EffectiveConfig motionHigh = {
-		GamescopeFramegenMode::Motion, 4u, GamescopeFramegenQuality::High };
-	const EffectiveConfig motionMedium = {
-		GamescopeFramegenMode::Motion, 4u, GamescopeFramegenQuality::Medium };
+	const EffectiveConfig motionLearned = {
+		GamescopeFramegenMode::Motion, 4u, GamescopeFramegenPipeline::Learned };
+	const EffectiveConfig motionChecked = {
+		GamescopeFramegenMode::Motion, 4u, GamescopeFramegenPipeline::Checked };
 	const EffectiveConfig extrapolate4 = {
-		GamescopeFramegenMode::Extrapolate, 4u, GamescopeFramegenQuality::Low };
+		GamescopeFramegenMode::Extrapolate, 4u, GamescopeFramegenPipeline::Warp };
 	const EffectiveConfig extrapolate3 = {
-		GamescopeFramegenMode::Extrapolate, 3u, GamescopeFramegenQuality::Low };
-	CHECK( degradation_reduces_work( motionHigh, motionMedium, 3u, 3u ) );
-	CHECK( degradation_reduces_work( motionMedium, extrapolate4, 3u, 3u ) );
+		GamescopeFramegenMode::Extrapolate, 3u, GamescopeFramegenPipeline::Warp };
+	CHECK( degradation_reduces_work( motionLearned, motionChecked, 3u, 3u ) );
+	CHECK( degradation_reduces_work( motionChecked, extrapolate4, 3u, 3u ) );
 	CHECK( degradation_reduces_work( extrapolate4, extrapolate3, 3u, 2u ) );
 	CHECK( !degradation_reduces_work( extrapolate4, extrapolate3, 1u, 1u ) );
 }

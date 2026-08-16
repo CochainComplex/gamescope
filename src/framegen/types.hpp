@@ -12,27 +12,25 @@ enum class GamescopeFramegenMode : uint32_t
 	Blend,
 	// Motion-compensated: estimate per-block motion between the last two real
 	// frames (luma pyramid + block matching) and reproject along it, falling
-	// back to extrapolation where matching is unconfident. Higher quality on
+	// back to extrapolation where matching is unconfident. Better reconstruction on
 	// panning/scrolling motion at a higher compute cost.
 	Motion,
 };
 
-enum class GamescopeFramegenQuality : uint32_t
+enum class GamescopeFramegenPipeline : uint32_t
 {
-	// Forward hierarchical matching only. No reverse consistency, adaptation,
-	// learned refinement, or temporal acceleration.
-	Low,
+	// Forward hierarchical matcher plus constant-velocity warp only.
+	Warp,
 	// Add reverse-field consistency and the full-resolution agreement test.
-	Medium,
+	Checked,
 	// Add self-supervised adaptation and permit learned field refinement.
-	// This preserves the behavior that predates explicit quality tiers.
-	High,
+	Learned,
 	// Add confidence-gated temporal acceleration from the preceding checked
 	// field.
-	Ultra,
-	// Add full-resolution, color-guided reconstruction of the low-resolution
-	// field at motion boundaries. This is the most expensive causal path.
-	Extreme,
+	Predict,
+	// Add full-resolution color-guided reconstruction, the three-frame
+	// disocclusion reservoir, and the shading-persistence head.
+	Guided,
 };
 
 namespace gamescope::framegen
@@ -53,20 +51,20 @@ namespace gamescope::framegen
 	}
 }
 
-[[nodiscard]] constexpr const char *quality_name( GamescopeFramegenQuality quality )
+[[nodiscard]] constexpr const char *pipeline_name( GamescopeFramegenPipeline pipeline )
 {
-	switch ( quality )
+	switch ( pipeline )
 	{
-		case GamescopeFramegenQuality::Low:
-			return "low";
-		case GamescopeFramegenQuality::Medium:
-			return "medium";
-		case GamescopeFramegenQuality::High:
-			return "high";
-		case GamescopeFramegenQuality::Ultra:
-			return "ultra";
-		case GamescopeFramegenQuality::Extreme:
-			return "extreme";
+		case GamescopeFramegenPipeline::Warp:
+			return "warp";
+		case GamescopeFramegenPipeline::Checked:
+			return "checked";
+		case GamescopeFramegenPipeline::Learned:
+			return "learned";
+		case GamescopeFramegenPipeline::Predict:
+			return "predict";
+		case GamescopeFramegenPipeline::Guided:
+			return "guided";
 		default:
 			return "unknown";
 	}

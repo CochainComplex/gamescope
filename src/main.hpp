@@ -83,7 +83,7 @@ extern bool g_bFramegenDebug;
 extern uint32_t g_uFramegenDebugEvery;
 extern int g_nFramegenMultiplier;
 extern GamescopeFramegenMode g_eFramegenMode;
-extern GamescopeFramegenQuality g_eFramegenQuality;
+extern GamescopeFramegenPipeline g_eFramegenPipeline;
 extern float g_flFramegenStrength;
 
 bool FramegenDebugShouldLog( uint64_t &counter );

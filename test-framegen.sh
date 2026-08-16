@@ -18,7 +18,7 @@
 #   LIMIT=2            game fps = REFRESH / LIMIT (the gap framegen fills; 2 => x2)
 #   DEBUG_EVERY=1      log every Nth framegen event (1 = exact counts, higher = less spam)
 #   DURATION=          seconds to auto-stop a 'run' (empty = until you close the window)
-#   QUALITY=high       motion tier: low | medium | high | ultra | extreme
+#   PIPELINE=warp      motion pipeline: warp | checked | learned | predict | guided
 #
 # Examples:
 #   ./test-framegen.sh bench amd
@@ -92,12 +92,12 @@ cmd_gpus() {
 
 cmd_bench() {
     require_binary
-    local id quality="${QUALITY:-high}"; id=$(resolve_gpu "${1:-auto}")
-    case "$quality" in low|medium|high|ultra|extreme) ;; *) echo "error: QUALITY must be low|medium|high|ultra|extreme" >&2; exit 1 ;; esac
+    local id pipeline="${PIPELINE:-warp}"; id=$(resolve_gpu "${1:-auto}")
+    case "$pipeline" in warp|checked|learned|predict|guided) ;; *) echo "error: PIPELINE must be warp|checked|learned|predict|guided" >&2; exit 1 ;; esac
     echo "# framegen GPU microbenchmark — device $id"
-    echo "# quality=$quality (compare extrapolate variants and the selected motion pipeline)"
+    echo "# pipeline=$pipeline (compare extrapolate variants and the selected motion pipeline)"
     GAMESCOPE_FRAMEGEN_BENCHMARK=1 "$BIN" --backend headless --prefer-vk-device "$id" \
-        --framegen-quality "$quality" -- true 2>/dev/null
+        --framegen-pipeline "$pipeline" -- true 2>/dev/null
 }
 
 summarize() {
@@ -158,10 +158,10 @@ cmd_run() {
     printf -v app '%q ' "${app_cmd[@]}"
     app="${app% }"
     read -r w h < <(res_to_dims "$res")
-    local refresh="${REFRESH:-144}" limit="${LIMIT:-2}" every="${DEBUG_EVERY:-1}" quality="${QUALITY:-high}"
+    local refresh="${REFRESH:-144}" limit="${LIMIT:-2}" every="${DEBUG_EVERY:-1}" pipeline="${PIPELINE:-warp}"
 
     case "$mode" in extrapolate|motion|blend) ;; *) echo "error: mode must be extrapolate|motion|blend" >&2; exit 1 ;; esac
-    case "$quality" in low|medium|high|ultra|extreme) ;; *) echo "error: QUALITY must be low|medium|high|ultra|extreme" >&2; exit 1 ;; esac
+    case "$pipeline" in warp|checked|learned|predict|guided) ;; *) echo "error: PIPELINE must be warp|checked|learned|predict|guided" >&2; exit 1 ;; esac
     [[ "$refresh" =~ ^[1-9][0-9]*$ ]] || { echo "error: REFRESH must be a positive integer" >&2; return 1; }
     [[ "$limit" =~ ^[1-9][0-9]*$ ]] || { echo "error: LIMIT must be a positive integer" >&2; return 1; }
     [[ "$every" =~ ^[1-9][0-9]*$ ]] || { echo "error: DEBUG_EVERY must be a positive integer" >&2; return 1; }
@@ -173,7 +173,7 @@ cmd_run() {
     fi
 
     local log; log="$(mktemp -t framegen-run.XXXXXX.log)"
-    echo "# device=$id  mode=$mode/$quality  res=${w}x${h}  refresh=${refresh}  game=~$((refresh/limit))fps  app=$app"
+    echo "# device=$id  mode=$mode/$pipeline  res=${w}x${h}  refresh=${refresh}  game=~$((refresh/limit))fps  app=$app"
     echo "# log: $log"
     echo "# close the gamescope window (or Ctrl+C) to stop and see the summary."
     [[ -n "${DURATION:-}" ]] && echo "# auto-stop after ${DURATION}s"
@@ -182,7 +182,7 @@ cmd_run() {
     local -a cmd=(
         "$BIN" --backend wayland --prefer-vk-device "$id"
         -W "$w" -H "$h" -r "$refresh" --framerate-limit "$limit"
-        --experimental-framegen --framegen-mode "$mode" --framegen-quality "$quality" --framegen-strength 0.5
+        --experimental-framegen --framegen-mode "$mode" --framegen-pipeline "$pipeline" --framegen-strength 0.5
         --framegen-debug -- "${app_cmd[@]}"
     )
 

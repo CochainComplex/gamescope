@@ -446,7 +446,7 @@ struct DeadlineMissEvaluation_t
 }
 
 // One isolated present miss is an honest skipped decision, not proof that the
-// selected quality rung is too expensive. A mature cost which cannot fit the
+// selected pipeline rung is too expensive. A mature cost which cannot fit the
 // full slot is direct capacity evidence; otherwise require two misses in the
 // small rolling window. Hitch-tagged misses are excluded from both verdict and
 // history because the display learner has already classified their cause.
@@ -601,7 +601,7 @@ evaluate_deadline_miss_hysteresis(
 	uint32_t currentGeneratedCount, uint32_t nextGeneratedCount )
 {
 	return next.mode != current.mode
-		|| next.quality != current.quality
+		|| next.pipeline != current.pipeline
 		|| nextGeneratedCount < currentGeneratedCount;
 }
 

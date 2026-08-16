@@ -11,7 +11,7 @@ symbols below.
 | Area | Primary source | Ownership |
 |---|---|---|
 | CLI and environment | `src/main.cpp` | parsing, validation, debug controls |
-| Framegen types and quality policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/quality vocabulary and pure degradation-ladder resolution |
+| Framegen types and pipeline policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/pipeline vocabulary and pure degradation-ladder resolution |
 | Temporal, scheduling, and dispatch policy | `src/framegen/temporal.hpp`, `src/framegen/scheduling.hpp`, `src/framegen/dispatch_policy.hpp` | pure phase math, cadence/deadline planning, and capability-to-strategy selection |
 | Self-supervised adaptation policy | `src/framegen/adaptation.hpp` | B4 counter decoding, EMA state, and next-batch threshold derivation |
 | Numeric and setting contracts | `src/framegen/numeric.hpp`, `src/framegen/settings.hpp` | fast-math-safe fp32 classification and strict scalar/path parsing |
@@ -97,8 +97,8 @@ or ownership bugs.
 - A motion-field vector is **displacement over one observed real-frame
   interval**, in field texels. It is not pixels per second and not a normalized
   velocity.
-- Ultra/Extreme acceleration compares consecutive displacement fields only when
-  frame IDs, quality, mode, and timestamps are consecutive. The preceding field
+- Predict/Guided acceleration compares consecutive displacement fields only when
+  frame IDs, pipeline, mode, and timestamps are consecutive. The preceding field
   is normalized by `currentDt / historyDt`; the irregular-sample quadratic term
   uses `currentDt / (currentDt + historyDt)`. Missing timestamps or an excessive
   interval ratio disables acceleration instead of guessing.
@@ -123,9 +123,9 @@ or ownership bugs.
   fallback trajectory.
 - Conservative bidirectional ML cannot change checked geometry, raise
   confidence, or emit causal shading focus. Its authority is a confidence veto.
-- Lower quality tiers must stay independently usable. Features added to Ultra or
-  Extreme must not allocate, dispatch, or change results in Low through High
-  unless that cross-tier change is deliberate and separately validated.
+- Cheaper pipelines must stay independently usable. Features added to Predict or
+  Guided must not allocate, dispatch, or change results in Warp through Learned
+  unless that cross-pipeline change is deliberate and separately validated.
 - A scene cut, focus change, layer/EOTF change, long gap, resource shape change,
   or base/output-space transition invalidates incompatible history. The first
   real frame after invalidation primes history and does not generate.
@@ -207,7 +207,7 @@ different protocol supplies explicit per-use completion tokens.
 The finalized motion field is reusable only when all identity keys match:
 
 - current real-frame ID;
-- motion quality tier;
+- motion pipeline;
 - causal versus bidirectional mode;
 - required forward and reverse field availability.
 
@@ -295,7 +295,7 @@ GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
   ninja -C build-perf
 GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
   meson test -C build-perf --print-errorlogs
-GAMESCOPE_BUILD_DIR=build-perf QUALITY=extreme \
+GAMESCOPE_BUILD_DIR=build-perf PIPELINE=guided \
   ./test-framegen.sh bench vendor:device
 ```
 

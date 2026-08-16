@@ -43,7 +43,7 @@ fact*:
 Neither path *knows how long generation actually takes*. They infer overrun
 from a boolean "did it finish yet". Consequences:
 
-- **No graceful middle.** The system is binary: full-quality generation, or
+- **No graceful middle.** The system is binary: the full generation pipeline, or
   dormant. There is no "the compositing GPU is 80% loaded, drop from motion
   mode to extrapolate" step. On an iGPU sharing memory bandwidth with the
   compositor, or a second GPU that is itself lightly used for other work, this
@@ -62,7 +62,7 @@ from a boolean "did it finish yet". Consequences:
   measurement of how much slack there is.
 
 The upgrade: **measure actual generation GPU time with timestamp queries, and
-preemptively step quality/rate down (or up) before deadlines are missed.**
+preemptively step pipeline/rate down (or up) before deadlines are missed.**
 Replace bang-bang with a ladder + a control loop driven by measured cost vs.
 the known vblank budget.
 
@@ -421,7 +421,7 @@ encodes this as the rung thresholds.
 | Query pool tied to resize/format resources | Lifetime bugs or unnecessary churn | Keep the query pool at device/process lifetime. Resize and format resets clear scene associations and costs but do not destroy or recreate the pool. |
 | Motion-mode per-stage stamps inflate query count | Pool sizing | The implementation records only one opening and closing timestamp per full batch; attribution is by `(rung, generated-count)`. |
 | `calibrated_timestamps` drift between recalibrations | Slack miscomputed | The implemented policy does not use calibrated timestamps; it compares queue-family GPU duration to the conservative interval budget. |
-| A background load spike invalidates the selected rung | Wasted generation or a repeated scanout | The non-blocking late-discard path bounds the effect. One isolated miss is skipped; two misses inside the short rolling window, or mature proof that the rung exceeds slot capacity, can reduce quality. Hitch-classified misses never degrade, and any failed recovery probe lengthens the next re-probe interval. |
+| A background load spike invalidates the selected rung | Wasted generation or a repeated scanout | The non-blocking late-discard path bounds the effect. One isolated miss is skipped; two misses inside the short rolling window, or mature proof that the rung exceeds slot capacity, can select a cheaper pipeline. Hitch-classified misses never degrade, and any failed recovery probe lengthens the next re-probe interval. |
 
 ---
 

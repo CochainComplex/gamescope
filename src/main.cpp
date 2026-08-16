@@ -141,7 +141,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "experimental-framegen", no_argument, nullptr, 0 },
 	{ "framegen-multiplier", required_argument, nullptr, 0 },
 	{ "framegen-mode", required_argument, nullptr, 0 },
-	{ "framegen-quality", required_argument, nullptr, 0 },
+	{ "framegen-pipeline", required_argument, nullptr, 0 },
 	{ "framegen-strength", required_argument, nullptr, 0 },
 	{ "framegen-debug", no_argument, nullptr, 0 },
 	{ "composite-debug", no_argument, nullptr, 0 },
@@ -277,7 +277,9 @@ const char usage[] =
 	"  --framegen-multiplier 2        generated-frame multiplier (2, 3 or 4); actual count adapts to the frame gap\n"
 	"  --framegen-mode MODE           generated-frame algorithm: 'extrapolate' (default, low latency),\n"
 	"                                 'motion' (motion-compensated, higher quality/cost) or 'blend' (debug)\n"
-	"  --framegen-quality LEVEL       motion quality/cost ceiling: 'low', 'medium', 'high' (default), 'ultra', or 'extreme'\n"
+	"  --framegen-pipeline NAME       generation pipeline: 'warp' (default), 'checked', 'learned', 'predict', 'guided'\n"
+	"                                 each adds passes and cost; 'checked' is the recommended step up;\n"
+	"                                 the last three are experimental and can smear\n"
 	"  --framegen-strength 0.5        extrapolation step for 'extrapolate'/'motion' modes (0.0-1.0); lower reduces ghosting\n"
 	"  --framegen-debug               log framegen history, dispatch, and present cadence\n"
 	"  --composite-debug              draw frame markers on alternating corners of the screen when compositing\n"
@@ -353,7 +355,7 @@ bool g_bFramegenDebug = false;
 uint32_t g_uFramegenDebugEvery = 60;
 int g_nFramegenMultiplier = 2;
 GamescopeFramegenMode g_eFramegenMode = GamescopeFramegenMode::Extrapolate;
-GamescopeFramegenQuality g_eFramegenQuality = GamescopeFramegenQuality::High;
+GamescopeFramegenPipeline g_eFramegenPipeline = GamescopeFramegenPipeline::Warp;
 float g_flFramegenStrength = 0.5f;
 
 pthread_t g_mainThread;
@@ -875,20 +877,20 @@ int main(int argc, char **argv)
 						fprintf( stderr, "gamescope: --framegen-mode must be 'extrapolate', 'motion' or 'blend'\n" );
 						return 1;
 					}
-				} else if (strcmp(opt_name, "framegen-quality") == 0) {
-					if ( strcmp( optarg, "low" ) == 0 )
-						g_eFramegenQuality = GamescopeFramegenQuality::Low;
-					else if ( strcmp( optarg, "medium" ) == 0 )
-						g_eFramegenQuality = GamescopeFramegenQuality::Medium;
-					else if ( strcmp( optarg, "high" ) == 0 )
-						g_eFramegenQuality = GamescopeFramegenQuality::High;
-					else if ( strcmp( optarg, "ultra" ) == 0 )
-						g_eFramegenQuality = GamescopeFramegenQuality::Ultra;
-					else if ( strcmp( optarg, "extreme" ) == 0 )
-						g_eFramegenQuality = GamescopeFramegenQuality::Extreme;
+				} else if (strcmp(opt_name, "framegen-pipeline") == 0) {
+					if ( strcmp( optarg, "warp" ) == 0 )
+						g_eFramegenPipeline = GamescopeFramegenPipeline::Warp;
+					else if ( strcmp( optarg, "checked" ) == 0 )
+						g_eFramegenPipeline = GamescopeFramegenPipeline::Checked;
+					else if ( strcmp( optarg, "learned" ) == 0 )
+						g_eFramegenPipeline = GamescopeFramegenPipeline::Learned;
+					else if ( strcmp( optarg, "predict" ) == 0 )
+						g_eFramegenPipeline = GamescopeFramegenPipeline::Predict;
+					else if ( strcmp( optarg, "guided" ) == 0 )
+						g_eFramegenPipeline = GamescopeFramegenPipeline::Guided;
 					else
 					{
-						fprintf( stderr, "gamescope: --framegen-quality must be 'low', 'medium', 'high', 'ultra' or 'extreme'\n" );
+						fprintf( stderr, "gamescope: --framegen-pipeline must be 'warp', 'checked', 'learned', 'predict' or 'guided'\n" );
 						return 1;
 					}
 				} else if (strcmp(opt_name, "framegen-strength") == 0) {

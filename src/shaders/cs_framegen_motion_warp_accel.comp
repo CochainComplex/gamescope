@@ -5,10 +5,10 @@
 
 #include "descriptor_set.h"
 
-// Ultra/Extreme causal motion warp. In addition to the current checked field,
+// Predict/Guided causal motion warp. In addition to the current checked field,
 // it reads the preceding interval's final field and reprojects that field to
 // the current content position. Their difference is a constant-acceleration
-// estimate; Extreme also reconstructs per-pixel motion-layer ownership. No
+// estimate; Guided also reconstructs per-pixel motion-layer ownership. No
 // future frame, application motion vector, optical-flow API, or vendor
 // extension is required.
 layout(
@@ -27,7 +27,7 @@ uniform motion_accel_t {
     // Component-wise acceleration cap in field texels per real interval^2.
     float u_accelMax;
     float u_historyValid;
-    // Extreme tier: reconstruct a full-resolution motion-layer verdict from
+    // Guided pipeline: reconstruct a full-resolution motion-layer verdict from
     // the four low-resolution field texels covering this output pixel.
     float u_guidedReconstruction;
     // Low-resolution real-frame luma from two intervals ago is available and
@@ -45,7 +45,7 @@ uniform motion_accel_t {
 
 // s_samplers[0] = previousReal, [1] = currentReal,
 // [2] = current final motion field, [3] = preceding final motion field,
-// [4] = real-frame luma from two intervals ago (Extreme reservoir),
+// [4] = real-frame luma from two intervals ago (Guided reservoir),
 // [5] = learned low-resolution shading-persistence focus.
 
 float colorError(vec3 a, vec3 b) {
@@ -110,7 +110,7 @@ vec4 reconstructField(vec2 uv, vec3 currentFrame, vec2 invOutSize) {
 // flow. This is temporal nearest-neighbour association, not another velocity
 // estimate: the quadratic predictor below remains bounded and confidence
 // gated. It prevents a bilinear old foreground/background mixture from being
-// mistaken for acceleration at precisely the edges Extreme is repairing.
+// mistaken for acceleration at precisely the edges Guided is repairing.
 vec4 coherentHistoryField(vec2 uv, vec2 currentFlow) {
     if (u_guidedReconstruction < 0.5f)
         return texture(s_samplers[3], uv);
@@ -362,7 +362,7 @@ void main() {
     predictedMotion = mix(predictedMotion, reservoirColor, reservoirTrust);
     conf = max(conf, reservoirTrust);
 
-    // Same bounded pixel-space fallback as every lower motion tier.
+    // Same bounded pixel-space fallback as every cheaper motion pipeline.
     vec3 delta = currentFrame - previousFrame;
     float motion = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
     float strength = u_strength * (1.0f - smoothstep(u_suppressLo, u_suppressHi, motion));

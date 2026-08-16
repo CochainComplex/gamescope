@@ -249,7 +249,7 @@ void CVulkanDevice::framegenGarbageCollect()
 			const uint64_t ulGpuNs = (uint64_t)( double( ulGpuTicks ) * m_flFramegenTimestampPeriodNs );
 			m_ulFramegenLastRawGpuTimeNs = ulGpuNs;
 			// Fold into this exact batch shape with a symmetric slow EMA (7/8).
-			// A single anomalous batch must not shed quality for the whole scene,
+			// A single anomalous batch must not shed pipeline passes for the whole scene,
 			// and x2-like gaps must not inherit x4-like batch timings.
 			uint64_t &ulRungCost = m_aFramegenRungCostNs[ nRung ][ nGeneratedCount ];
 			ulRungCost = ( ulRungCost == 0 ) ? ulGpuNs : ( ulRungCost * 7 + ulGpuNs ) / 8;

@@ -6,28 +6,28 @@ honest list of what doesn't work yet.
 
 > **Heads-up:** this is **experimental** and specific to this fork (it is not in
 > upstream gamescope). Expect visual glitches and occasional crashes; retry with
-> a lower quality tier or simpler mode when a workload is unstable.
+> a cheaper pipeline or simpler mode when a workload is unstable.
 
 ## Recommended settings (start with these)
 
 For a first real game test, start with the zero-added-frame-latency causal path:
 
 ```bash
-GAMESCOPE_FRAMEGEN_HUD=2 GAMESCOPE_FRAMEGEN_NET_ONLINE=1 GAMESCOPE_FRAMEGEN_NET_PROFILE=~/.cache/gamescope-fg-mygame.bin gamescope --expose-wayland --backend wayland --prefer-vk-device <present vendor:device> -W 2560 -H 1440 -r 120 -f --experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-quality high -- env MESA_VK_DEVICE_SELECT='<render vendor:device>!' <game>
+GAMESCOPE_FRAMEGEN_HUD=2 gamescope --expose-wayland --backend wayland --prefer-vk-device <present vendor:device> -W 2560 -H 1440 -r 120 -f --experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline checked -- env MESA_VK_DEVICE_SELECT='<render vendor:device>!' <game>
 ```
 
-- Use `--framegen-mode motion`, `--framegen-multiplier 2`, `--framegen-quality high`; try multiplier `3` only if the present GPU has headroom. Measured 2026-08-15 on the POC laptop with a real Proton game running single-GPU on the AMD 890M (game, generation and scanout on one iGPU); the dual-GPU re-baseline is pending.
-- Raise quality to `ultra` or `extreme` only while the HUD `ladder` row stays full; the ladder auto-degrades and now auto-recovers.
-- Keep `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`; adaptation is on by default at `high` and above.
+- `warp` is the cheapest default. Use `--framegen-mode motion`, `--framegen-multiplier 2`, and the recommended step-up `--framegen-pipeline checked`; try multiplier `3` only if the present GPU has headroom. Measured 2026-08-15 on the POC laptop with a real Proton game running single-GPU on the AMD 890M (game, generation and scanout on one iGPU); the dual-GPU re-baseline is pending.
+- `learned`, `predict`, and `guided` are experimental pipelines that add passes and can smear more; the ladder auto-degrades and now auto-recovers.
+- When testing `learned` or later, use `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`.
 - On an iGPU-class present GPU (e.g. an 890M) set `GAMESCOPE_FRAMEGEN_NET_EVERY=2` (train every 2nd frame): pacing stays equal and it played best in our real-game test; `1` on a desktop card.
-- Tune with `GAMESCOPE_FRAMEGEN_HUD=2`: `rates` shows source/generated fps, `ladder` shows effective tier/recovery, and `pace` shows hit-rate/jitter sparklines. Add `GAMESCOPE_FRAMEGEN_METRICS=1` for a log summary.
+- Tune with `GAMESCOPE_FRAMEGEN_HUD=2`: `rates` shows source/generated fps, `ladder` shows effective pipeline/recovery, and `pace` shows hit-rate/jitter sparklines. Add `GAMESCOPE_FRAMEGEN_METRICS=1` for a log summary.
 - Use `GAMESCOPE_FRAMEGEN_BIDIR=1` only when latency does not matter, such as video-like content or benchmarks. It delays every real frame by one interval and felt clearly laggy in play.
 - Nested Wayland is fine for trying it, but heavy scenes make the desktop compositor compete for the present GPU. Native/DRM from a VT, or running as the session compositor, is the real test. x3/x4 only helps when source fps is at most refresh/3; otherwise the scheduler goes dormant.
 
 ## Preferred visual baseline: GravityMark x4
 
 This is the accepted, most visually appealing GravityMark configuration from
-live testing: Motion Extreme, three generated frames per real frame,
+live testing: Motion Guided, three generated frames per real frame,
 bidirectional presentation, strength `0.5`, and the frozen learned profile. It
 prioritizes visual smoothness and quality; bidirectional mode adds one real-frame
 interval of latency, so this is not the competitive-latency preset.
@@ -60,7 +60,7 @@ gamescope --expose-wayland --backend wayland \
   --experimental-framegen \
   --framegen-mode motion \
   --framegen-multiplier 4 \
-  --framegen-quality extreme \
+  --framegen-pipeline guided \
   --framegen-strength 0.5 \
   --framegen-debug \
   -- env -C "$GRAVITYMARK_DIR" MESA_VK_DEVICE_SELECT="$RENDER_DEV" \
@@ -69,7 +69,7 @@ gamescope --expose-wayland --backend wayland \
 ```
 
 The frozen command is repeatable and cannot modify the accepted profile.
-Reservoir and shading remain enabled for the complete Extreme configuration,
+Reservoir and shading remain enabled for the complete Guided configuration,
 although their causal passes are not scheduled while bidirectional mode is
 active.
 
@@ -149,7 +149,7 @@ gamescope --expose-wayland --backend wayland \
   --experimental-framegen \
   --framegen-mode motion \
   --framegen-multiplier 4 \
-  --framegen-quality extreme \
+  --framegen-pipeline guided \
   --framegen-strength 0.5 \
   --framegen-debug \
   -- env -C "$GRAVITYMARK_DIR" MESA_VK_DEVICE_SELECT="$RENDER_DEV" \
@@ -342,7 +342,7 @@ the default. Legend:
 
 | Term | Meaning |
 |---|---|
-| `motion x2 quality:high` | active mode, frame multiplier, quality tier |
+| `motion x2 . learned . 120Hz fixed` | active mode, frame multiplier, pipeline, refresh, and display mode |
 | `120Hz fixed` / `120Hz VRR` | display refresh and whether VRR is actually driving it |
 | `present:` | the GPU that generates and drives the display |
 | `render` | vendor of the client dma-buf from its DRM modifier; linear staged buffers show the single other Vulkan device name when known, otherwise other-GPU; linear local buffers show present-GPU |
@@ -354,7 +354,7 @@ the default. Legend:
 | `adapt` | self-supervised adaptation grading each prediction against reality |
 | `requested(OFF)` | you set the env var but the mode is NOT running — check the terminal for why (fallback or incompatible combination) |
 | `source 40fps[200] gen 78fps[390] repeat 2fps fill 118/120` | source/game and generated frame rates with cumulative counts, repeated slots, and display slots filled |
-| `ladder high/motion rung 0/4 full` | effective quality/mode, current degradation rung, and recovery state |
+| `ladder learned/motion rung 0/4 full` | effective pipeline/mode, current degradation rung, and recovery state |
 | `gen / repeat` | compositor-generated frames per second / refresh slots that showed a repeat |
 | `pace: 99% on-target ±0.7ms` | share of generated frames flipped within half a refresh of their planned time, and the flip-time spread (jitter) |
 | `bias` | learned display-chain delay the scheduler compensates automatically |
@@ -378,29 +378,29 @@ look a little juddery.
 
 ### b) Motion — the recommended everyday mode
 ```
---experimental-framegen --framegen-mode motion --framegen-quality high --framegen-multiplier 2
+--experimental-framegen --framegen-mode motion --framegen-pipeline checked --framegen-multiplier 2
 ```
-Tracks how things move for sharper, cleaner extra frames. Extra quality helpers
-(consistency checks + self-tuning) are **on automatically**. Good default.
+Tracks how things move for sharper, cleaner extra frames. The recommended
+`checked` pipeline adds consistency and agreement checks.
 
 Choose the cost explicitly for the display/framegen GPU:
 
-| Quality | Work enabled | Best fit |
+| Pipeline | Work enabled | Best fit |
 |---------|--------------|----------|
-| `low` | forward motion match only | older or bandwidth-limited GPUs |
-| `medium` | + reverse consistency and edge agreement | balanced quality/cost |
-| `high` | + self-tuning; optional AI | recommended default |
-| `ultra` | + bounded acceleration prediction from the preceding checked field | fast present GPUs |
-| `extreme` | + color-guided motion-layer reconstruction and a three-real-frame disocclusion resolver | idle second GPU, maximum forward quality |
+| `warp` | forward motion match only | cheapest default; older or bandwidth-limited GPUs |
+| `checked` | + reverse consistency and edge agreement | recommended step up |
+| `learned` | + self-tuning; optional AI | experimental; can smear |
+| `predict` | + bounded acceleration prediction from the preceding checked field | experimental; can smear |
+| `guided` | + color-guided motion-layer reconstruction and a three-real-frame disocclusion resolver | experimental; most passes and cost, can smear |
 
-Gamescope automatically walks downward through these levels if measured GPU
+Gamescope automatically walks downward through these pipelines if measured GPU
 time misses the display deadline. It recovers one adjacent level only after
 sustained measured headroom; native fixed-refresh recovery uses the whole
 generation slot's capacity, so a decision that merely arrived late within the
 slot does not erase the recovery streak. One isolated deadline miss skips a
-slot without lowering quality, while repeated misses or a mature cost that
+slot without dropping a pipeline rung, while repeated misses or a mature cost that
 cannot fit the slot can degrade. Loading-hitch episodes do not degrade.
-The Extreme disocclusion search is on by default and never affects lower tiers;
+The Guided disocclusion search is on by default and never affects cheaper pipelines;
 set `GAMESCOPE_FRAMEGEN_RESERVOIR=0` only for live A/B attribution.
 
 ### c) Bidirectional — the smoothest motion
@@ -414,7 +414,7 @@ GAMESCOPE_FRAMEGEN_BIDIR=1 gamescope --prefer-vk-device "$PRESENT_DEV" …
 Blends *between* two real frames instead of guessing ahead — the smoothest
 result and the best with see-through effects (smoke, glass). **Trade-off: adds
 about one frame of lag**, so avoid it for fast/competitive shooters. Great for
-single-player, racing, scenery. Extreme's causal acceleration, guided
+single-player, racing, scenery. Guided's causal acceleration, guided
 reconstruction, disocclusion reservoir and shading-persistence correction do
 not run in this mode; bidirectional interpolation uses two checked endpoint
 fields instead. Bidir phases are timestamp-exact since the deadline timeline.
@@ -424,7 +424,7 @@ of dissolving into the unwarped crossfade. It changes neither motion fields nor
 queue/flip timing, and defaults to `0` because the measured spatial gain is small
 and still needs broad live validation.
 
-`GAMESCOPE_FRAMEGEN_BIDIR_TRACE=0.5` is an Extreme-only quality candidate for
+`GAMESCOPE_FRAMEGEN_BIDIR_TRACE=0.5` is a Guided-only reconstruction candidate for
 fast camera motion. It takes one additional, symmetric fixed-point sample of
 each endpoint field and accepts it only when the two paths close, both endpoint
 confidences support it, and neither path leaves the image. Across three
@@ -458,10 +458,10 @@ ignores bidirectional mode.
 ### f) AI refiner (most experimental)
 ```bash
 GAMESCOPE_FRAMEGEN_NET_ONLINE=1 gamescope --prefer-vk-device "$PRESENT_DEV" \
-  --experimental-framegen --framegen-mode motion --framegen-quality extreme …
+  --experimental-framegen --framegen-mode motion --framegen-pipeline guided …
 ```
 A tiny neural net cleans up the motion and **learns your game as you play**.
-It works with zero-latency forward prediction; at Extreme it also learns a
+It works with zero-latency forward prediction; at Guided it also learns a
 three-frame-validated focus mask for tightly bounded shadow/reflection/specular
 color trends. `GAMESCOPE_FRAMEGEN_SHADING=0` disables only that color-trend
 head for A/B. In bidirectional mode, ML is intentionally conservative: it keeps
@@ -482,13 +482,13 @@ before use (`scripts/framegen-net-train.py` then `scripts/framegen-net-eval.py`)
 
 | You want… | Use |
 |-----------|-----|
-| Just try it, keep it simple | **Motion high, x2** (b) |
-| Weak display/framegen GPU | **Motion low or medium, x2** |
+| Just try it, keep it simple | **Motion checked, x2** (b) |
+| Weak display/framegen GPU | **Motion warp, x2** |
 | The smoothest single-player experience | **Bidirectional** (c) |
 | Competitive / fast shooter (lowest lag) | **Simple** (a), *not* bidirectional |
 | Crisp menus and HUD | add **Base-layer** (d) |
 | You own a FreeSync/G-Sync monitor | add **VRR** (e) |
-| Maximum quality without added latency | **Motion extreme + AI** (f) |
+| Try every causal reconstruction pass | **Motion guided + AI** (f), experimental and potentially smearier |
 | Smoothest output, one-frame latency acceptable | **Bidirectional + AI** |
 
 Start with `--framegen-multiplier 2`. Try `3` or `4` only if the present card
@@ -519,7 +519,7 @@ can keep up (see limits).
   does nothing on ordinary screens or typical laptop panels.
 - **Base-layer** and **bidirectional** can't be used at the same time. Neither can
   bidirectional and VRR — pick one of those modes.
-- **AI refiner** needs `--framegen-mode motion` and `--framegen-quality high`
+- **AI refiner** needs `--framegen-mode motion` and `--framegen-pipeline learned`
   or above; bidirectional is optional (it works in the zero-latency forward
   path too).
 
@@ -539,7 +539,7 @@ the generation)
 **Good to know**
 - The performance tuning is automatic: on newer hardware it uses packed-fp16
   shaders, on others it falls back — you don't set this.
-- If quality drops because the card is overloaded, gamescope automatically
+- If the pipeline steps down because the card is overloaded, gamescope automatically
   steps *down* (motion → simpler → fewer extra frames) to avoid stutter. After
   the post-step hold, sustained slot-capacity headroom can re-probe one adjacent
   richer rung. A failed probe lengthens the next recovery back-off.

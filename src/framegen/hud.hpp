@@ -173,7 +173,7 @@ struct FramegenHudSnapshot_t
 	const char *otherDeviceName = nullptr;
 	const char *renderOrigin = nullptr;
 	GamescopeFramegenMode mode = GamescopeFramegenMode::Extrapolate;
-	GamescopeFramegenQuality quality = GamescopeFramegenQuality::Low;
+	GamescopeFramegenPipeline pipeline = GamescopeFramegenPipeline::Warp;
 	uint32_t multiplier = 2u;
 	uint32_t refreshMilliHz = 0u;
 	bool vrrRequested = false;
@@ -325,7 +325,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		"%-8s %-21.21s%s x%u . %s . %uHz %s", "gameslop",
 		snapshot.version != nullptr ? snapshot.version : "unknown",
 		mode_name( snapshot.mode ), std::clamp( snapshot.multiplier, 2u, 4u ),
-		quality_name( snapshot.quality ), refreshHz,
+		pipeline_name( snapshot.pipeline ), refreshHz,
 		snapshot.vrrActive ? "VRR" : "fixed" );
 	framegen_hud_add_line( result, line );
 
@@ -393,7 +393,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	const char *ladderMode = snapshot.mode == GamescopeFramegenMode::Motion
 		? "motion" : "extrapolate";
 	std::snprintf( line, sizeof( line ), "%-8s %s/%s rung %u/%u  %s", "ladder",
-		quality_name( snapshot.quality ), ladderMode,
+		pipeline_name( snapshot.pipeline ), ladderMode,
 		snapshot.ladderSteps, snapshot.ladderMaxSteps,
 		framegen_hud_ladder_state( ladderState, sizeof( ladderState ), snapshot ) );
 	framegen_hud_add_line( result, line );

@@ -1599,7 +1599,7 @@ bool CVulkanDevice::createScratchResources()
 	// isolated generation work; the shared-queue fallback measures the actual
 	// submission span, including unavoidable same-queue interference. Both are
 	// useful deadline signals. If the family cannot timestamp, framegen simply
-	// runs without measurement and the ladder stays at full quality.
+	// runs without measurement and the ladder stays on the full pipeline.
 	{
 		uint32_t nQueueFamilyCount = 0;
 		vk.GetPhysicalDeviceQueueFamilyProperties( physDev(), &nQueueFamilyCount, nullptr );
@@ -5200,7 +5200,7 @@ struct FramegenMotionResources_t
 	// check's output (reverse vectors whose round trip through the forward
 	// field does not close lose their confidence too).
 	gamescope::OwningRc<CVulkanTexture> mvFieldRevChk;
-	// Ultra-quality causal acceleration: a retained copy of the preceding
+	// Predict-pipeline causal acceleration: a retained copy of the preceding
 	// interval's final checked forward field. It is reprojected through the
 	// current field before differencing, so acceleration compares the same
 	// moving content rather than the same screen coordinate. The frame ID gate
@@ -5215,9 +5215,9 @@ struct FramegenMotionResources_t
 	// overwrites the working images.
 	uint64_t uMotionFieldFrameId = 0;
 	uint64_t uMotionFieldIntervalNs = 0;
-	GamescopeFramegenQuality eMotionFieldQuality = GamescopeFramegenQuality::Low;
+	GamescopeFramegenPipeline eMotionFieldPipeline = GamescopeFramegenPipeline::Warp;
 	bool bMotionFieldBidir = false;
-	// Extreme-quality frames-only disocclusion evidence. This low-resolution
+	// Guided-pipeline frames-only disocclusion evidence. This low-resolution
 	// image contains luma from two intervals ago: a batch samples it during
 	// every warp, then refreshes it from lumaPrev after all warps complete. The
 	// internally-owned copy avoids retaining a third output-ring slot, and luma
@@ -5242,7 +5242,7 @@ struct FramegenMotionResources_t
 	gamescope::OwningRc<CVulkanTexture> mvFieldNet;
 	gamescope::OwningRc<CVulkanTexture> mvFieldRevNet;
 	// Fourth CNN head: a zero-neutral focus mask for persistent non-geometric
-	// color change. Kept at field resolution and sampled only by Extreme's
+	// color change. Kept at field resolution and sampled only by Guided's
 	// existing full-resolution warp, so it adds no output-resolution pass.
 	gamescope::OwningRc<CVulkanTexture> netShadingFocus;
 	gamescope::OwningRc<CVulkanTexture> netWeightsGpu;
@@ -6319,7 +6319,7 @@ struct FramegenHistory_t
 	// Consecutive real frames slow enough to leave an empty vblank to fill.
 	uint32_t nStableFrames = 0;
 	// Deadline-driven degradation ladder (#04) position: 0 = full startup config,
-	// each step sheds work (motion quality tiers, then extrapolate, then a
+	// each step sheds work (motion pipelines, then extrapolate, then a
 	// multiplier notch). Never
 	// reaches "stop generating" — that is left to the reactive pacing gate below.
 	// nDegradeHold is a post-step cooldown so the new rung's cost folds into the
@@ -6703,14 +6703,14 @@ static float framegen_bidir_one_sided_strength()
 	return s_flStrength;
 }
 
-// Extreme-only intermediate-grid correction. Endpoint motion fields are
+// Guided-only intermediate-grid correction. Endpoint motion fields are
 // defined on their respective real-frame grids, so sampling them directly at
 // an intermediate output coordinate is only the first fixed-point iterate.
 // This opt-in strength selects a separately specialized, symmetric,
-// closure-checked warp. Lower tiers retain the established pipeline.
-static float framegen_bidir_endpoint_trace_strength( GamescopeFramegenQuality eQuality )
+// closure-checked warp. Cheaper pipelines retain the established behavior.
+static float framegen_bidir_endpoint_trace_strength( GamescopeFramegenPipeline ePipeline )
 {
-	if ( eQuality != GamescopeFramegenQuality::Extreme )
+	if ( ePipeline != GamescopeFramegenPipeline::Guided )
 		return 0.0f;
 
 	static const float s_flStrength = []()
@@ -6760,8 +6760,8 @@ bool vulkan_framegen_is_enabled()
 			|| g_eFramegenMode == GamescopeFramegenMode::Motion );
 }
 
-// Deadline-driven degradation ladder (#04). The startup mode/quality/multiplier are the
-// quality CEILING; under GPU-time pressure the ladder sheds work immediately.
+// Deadline-driven degradation ladder (#04). The startup mode/pipeline/multiplier are the
+// cost ceiling; under GPU-time pressure the ladder sheds work immediately.
 // Slow evidence-gated recovery may jump to the richest measured fitting rung,
 // or re-probe one adjacent cold rung. It NEVER mutates
 // the base globals (g_eFramegenMode / g_nFramegenMultiplier): those gate the whole
@@ -6844,7 +6844,7 @@ static void framegen_log_ladder_recovery_blocked( uint32_t nMaxDegradeSteps,
 }
 
 // Total number of rungs available from the startup config: motion walks through
-// every lower quality tier and then to extrapolate, followed by one rung per
+// every cheaper pipeline and then to extrapolate, followed by one rung per
 // multiplier notch down to x2. Deliberately does NOT include a "stop generating" rung: the
 // ladder always keeps generating (at worst the cheapest config), so its GPU-time
 // input never starves. The genuine "even the cheapest config overruns" case is
@@ -6854,7 +6854,7 @@ static void framegen_log_ladder_recovery_blocked( uint32_t nMaxDegradeSteps,
 static uint32_t framegen_max_degrade_steps()
 {
 	return gamescope::framegen::max_degrade_steps(
-		g_eFramegenMode, g_eFramegenQuality, g_nFramegenMultiplier );
+		g_eFramegenMode, g_eFramegenPipeline, g_nFramegenMultiplier );
 }
 
 // Apply nDegradeSteps degradations to the startup ceiling. Motion (the priciest
@@ -6864,7 +6864,7 @@ static uint32_t framegen_max_degrade_steps()
 static FramegenEffective_t framegen_effective_config( uint32_t nDegradeSteps )
 {
 	return gamescope::framegen::effective_config(
-		g_eFramegenMode, g_eFramegenQuality, g_nFramegenMultiplier, nDegradeSteps );
+		g_eFramegenMode, g_eFramegenPipeline, g_nFramegenMultiplier, nDegradeSteps );
 }
 
 static size_t framegen_bidir_pending_hard_capacity( uint32_t multiplier )
@@ -7016,7 +7016,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.lastCompositeSeqNo = 0;
 	g_framegenHistory.nLastGeneratedSlot = 0;
 	g_framegenHistory.nLastGenerationGapVblanks = 0;
-	// Re-probe quality from the top on a fresh scene and restore the base recovery
+	// Re-probe the configured pipeline from the top on a fresh scene and restore the base recovery
 	// delay; neither stale rung costs nor a prior scene's failed probes carry over.
 	g_framegenHistory.nDegradeSteps = 0;
 	g_framegenHistory.nDegradeHold = 0;
@@ -7092,7 +7092,7 @@ void vulkan_framegen_reset( const char *reason )
 	framegen_invalidate_deadline_shadow_content();
 	// The per-rung costs live on g_device and survive the history reset; forget
 	// them too (as invalidate_history does) so the ladder re-probes the
-	// new workload from full quality instead of stepping on the old scene's stale
+	// new workload from the configured pipeline instead of stepping on the old scene's stale
 	// over-deadline measurements.
 	g_device.framegenResetRungCosts();
 	g_output.framegenOutputImages.clear();
@@ -7790,7 +7790,7 @@ static void framegen_bind_blend( CVulkanCmdBuffer *pCmdBuffer, const gamescope::
 // geometry therefore stays untouched and confidence can only go down.
 // The causal path predicts corrections on top of the
 // Stage-B field — a zero-initialized head IS Stage B, so the failure floor is
-// the current behavior. The fourth head never predicts pixels; Extreme uses it
+// the current behavior. The fourth head never predicts pixels; Guided uses it
 // to gate a separately bounded analytic color trend. B4 closes the field safety loop:
 // the stats probe grades the REFINED field, so a net that mispredicts is
 // clamped by the same-batch trust factor and shows up in the adapt log lines.
@@ -7969,7 +7969,7 @@ static const std::vector<float> &framegen_net_weights()
 	return s_weights;
 }
 
-static bool framegen_net_requested( GamescopeFramegenQuality eQuality )
+static bool framegen_net_requested( GamescopeFramegenPipeline ePipeline )
 {
 	if ( !framegen_net_lds_supported() )
 	{
@@ -7984,7 +7984,7 @@ static bool framegen_net_requested( GamescopeFramegenQuality eQuality )
 		return false;
 	}
 
-	return eQuality >= GamescopeFramegenQuality::High
+	return ePipeline >= GamescopeFramegenPipeline::Learned
 		&& !framegen_net_weights().empty();
 }
 
@@ -8008,7 +8008,7 @@ static uint32_t framegen_record_max()
 
 static uint32_t g_uFramegenRecordCount = 0;
 
-// The field the warps and the quality probe consume: the net's refined copy
+// The field the warps and the adaptation probe consume: the net's refined copy
 // when the refiner ran this batch, the checked Stage-B field otherwise.
 static const gamescope::OwningRc<CVulkanTexture> &framegen_motion_field()
 {
@@ -8026,10 +8026,10 @@ static bool framegen_create_intermediate( gamescope::OwningRc<CVulkanTexture> *p
 	createFlags.bStorage = true;
 	createFlags.bSampled = true;
 	// Dataset capture copies the lumas and fields out to mapped readbacks.
-	// Ultra and Extreme also rotate the final field into a retained transfer destination.
+	// Predict and Guided also rotate the final field into a retained transfer destination.
 	createFlags.bTransferSrc = framegen_record_dir() != nullptr
-		|| g_eFramegenQuality >= GamescopeFramegenQuality::Ultra;
-	createFlags.bTransferDst = g_eFramegenQuality >= GamescopeFramegenQuality::Ultra;
+		|| g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict;
+	createFlags.bTransferDst = g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict;
 
 	*ppTexture = new CVulkanTexture();
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
@@ -8124,9 +8124,9 @@ static const FramegenDispatch_t &framegen_dispatch_for_format( uint32_t drmForma
 // does not close. Default on — it targets the disocclusion/mislock fizzle
 // class directly; GAMESCOPE_FRAMEGEN_FB=0 restores the unchecked field for
 // A/B comparison.
-static bool framegen_fbcheck_enabled( GamescopeFramegenQuality eQuality )
+static bool framegen_fbcheck_enabled( GamescopeFramegenPipeline ePipeline )
 {
-	if ( eQuality < GamescopeFramegenQuality::Medium )
+	if ( ePipeline < GamescopeFramegenPipeline::Checked )
 		return false;
 
 	static const bool s_bEnabled = []()
@@ -8167,9 +8167,9 @@ static constexpr float k_flFramegenFBTolSlope = 0.05f;
 // GAMESCOPE_FRAMEGEN_AGREE=0 disables the test for A/B attribution.
 static constexpr float k_flFramegenAgreeLo = 0.12f;
 static constexpr float k_flFramegenAgreeHi = 0.45f;
-static bool framegen_agreement_enabled( GamescopeFramegenQuality eQuality )
+static bool framegen_agreement_enabled( GamescopeFramegenPipeline ePipeline )
 {
-	if ( eQuality < GamescopeFramegenQuality::Medium )
+	if ( ePipeline < GamescopeFramegenPipeline::Checked )
 		return false;
 
 	static const bool s_bEnabled = []()
@@ -8180,12 +8180,12 @@ static bool framegen_agreement_enabled( GamescopeFramegenQuality eQuality )
 	return s_bEnabled;
 }
 
-// Extreme-only three-frame disocclusion evidence. Default on as part of the
-// Extreme quality contract; the environment switch exists for live A/B cost
-// and artifact attribution without changing any lower quality rung.
-static bool framegen_reservoir_enabled( GamescopeFramegenQuality eQuality )
+// Guided-only three-frame disocclusion evidence. Default on as part of the
+// Guided pipeline contract; the environment switch exists for live A/B cost
+// and artifact attribution without changing any cheaper pipeline rung.
+static bool framegen_reservoir_enabled( GamescopeFramegenPipeline ePipeline )
 {
-	if ( eQuality != GamescopeFramegenQuality::Extreme )
+	if ( ePipeline != GamescopeFramegenPipeline::Guided )
 		return false;
 
 	static const bool s_bEnabled = []()
@@ -8196,12 +8196,12 @@ static bool framegen_reservoir_enabled( GamescopeFramegenQuality eQuality )
 	return s_bEnabled;
 }
 
-// Extreme-only learned non-geometric color trend. The switch isolates the
+// Guided-only learned non-geometric color trend. The switch isolates the
 // final correction for live A/B while leaving the field net and every queue /
 // descriptor / timing decision identical.
-static bool framegen_shading_enabled( GamescopeFramegenQuality eQuality )
+static bool framegen_shading_enabled( GamescopeFramegenPipeline ePipeline )
 {
-	if ( eQuality != GamescopeFramegenQuality::Extreme )
+	if ( ePipeline != GamescopeFramegenPipeline::Guided )
 		return false;
 
 	static const bool s_bEnabled = []()
@@ -8222,16 +8222,16 @@ static bool framegen_shading_enabled( GamescopeFramegenQuality eQuality )
 //   mispredicted (regimes where the per-texel checks lie: lighting flashes,
 //   particle chaos, stroboscopic content) — and fade the motion term toward
 //   the safe fallback. Continuous, zero-latency, self-recovering: this is the
-//   quality-driven degradation #04's monotonic ladder must not provide (a
-//   discrete quality rung would either oscillate or, held monotonic, let one
+//   pipeline-driven degradation #04's monotonic ladder must not provide (a
+//   discrete pipeline rung would either oscillate or, held monotonic, let one
 //   bad interval degrade the whole scene).
 //   CPU, next batch: the readback auto-calibrates the FB tolerance and the
 //   agreement window to the content (see framegen_adapt_consume).
 // Default on in motion mode; GAMESCOPE_FRAMEGEN_ADAPT=0 restores B3 behavior
 // bit-exactly for A/B attribution.
-static bool framegen_adapt_enabled( GamescopeFramegenQuality eQuality )
+static bool framegen_adapt_enabled( GamescopeFramegenPipeline ePipeline )
 {
-	if ( eQuality < GamescopeFramegenQuality::High )
+	if ( ePipeline < GamescopeFramegenPipeline::Learned )
 		return false;
 
 	static const bool s_bEnabled = []()
@@ -8340,7 +8340,7 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 		.renderOrigin = pBaseClientTexture != nullptr
 			? pBaseClientTexture->renderOrigin() : nullptr,
 		.mode = effective.mode,
-		.quality = effective.quality,
+		.pipeline = effective.pipeline,
 		.multiplier = effective.multiplier,
 		.refreshMilliHz = nRefreshMilliHz > 0
 			? static_cast<uint32_t>( nRefreshMilliHz ) : 0u,
@@ -8356,14 +8356,14 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 		.netActive = bNetActive,
 		.netOnline = bNetActive && framegen_net_online_enabled(),
 		.adapt = effective.mode == GamescopeFramegenMode::Motion
-			&& framegen_adapt_enabled( effective.quality ),
+			&& framegen_adapt_enabled( effective.pipeline ),
 		.real = window.real,
 		.delayedReal = window.delayedReal,
 		.generated = window.generated,
 		.repeats = window.repeats,
 		.ladderSteps = g_framegenHistory.nDegradeSteps,
 		.ladderMaxSteps = gamescope::framegen::max_degrade_steps(
-			g_eFramegenMode, g_eFramegenQuality, 2 ),
+			g_eFramegenMode, g_eFramegenPipeline, 2 ),
 		.ladderHold = g_framegenHistory.nDegradeHold,
 		.ladderRecoveryStreak = g_framegenHistory.recovery.streak,
 		.ladderRecoveryBackoffDecisions =
@@ -8536,21 +8536,21 @@ static float framegen_adapt_agree_hi()
 		g_framegenHistory.adaptation, k_flFramegenAgreeHi );
 }
 
-static float framegen_effective_fbcheck_tol( GamescopeFramegenQuality eQuality )
+static float framegen_effective_fbcheck_tol( GamescopeFramegenPipeline ePipeline )
 {
-	return framegen_adapt_enabled( eQuality )
+	return framegen_adapt_enabled( ePipeline )
 		? framegen_adapt_fbcheck_tol() : framegen_fbcheck_tol_base();
 }
 
-static float framegen_effective_agree_lo( GamescopeFramegenQuality eQuality )
+static float framegen_effective_agree_lo( GamescopeFramegenPipeline ePipeline )
 {
-	return framegen_adapt_enabled( eQuality )
+	return framegen_adapt_enabled( ePipeline )
 		? framegen_adapt_agree_lo() : k_flFramegenAgreeLo;
 }
 
-static float framegen_effective_agree_hi( GamescopeFramegenQuality eQuality )
+static float framegen_effective_agree_hi( GamescopeFramegenPipeline ePipeline )
 {
-	return framegen_adapt_enabled( eQuality )
+	return framegen_adapt_enabled( ePipeline )
 		? framegen_adapt_agree_hi() : k_flFramegenAgreeHi;
 }
 
@@ -8558,9 +8558,9 @@ static float framegen_effective_agree_hi( GamescopeFramegenQuality eQuality )
 // EMAs, then derive the threshold values the next batch records with. Called
 // at batch-planning time: the same hasCompletedFramegen() gate that admits a
 // new batch guarantees the mapped memory is no longer being written.
-static void framegen_adapt_consume( GamescopeFramegenQuality eQuality )
+static void framegen_adapt_consume( GamescopeFramegenPipeline ePipeline )
 {
-	if ( !framegen_adapt_enabled( eQuality ) )
+	if ( !framegen_adapt_enabled( ePipeline ) )
 		return;
 
 	FramegenHistory_t &h = g_framegenHistory;
@@ -8946,7 +8946,7 @@ static void framegen_motion_bind_sampler( CVulkanCmdBuffer *pCmdBuffer, uint32_t
 // well the checked field predicts the real frame and accumulates the verdicts
 // (see cs_framegen_motion_stats.comp), and an apply dispatch folds the
 // resulting global field trust into the field's confidence channel — so the
-// full-res warps inherit the quality verdict through the field fetch they
+// full-res warps inherit the confidence verdict through the field fetch they
 // already do, at zero added per-pixel cost. The copy at the end lands the raw
 // counters in the host-mapped readback for the CPU-side threshold
 // calibration. The command buffer's barrier tracking orders all of it
@@ -9051,7 +9051,7 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 	g_framegenMotion.bNetActive = true;
 }
 
-static bool framegen_motion_history_valid( GamescopeFramegenQuality eQuality )
+static bool framegen_motion_history_valid( GamescopeFramegenPipeline ePipeline )
 {
 	const uint64_t ulCurrentIntervalNs = gamescope::framegen::present_interval_ns(
 		g_framegenHistory.currentPresentTimeNs, g_framegenHistory.previousPresentTimeNs );
@@ -9061,7 +9061,7 @@ static bool framegen_motion_history_valid( GamescopeFramegenQuality eQuality )
 	// the newly stored field immediately re-primes the next batch.
 	const bool bComparableIntervals = gamescope::framegen::motion_intervals_comparable(
 		ulCurrentIntervalNs, ulHistoryIntervalNs );
-	return eQuality >= GamescopeFramegenQuality::Ultra
+	return ePipeline >= GamescopeFramegenPipeline::Predict
 		&& g_framegenMotion.mvFieldHistory != nullptr
 		&& g_framegenMotion.uMotionHistoryFrameId != 0
 		&& g_framegenMotion.uMotionHistoryFrameId + 1u == g_framegenHistory.currentFrameId
@@ -9070,7 +9070,7 @@ static bool framegen_motion_history_valid( GamescopeFramegenQuality eQuality )
 
 static float framegen_motion_history_time_scale()
 {
-	if ( !framegen_motion_history_valid( GamescopeFramegenQuality::Ultra ) )
+	if ( !framegen_motion_history_valid( GamescopeFramegenPipeline::Predict ) )
 		return 1.0f;
 	const uint64_t ulCurrentIntervalNs = g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs;
 	return gamescope::framegen::motion_history_time_scale(
@@ -9079,7 +9079,7 @@ static float framegen_motion_history_time_scale()
 
 static float framegen_motion_accel_time_factor()
 {
-	if ( !framegen_motion_history_valid( GamescopeFramegenQuality::Ultra ) )
+	if ( !framegen_motion_history_valid( GamescopeFramegenPipeline::Predict ) )
 		return 0.5f;
 	const uint64_t ulCurrentIntervalNs = g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs;
 	return gamescope::framegen::motion_acceleration_time_factor(
@@ -9107,7 +9107,7 @@ static int framegen_luma_reservoir_read_index()
 // and the one-batch-in-flight rule serializes everything across batches.
 // Training reads the RAW fields: the net never trains on its own output.
 // Returns true when this batch also carries a profile-dump copy.
-static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFramegenQuality eQuality, bool bSceneCutGuard )
+static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFramegenPipeline ePipeline, bool bSceneCutGuard )
 {
 	FramegenMotionResources_t &m = g_framegenMotion;
 	if ( m.netState == nullptr || m.netGradSlices == nullptr || m.netWeightsPrior == nullptr
@@ -9147,10 +9147,10 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	const uint32_t uSeed = m.uNetTrainStep * 0x9E3779B9u + 0x61C88647u;
 	const bool bConservativeBidir = vulkan_framegen_bidir_active();
 	const int nReservoirRead = framegen_luma_reservoir_read_index();
-	const bool bShadingHistoryValid = eQuality == GamescopeFramegenQuality::Extreme
-		&& framegen_shading_enabled( eQuality )
+	const bool bShadingHistoryValid = ePipeline == GamescopeFramegenPipeline::Guided
+		&& framegen_shading_enabled( ePipeline )
 		&& bSceneCutGuard
-		&& framegen_motion_history_valid( eQuality ) && nReservoirRead >= 0;
+		&& framegen_motion_history_valid( ePipeline ) && nReservoirRead >= 0;
 	const gamescope::Rc<CVulkanTexture> pOlderLuma = bShadingHistoryValid
 		? gamescope::Rc<CVulkanTexture>( m.lumaReservoir[nReservoirRead] )
 		: gamescope::Rc<CVulkanTexture>( m.lumaPrev );
@@ -9359,7 +9359,7 @@ static void framegen_net_profile_consume()
 // The finer levels then re-localize with a 9-candidate seeded search, so the
 // finest (largest) level does ~9x less matching work than before.
 static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t width, uint32_t height,
-	const FramegenDispatch_t &dispatch, GamescopeFramegenQuality eQuality )
+	const FramegenDispatch_t &dispatch, GamescopeFramegenPipeline ePipeline )
 {
 	// Every call below overwrites the working field. Callers which can reuse the
 	// finalized field must decide that before entering; clearing the identity
@@ -9378,12 +9378,12 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	// zero-latency forward-prediction path. Both therefore require the reverse
 	// chain and symmetric consistency check, overriding GAMESCOPE_FRAMEGEN_FB=0.
 	const bool bBidir = vulkan_framegen_bidir_active();
-	const bool bNeedMotionHistory = eQuality >= GamescopeFramegenQuality::Ultra && !bBidir;
-	const bool bNeedLumaReservoir = framegen_reservoir_enabled( eQuality ) && !bBidir;
+	const bool bNeedMotionHistory = ePipeline >= GamescopeFramegenPipeline::Predict && !bBidir;
+	const bool bNeedLumaReservoir = framegen_reservoir_enabled( ePipeline ) && !bBidir;
 	const bool bCaptureNeedsReverse = framegen_record_dir() != nullptr
 		&& g_uFramegenRecordCount < framegen_record_max();
-	const bool bNeedCheckedReverse = bBidir || framegen_net_requested( eQuality ) || bCaptureNeedsReverse;
-	const bool bFBCheck = framegen_fbcheck_enabled( eQuality ) || bNeedCheckedReverse;
+	const bool bNeedCheckedReverse = bBidir || framegen_net_requested( ePipeline ) || bCaptureNeedsReverse;
+	const bool bFBCheck = framegen_fbcheck_enabled( ePipeline ) || bNeedCheckedReverse;
 
 	// Whether the net refiner ran is re-decided every batch (see
 	// framegen_record_net); consumers must never inherit a stale verdict.
@@ -9396,8 +9396,8 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		|| ( bFBCheck && ( g_framegenMotion.mvFieldFwd == nullptr || g_framegenMotion.mvFieldRev == nullptr ) )
 		|| ( bNeedCheckedReverse && g_framegenMotion.mvFieldRevChk == nullptr )
 		|| ( bNeedMotionHistory && g_framegenMotion.mvFieldHistory == nullptr )
-		|| ( framegen_net_requested( eQuality ) && !g_framegenMotion.bNetAllocTried )
-		|| ( bBidir && framegen_net_requested( eQuality ) && g_framegenMotion.mvFieldRevNet == nullptr )
+		|| ( framegen_net_requested( ePipeline ) && !g_framegenMotion.bNetAllocTried )
+		|| ( bBidir && framegen_net_requested( ePipeline ) && g_framegenMotion.mvFieldRevNet == nullptr )
 		|| ( bCaptureNeedsReverse && !g_framegenMotion.bRecAllocTried ) )
 	{
 		// Full-resolution history is keyed to the same reset as these field
@@ -9427,13 +9427,13 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 			bAllocated = framegen_create_intermediate( &g_framegenMotion.mvFieldHistory, lowW, lowH, uFieldFormat );
 		g_framegenMotion.uMotionHistoryFrameId = 0;
 		g_framegenMotion.uMotionHistoryIntervalNs = 0;
-		// B4 stats are a high-tier resource. Lower tiers must not fail motion
+		// B4 stats are a Learned-pipeline resource. Cheaper pipelines must not fail motion
 		// setup because an adaptation-only image format/allocation failed.
 		g_framegenMotion.statsAccum = nullptr;
 		g_framegenMotion.statsReadback = nullptr;
 		g_framegenHistory.ulAdaptStatsSeqNo = 0;
-		if ( bAllocated && ( framegen_adapt_enabled( eQuality )
-			|| ( framegen_net_requested( eQuality ) && framegen_net_online_enabled() ) ) )
+		if ( bAllocated && ( framegen_adapt_enabled( ePipeline )
+			|| ( framegen_net_requested( ePipeline ) && framegen_net_online_enabled() ) ) )
 		{
 			CVulkanTexture::createFlags accumFlags;
 			accumFlags.bStorage = true;
@@ -9459,7 +9459,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		g_framegenMotion.mvFieldRevNet = nullptr;
 		g_framegenMotion.netShadingFocus = nullptr;
 		g_framegenMotion.bNetAllocTried = false;
-		if ( bAllocated && framegen_net_requested( eQuality ) )
+		if ( bAllocated && framegen_net_requested( ePipeline ) )
 		{
 			g_framegenMotion.bNetAllocTried = true;
 			bool bNetOk = framegen_create_intermediate( &g_framegenMotion.mvFieldNet, lowW, lowH, uFieldFormat );
@@ -9605,7 +9605,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		g_framegenMotion.lumaFormat = dispatch.motionLumaFormat;
 	}
 
-	// The luma reservoir is an Extreme-only enhancement, not a prerequisite
+	// The luma reservoir is a Guided-only enhancement, not a prerequisite
 	// for motion generation. Allocation failure leaves the established guided
 	// warp intact and is not retried every frame.
 	if ( bNeedLumaReservoir && !g_framegenMotion.bLumaReservoirAllocTried )
@@ -9619,7 +9619,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		{
 			g_framegenMotion.lumaReservoir[0] = nullptr;
 			g_framegenMotion.lumaReservoir[1] = nullptr;
-			vk_log.errorf( "framegen: luma-reservoir allocation failed; keeping the Extreme guided warp without third-frame disocclusion evidence" );
+			vk_log.errorf( "framegen: luma-reservoir allocation failed; keeping the Guided warp without third-frame disocclusion evidence" );
 		}
 	}
 
@@ -9712,7 +9712,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	pCmdBuffer->bindTarget( g_framegenMotion.mvField );
 	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.mvFieldFwd, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.mvFieldRev, true );
-	pCmdBuffer->pushConstants<FramegenMotionFBCheckPush_t>( framegen_effective_fbcheck_tol( eQuality ), k_flFramegenFBTolSlope );
+	pCmdBuffer->pushConstants<FramegenMotionFBCheckPush_t>( framegen_effective_fbcheck_tol( ePipeline ), k_flFramegenFBTolSlope );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 
 	if ( !bNeedCheckedReverse )
@@ -9726,7 +9726,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldRevChk );
 	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.mvFieldRev, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.mvFieldFwd, true );
-	pCmdBuffer->pushConstants<FramegenMotionFBCheckPush_t>( framegen_effective_fbcheck_tol( eQuality ), k_flFramegenFBTolSlope );
+	pCmdBuffer->pushConstants<FramegenMotionFBCheckPush_t>( framegen_effective_fbcheck_tol( ePipeline ), k_flFramegenFBTolSlope );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 
 	return true;
@@ -9737,20 +9737,20 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 // the match is unconfident. Each slot writes a distinct target, so warps in the
 // same batch don't hazard against each other.
 static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::Rc<CVulkanTexture> &pTarget,
-	float flStrength, GamescopeFramegenQuality eQuality )
+	float flStrength, GamescopeFramegenPipeline ePipeline )
 {
 	const uint32_t pg = 8;
-	const bool bHistoryValid = framegen_motion_history_valid( eQuality );
-	const bool bGuided = eQuality == GamescopeFramegenQuality::Extreme;
+	const bool bHistoryValid = framegen_motion_history_valid( ePipeline );
+	const bool bGuided = ePipeline == GamescopeFramegenPipeline::Guided;
 	const int nReservoirRead = framegen_luma_reservoir_read_index();
 	const bool bReservoirValid = bGuided && bHistoryValid
 		&& nReservoirRead >= 0;
 	const bool bShadingValid = bGuided && bHistoryValid
-		&& framegen_shading_enabled( eQuality )
+		&& framegen_shading_enabled( ePipeline )
 		&& g_framegenMotion.bNetActive && g_framegenMotion.netShadingFocus != nullptr;
 	const float flHistoryFlowScale = bHistoryValid ? framegen_motion_history_time_scale() : 1.0f;
 	const float flAccelTimeFactor = bHistoryValid ? framegen_motion_accel_time_factor() : 0.5f;
-	// Extreme uses the accelerated shader even during the first interval: its
+	// Guided uses the accelerated shader even during the first interval: its
 	// full-resolution field reconstruction does not need temporal history.
 	const bool bAccelPipeline = bHistoryValid || bGuided;
 
@@ -9769,9 +9769,9 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	pCmdBuffer->setTextureSrgb( 2, false );
 	pCmdBuffer->setSamplerUnnormalized( 2, false );
 	pCmdBuffer->setSamplerNearest( 2, false );
-	const bool bAgree = framegen_agreement_enabled( eQuality );
-	const float flAgreeLo = bAgree ? framegen_effective_agree_lo( eQuality ) : 1e5f;
-	const float flAgreeHi = bAgree ? framegen_effective_agree_hi( eQuality ) : 1e6f;
+	const bool bAgree = framegen_agreement_enabled( ePipeline );
+	const float flAgreeLo = bAgree ? framegen_effective_agree_lo( ePipeline ) : 1e5f;
+	const float flAgreeHi = bAgree ? framegen_effective_agree_hi( ePipeline ) : 1e6f;
 	if ( bAccelPipeline )
 	{
 		framegen_motion_bind_sampler( pCmdBuffer, 3, g_framegenMotion.mvFieldHistory, false );
@@ -9785,7 +9785,7 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 		pCmdBuffer->setSamplerUnnormalized( 4, false );
 		pCmdBuffer->setSamplerNearest( 4, false );
 		// The focus texture is always valid when the net dispatch ran. During a
-		// warm-up or non-net Extreme batch, bind a harmless sampled fallback and
+		// warm-up or non-net Guided batch, bind a harmless sampled fallback and
 		// keep the shader branch disabled through the push constant.
 		framegen_motion_bind_sampler( pCmdBuffer, 5, bShadingValid
 			? gamescope::Rc<CVulkanTexture>( g_framegenMotion.netShadingFocus )
@@ -9810,14 +9810,14 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 // field) and blend by confidence x phase proximity; pixels neither direction
 // can vouch for degrade to a phase-correct crossfade inside the shader.
 static void framegen_bidir_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::Rc<CVulkanTexture> &pTarget,
-	float flPhase, GamescopeFramegenQuality eQuality, float flOneSidedOverride = -1.0f,
+	float flPhase, GamescopeFramegenPipeline ePipeline, float flOneSidedOverride = -1.0f,
 	float flEndpointTraceOverride = -1.0f )
 {
 	const uint32_t pg = 8;
-	const float flEndpointTraceStrength = eQuality == GamescopeFramegenQuality::Extreme
+	const float flEndpointTraceStrength = ePipeline == GamescopeFramegenPipeline::Guided
 		? ( flEndpointTraceOverride >= 0.0f
 			? std::clamp( flEndpointTraceOverride, 0.0f, 1.0f )
-			: framegen_bidir_endpoint_trace_strength( eQuality ) )
+			: framegen_bidir_endpoint_trace_strength( ePipeline ) )
 		: 0.0f;
 
 	pCmdBuffer->bindPipeline( g_device.pipeline( flEndpointTraceStrength > 0.0f
@@ -9840,13 +9840,13 @@ static void framegen_bidir_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamesc
 	pCmdBuffer->setTextureSrgb( 3, false );
 	pCmdBuffer->setSamplerUnnormalized( 3, false );
 	pCmdBuffer->setSamplerNearest( 3, false );
-	const bool bAgree = framegen_agreement_enabled( eQuality );
+	const bool bAgree = framegen_agreement_enabled( ePipeline );
 	const float flOneSidedStrength = flOneSidedOverride >= 0.0f
 		? std::clamp( flOneSidedOverride, 0.0f, 1.0f )
 		: framegen_bidir_one_sided_strength();
 	pCmdBuffer->pushConstants<FramegenMotionBidirPush_t>( flPhase, (float)k_uFramegenMotionDownscale,
-		bAgree ? framegen_effective_agree_lo( eQuality ) : 1e5f,
-		bAgree ? framegen_effective_agree_hi( eQuality ) : 1e6f,
+		bAgree ? framegen_effective_agree_lo( ePipeline ) : 1e5f,
+		bAgree ? framegen_effective_agree_hi( ePipeline ) : 1e6f,
 		flOneSidedStrength, flEndpointTraceStrength );
 	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pg ), div_roundup( pTarget->height(), pg ) );
 }
@@ -10114,9 +10114,9 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0 )
 		return false;
 
-	// B4: fold the previous batch's quality readback into the adaptation state
+	// B4: fold the previous batch's adaptation readback into the adaptation state
 	// before recording this one, so its thresholds ride these push constants.
-	framegen_adapt_consume( eff.quality );
+	framegen_adapt_consume( eff.pipeline );
 	// Stage C dataset capture: flush the previous batch's training tensors
 	// under the same completion gate.
 	framegen_record_consume();
@@ -10203,7 +10203,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		&& bMotionRequested
 		&& g_framegenMotion.uMotionFieldFrameId != 0
 		&& g_framegenMotion.uMotionFieldFrameId == g_framegenHistory.currentFrameId
-		&& g_framegenMotion.eMotionFieldQuality == eff.quality
+		&& g_framegenMotion.eMotionFieldPipeline == eff.pipeline
 		&& g_framegenMotion.bMotionFieldBidir == bBidir
 		&& framegen_motion_field() != nullptr
 		&& ( !bBidir || framegen_motion_field_rev() != nullptr );
@@ -10217,17 +10217,17 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		? g_device.framegenTimestampBegin( pCmdBuffer.get() ) : -1;
 
 	// Preserve the preceding pair's finalized displacement before preparation
-	// overwrites the working fields. The exact quality/mode and consecutive-ID
+	// overwrites the working fields. The exact pipeline/mode and consecutive-ID
 	// gates keep estimator changes or a skipped interval from looking like
 	// physical acceleration. The copy and later history reads are ordered in
 	// this same command buffer.
 	if ( !bReuseMotion && pColorProbe == nullptr && bMotionRequested && !bBidir
-		&& eff.quality >= GamescopeFramegenQuality::Ultra )
+		&& eff.pipeline >= GamescopeFramegenPipeline::Predict )
 	{
 		const bool bHistorySourceValid = g_framegenMotion.mvFieldHistory != nullptr
 			&& g_framegenMotion.uMotionFieldFrameId != 0
 			&& g_framegenMotion.uMotionFieldFrameId + 1u == g_framegenHistory.currentFrameId
-			&& g_framegenMotion.eMotionFieldQuality == eff.quality
+			&& g_framegenMotion.eMotionFieldPipeline == eff.pipeline
 			&& !g_framegenMotion.bMotionFieldBidir
 			&& framegen_motion_field() != nullptr;
 		if ( bHistorySourceValid )
@@ -10251,7 +10251,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// disturbing vulkan_framegen_is_enabled() or the forced-composite tax.
 	const bool bMotion = bReuseMotion || ( bMotionRequested
 		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(),
-			g_framegenHistory.currentReal->height(), dispatch, eff.quality ) );
+			g_framegenHistory.currentReal->height(), dispatch, eff.pipeline ) );
 	// Held-out E2 samples grade the actual motion path, not its allocation or
 	// capability fallback. A failed motion setup drops the sample and leaves all
 	// real-frame presentation untouched.
@@ -10274,9 +10274,9 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	}
 	if ( bMotion && !bReuseMotion && g_framegenMotion.mvFieldNet != nullptr )
 		framegen_record_net( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height, bBidir );
-	// B4: with the field final, record the quality probe — the warps below
+	// B4: with the field final, record the adaptation probe — the warps below
 	// read its verdict in this same batch, the CPU next batch.
-	const bool bAdaptProbe = bMotion && !bReuseMotion && framegen_adapt_enabled( eff.quality );
+	const bool bAdaptProbe = bMotion && !bReuseMotion && framegen_adapt_enabled( eff.pipeline );
 	if ( bAdaptProbe )
 		framegen_record_adapt_probe( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height );
 
@@ -10286,14 +10286,14 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// explicitly disabled, training retains its previous unguarded behavior.
 	const bool bNetStateReadback = pColorProbe == nullptr
 		&& !bReuseMotion && g_framegenMotion.bNetActive && framegen_net_online_enabled()
-		&& framegen_record_net_train( pCmdBuffer.get(), eff.quality, bAdaptProbe );
+		&& framegen_record_net_train( pCmdBuffer.get(), eff.pipeline, bAdaptProbe );
 	if ( bMotion && !bReuseMotion && pColorProbe == nullptr )
 	{
 		g_framegenMotion.uMotionFieldFrameId = g_framegenHistory.currentFrameId;
 		g_framegenMotion.uMotionFieldIntervalNs =
 			g_framegenHistory.currentPresentTimeNs > g_framegenHistory.previousPresentTimeNs
 			? g_framegenHistory.currentPresentTimeNs - g_framegenHistory.previousPresentTimeNs : 0;
-		g_framegenMotion.eMotionFieldQuality = eff.quality;
+		g_framegenMotion.eMotionFieldPipeline = eff.pipeline;
 		g_framegenMotion.bMotionFieldBidir = bBidir;
 	}
 	if ( bMotion )
@@ -10317,11 +10317,11 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 					flOverride = k_flFramegenColorProbeStrengths[ i ];
 				}
 				framegen_bidir_warp_slot( pCmdBuffer.get(), slot.tex,
-					std::clamp( slot.phase, 0.0f, 1.0f ), eff.quality,
+					std::clamp( slot.phase, 0.0f, 1.0f ), eff.pipeline,
 					flOneSidedOverride, flEndpointTraceOverride );
 			}
 			else
-				framegen_warp_slot( pCmdBuffer.get(), slot.tex, slot.strength, eff.quality );
+				framegen_warp_slot( pCmdBuffer.get(), slot.tex, slot.strength, eff.pipeline );
 		}
 	}
 	else if ( eff.mode == GamescopeFramegenMode::Blend || bBidir )
@@ -10352,12 +10352,12 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// Preserve two-interval-old real-frame luma without extending the
 	// output-ring lifetime. Every warp above reads the old reservoir first;
 	// this same-command-buffer copy is ordered after those reads and publishes
-	// lumaPrev for the next consecutive Extreme batch. At 1/8 resolution this
+	// lumaPrev for the next consecutive Guided batch. At 1/8 resolution this
 	// is 1/64 the texel traffic of copying the full color frame. Two tiny images
 	// retain both current-2 (for deadline/refill slots of this same interval) and
 	// current-1 (for the next interval); a refill finds the latter already
 	// published and records no redundant copy.
-	if ( bMotion && !bBidir && eff.quality == GamescopeFramegenQuality::Extreme
+	if ( bMotion && !bBidir && eff.pipeline == GamescopeFramegenPipeline::Guided
 		&& g_framegenMotion.lumaReservoir[0] != nullptr
 		&& g_framegenMotion.lumaReservoir[1] != nullptr )
 	{
@@ -10467,7 +10467,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 			g_framegenHistory.currentFrameId,
 			nGapVblanks,
 			gamescope::framegen::mode_name( bMotion ? GamescopeFramegenMode::Motion : eff.mode ),
-			gamescope::framegen::quality_name( eff.quality ),
+			gamescope::framegen::pipeline_name( eff.pipeline ),
 			eff.multiplier,
 			g_framegenHistory.nDegradeSteps,
 			nMaxDegradeSteps,
@@ -10523,7 +10523,7 @@ static gamescope::framegen::DeadlineWorkClass_t framegen_causal_work_class(
 		&& dispatch.motionSupported
 		&& g_framegenMotion.uMotionFieldFrameId != 0
 		&& g_framegenMotion.uMotionFieldFrameId == g_framegenHistory.currentFrameId
-		&& g_framegenMotion.eMotionFieldQuality == eff.quality
+		&& g_framegenMotion.eMotionFieldPipeline == eff.pipeline
 		&& !g_framegenMotion.bMotionFieldBidir
 		&& framegen_motion_field() != nullptr;
 	return bCachedMotion
@@ -10551,10 +10551,10 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 {
 	FramegenCausalRungSelection_t result;
 	// A multiplier notch cannot reduce a one-slot submission. Stop this ladder
-	// after the motion-quality/mode rungs; the configured multiplier remains a
+	// after the motion-pipeline/mode rungs; the configured multiplier remains a
 	// resource and density ceiling for the untouched paths.
 	const uint32_t nMaxCausalDegradeSteps = gamescope::framegen::max_degrade_steps(
-		g_eFramegenMode, g_eFramegenQuality, 2 );
+		g_eFramegenMode, g_eFramegenPipeline, 2 );
 	g_framegenHistory.nDegradeSteps = std::min(
 		g_framegenHistory.nDegradeSteps, nMaxCausalDegradeSteps );
 	const uint64_t ulStartEstimateNs = plan.provisional
@@ -10612,7 +10612,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	// When the KMS commit reservation is earlier than the ordinary compositor
 	// wake, it may make this one slot unavailable even though the current rung
 	// still fits the plain display-grid opportunity. Skip that slot without
-	// teaching the quality ladder that the rung itself is too expensive.
+	// teaching the pipeline ladder that the rung itself is too expensive.
 	const bool bCurrentCostMature = result.ulCostNs != 0u
 		&& result.uSamples >= gamescope::framegen::k_uDeadlineMinSamples;
 	if ( !bDegradeForPriorMiss && bNativeCommitDeadline && bCurrentCostMature
@@ -10928,7 +10928,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 		.wakeDeadlineNs = plan.wakeNs,
 	};
 	const uint32_t nMaxCausalDegradeSteps = gamescope::framegen::max_degrade_steps(
-		g_eFramegenMode, g_eFramegenQuality, 2 );
+		g_eFramegenMode, g_eFramegenPipeline, 2 );
 	const bool bSubmitted = framegen_submit_planned( &request, 1, nGapVblanks,
 		rung.eff, ulCompositeSeqNo, nMaxCausalDegradeSteps, false, nullptr,
 		plan.targetNs, true );
@@ -11149,9 +11149,9 @@ static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback 
 	}
 
 	// One-slot deadline work has no useful multiplier rung. Walk only the
-	// quality/mode portion and admit the first cold or measured-fitting class.
+	// pipeline/mode portion and admit the first cold or measured-fitting class.
 	const uint32_t nMaxDegradeSteps = gamescope::framegen::max_degrade_steps(
-		g_eFramegenMode, g_eFramegenQuality, 2u );
+		g_eFramegenMode, g_eFramegenPipeline, 2u );
 	g_framegenHistory.nDegradeSteps = std::min(
 		g_framegenHistory.nDegradeSteps, nMaxDegradeSteps );
 	FramegenEffective_t eff = framegen_effective_config(
@@ -11774,16 +11774,16 @@ void vulkan_framegen_benchmark()
 			// Prime intermediates so the warp timing doesn't include allocation.
 			{
 				auto cmd = g_device.commandBuffer();
-				framegen_prepare_motion( cmd.get(), res.nWidth, res.nHeight, dispatch, g_eFramegenQuality );
-				if ( g_eFramegenQuality >= GamescopeFramegenQuality::Ultra
+				framegen_prepare_motion( cmd.get(), res.nWidth, res.nHeight, dispatch, g_eFramegenPipeline );
+				if ( g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 					cmd->copyImage( framegen_motion_field(), g_framegenMotion.mvFieldHistory );
-				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme
+				if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
 					&& g_framegenMotion.lumaReservoir[0] != nullptr )
 					cmd->copyImage( g_framegenMotion.lumaPrev, g_framegenMotion.lumaReservoir[0] );
 				g_device.submit( std::move( cmd ) );
 				g_device.waitIdle();
-				if ( g_eFramegenQuality >= GamescopeFramegenQuality::Ultra
+				if ( g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 				{
 					g_framegenMotion.uMotionHistoryFrameId = 2;
@@ -11792,20 +11792,20 @@ void vulkan_framegen_benchmark()
 					g_framegenHistory.previousPresentTimeNs = 16'666'667ull;
 					g_framegenHistory.currentPresentTimeNs = 33'333'334ull;
 				}
-				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme
+				if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
 					&& g_framegenMotion.lumaReservoir[0] != nullptr )
 					g_framegenMotion.uLumaReservoirFrameId[0] = 1;
 			}
 
 			double msMotionPrep = timePass( [&]( CVulkanCmdBuffer *cmd ) {
-				framegen_prepare_motion( cmd, res.nWidth, res.nHeight, dispatch, g_eFramegenQuality );
+				framegen_prepare_motion( cmd, res.nWidth, res.nHeight, dispatch, g_eFramegenPipeline );
 			} );
 			printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion setup (per real)", msMotionPrep );
 
 			// B4 stats probe (clear + accumulate + 384-byte readback copy) —
 			// recorded after setup in production, so its cost adds to the
 			// per-real tail, not per-slot.
-			if ( framegen_adapt_enabled( g_eFramegenQuality ) )
+			if ( framegen_adapt_enabled( g_eFramegenPipeline ) )
 			{
 				double msAdaptProbe = timePass( [&]( CVulkanCmdBuffer *cmd ) {
 					framegen_record_adapt_probe( cmd, g_framegenMotion.width, g_framegenMotion.height );
@@ -11825,23 +11825,23 @@ void vulkan_framegen_benchmark()
 				if ( framegen_net_online_enabled() )
 				{
 					double msNetTrain = timePass( [&]( CVulkanCmdBuffer *cmd ) {
-						framegen_record_net_train( cmd, g_eFramegenQuality, false );
+						framegen_record_net_train( cmd, g_eFramegenPipeline, false );
 					} );
 					printf( "%-8s  %-26s  %10.3f\n", res.pszName, "online net train (per real)", msNetTrain );
 				}
 			}
 
 			double msMotionWarp = timePass( [&]( CVulkanCmdBuffer *cmd ) {
-				framegen_warp_slot( cmd, pOut, g_flFramegenStrength, g_eFramegenQuality );
+				framegen_warp_slot( cmd, pOut, g_flFramegenStrength, g_eFramegenPipeline );
 			} );
 			printf( "%-8s  %-26s  %10.3f\n", res.pszName,
-				g_eFramegenQuality == GamescopeFramegenQuality::Extreme
+				g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
 					? "motion guided warp (per gen)"
-					: g_eFramegenQuality == GamescopeFramegenQuality::Ultra
+					: g_eFramegenPipeline == GamescopeFramegenPipeline::Predict
 						? "motion accel warp (per gen)" : "motion warp (per gen)",
 				msMotionWarp );
 
-			if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme
+			if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
 				&& g_framegenMotion.lumaReservoir[0] != nullptr )
 			{
 				double msReservoirUpdate = timePass( [&]( CVulkanCmdBuffer *cmd ) {
@@ -11857,13 +11857,13 @@ void vulkan_framegen_benchmark()
 			if ( vulkan_framegen_bidir_active() )
 			{
 				double msBidirWarp = timePass( [&]( CVulkanCmdBuffer *cmd ) {
-					framegen_bidir_warp_slot( cmd, pOut, 0.5f, g_eFramegenQuality, -1.0f, 0.0f );
+					framegen_bidir_warp_slot( cmd, pOut, 0.5f, g_eFramegenPipeline, -1.0f, 0.0f );
 				} );
 				printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion bidir warp (per gen)", msBidirWarp );
-				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme )
+				if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided )
 				{
 					double msBidirTrace = timePass( [&]( CVulkanCmdBuffer *cmd ) {
-						framegen_bidir_warp_slot( cmd, pOut, 0.5f, g_eFramegenQuality, -1.0f, 1.0f );
+						framegen_bidir_warp_slot( cmd, pOut, 0.5f, g_eFramegenPipeline, -1.0f, 1.0f );
 					} );
 					printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion bidir trace (per gen)", msBidirTrace );
 				}
@@ -12029,7 +12029,7 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 	const FramegenEffective_t eff = {
 		.mode = GamescopeFramegenMode::Motion,
 		.multiplier = 4u,
-		.quality = g_eFramegenQuality,
+		.pipeline = g_eFramegenPipeline,
 	};
 	FramegenSlotRequest_t slots[ k_uFramegenColorProbeCandidates ];
 	for ( uint32_t i = 0; i < k_uFramegenColorProbeCandidates; i++ )
@@ -12064,9 +12064,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	if ( !g_bLoggedFramegenConfig )
 	{
-		vk_log.infof( "framegen: enabled mode=%s quality=%s multiplier=%d%s",
+		vk_log.infof( "framegen: enabled mode=%s pipeline=%s multiplier=%d%s",
 			gamescope::framegen::mode_name( g_eFramegenMode ),
-			gamescope::framegen::quality_name( g_eFramegenQuality ), g_nFramegenMultiplier,
+			gamescope::framegen::pipeline_name( g_eFramegenPipeline ), g_nFramegenMultiplier,
 			g_device.hasFramegenQueue() ? " (dedicated queue)" : "" );
 		if ( GetBackend() != nullptr && GetBackend()->OwnsKMSPresentTiming()
 			&& framegen_commit_lead_override_ns() != 0u )
@@ -12084,7 +12084,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		if ( framegen_causal_deadline_enabled()
 			&& !vulkan_framegen_vrr_hybrid_active()
 			&& !vulkan_framegen_bidir_active() )
-			vk_log.infof( "framegen: causal fixed-refresh deadline scheduling active by default — one exact display slot is planned at a time; multiplier is a resource/quality ceiling" );
+			vk_log.infof( "framegen: causal fixed-refresh deadline scheduling active by default — one exact display slot is planned at a time; multiplier is a resource ceiling" );
 		else if ( g_device.hasFramegenQueue() && framegen_classic_enabled()
 			&& !vulkan_framegen_vrr_hybrid_active()
 			&& !vulkan_framegen_bidir_active() )
@@ -12103,42 +12103,42 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			const bool bBidirActive = vulkan_framegen_bidir_active();
 			if ( bBidirActive )
 			{
-				vk_log.infof( "framegen: bidirectional quality path — symmetric checked forward/reverse fields%s; causal acceleration, Extreme color-guided reconstruction, reservoir and shading are not scheduled",
-					framegen_agreement_enabled( g_eFramegenQuality ) ? " + full-resolution agreement" : "" );
+				vk_log.infof( "framegen: bidirectional pipeline — symmetric checked forward/reverse fields%s; causal acceleration, Guided color-guided reconstruction, reservoir and shading are not scheduled",
+					framegen_agreement_enabled( g_eFramegenPipeline ) ? " + full-resolution agreement" : "" );
 				if ( framegen_bidir_one_sided_strength() > 0.0f )
 					vk_log.infof( "framegen: experimental bidir one-sided occlusion authority %.2f — strongly asymmetric checked fields retain more of the surviving warped side without changing both-valid or both-killed fallback",
 						framegen_bidir_one_sided_strength() );
-				if ( framegen_bidir_endpoint_trace_strength( g_eFramegenQuality ) > 0.0f )
+				if ( framegen_bidir_endpoint_trace_strength( g_eFramegenPipeline ) > 0.0f )
 					vk_log.infof( "framegen: experimental bidir endpoint trace %.2f — one symmetric closure-gated fixed-point correction; queue and flip timing are unchanged",
-						framegen_bidir_endpoint_trace_strength( g_eFramegenQuality ) );
+						framegen_bidir_endpoint_trace_strength( g_eFramegenPipeline ) );
 			}
-			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Low )
-				vk_log.infof( "framegen: low quality — forward matcher + constant-velocity warp only" );
-			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Medium )
-				vk_log.infof( "framegen: medium quality — reverse consistency + full-resolution agreement enabled" );
-			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Ultra )
-				vk_log.infof( "framegen: ultra quality — confidence-gated causal temporal acceleration enabled after one consecutive field warm-up" );
-			else if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme )
-				vk_log.infof( "framegen: extreme quality — color-guided reconstruction + causal acceleration%s",
-					framegen_reservoir_enabled( g_eFramegenQuality )
+			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Warp )
+				vk_log.infof( "framegen: warp pipeline — forward matcher + constant-velocity warp only" );
+			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Checked )
+				vk_log.infof( "framegen: checked pipeline — reverse consistency + full-resolution agreement enabled" );
+			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Predict )
+				vk_log.infof( "framegen: predict pipeline — confidence-gated causal temporal acceleration enabled after one consecutive field warm-up" );
+			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided )
+				vk_log.infof( "framegen: guided pipeline — color-guided reconstruction + causal acceleration%s",
+					framegen_reservoir_enabled( g_eFramegenPipeline )
 						? " + three-real-frame disocclusion reservoir enabled"
 						: " (disocclusion reservoir disabled by GAMESCOPE_FRAMEGEN_RESERVOIR=0)" );
-			if ( framegen_adapt_enabled( g_eFramegenQuality ) )
+			if ( framegen_adapt_enabled( g_eFramegenPipeline ) )
 				vk_log.infof( "framegen: self-supervised adaptation active (B4) — each real frame grades the field that predicted it; blend trust follows same-batch, thresholds auto-calibrate next batch (GAMESCOPE_FRAMEGEN_ADAPT=0 disables)" );
-			else if ( g_eFramegenQuality < GamescopeFramegenQuality::High )
-				vk_log.infof( "framegen: self-supervised adaptation not scheduled below high quality" );
+			else if ( g_eFramegenPipeline < GamescopeFramegenPipeline::Learned )
+				vk_log.infof( "framegen: self-supervised adaptation not scheduled below the learned pipeline" );
 			else
 				vk_log.infof( "framegen: self-supervised adaptation disabled (GAMESCOPE_FRAMEGEN_ADAPT=0)" );
-			if ( framegen_net_requested( g_eFramegenQuality ) )
+			if ( framegen_net_requested( g_eFramegenPipeline ) )
 			{
 				const bool bConservativeBidir = vulkan_framegen_bidir_active();
 				if ( bConservativeBidir )
 					vk_log.infof( "framegen: learned bidirectional confidence veto active (C) — FB-checked geometry is preserved and confidence can only decrease" );
 				else
 					vk_log.infof( "framegen: learned forward-field refinement active (C) — the net improves causal motion prediction once per real frame (bounded flow residual + evidence-gated confidence)" );
-				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme && !bBidirActive )
+				if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided && !bBidirActive )
 					vk_log.infof( "framegen: causal shading-persistence head %s — three-frame in-situ supervision, bounded color-trend correction (GAMESCOPE_FRAMEGEN_SHADING=0 disables for A/B)",
-						framegen_shading_enabled( g_eFramegenQuality ) ? "enabled" : "disabled" );
+						framegen_shading_enabled( g_eFramegenPipeline ) ? "enabled" : "disabled" );
 				if ( framegen_net_online_enabled() )
 					vk_log.infof( "framegen: in-situ learning active (C2) — %s (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
 						bConservativeBidir
@@ -12149,11 +12149,11 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 							? " — persistent per-game profile (checkpointed on an owned worker, flushed at exit/reset, atomic replace)"
 							: " — ephemeral model, nothing is written to disk" );
 			}
-			else if ( g_eFramegenQuality < GamescopeFramegenQuality::High
+			else if ( g_eFramegenPipeline < GamescopeFramegenPipeline::Learned
 				&& framegen_net_lds_supported()
 				&& ( framegen_net_weights_path() != nullptr || framegen_net_online_enabled() ) )
 			{
-				vk_log.infof( "framegen: learned refinement requested but not scheduled below high quality" );
+				vk_log.infof( "framegen: learned refinement requested but not scheduled below the learned pipeline" );
 			}
 			if ( framegen_record_dir() != nullptr )
 				vk_log.infof( "framegen: dataset capture requested — writing up to %u field-res training samples to '%s'", framegen_record_max(), framegen_record_dir() );
@@ -12461,7 +12461,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		// re-prime only when both post-cut source timestamps are compatible.
 		framegen_adapt_consume(
 			framegen_effective_config(
-				g_framegenHistory.nDegradeSteps ).quality );
+				g_framegenHistory.nDegradeSteps ).pipeline );
 	}
 
 	if ( bVrrHybrid )
@@ -12520,7 +12520,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		return;
 	}
 
-	// Deadline-driven degradation (#04): shed one quality rung whenever the CURRENT
+	// Deadline-driven degradation (#04): shed one pipeline rung whenever the CURRENT
 	// config's measured GPU cost (see framegenGarbageCollect) overruns the vblank
 	// budget, so a too-slow config never causes a missed generated frame. Evaluated
 	// only here, on frames we actually generate, so the rung it settles on is a rung
@@ -12537,7 +12537,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	const uint32_t nGapSlots = nLadderGapVblanks > 1 ? nLadderGapVblanks - 1 : 0;
 	// VRR hybrid always submits one-slot batches, so its rung costs are keyed by
 	// count 1 and only the mode rung
-	// (motion tier or motion->extrapolate) can shed work — a multiplier notch cannot reduce a
+	// (motion pipeline or motion->extrapolate) can shed work — a multiplier notch cannot reduce a
 	// count that is already minimal, and the "does the step actually help"
 	// check below correctly never takes it.
 	const bool bSingleSlotPacing = bVrrHybrid;
@@ -12556,9 +12556,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	if ( ladderEvaluation.tryDegrade )
 	{
 		// Over budget at the current rung. Only take the step if it actually
-		// reduces work at THIS gap: dropping a motion tier or motion->extrapolate
+		// reduces work at THIS gap: dropping a motion pipeline or motion->extrapolate
 		// always lowers per-frame cost, but a pure multiplier notch only helps when the gap
-		// lets it generate fewer frames. Otherwise stepping would cost quality
+		// lets it generate fewer frames. Otherwise stepping would add cost
 		// (a coarser cadence / fewer inserted frames) for zero GPU saving.
 		const FramegenEffective_t nextEff = framegen_effective_config( g_framegenHistory.nDegradeSteps + 1 );
 		const uint32_t nNextGen = gamescope::framegen::ladder_generated_count(

@@ -54,7 +54,7 @@ path; the opt-in **bidir** mode (`GAMESCOPE_FRAMEGEN_BIDIR=1`, §3.3) deliberate
 |---|---|---|
 | `--experimental-framegen` | `g_bExperimentalFramegen` | master enable; forces the full-composite path |
 | `--framegen-mode {extrapolate\|motion\|blend}` | `g_eFramegenMode` | default `extrapolate`; `blend` is debug-only |
-| `--framegen-quality {low\|medium\|high\|ultra\|extreme}` | `g_eFramegenQuality` | motion cost ceiling; default `high` preserves the pre-tier pipeline |
+| `--framegen-pipeline {warp\|checked\|learned\|predict\|guided}` | `g_eFramegenPipeline` | additive generation pipeline; default `warp`, with `checked` the recommended step up; the last three are experimental and can smear |
 | `--framegen-multiplier {2,3,4}` | `g_nFramegenMultiplier` | validated, `exit(1)` on bad value; also *sizes the output pool* |
 | `--framegen-strength <0.0-1.0>` | `g_flFramegenStrength` | validated finite float forward step; malformed or out-of-range values fail startup |
 | `--framegen-debug` | `g_bFramegenDebug`, `g_uFramegenDebugEvery` | see §8 observability |
@@ -65,22 +65,22 @@ Parsing and benchmark early-exit are in `src/main.cpp`.
 - `GAMESCOPE_FRAMEGEN_BENCHMARK` — **presence-only** (even `=0` triggers); runs the microbench then `exit(0)` *before* output creation.
 - `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE` — needs a **truthy int** (`=0` does not force it); selects the shared-queue regime.
 - `GAMESCOPE_FRAMEGEN_DEBUG_EVERY` — debug log rate (default 60; rejects 0/non-uint → 60).
-- `GAMESCOPE_FRAMEGEN_HUD={1,2}` — built-in present-only status HUD, off by default. Level 1 shows mode/quality, current refresh and the last closed five-second real/generated/repeat rates; level 2 adds pacing and the net line when active. Its text UBO is rebuilt at 1 Hz and one compute dispatch is appended to eligible real composites, after capture copies, with no extra submission. HDR uses a deliberately fixed raw-code approximation (glyphs near 200 nits plus a low-alpha backing), not a color-managed text pipeline.
+- `GAMESCOPE_FRAMEGEN_HUD={1,2}` — built-in present-only status HUD, off by default. Level 1 shows mode/pipeline, current refresh and the last closed five-second real/generated/repeat rates; level 2 adds pacing and the net line when active. Its text UBO is rebuilt at 1 Hz and one compute dispatch is appended to eligible real composites, after capture copies, with no extra submission. HDR uses a deliberately fixed raw-code approximation (glyphs near 200 nits plus a low-alpha backing), not a color-managed text pipeline.
 - `GAMESCOPE_FRAMEGEN_JIT` — legacy compatibility setting; causal fixed-refresh deadline scheduling is now the **default behavior** on a dedicated framegen queue. A truthy value only emits a one-time “now default” notice.
 - `GAMESCOPE_FRAMEGEN_VRR_HYBRID` — truthy int; opt-in **#01 VRR hybrid** prototype (`vulkan_framegen_vrr_hybrid_requested`). Real frames present VRR-style, one generated frame flips mid-interval on a timer. Gated on the dedicated queue **and** only active while the connector is actually in VRR (`IsVRRActive()`); otherwise it falls back live to the fixed-refresh paths.
 - `GAMESCOPE_FRAMEGEN_BASE` — truthy int; opt-in **#02 base-layer generation** prototype (`framegen_base_layer_enabled`). Generates on the pre-upscale game layer (`layers[0].tex`), then `framegen_base_present_composite` runs against the live `FrameInfo_t`: generated frames go through the full FSR/color pipeline and carry fresh overlays and cursor. It does not need the dedicated queue. `framegen_base_layer_usable` selects it per frame (base plane, non-YCbCr, no ReShade, sampled+storage format) and falls back live to output-space generation for unusable scenes.
 
-Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution — see §3.2):
+Stage-B motion-pipeline knobs (**on whenever their pipeline schedules them**; `=0` disables for A/B attribution — see §3.2):
 - `GAMESCOPE_FRAMEGEN_FB` — forward-backward consistency check (`framegen_fbcheck_enabled`; runs the coarse-to-fine matcher a second time reverse-anchored and kills confidence where the round trip does not close). `=0` disables.
 - `GAMESCOPE_FRAMEGEN_FB_TOL` — float, clamped `[0.05, 8.0]`, default `0.75`; the FB round-trip tolerance in low-res texels (larger = more forgiving = fewer kills).
 - `GAMESCOPE_FRAMEGEN_AGREE` — per-pixel two-source agreement test in the warp (kills `conf` at full res where the two real-frame projections of the flow read different content). `=0` disables.
 - `GAMESCOPE_FRAMEGEN_BIDIR` — truthy int; opt-in **B3 bidirectional interpolation** (`vulkan_framegen_bidir_active`). Generated frames sit *between* the two reals (warp both toward phase `t`, blend by confidence, phase-correct crossfade fallback) instead of extrapolating past the newest. This removes hold-then-jump judder and handles translucency at the cost of presenting each real frame **one interval late** (§0 invariants #1/#4 exception; see §3.3). **Requires motion mode; mutually exclusive with `_VRR_HYBRID`/#01 and `_BASE`/#02**; ignored otherwise with a one-time log.
 - `GAMESCOPE_FRAMEGEN_ADAPT` — **B4 self-supervised adaptation** (`framegen_adapt_enabled`; motion mode). Each real frame grades the field that predicted it (field-res stats probe, measured 20–39 µs per real at 1080p–4K on Radeon 890M); a same-batch apply pass folds a global field-trust factor into the field's confidence and rejects content scene cuts from nine regional luminance histograms, while the next-batch CPU readback auto-calibrates the FB tolerance and agreement window (see §3.4). `=0` disables (B3-bit-exact warps, no probe). An explicit `_FB_TOL` pins the tolerance against auto-calibration.
-- `GAMESCOPE_FRAMEGEN_RESERVOIR` — Extreme causal mode only, default on; `=0` disables the three-real-frame screen-space disocclusion resolver for live A/B attribution. It is never allocated or sampled by lower tiers or bidirectional interpolation.
-- `GAMESCOPE_FRAMEGEN_SHADING` — Extreme causal mode with the learned net only, default on; `=0` disables fourth-head in-situ supervision and the final bounded color-trend correction for an otherwise-identical net/queue A/B. Lower tiers and bidir never consume the focus map.
-- `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned refinement** (`framegen_net_weights_path`; motion High+). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). In Extreme causal mode, output four is additionally a zero-neutral shading-persistence focus map; it never predicts pixels. **Bidir's default contract is stricter:** both directions keep their FB-checked geometry bit-exact and ML may only lower confidence. Endpoint reconstruction cannot prove that a vector traces a valid intermediate-time path. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
+- `GAMESCOPE_FRAMEGEN_RESERVOIR` — Guided causal mode only, default on; `=0` disables the three-real-frame screen-space disocclusion resolver for live A/B attribution. It is never allocated or sampled by cheaper pipelines or bidirectional interpolation.
+- `GAMESCOPE_FRAMEGEN_SHADING` — Guided causal mode with the learned net only, default on; `=0` disables fourth-head in-situ supervision and the final bounded color-trend correction for an otherwise-identical net/queue A/B. Cheaper pipelines and bidir never consume the focus map.
+- `GAMESCOPE_FRAMEGEN_NET` — path to a weights blob; opt-in **Stage C learned refinement** (`framegen_net_weights_path`; motion Learned+). A tiny fused-conv net (`cs_framegen_motion_net.comp`, 12→16→16→4, ~4.6k params) refines the checked causal field once per real frame — bounded flow residual (±2 field texels, tanh-limited) + evidence-gated confidence recalibration — before the B4 probe and forward warp consume it (`framegen_motion_field()`). In Guided causal mode, output four is additionally a zero-neutral shading-persistence focus map; it never predicts pixels. **Bidir's default contract is stricter:** both directions keep their FB-checked geometry bit-exact and ML may only lower confidence. Endpoint reconstruction cannot prove that a vector traces a valid intermediate-time path. Trained offline by `scripts/framegen-net-train.py`; a zero-head blob is bit-neutral (= Stage B). See §3.5.
 - `GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION` — float `[0,1]`, default `0`; **experimental spatial A/B**. A clear one-sided checked field keeps more of its surviving warped gather instead of losing most of it to phase-weighted crossfade validity. The gate is continuous and requires strong/weak confidence asymmetry; both-valid agreement, both-killed fallback, scene cuts, fields, queues, and flip timing are unchanged.
-- `GAMESCOPE_FRAMEGEN_BIDIR_TRACE` — float `[0,1]`, default `0`; **experimental Extreme-only intermediate-grid correction**. Endpoint fields are defined on the two real-frame grids, not the generated frame's grid. One symmetric fixed-point resample moves each complete checked field (flow plus its existing FB/B4/ML confidence verdict) to its provisional endpoint and is blended in only when forward/reverse closure, both traced confidences, and image bounds agree. A nonzero strength selects a separately specialized pipeline; trace `0` compiles the branch and extra samples out of the established B3 pipeline. It adds no pass or resource and changes no estimation, ML, phase, queue, or flip state. Lower tiers always use `0`.
+- `GAMESCOPE_FRAMEGEN_BIDIR_TRACE` — float `[0,1]`, default `0`; **experimental Guided-only intermediate-grid correction**. Endpoint fields are defined on the two real-frame grids, not the generated frame's grid. One symmetric fixed-point resample moves each complete checked field (flow plus its existing FB/B4/ML confidence verdict) to its provisional endpoint and is blended in only when forward/reverse closure, both traced confidences, and image bounds agree. A nonzero strength selects a separately specialized pipeline; trace `0` compiles the branch and extra samples out of the established B3 pipeline. It adds no pass or resource and changes no estimation, ML, phase, queue, or flip state. Cheaper pipelines always use `0`.
 - `GAMESCOPE_FRAMEGEN_RECORD` — directory; **Stage C dataset capture** (motion mode, no `_BIDIR` requirement). Dumps raw field-res training tensors (both lumas + both checked fields, pre-refinement/pre-trust) one `GSFD` file per real frame, up to `GAMESCOPE_FRAMEGEN_RECORD_MAX` (default 1000, ~0.6–1.2 MB each — mind the disk).
 - `GAMESCOPE_FRAMEGEN_RECORD_COLOR` — directory; **E2 held-out full-colour validation**. Requires motion+bidir, a dedicated framegen queue, and base-layer mode off. Real A/B/C frames present normally, B is omitted from estimator history, and one shared A/C field renders three invisible B candidates at one measured phase. `_RECORD_COLOR_SWEEP=occlusion` (default) sweeps `GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION={0,0.5,1}`; `_SWEEP=trace` instead sweeps endpoint-trace strength with the configured occlusion value fixed. The candidates plus exact B are copied after the algorithm timestamp into a GSCF v3 file whose candidate-kind field prevents mislabeled evaluation; the evaluator remains compatible with v1/v2. Candidates never enter the present FIFO. `_RECORD_COLOR_MAX` defaults to 8; `_RECORD_COLOR_SKIP` skips real-frame warm-up. `_RECORD_COLOR_SPAN` (default 2, range 2..16) and `_OFFSET` (default 1, `< span`) generalize consecutive A/B/C into a longer exact sequence. The recorded timestamp ratio remains authoritative because uneven source cadence means offset/span is not necessarily the temporal phase. `_RECORD_COLOR_PHASE_TOLERANCE` (default 1, disabled) rejects samples outside `OFFSET/SPAN +/- tolerance`; use `SPAN=6 OFFSET=1 PHASE_TOLERANCE=0.05` for a targeted early-phase sweep. Only A/B stay pinned while waiting for C; the ownership-aware eight-image ring still leaves ample rotating targets. Each completed synchronous write clears the provisional next sequence so its stall cannot contaminate later timestamps. Four full-resolution planes make a 1440p XB30 sample about 62 MiB; CPU writes are deliberately measurement-only, so capture cadence is not production cadence.
 - `GAMESCOPE_FRAMEGEN_NET_ONLINE` — truthy int; **C2 in-situ learning** (see §3.5). The causal refiner keeps training all established flow/confidence outputs on the framegen GPU. Conservative bidir trains **only the final confidence row/bias**, with flow heads and the shared trunk frozen; its learned output can only suppress a checked vector. Works with a `_NET` blob as the prior or from a synthesized neutral init. Without `_NET_PROFILE` the model is **ephemeral — nothing is ever written to disk**. `_NET_LR` (default `3e-4`), `_NET_EVERY` (train every Nth real frame, default 1) tune it; `_NET_PROFILE=<path>` makes the learning persistent per game: loaded as the prior when present (a malformed/torn file is rejected loudly and the neutral prior used instead), checkpointed back every 1024 trained steps on an **owned worker thread** (file I/O never rides the render thread) and joined before exit/reset performs its final flush, so sessions shorter than the checkpoint interval persist without a detached-writer teardown race. Writes use a unique same-directory staging file plus checked close and atomic rename: a process crash, concurrent writer, or full disk cannot expose a partial profile or tear an existing good one. The served weights are health-checked every trained step; a non-finite value re-initializes the optimizer state from the prior automatically and is never persisted. Healthy readbacks ping-pong between two reusable CPU buffers, avoiding allocator traffic on steady-state training frames.
@@ -92,7 +92,7 @@ Stage-B motion-quality knobs (**default ON**; `=0` disables for A/B attribution 
 - **`IBackend::SupportsFramegen()`** in `src/backend.h` — defaults false; DRM and nested Wayland return true, and `CDeferredBackend` delegates to its child. It contains the forced-composite/present-timing cost to capable backends.
 
 ### Shader build wiring (`src/meson.build`)
-The 22 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) and registered unconditionally by the `SHADER()` macro table; `MOTION_WARP_ACCEL` serves Ultra acceleration and Extreme guided reconstruction. **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays**, so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
+The 22 framegen `.comp` shaders are compiled to SPIR-V C-arrays (`meson.build`) and registered unconditionally by the `SHADER()` macro table; `MOTION_WARP_ACCEL` serves Predict acceleration and Guided reconstruction. **Load-bearing:** when `!supportsShaderFloat16`, the FP16 enum slots are **aliased to the fp32 SPIR-V arrays**, so the dispatcher can name an fp16 `ShaderType` unconditionally with no null-pipeline branch at dispatch time.
 
 ---
 
@@ -178,14 +178,14 @@ hardware linearizes on read).
 | **Extrapolate fp16** (`_extrapolate_fp16.comp`) | same math, `f16vec3` ALU; push uploaded fp32 then cast; alpha never demoted | **LDS apron stays vec4 fp32** — only ALU is fp16, bandwidth unchanged, so upside is capped | `supportsShaderFloat16 && !floatTarget`, non-NVIDIA | fp16 range/precision bands scRGB highlights → **gated off for float targets** |
 | **Extrapolate pair (+ pair_fp16)** (`_extrapolate_pair.comp`) | writes TWO slots from one dispatch; suppress term + neighbor min/max computed **once** and shared | halves the two full-res history reads across the pair | x3/x4 | same quality; halves history bandwidth at high multipliers |
 | **Blend** — DEBUG ONLY (`cs_framegen_blend.comp`) | `mix(prev, cur, phase)` full vec4 **including alpha**; **INTERPOLATION**; no suppression/rectification | normalized-coord **bilinear** `texture()` (the only framegen shader using sampler filtering) | `eff.mode==Blend` only | structurally violates invariant #4 → judder; reference lever |
-| **Motion low** | forward luma pyramid + hierarchical match + constant-velocity warp | no reverse field, stats, or ML dispatches | `eff.quality==Low` | cheapest motion-compensated tier |
-| **Motion medium** | low + reverse match / FB check + full-res agreement | reverse chain once per real | `eff.quality==Medium` | rejects disocclusions and boundary bleed |
-| **Motion high** | medium + B4 adaptation; optional learned refiner/training | default; compatible with the pre-tier path | `eff.quality==High` | self-tuning quality with optional ML |
-| **Motion ultra** | high + retained-field acceleration warp | one field copy per estimated interval + one low-res field sample per output pixel | `eff.quality==Ultra` | bounded second-order forward prediction |
-| **Motion extreme** | ultra + color-guided reconstruction + three-frame disocclusion resolver; optional learned shading focus | bounded boundary hypotheses; two 1/8-res luma history images; with net, one low-res focus write and a bounded color-trend term in the existing warp | `eff.quality==Extreme` | maximum causal frames-only quality on an idle second GPU |
+| **Motion warp** | forward luma pyramid + hierarchical match + constant-velocity warp | no reverse field, stats, or ML dispatches | `eff.pipeline==Warp` | cheapest motion-compensated pipeline; default |
+| **Motion checked** | warp + reverse match / FB check + full-res agreement | reverse chain once per real | `eff.pipeline==Checked` | recommended step up; rejects disocclusions and boundary bleed |
+| **Motion learned** | checked + B4 adaptation; optional learned refiner/training | experimental | `eff.pipeline==Learned` | adds self-tuning and optional ML; can smear |
+| **Motion predict** | learned + retained-field acceleration warp | one field copy per estimated interval + one low-res field sample per output pixel | `eff.pipeline==Predict` | experimental bounded second-order forward prediction; can smear |
+| **Motion guided** | predict + color-guided reconstruction + three-frame disocclusion resolver; optional learned shading focus | bounded boundary hypotheses; two 1/8-res luma history images; with net, one low-res focus write and a bounded color-trend term in the existing warp | `eff.pipeline==Guided` | experimental, most passes and cost; can smear |
 
-The Ultra/Extreme acceleration, guided reconstruction, reservoir and shading entries are causal
-only. Bidir uses its symmetric checked-field warp at every tier; High+ adds B4 and optional
+The Predict/Guided acceleration, guided reconstruction, reservoir and shading entries are causal
+only. Bidir uses its symmetric checked-field warp at every pipeline; Learned+ adds B4 and optional
 confidence-only ML, but does not schedule those causal extensions.
 
 **Invariant across all extrapolate variants:** alpha pinned to `current`; the *only* range bound is
@@ -196,7 +196,7 @@ wide-gamut negatives; previous frame sampled at center only.
 
 Stages 1+2, learned refinement, B4 probing and online training run **once per real-frame pair**
 through `framegen_prepare_motion`; stage 3 runs **per slot** through `framegen_warp_slot`. The
-final field is cached by real-frame ID, quality and causal/bidir mode, so later deadline/classic-refill slots for
+final field is cached by real-frame ID, pipeline and causal/bidir mode, so later deadline/classic-refill slots for
 the same pair issue only their warps and cannot overweight a slow interval in online training.
 Falls back to extrapolate for the whole batch if intermediates can't be allocated.
 
@@ -260,12 +260,12 @@ Because `predicted = mix(predictedExtra, predictedMotion, conf)`, **motion is a 
 extrapolate** — `conf=0` reproduces the bounded extrapolate output exactly, so it can never be much
 worse even where matching fails.
 
-#### 3.2.1 Ultra causal acceleration and Extreme guided reconstruction
+#### 3.2.1 Predict causal acceleration and Guided reconstruction
 
 `cs_framegen_motion_warp_accel.comp` uses a third causal interval without requiring application
 motion vectors, a vendor optical-flow block, or a future frame. The final
 checked/refined/trust-scaled forward field remains resident as the current pair's cached field. At
-the start of the next consecutive, same-quality causal pair it is copied to `mvFieldHistory`
+the start of the next consecutive, same-pipeline causal pair it is copied to `mvFieldHistory`
 **before** preparation overwrites the working images; same-pair deadline/classic refills therefore retain both
 the finalized current field and the true preceding field. The shader samples that history at
 `uv-currentFlow`, so the old and current vectors describe the same moving content. The fields are interval
@@ -284,10 +284,10 @@ dead zone removes sub-pel estimator noise; acceleration fades out when large rel
 speed and is capped to ±1 field texel per component; and the existing full-resolution two-source
 agreement still decides whether the motion gather reaches the output. The retained field carries a
 real-frame ID. If shared-queue admission skips even one interval, the ID is non-consecutive and the
-original constant-velocity shader runs instead. Scene invalidation clears the ID. Lower tiers never
+original constant-velocity shader runs instead. Scene invalidation clears the ID. Cheaper pipelines never
 allocate, copy, bind, or dispatch this path.
 
-Extreme treats the 1/8-resolution field as a set of motion hypotheses instead of bilinearly
+Guided treats the 1/8-resolution field as a set of motion hypotheses instead of bilinearly
 turning a foreground vector and a background vector into a vector that no object followed. For each
 full-resolution output pixel, `reconstructField` evaluates the four covering field texels by
 gathering the previous real frame along each candidate and comparing it with the current pixel.
@@ -297,7 +297,7 @@ selected from the history layer whose velocity is nearest to that reconstructed 
 foreground/background mixture cannot masquerade as acceleration. This is a causal, vendor-neutral
 software approximation of the most valuable part of dense optical flow: motion-boundary ownership.
 
-The Extreme disocclusion resolver extends that ownership test across a third
+The Guided disocclusion resolver extends that ownership test across a third
 real frame without retaining another output-ring slot. Two internally owned
 1/8-resolution luma images form a frame-ID-keyed ping-pong: one remains the
 `current-2` evidence for every initial/deadline/refill warp of the current interval,
@@ -314,8 +314,8 @@ through the preceding field must remain on-screen and agree across current
 color, previous color, and the two-interval-old luma. The accepted output color
 always comes from the newest real frame, not the reservoir, so the mechanism
 cannot create a stale historical-color trail. Its capped trust blends into the
-same bounded fallback as every lower causal tier. Scene-cut sentinels, skipped
-field IDs, allocation failure, bidir, or a ladder step to Ultra disable it
+same bounded fallback as every cheaper causal pipeline. Scene-cut sentinels, skipped
+field IDs, allocation failure, bidir, or a ladder step to Predict disable it
 without a separate pipeline. This is screen-space evidence, not depth: it
 cannot reconstruct out-of-screen or long-hidden content.
 
@@ -338,7 +338,7 @@ Bidir removes it by generating BETWEEN the two real frames instead of past the n
   translucency (both motion layers fade on schedule), temporally smooth (killed regions dissolve
   instead of hold-jumping). No TAA clamp needed (no term invents colors) — the bidir warp is
   *cheaper* than the forward warp (0.095 vs 0.136 ms @1080p int on Blackwell).
-- **Endpoint-grid correction (experimental, Extreme only):** `F` is anchored at the current
+- **Endpoint-grid correction (experimental, Guided only):** `F` is anchored at the current
   endpoint and `R` at the previous endpoint, while the established warp samples both at the
   intermediate output coordinate. `GAMESCOPE_FRAMEGEN_BIDIR_TRACE` performs one bounded Picard
   step toward the exact relations `x1=p+(1-t)F(x1)` and `x0=p+tR(x0)`. The correction is rejected
@@ -407,7 +407,7 @@ Two consumers, two latencies:
   the per-texel checks *lie*: texels that passed FB + feathering yet still mispredicted (lighting
   flashes, particle chaos, stroboscopic content). Low trust slides the whole frame toward the safe
   fallback (crossfade in bidir, bounded extrapolation forward) — smoothly, with zero latency, and
-  self-recovering the moment the field predicts again. This is deliberately how quality-driven
+  self-recovering the moment the field predicts again. This is deliberately how pipeline-driven
   degradation ships without forcing #04's discrete ladder to react: rung changes are held and
   recovery requires long capacity evidence, while per-frame trust can move smoothly. Perf note: baking
   trust into the field (which the warps already fetch per pixel) is load-bearing — reading the
@@ -419,7 +419,7 @@ Two consumers, two latencies:
   residual and unreliable-field coverage are high. A pan can break correspondence without changing
   regional distributions; particle chaos can kill confidence without satisfying the histogram
   tests. On a cut, a negative internal `field.a` sentinel makes causal warps copy the newest real
-  frame and bidir choose the nearest endpoint. The sentinel is retained into Ultra history with
+  frame and bidir choose the nearest endpoint. The sentinel is retained into Predict history with
   zero confidence, so the unrelated interval cannot become a false acceleration estimate.
 - **CPU, next batch** (`framegen_adapt_consume`): the counters copy into a host-mapped readback
   image; the one-batch-in-flight guarantee makes the mapped read race-free (parsed only after
@@ -447,7 +447,7 @@ A tiny convolutional net (12→16→16→4 channels, 3×3 kernels, ~4.6k paramet
 `cs_framegen_motion_net.comp`) processes the checked forward motion field at field resolution once
 per real frame, with no future-frame dependency. Causal prediction serves **corrections, not
 pixels**: a flow residual bounded to ±2 field texels (`2·tanh`), an additive confidence
-recalibration, and in Extreme a zero-neutral shading-persistence focus. Bidir processes the checked
+recalibration, and in Guided a zero-neutral shading-persistence focus. Bidir processes the checked
 reverse field too, but defaults to confidence-only service: no learned flow, no confidence raise,
 no shading focus. Safety is structural, three layers deep:
 
@@ -458,7 +458,7 @@ no shading focus. Safety is structural, three layers deep:
 3. the B4 probe grades (and trust-scales) the **refined** field — the one the warps consume — so a
    mispredicting net is clamped in the same batch and shows up in the `adapt resid=…` log lines.
 
-The fourth head does not synthesize color: the Extreme warp applies an analytic aligned
+The fourth head does not synthesize color: the Guided warp applies an analytic aligned
 `current-previous` color trend, phase-scaled, capped to 8% of local magnitude per interval, and
 multiplied by focus, current/old field confidence, acceleration consistency, and a moderate-change
 band. The output remains in the existing sampled color domain (sRGB views decode; scRGB is linear),
@@ -504,9 +504,9 @@ On Radeon 890M with the v3 online path, causal inference measured
 training + Adam + profile-readback copy measured 0.35–0.38 ms at every
 resolution. With a neutral (zero-focus) head, the isolated
 `GAMESCOPE_FRAMEGEN_SHADING=0` A/B measured 0.044/0.055/0.142 ms additional
-Extreme-warp cost per generated frame at those resolutions. This is the cached
+Guided-warp cost per generated frame at those resolutions. This is the cached
 low-res focus sample and branch floor; active-focus cost depends on mask density
-and is charged to Extreme's normal timestamp/degradation rung.
+and is charged to Guided's normal timestamp/degradation rung.
 
 **In-situ learning (C2, `GAMESCOPE_FRAMEGEN_NET_ONLINE=1`).** The net keeps training *on the
 framegen GPU while it serves*, so the correction function tracks the current scene instead of
@@ -534,14 +534,14 @@ live: from a neutral prior on vkmark, the confidence head recovers ~10 points of
 within seconds; warm-started from an offline blob it holds the blob's precision while tracking
 (see `doc/framegen-proposals/README.md` for the measured A/B).
 
-**Causal shading supervision (Extreme only).** The old luma reservoir and preceding final field
+**Causal shading supervision (Guided only).** The old luma reservoir and preceding final field
 reproject a third observed frame onto each forward training tile. Head four learns whether the
 aligned `older→previous` luma trend actually persisted into the now-known current real frame. This
 avoids the invalid two-frame objective that would reward blindly repeating every difference. Only
 the fourth output row/bias receive this loss; it cannot perturb the shared trunk or the established
 flow/confidence heads. Reverse tiles write an exact zero shading gradient. Detected scene cuts,
 disabled B4/cut detection, stale frame IDs, a same-real-pair deadline/refill, missing resources,
-lower tiers, and bidir all disable the objective. GSFR v3 activates the head;
+cheaper pipelines, and bidir all disable the objective. GSFR v3 activates the head;
 v1/v2 blobs are migrated only after forcibly zeroing their formerly undefined
 fourth row and bias. `src/framegen/net_profile.hpp` centralizes that metadata,
 finite-weight validation, and compatibility transform; the renderer retains
@@ -573,10 +573,10 @@ vectors, depth, or G-buffers — so the engine-integrated methods below are
 | Pyramidal SAD block-matcher (§3.2, stage 2) | **AMD FSR 3** FidelityFX Optical Flow (GPUOpen): 8×8 blocks, 24×24 SAD search, luma-pyramid coarse-to-fine | Same classical construction; learned flow (**RIFE**; **SEA-RAFT**, ECCV 2024, arXiv 2405.14793) is the ML alternative we don't run. |
 | Two-source agreement / fallback arbitration (§3.2, stage 3) | **FSR 3**: blends optical-flow vs MV interpolation, *preferring the better color match* (GPUOpen) | We arbitrate per-pixel between the motion gather and the bounded extrapolation, by the same color-match logic. |
 | Forward-backward consistency check (§3.2, stage 2.5) | Classical **forward-backward / left-right flow-consistency** occlusion detection (standard across optical-flow & VFI) | Standard technique; no single survey paper to cite. |
-| Ultra quadratic acceleration (§3.2.1) | **Mob-FGSR** (Yang et al., SIGGRAPH 2024, DOI 10.1145/3641519.3657424): quadratic / uniform-acceleration motion | Mob-FGSR forms it in *world space* from depth+MVs; we form it in *screen space* from two consecutive motion fields. |
-| Extreme guided reconstruction (§3.2.1) | Motion-boundary ownership from **dense optical flow** (research §2); edge-aware joint upsampling | Local contribution: a hypothesis-testing software approximation — no flow net or vendor block. |
+| Predict quadratic acceleration (§3.2.1) | **Mob-FGSR** (Yang et al., SIGGRAPH 2024, DOI 10.1145/3641519.3657424): quadratic / uniform-acceleration motion | Mob-FGSR forms it in *world space* from depth+MVs; we form it in *screen space* from two consecutive motion fields. |
+| Guided reconstruction (§3.2.1) | Motion-boundary ownership from **dense optical flow** (research §2); edge-aware joint upsampling | Local contribution: a hypothesis-testing software approximation — no flow net or vendor block. |
 | Bidirectional interpolation (§3.3) | The **VFI** family — **RIFE** (Huang et al., ECCV 2022, arXiv 2011.06294), **FILM** (Reda et al., ECCV 2022, arXiv 2202.04901) | The interpolation regime and its intrinsic ≥1-interval latency (§0). Ours is a hand-written warp-blend, not a learned VFI net. |
-| Learned refiner + shading focus, Stage C (§3.5) | **GFFE**'s lightweight correction-CNN template (its Shading Correction Network); self-supervision cf. **FILM/RIFE** | Main heads refine the *motion field*; Extreme's fourth head gates a bounded analytic color trend. Unlike GFFE SCN, it has no output-res feature warp or invented RGB. |
+| Learned refiner + shading focus, Stage C (§3.5) | **GFFE**'s lightweight correction-CNN template (its Shading Correction Network); self-supervision cf. **FILM/RIFE** | Main heads refine the *motion field*; Guided's fourth head gates a bounded analytic color trend. Unlike GFFE SCN, it has no output-res feature warp or invented RGB. |
 | B4 adaptation + C2 in-situ learning (§3.4, §3.5) | Online / test-time adaptation | No direct frames-only precedent in the surveyed work; home-grown. |
 
 The prototypes cross-reference the literature too: **#02** base-layer late
@@ -649,21 +649,21 @@ scene-local rung counter remain owned by `rendervulkan.cpp`.
   cost of the current config's batch shape (per-(rung, gen-count), 7/8 EMA; §6).
 - Guard: `nMaxDegradeSteps>0 && cost!=0 && samples>=3 && steps<max`. Three completed
   batches of that exact `(rung, generated-count)` shape keep a cold or anomalous first sample from
-  making an irreversible scene-local quality decision.
+  making an irreversible scene-local pipeline decision.
 - If `nDegradeHold>0`: decrement only (cooldown — burns down even during a dip below deadline; it is
   **wall-frames, not over-budget-frames**).
 - Else if `cost > deadline`: peek `nextEff = framegen_effective_config(steps+1)` and **step only if
-  it truly reduces work** (`nextEff.mode != curEff.mode || nextEff.quality != curEff.quality || nNextGen < nCurGen`) — a
-  pure multiplier notch that doesn't lower the generated count this gap would cost quality for zero
+  it truly reduces work** (`nextEff.mode != curEff.mode || nextEff.pipeline != curEff.pipeline || nNextGen < nCurGen`) — a
+  pure multiplier notch that doesn't lower the generated count this gap would drop work for zero
   GPU saving. On step: `nDegradeSteps++`, `nDegradeHold = k_uFramegenDegradeHoldFrames(4)`.
 
 **Rung ordering** (`framegen_effective_config`): applies `n` degradations to the ceiling
-`{g_eFramegenMode, g_eFramegenQuality, max(2, g_nFramegenMultiplier)}`. Motion walks
-**extreme → ultra → high → medium → low → extrapolate**, beginning wherever the user set the ceiling, then
-the multiplier steps toward x2. `framegen_max_degrade_steps()` counts the selected quality rank plus
+`{g_eFramegenMode, g_eFramegenPipeline, max(2, g_nFramegenMultiplier)}`. Motion walks
+**guided → predict → learned → checked → warp → extrapolate**, beginning wherever the user set the ceiling, then
+the multiplier steps toward x2. `framegen_max_degrade_steps()` counts the selected pipeline rank plus
 the final motion-to-extrapolate step and multiplier notches. There is deliberately **no "stop generating" rung** — the ladder always keeps
 generating (so its GPU-time input never starves); the genuine "even x2 overruns" case is left to the
-reactive pacing gate. It **never mutates** `g_eFramegenMode`/`g_eFramegenQuality`/`g_nFramegenMultiplier`
+reactive pacing gate. It **never mutates** `g_eFramegenMode`/`g_eFramegenPipeline`/`g_nFramegenMultiplier`
 (those are the user's ceiling and size the pool); it only reads an *effective* config. The selected
 rung remains monotonic throughout each post-step hold. Afterward, 90 consecutive large-headroom
 decisions may re-probe exactly one adjacent richer rung, followed by probation and scene-local
@@ -744,7 +744,7 @@ lockless structures safe (§6).
   ring slots**, not copies — saves a full-resolution copy per real
   frame (~66 MB/frame at 4K) on the weak card. The framegen ring grows from the classic **3**
   slots to **8/10/12 at x2/x3/x4** (`output_ring_size_for_multiplier`): two history endpoints
-  plus multiplier-scaled nested-Wayland release depth and real-composite progress. Lower tiers
+  plus multiplier-scaled nested-Wayland release depth and real-composite progress. Cheaper pipelines
   retain the smaller memory footprint. Reuse is governed by `IsInUse()`, not the size estimate;
   partial-overlay aliases remain suppressed while framegen is active.
 - **Generated-frame scanout pool** `framegenOutputImages`, sized **`2·g_nFramegenMultiplier`**
@@ -779,7 +779,7 @@ lockless structures safe (§6).
   field still resident in `mvField`/`mvFieldNet`. Same-pair deadline slots and classic idle refills reuse it and run only
   their warps; they do not repeat estimation, B4, net inference or online training. A new preparation,
   held-out probe, resource rebuild or history invalidation clears the identity. The next consecutive
-  same-quality causal pair shifts it to `mvFieldHistory` before overwriting the working field.
+  same-pipeline causal pair shifts it to `mvFieldHistory` before overwriting the working field.
 - **Cross-queue WAR pin.** `genReadA/B/genReadSeqNo` pin history slots against ring reuse
   until `hasCompletedFramegen(genReadSeqNo)`. The compositor explicitly releases completed pins
   before target acquisition; unfinished pins survive history invalidation. Ring availability is
@@ -832,7 +832,7 @@ cache hit.
   a 3-res × 2-format sweep {1080p/1440p/2160p} × {ABGR2101010 int, ABGR16161616F float}, `nIters=200`,
   own 2-query pool, `waitIdle`-serialized; marks the production-selected variant with `(*)` and,
   when online ML is enabled, reports inference and training separately. Empirical
-  basis for the NVIDIA=direct choice. On Radeon 890M, Extreme versus Ultra warp cost measured
+  basis for the NVIDIA=direct choice. On Radeon 890M, Guided versus Predict warp cost measured
   0.649 vs 0.587 ms at 1440p integer and 1.517 vs 1.411 ms at 2160p integer (200 dispatch mean),
   a 4–11% premium for the full-resolution boundary verdict. It uses the selected queue family's
   `timestampValidBits` and modular wrap subtraction, matching the live estimator.
@@ -874,9 +874,9 @@ cache hit.
 | **01** | VRR hybrid — present the real frame VRR-style for the full latency win, schedule the generated frame with a timer-armed mid-interval atomic flip | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_VRR_HYBRID=1`, dedicated queue + active VRR only). `steamcompmgr` keeps `allowVRR` enabled only while the hybrid is requested, and the DRM backend inherits the real frame's VRR state so the two flips agree. One generated frame at phase 0.5 is flipped by `g_FramegenMidTimer` and planned by `framegen_vrr_hybrid_submit`. Built on #06's source-cadence predictor. **Not yet validated on a VRR panel** (see the proposal status). |
 | **02** | Base-layer generation + late overlay/cursor composite — generate on the pre-upscale game layer, composite UI on top (no HUD ghosting) | **PROTOTYPE IMPLEMENTED** (`GAMESCOPE_FRAMEGEN_BASE=1`, no dedicated-queue requirement). Generation runs on `layers[0].tex`; `framegen_base_present_composite` late-composites current overlays/cursor through `vulkan_composite`, so generated frames receive the full FSR and color-management pipeline. **Divergence:** the draft's bandwidth reduction no longer applies after zero-copy history; base mode adds a base-sized history copy per real frame and a full composite per presented generated frame. `framegen_base_layer_usable` falls back to output-space generation for video-underlay, YCbCr, ReShade, or unsupported storage formats. |
 | **03** | dGPU optical-flow donor — offload motion estimation to the render GPU's `VK_NV_optical_flow` OFA, ship a small flow field over PCIe | **Aspirational** (longest horizon). Zero OFA symbols; needs a second Vulkan device gamescope has never had; cross-vendor timeline interop rated unreliable. Motion mode is the shipped fallback. |
-| **04** | Timestamp-driven adaptive degradation | **IMPLEMENTED** (`a75bfbe`) but **divergent** from the proposal — rungs are motion-quality/mode/multiplier notches (not a pyramid table), use an 85% budget (not 0.6), and have a 2D per-(rung,gen-count) 7/8-EMA, three-sample cold-start guard, fixed 4-frame hold, and slow evidence-gated one-rung recovery with probation/back-off. Native fixed-refresh recovery uses full slot capacity and two-miss hysteresis. `VK_EXT_calibrated_timestamps` is unused. |
+| **04** | Timestamp-driven adaptive degradation | **IMPLEMENTED** (`a75bfbe`) but **divergent** from the proposal — rungs are motion-pipeline/mode/multiplier notches (not a pyramid table), use an 85% budget (not 0.6), and have a 2D per-(rung,gen-count) 7/8-EMA, three-sample cold-start guard, fixed 4-frame hold, and slow evidence-gated one-rung recovery with probation/back-off. Native fixed-refresh recovery uses full slot capacity and two-miss hysteresis. `VK_EXT_calibrated_timestamps` is unused. |
 | **05** | Tile classification + `vkCmdDispatchIndirect` + SDMA static fill — generate only over moving tiles, fill static tiles on the transfer engine | **Aspirational** (deferred). No transfer-only queue discovery / classify shader exists; the doc admits it depends on transfer-queue discovery that isn't there yet. |
-| **06** | Causal fixed-cadence scheduling — treat each refresh as a deadline, present a real frame when ready, otherwise use a one-slot forward prediction | **DEFAULT BEHAVIOR** on the dedicated queue. `commit_t::present_time` supplies source-ready observations; `CadencePredictorState` learns bounded period/trend/late error; the deadline planner compares protected arrival with the exact display wake, carries target timestamps through submission, and replans after feedback or repeat. The multiplier is a resource/quality ceiling rather than a batch size. The shared-queue fallback remains conservative. |
+| **06** | Causal fixed-cadence scheduling — treat each refresh as a deadline, present a real frame when ready, otherwise use a one-slot forward prediction | **DEFAULT BEHAVIOR** on the dedicated queue. `commit_t::present_time` supplies source-ready observations; `CadencePredictorState` learns bounded period/trend/late error; the deadline planner compares protected arrival with the exact display wake, carries target timestamps through submission, and replans after feedback or repeat. The multiplier is a resource ceiling rather than a batch size. The shared-queue fallback remains conservative. |
 | **07** | Frames-only SOTA alignment and validation | **BOUNDED IMPLEMENTATIONS COMPLETE FOR E1, E2, B, A, D.** E2 now captures exact full-resolution held-out colour with paired candidates; optional LPIPS is available, while DISTS/FvVDP remain external evaluation work. The confidence-only bidir ML authority boundary remains the production contract. |
 
 ---

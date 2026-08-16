@@ -83,7 +83,7 @@ uniform motion_net_t {
 // confidence, .a = round-trip error passed through). A conv reads an apron
 // of RAW neighbors, so refinement can never be in place.
 layout(binding = 1, rgba16f) writeonly uniform image2D u_refined;
-// Low-resolution focus map consumed only by Extreme's existing warp. RGBA16F
+// Low-resolution focus map consumed only by Guided's existing warp. RGBA16F
 // matches the universally required motion-field format; only .r is used.
 layout(binding = 2, rgba16f) writeonly uniform image2D u_shadingFocus;
 

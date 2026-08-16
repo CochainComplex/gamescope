@@ -12,7 +12,7 @@ struct EffectiveConfig
 {
 	GamescopeFramegenMode mode;
 	uint32_t multiplier;
-	GamescopeFramegenQuality quality;
+	GamescopeFramegenPipeline pipeline;
 };
 
 // The compositor output ring also carries zero-copy real-frame history. A
@@ -28,14 +28,14 @@ struct EffectiveConfig
 	return 4u + 2u * boundedMultiplier;
 }
 
-// Count the degradation rungs below a startup quality ceiling. Motion sheds
-// quality first, then falls back to extrapolation; multiplier reductions are
+// Count the degradation rungs below a startup pipeline ceiling. Motion sheds
+// pipeline passes first, then falls back to extrapolation; multiplier reductions are
 // last. There is deliberately no disabled rung, so GPU timing never starves.
 [[nodiscard]] constexpr uint32_t max_degrade_steps( GamescopeFramegenMode mode,
-	GamescopeFramegenQuality quality, int multiplier )
+	GamescopeFramegenPipeline pipeline, int multiplier )
 {
 	const uint32_t nMotionRungs = mode == GamescopeFramegenMode::Motion
-		? static_cast<uint32_t>( quality ) + 1u : 0u;
+		? static_cast<uint32_t>( pipeline ) + 1u : 0u;
 	const uint32_t nMultiplierRungs =
 		static_cast<uint32_t>( std::max( 0, multiplier - 2 ) );
 	return nMotionRungs + nMultiplierRungs;
@@ -44,20 +44,20 @@ struct EffectiveConfig
 // Resolve one rung without touching global state. Keeping this constexpr makes
 // the renderer call site zero-cost while allowing exhaustive CPU-only tests.
 [[nodiscard]] constexpr EffectiveConfig effective_config( GamescopeFramegenMode mode,
-	GamescopeFramegenQuality quality, int multiplier, uint32_t nDegradeSteps )
+	GamescopeFramegenPipeline pipeline, int multiplier, uint32_t nDegradeSteps )
 {
 	EffectiveConfig config = {
 		mode,
 		static_cast<uint32_t>( std::max( 2, multiplier ) ),
-		quality,
+		pipeline,
 	};
 	uint32_t n = nDegradeSteps;
 
 	while ( n > 0 && config.mode == GamescopeFramegenMode::Motion
-		&& config.quality > GamescopeFramegenQuality::Low )
+		&& config.pipeline > GamescopeFramegenPipeline::Warp )
 	{
-		config.quality = static_cast<GamescopeFramegenQuality>(
-			static_cast<uint32_t>( config.quality ) - 1u );
+		config.pipeline = static_cast<GamescopeFramegenPipeline>(
+			static_cast<uint32_t>( config.pipeline ) - 1u );
 		n--;
 	}
 	if ( n > 0 && config.mode == GamescopeFramegenMode::Motion )

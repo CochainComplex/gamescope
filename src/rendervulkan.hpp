@@ -978,7 +978,7 @@ public:
 	// Raw GPU time (ns) of the most recent framegen batch, for logging only.
 	uint64_t framegenLastGpuTimeNs() const { return m_ulFramegenLastRawGpuTimeNs; }
 	// Forget all per-rung costs (e.g. on a scene change) so the ladder re-probes
-	// quality optimistically for the new scene.
+	// configured pipeline optimistically for the new scene.
 	void framegenResetRungCosts();
 	// Bracket a framegen batch's dispatches with GPU timestamps. Begin records a
 	// pool reset + TOP_OF_PIPE write and returns the ring slot (or -1 if timing is

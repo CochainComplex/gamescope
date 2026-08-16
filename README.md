@@ -80,18 +80,18 @@ The generation runs on silicon that would otherwise sit mostly idle — not lite
 Under the hood it's a staged, self-correcting motion pipeline:
 
 - **Motion estimation** — a 3-level coarse-to-fine luma **pyramid block matcher** (full search only at the coarsest level, ≈±128 px reach), **sub-pixel parabolic** refinement, seeded ±1 search down the levels, and vector-median seeding to kill tear-like mislocks.
-- **Artifact control** — a **forward-backward consistency check** (round-trip a vector; if it doesn't close, drop its confidence — kills disocclusion/mislock fizzle), a **per-pixel two-source agreement test** that stops ghosted double-exposures at edges, TAA-style neighbourhood clamping, and an Extreme-tier three-real-frame reservoir that validates adjacent background motion before filling a newly revealed boundary.
+- **Artifact control** — a **forward-backward consistency check** (round-trip a vector; if it doesn't close, drop its confidence — kills disocclusion/mislock fizzle), a **per-pixel two-source agreement test** that stops ghosted double-exposures at edges, TAA-style neighbourhood clamping, and the Guided pipeline's three-real-frame reservoir that validates adjacent background motion before filling a newly revealed boundary.
 - **Extrapolate *or* interpolate** — default **forward extrapolation** (zero added latency), or true **bidirectional interpolation** (warp *both* real frames to the in-between phase, confidence-blend, phase-correct crossfade in the gaps) for the smoothest motion at the cost of ~1 frame of latency.
-- **It learns** — a small (~4.6k-param) **convolutional refiner net** cleans up the motion fields (bounded flow residual + confidence recalibration), trainable offline from captured frames *or* **learning in-situ on the GPU while you play**, with per-game persistence. In Extreme, its zero-neutral fourth head learns whether aligned lighting/color trends persist across three causal real frames; the warp applies only a tightly bounded analytic correction. On top of that a **self-supervised loop** grades every real frame against the prediction that targeted it and auto-tunes its own thresholds.
+- **It learns** — a small (~4.6k-param) **convolutional refiner net** cleans up the motion fields (bounded flow residual + confidence recalibration), trainable offline from captured frames *or* **learning in-situ on the GPU while you play**, with per-game persistence. In Guided, its zero-neutral fourth head learns whether aligned lighting/color trends persist across three causal real frames; the warp applies only a tightly bounded analytic correction. On top of that a **self-supervised loop** grades every real frame against the prediction that targeted it and auto-tunes its own thresholds.
 - **Pacing & display** — an **absolute-deadline scheduler** plans one slot at a time against the real vblank grid, corrects its anchor from tagged pageflip feedback, and *learns* the display chain's present lead instead of rediscovering it; a **VRR/adaptive-sync-compatible** hybrid; and a **base-layer** path that composites HUD/cursor *after* generation so UI text stays crisp.
-- **Engineering** — generation runs on a **dedicated async-compute queue** so it never queues ahead of the real frame (it still shares the silicon — the degradation ladder exists precisely because contention is real); **zero-copy** history; **fp16** + vendor-aware shader dispatch; and a **deadline-driven degradation ladder** that measures its own GPU time and sheds quality *before* it misses a vblank.
+- **Engineering** — generation runs on a **dedicated async-compute queue** so it never queues ahead of the real frame (it still shares the silicon — the degradation ladder exists precisely because contention is real); **zero-copy** history; **fp16** + vendor-aware shader dispatch; and a **deadline-driven degradation ladder** that measures its own GPU time and sheds passes *before* it misses a vblank.
 
 ### How it maps to the state of the art
 
 Working from finished frames only is the *hard* frontier of frame generation, and the design deliberately tracks the published frames-only research rather than reinventing it. Each piece has a named ancestor — an **analog**, since we have no engine motion vectors, depth, or G-buffers to lean on:
 
 - the pyramid block-matcher is the classical construction behind **AMD FSR 3**'s FidelityFX Optical Flow;
-- the causal-acceleration tier follows **Mob-FGSR**'s quadratic (uniform-acceleration) motion model;
+- the Predict pipeline follows **Mob-FGSR**'s quadratic (uniform-acceleration) motion model;
 - the heuristic-motion-plus-lightweight-correction-net shape is the **GFFE** (G-buffer-Free Frame Extrapolation) template;
 - forward-vs-bidirectional is the extrapolation/interpolation split the literature draws, with the same latency trade-off.
 
@@ -120,12 +120,12 @@ It's **experimental**. Expect shimmer on fine detail, ghost trails on fast motio
 ### Recommended settings (start with these)
 
 ```bash
-GAMESCOPE_FRAMEGEN_HUD=2 GAMESCOPE_FRAMEGEN_NET_ONLINE=1 GAMESCOPE_FRAMEGEN_NET_PROFILE=~/.cache/gamescope-fg-mygame.bin gamescope --expose-wayland --backend wayland --prefer-vk-device <present vendor:device> -W 2560 -H 1440 -r 120 -f --experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-quality high -- env MESA_VK_DEVICE_SELECT='<render vendor:device>!' <game>
+GAMESCOPE_FRAMEGEN_HUD=2 gamescope --expose-wayland --backend wayland --prefer-vk-device <present vendor:device> -W 2560 -H 1440 -r 120 -f --experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline checked -- env MESA_VK_DEVICE_SELECT='<render vendor:device>!' <game>
 ```
 
-- Default to causal/forward `--framegen-mode motion`, `--framegen-multiplier 2`, `--framegen-quality high`; try `3` only if the present GPU has headroom. Measured 2026-08-15 on the POC laptop with a real Proton game running single-GPU on the AMD 890M (game, generation and scanout on one iGPU); the dual-GPU re-baseline is pending.
-- Raise quality to `ultra`/`extreme` only if the HUD ladder row stays full; the ladder auto-degrades and now auto-recovers.
-- Keep the learned net online with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`; adaptation is on by default at `high` and above. This path adds no frame of latency.
+- The default `warp` pipeline is the cheapest. Start with `checked` for the recommended consistency/agreement passes, keep `--framegen-multiplier 2`, and try `3` only if the present GPU has headroom. Measured 2026-08-15 on the POC laptop with a real Proton game running single-GPU on the AMD 890M (game, generation and scanout on one iGPU); the dual-GPU re-baseline is pending.
+- `learned`, `predict`, and `guided` are experimental pipelines that add passes and can smear more; the ladder auto-degrades and now auto-recovers.
+- If testing `learned` or later, enable the net online with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`. This path adds no frame of latency.
 - On an iGPU-class present GPU (e.g. an 890M) set `GAMESCOPE_FRAMEGEN_NET_EVERY=2` (train every 2nd frame): pacing stays equal and it played best in our real-game test; `1` on a desktop card.
 - JIT display-clock pacing is on by default in the causal path; no flag is needed. It plans one exact display slot at a time, reducing wasted generation passes and placing generated frames closer to their slot with fresher real-frame prediction.
 - Tune with `GAMESCOPE_FRAMEGEN_HUD=2` (`rates`, `ladder`, `pace` rows); add `GAMESCOPE_FRAMEGEN_METRICS=1` for a log summary.
@@ -267,23 +267,22 @@ This is a prototype. Keep the following in mind:
   falling back to extrapolation where the match is unconfident — higher quality
   on panning/scrolling at a higher compute cost; `blend` averages the last two
   real frames and is kept as a debug aid only. For `motion`,
-  `--framegen-quality` selects a real cost ceiling: `low` runs forward matching
-  only; `medium` adds reverse consistency and per-pixel agreement; `high`
-  (default, compatible with the previous behavior) adds self-supervised
-  adaptation and permits the optional learned refiner; `ultra` additionally
+  `--framegen-pipeline` selects a real cost ceiling: `warp` (default) runs forward matching
+  only; `checked` adds reverse consistency and per-pixel agreement; `learned`
+  adds self-supervised adaptation and permits the optional learned refiner; `predict` additionally
   retains and reprojects the preceding checked field to make a bounded causal
-  acceleration prediction; `extreme` reconstructs a per-pixel motion-layer
+  acceleration prediction; `guided` reconstructs a per-pixel motion-layer
   verdict from nearby field hypotheses using full-resolution color
   correspondence before applying that acceleration, then uses two-interval-old
   luma to validate adjacent background motion at locally diagnosed
   disocclusions. The displayed color still comes from the newest real frame,
   not history. The timestamp ladder
-  sheds these tiers one at a time before falling back to plain extrapolation
+  sheds these pipelines one at a time before falling back to plain extrapolation
   or reducing the multiplier.
 * **Scene changes.** Prediction history is dropped automatically on focus
   change, overlay/notification appearance or disappearance, SDR↔HDR/EOTF
   changes, resolution or format changes, and long frame gaps, so stale content
-  is never smeared across a scene transition. High and higher motion tiers also
+  is never smeared across a scene transition. Learned and later pipelines also
   compare nine regional luminance histograms plus motion-compensated prediction
   error in the same GPU batch. A content cut with steady frametime duplicates
   the newest real frame instead of extrapolating across unrelated images (or
@@ -462,7 +461,7 @@ See `gamescope --help` for a full list of options.
 * `-f`: create a full-screen window.
 * `--experimental-framegen`: enable experimental compositor-side frame generation (x2–x4). Implies `--force-composite`; the default fixed-slot path disables adaptive sync, and tearing remains disabled. `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` is the opt-in VRR exception. See [Experimental frame generation](#experimental-frame-generation).
 * `--framegen-mode`: generated-frame algorithm, `extrapolate` (default, low latency), `motion` (motion-compensated, higher quality/cost) or `blend` (debug).
-* `--framegen-quality`: motion quality/cost ceiling: `low`, `medium`, `high` (default), `ultra`, or `extreme`. Lower tiers skip whole passes; `ultra` adds causal temporal acceleration and `extreme` adds full-resolution color-guided motion reconstruction, a bounded three-frame disocclusion resolver (`GAMESCOPE_FRAMEGEN_RESERVOIR=0`), and with ML a causal shading-persistence correction (`GAMESCOPE_FRAMEGEN_SHADING=0`).
+* `--framegen-pipeline`: generation pipeline: `warp` (default), `checked`, `learned`, `predict`, or `guided`; each adds passes and cost. `checked` is the recommended step up. The last three are experimental and can smear; `predict` adds causal temporal acceleration and `guided` adds full-resolution color-guided motion reconstruction, a bounded three-frame disocclusion resolver (`GAMESCOPE_FRAMEGEN_RESERVOIR=0`), and with ML a causal shading-persistence correction (`GAMESCOPE_FRAMEGEN_SHADING=0`).
 * `--framegen-strength`: forward-extrapolation step for `extrapolate`/`motion` modes, `0.0`–`1.0` (default `0.5`). Lower values reduce ghosting.
 * `--framegen-multiplier`: generated-frame multiplier, `2` (default), `3` or `4`. The number of frames actually displayed adapts to empty vblanks; on a dedicated framegen queue gamescope may speculatively prepare candidates that are later dropped if real content arrives first.
 * `--framegen-debug`: log framegen history, dispatch, and present cadence.

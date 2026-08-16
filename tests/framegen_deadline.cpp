@@ -46,7 +46,7 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 		.otherDeviceName = "NVIDIA GeForce RTX 3070",
 		.renderOrigin = "linear",
 		.mode = GamescopeFramegenMode::Motion,
-		.quality = GamescopeFramegenQuality::High,
+		.pipeline = GamescopeFramegenPipeline::Learned,
 		.multiplier = 2u,
 		.refreshMilliHz = 120'000u,
 		.clientBuffersStaged = true,
@@ -71,7 +71,7 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 
 	REQUIRE( text.lineCount == 7u );
 	CHECK( text.lines[0].data() == std::string_view{
-		"gameslop 0.1.0+76e6d5         motion x2 . high . 120Hz fixed" } );
+		"gameslop 0.1.0+76e6d5         motion x2 . learned . 120Hz fixed" } );
 	CHECK( text.lines[1].data() == std::string_view{
 		"present  AMD Radeon Graphics render NVIDIA GeForce RTX  buffers xGPU" } );
 	CHECK( text.lines[2].data() == std::string_view{
@@ -79,7 +79,7 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	CHECK( text.lines[3].data() == std::string_view{
 		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 118/120" } );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   high/motion rung 0/0  full" } );
+		"ladder   learned/motion rung 0/0  full" } );
 	std::string paceLine = "pace     hit 99%  ";
 	paceLine.append( k_nFramegenHudSparklineSamples, '\x08' );
 	paceLine += "   jitter +/-0.7ms  ";
@@ -119,7 +119,7 @@ TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hu
 		.deviceName = "AMD Radeon RX 5700 XT",
 		.renderOrigin = nullptr,
 		.mode = GamescopeFramegenMode::Motion,
-		.quality = GamescopeFramegenQuality::High,
+		.pipeline = GamescopeFramegenPipeline::Learned,
 		.multiplier = 2u,
 		.refreshMilliHz = 120'000u,
 		.bidirRequested = true,
@@ -161,7 +161,7 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 		.version = "0.1.0+76e6d5",
 		.deviceName = "AMD Radeon 890M",
 		.mode = GamescopeFramegenMode::Motion,
-		.quality = GamescopeFramegenQuality::High,
+		.pipeline = GamescopeFramegenPipeline::Learned,
 		.multiplier = 2u,
 		.refreshMilliHz = 120'000u,
 		.real = 200u,
@@ -178,14 +178,14 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	CHECK( text.lines[3].data() == std::string_view{
 		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 118/120" } );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   high/motion rung 0/0  full" } );
+		"ladder   learned/motion rung 0/0  full" } );
 }
 
 TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
 {
 	FramegenHudSnapshot_t snapshot = {
 		.mode = GamescopeFramegenMode::Extrapolate,
-		.quality = GamescopeFramegenQuality::Medium,
+		.pipeline = GamescopeFramegenPipeline::Checked,
 		.refreshMilliHz = 120'000u,
 		.real = 1'234u,
 		.generated = 56'789u,
@@ -198,24 +198,24 @@ TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
 	CHECK( text.lines[3].data() == std::string_view{
 		"rates    source 246fps[1.2k] gen 999fps[56.8k] repeat 0fps fill 999/120" } );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   medium/extrapolate rung 2/4  hold" } );
+		"ladder   checked/extrapolate rung 2/4  hold" } );
 
 	snapshot.ladderHold = 0u;
 	snapshot.ladderRecoveryProbationRemaining = 46u;
 	text = format_framegen_hud( 1u, snapshot );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   medium/extrapolate rung 2/4  probation 2s" } );
+		"ladder   checked/extrapolate rung 2/4  probation 2s" } );
 
 	snapshot.ladderRecoveryProbationRemaining = 0u;
 	snapshot.ladderRecoveryDecisionsSinceClimb = 44u;
 	text = format_framegen_hud( 1u, snapshot );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   medium/extrapolate rung 2/4  recover in 2s" } );
+		"ladder   checked/extrapolate rung 2/4  recover in 2s" } );
 
 	snapshot.ladderRecoveryDecisionsSinceClimb = 90u;
 	text = format_framegen_hud( 1u, snapshot );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   medium/extrapolate rung 2/4  watching" } );
+		"ladder   checked/extrapolate rung 2/4  watching" } );
 }
 
 TEST_CASE( "framegen HUD sparkline mapping is monotone and saturated",

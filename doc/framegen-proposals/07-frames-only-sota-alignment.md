@@ -2,7 +2,7 @@
 
 Status: **design map / gap analysis**; Gaps E1/E2, B, bounded frames-only A, and a
 bounded frames-only form of D implemented (`scripts/framegen-net-eval.py`, the
-B4 GPU scene-cut guard, the E2 paired full-colour probe/evaluator, the Extreme
+B4 GPU scene-cut guard, the E2 paired full-colour probe/evaluator, the Guided
 disocclusion reservoir, the causal shading-persistence head, the conservative bidir ML authority boundary,
 and an experimental symmetric endpoint-grid correction). Maps
 [`../research-framegen.md`](../research-framegen.md) onto the shipped pipeline and
@@ -18,8 +18,8 @@ the **never-degrade-HDR** rule. That rules out the whole engine-integrated
 school (Mob-FGSR, ExtraNet, ExtraSS, LMV, DLSS/FSR) as *direct* ports; we can
 only borrow the parts that survive without engine buffers.
 
-Scope note: the motion-quality stack is `--framegen-mode motion` only. The
-default `extrapolate` mode and the quality tiers below it are the low-latency
+Scope note: the motion-pipeline stack is `--framegen-mode motion` only. The
+default `extrapolate` mode and the cheaper pipelines below it are the low-latency
 forward path; SOTA alignment is about the `motion` path.
 
 ## Part 1 — Where the shipped pipeline already meets the research
@@ -28,11 +28,11 @@ forward path; SOTA alignment is about the `motion` path.
 |---|---|---|
 | **Extrapolation as the games-appropriate default** (zero added latency); interpolation is opt-in for its ≥1-frame latency (§0, Recommendations) | `extrapolate` default; `motion` forward path; `GAMESCOPE_FRAMEGEN_BIDIR` opt-in interpolation that presents one interval late | **Aligned by design.** The latency taxonomy is baked into the mode/bidir split. |
 | **Heuristic motion + a lightweight correction net** is the real-time frontier — the GFFE template (§3, Rec 1) | 3-level luma pyramid matcher → FB/agreement/adaptation → ~4.6k-param field refiner + causal shading-focus head → bounded screen-space disocclusion reservoir | **Same shape within frames-only limits.** The remaining major GFFE gaps are its depth/MV-backed layered world-space background and full feature-domain SCN, neither of which a compositor can reproduce cheaply. |
-| **Quadratic / uniform-acceleration motion** (Mob-FGSR, KF1) | Ultra tier: `mvFieldHistory` gives a 2-field second derivative → quadratic through 3 causal positions, interval-normalized + deadzoned + accel-capped + confidence-gated (`cs_framegen_motion_warp_accel.comp`) | **Implemented, frames-only variant.** Mob-FGSR does this in world space from depth+MVs; we do it in screen space on the *motion field*. Real-frame timestamps normalize unequal intervals, preventing cadence jitter from masquerading as acceleration; a >4:1 transition falls back one interval to constant velocity. Ours is the correct choice given no depth. |
+| **Quadratic / uniform-acceleration motion** (Mob-FGSR, KF1) | Predict pipeline: `mvFieldHistory` gives a 2-field second derivative → quadratic through 3 causal positions, interval-normalized + deadzoned + accel-capped + confidence-gated (`cs_framegen_motion_warp_accel.comp`) | **Implemented, frames-only variant.** Mob-FGSR does this in world space from depth+MVs; we do it in screen space on the *motion field*. Real-frame timestamps normalize unequal intervals, preventing cadence jitter from masquerading as acceleration; a >4:1 transition falls back one interval to constant velocity. Ours is the correct choice given no depth. |
 | **Hybrid "prefer whichever source gives the better color match"** at block level (FSR 3, §4, Recommendations) | Per-pixel two-source agreement + FB round-trip + confidence blend to the bounded pixel-space fallback | **Conceptually equivalent** — a home-grown per-pixel version of FSR's block-level color-match arbitration. |
 | **UI/HUD must be composited after generation** (KF, §5) | Proposal **#02** base-layer generation + late overlay/cursor composite (prototyped, `GAMESCOPE_FRAMEGEN_BASE=1`) | **This *is* the research's UI recommendation.** Already prototyped. |
-| **Heavy split net once per pair, cheap per-output-frame work** (DLSS 4, KF5) | Field estimation + net/B4/training run **once per real pair**; a frame-ID/quality/mode cache makes later JIT/idle batches issue only their warps | **Structurally satisfied.** The expensive stage is amortized across the multiplier exactly as DLSS 4 splits it, including refills that are separate submissions. Reusing one finalized field/weight snapshot also prevents temporal inconsistency and repeated self-supervision on low-FPS pairs. (DLSS 4 *interpolates*; the amortization structure maps, not the mode.) |
-| Edge-aware upsampling of a low-res field at fg/bg boundaries | Extreme tier `reconstructField()` guided reconstruction | **Local contribution** not named in the research; solves the bilinear-average-vector-at-boundaries problem the research only flags. |
+| **Heavy split net once per pair, cheap per-output-frame work** (DLSS 4, KF5) | Field estimation + net/B4/training run **once per real pair**; a frame-ID/pipeline/mode cache makes later JIT/idle batches issue only their warps | **Structurally satisfied.** The expensive stage is amortized across the multiplier exactly as DLSS 4 splits it, including refills that are separate submissions. Reusing one finalized field/weight snapshot also prevents temporal inconsistency and repeated self-supervision on low-FPS pairs. (DLSS 4 *interpolates*; the amortization structure maps, not the mode.) |
+| Edge-aware upsampling of a low-res field at fg/bg boundaries | Guided pipeline `reconstructField()` | **Local contribution** not named in the research; solves the bilinear-average-vector-at-boundaries problem the research only flags. |
 
 ## Part 2 — Genuine gaps, ranked by value ÷ (cost · risk)
 
@@ -92,12 +92,12 @@ pixel correspondence while preserving regional distributions, and particle
 chaos can kill most field confidence without being a cut. The verdict is
 encoded into the final field after its FB diagnostic has been consumed. Causal
 warps duplicate the newest real endpoint; bidir chooses the nearest endpoint;
-Ultra/Extreme history receives zero confidence so the cut cannot seed a false
+Predict/Guided history receives zero confidence so the cut cannot seed a false
 acceleration. No CPU round trip, future frame, vendor API, or per-generated-frame
 stats read is added. Measured B4 cost is 20–39 µs per real at 1080p–4K on the
 Radeon 890M, and a 1M-asteroid camera-motion stress run produced no false cuts.
 
-### Gap A — Disocclusion background reservoir · implemented, Extreme only
+### Gap A — Disocclusion background reservoir · implemented, Guided only
 **The single biggest frames-only quality gap.** On a disocclusion (revealed
 background) the pipeline can only kill confidence and fall back to bounded
 pixel-space extrapolation → hold-then-ghost. GFFE's core contribution is
@@ -119,7 +119,7 @@ two-interval-old evidence needed by both the current batch and same-interval JIT
 refills. Each image carries a real-frame ID; skipped estimates, invalidations,
 scene cuts, and non-consecutive history cannot consume it.
 
-At a full-resolution pixel, the Extreme warp enters the reservoir search only
+At a full-resolution pixel, the Guided warp enters the reservoir search only
 when the centre field has both low confidence and a large local FB round-trip
 error. It tests the eight adjacent field hypotheses, rejects candidates that are
 not a distinct, locally FB-consistent layer, reprojects each through the retained
@@ -135,7 +135,7 @@ still cannot recover content that is out of screen, hidden for many frames, or
 correctly depth-order arbitrary overlapping motions. Those require the engine
 depth/MVs that GFFE actually uses. The luma ping-pong copy costs 4–9 us per real
 frame at 1080p–4K on Radeon 890M; the conditional full-res search is charged to
-the Extreme rung and disappears as soon as the deadline ladder drops to Ultra.
+the Guided rung and disappears as soon as the deadline ladder drops to Predict.
 
 ### Rejected experiment — temporal global-camera prior
 Two causal variants used the preceding checked field as a global translation
@@ -195,7 +195,7 @@ requires the live result to retain baseline sharpness and responsiveness.
 
 The two checked fields are endpoint-anchored, but the inexpensive bidirectional
 warp samples them on the intermediate output grid. For non-translational screen
-motion this is only the first fixed-point approximation. Extreme can opt into
+motion this is only the first fixed-point approximation. Guided can opt into
 one extra symmetric step with `GAMESCOPE_FRAMEGEN_BIDIR_TRACE=0…1`:
 
 `x1 = p + (1-t) F(x1)`, `x0 = p + t R(x0)`.
@@ -208,7 +208,7 @@ both are endpoint-anchored; no net manufactures authority. The trace path is a
 separate specialization of the B3 pipeline, so trace `0` compiles out its extra
 samples and registers. This uses two low-resolution field samples per output
 pixel, no extra image/pass, no CPU work, and no estimator, ML, phase, queue, or
-flip changes. It is Extreme-only; cheaper tiers remain unchanged.
+flip changes. It is Guided-only; cheaper pipelines remain unchanged.
 
 Across three 12-frame held-out GravityMark sets with user-driven camera motion,
 strength `0.5` improved 26/36 exact pairs. Pooled MAE changed
@@ -232,10 +232,10 @@ third causal frame: the head learns whether an aligned `older→previous` luma
 trend actually persisted into the now-known current real frame. A two-frame
 loss was rejected because it would reward repeating every mismatch. The new
 loss updates only output row four/bias, never the shared trunk or established
-flow/confidence heads; reverse tiles, cuts, stale IDs, refills, lower tiers and
+flow/confidence heads; reverse tiles, cuts, stale IDs, refills, cheaper pipelines and
 bidir provide exactly zero shading gradient.
 
-Extreme's existing full-resolution warp then extrapolates the aligned
+Guided's existing full-resolution warp then extrapolates the aligned
 `current-previous` RGB trend under the learned focus. It is phase-scaled, capped
 to 8% of local magnitude per interval, confidence/history/acceleration gated,
 restricted to moderate changes, finite-checked, and never `[0,1]` clamped. A
@@ -302,7 +302,7 @@ survey. Load-bearing confirmations:
   Ti Super; Appendix D for the SCN internals).
 - **Mob-FGSR** (SIGGRAPH 2024, DOI 10.1145/3641519.3657424) — *"under the
   assumption of quadratic motion… uniform acceleration,"* from color+depth+MVs →
-  our ultra tier's screen-space analog.
+  our Predict pipeline's screen-space analog.
 - **DLSS 4** (research.nvidia.com/labs/adlr/DLSS4) — the split network (*"one half
   runs once for every input frame pair… re-used; the other much smaller half runs
   once for every generated output frame"*) and the OFA→AI-model replacement.
