@@ -7,7 +7,7 @@ usage()
 	cat <<'EOF'
 Usage (from a text VT, outside a graphical session):
   RENDER_DEV=vendor:device! PRESENT_DEV=vendor:device \
-    ./run-framegen-native.sh [mode] [multiplier] [windows] [WxH] [refresh] [-- client [args...]]
+    ./scripts/run-framegen-native.sh [mode] [multiplier] [windows] [WxH] [refresh] [-- client [args...]]
 
 Arguments:
   mode        motion | extrapolate | blend  (default: motion)
@@ -33,10 +33,10 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=env-gamescope-local.sh
+# shellcheck source=scripts/env-gamescope-local.sh
 source "$SCRIPT_DIR/env-gamescope-local.sh"
 # shellcheck source=scripts/framegen-launch-common.sh
-source "$SCRIPT_DIR/scripts/framegen-launch-common.sh"
+source "$SCRIPT_DIR/framegen-launch-common.sh"
 
 framegen_parse_launch_args 2 600 2560x1440 120 "$@"
 mode="$FRAMEGEN_MODE"

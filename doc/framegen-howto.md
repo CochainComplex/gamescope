@@ -53,7 +53,7 @@ GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0 \
 GAMESCOPE_FRAMEGEN_RESERVOIR=1 \
 GAMESCOPE_FRAMEGEN_SHADING=1 \
 GAMESCOPE_FRAMEGEN_DEBUG_EVERY=60 \
-./env-gamescope-local.sh \
+./scripts/env-gamescope-local.sh \
 gamescope --expose-wayland --backend wayland \
   --prefer-vk-device "$PRESENT_DEV" \
   -W 2560 -H 1440 -r 120 \
@@ -142,7 +142,7 @@ GAMESCOPE_FRAMEGEN_NET="$FRAMEGEN_BEST_PROFILE" \
 GAMESCOPE_FRAMEGEN_RESERVOIR=1 \
 GAMESCOPE_FRAMEGEN_SHADING=1 \
 GAMESCOPE_FRAMEGEN_DEBUG_EVERY=60 \
-./env-gamescope-local.sh \
+./scripts/env-gamescope-local.sh \
 gamescope --expose-wayland --backend wayland \
   --prefer-vk-device "$PRESENT_DEV" \
   -W 2560 -H 1440 -r 120 \
@@ -280,7 +280,7 @@ which card is which. Replace the example paths and IDs with your own:
 ```bash
 cd /path/to/gamescope-gameslop
 export GAMESCOPE_BUILD_DIR=build-perf
-source ./env-gamescope-local.sh
+source ./scripts/env-gamescope-local.sh
 
 export RENDER_DEV=10de:1234!   # strong card that runs the game
 export PRESENT_DEV=1002:5678   # card your monitor is plugged into

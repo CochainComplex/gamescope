@@ -26,10 +26,12 @@ jobs:
           submodules: recursive
       - name: Check framegen maintenance tooling
         run: |
-          bash -n env-gamescope-local.sh test-framegen.sh \
-            scripts/framegen-launch-common.sh watch-framegen.sh run-framegen-native.sh
-          shellcheck -x env-gamescope-local.sh test-framegen.sh \
-            scripts/framegen-launch-common.sh watch-framegen.sh run-framegen-native.sh
+          bash -n scripts/env-gamescope-local.sh scripts/test-framegen.sh \
+            scripts/framegen-launch-common.sh scripts/watch-framegen.sh \
+            scripts/run-framegen-native.sh
+          shellcheck -x scripts/env-gamescope-local.sh scripts/test-framegen.sh \
+            scripts/framegen-launch-common.sh scripts/watch-framegen.sh \
+            scripts/run-framegen-native.sh
           PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
             python3 -m py_compile scripts/framegen-net-train.py \
               scripts/framegen-net-eval.py scripts/framegen-color-eval.py
@@ -37,11 +39,13 @@ jobs:
             tests/test_framegen.cpp src/framegen/atomic_file.cpp \
             -o /tmp/gamescope-framegen-contracts
           /tmp/gamescope-framegen-contracts
-          if git grep -nE '/home/[[:alnum:]_.-]+/' -- \
+          home_path_regex='/''home/[[:alnum:]_.-]+/'
+          if git grep -nE "$home_path_regex" -- \
             README.md doc/framegen-architecture.md doc/framegen-howto.md \
             doc/framegen-maintenance.md doc/framegen-proposals \
-            env-gamescope-local.sh test-framegen.sh watch-framegen.sh \
-            run-framegen-native.sh scripts/framegen-\*.py \
+            scripts/env-gamescope-local.sh scripts/test-framegen.sh \
+            scripts/watch-framegen.sh scripts/run-framegen-native.sh \
+            scripts/framegen-\*.py \
             scripts/framegen-launch-common.sh src/framegen \
             tests/test_framegen.cpp; then
             echo 'Machine-specific home path found in a published framegen file.' >&2

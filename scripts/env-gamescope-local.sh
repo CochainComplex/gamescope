@@ -2,10 +2,10 @@
 # Load the local runtime used by this gamescope checkout.
 #
 # Source this before running gamescope manually:
-#   source ./env-gamescope-local.sh
+#   source ./scripts/env-gamescope-local.sh
 #
 # Or run one command inside the environment:
-#   ./env-gamescope-local.sh gamescope --help
+#   ./scripts/env-gamescope-local.sh gamescope --help
 #
 # Overrides:
 #   GAMESCOPE_LOCAL_PREFIX=/path/to/local/prefix
@@ -28,8 +28,9 @@ _gamescope_env_prepend()
 
 _gamescope_env_script="${BASH_SOURCE[0]}"
 _gamescope_env_dir="$(cd "$(dirname "$_gamescope_env_script")" && pwd)"
+_gamescope_env_repo="$(cd "$_gamescope_env_dir/.." && pwd)"
 
-export GAMESCOPE_REPO="${GAMESCOPE_REPO:-$_gamescope_env_dir}"
+export GAMESCOPE_REPO="${GAMESCOPE_REPO:-$_gamescope_env_repo}"
 export GAMESCOPE_LOCAL_PREFIX="${GAMESCOPE_LOCAL_PREFIX:-$HOME/.local/gamescope-wayland}"
 export GAMESCOPE_BUILD_DIR="${GAMESCOPE_BUILD_DIR:-build}"
 
@@ -56,7 +57,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 
 	printf '%s\n' "Loaded gamescope local environment for this process only."
 	printf '%s\n' "To keep it in your shell, run:"
-	printf '%s\n' "  source ./env-gamescope-local.sh"
+	printf '%s\n' "  source ./scripts/env-gamescope-local.sh"
 	printf '%s\n' ""
 	printf '%s\n' "Current values:"
 	printf '  GAMESCOPE_LOCAL_PREFIX=%s\n' "$GAMESCOPE_LOCAL_PREFIX"
@@ -64,4 +65,4 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 	printf '  GAMESCOPE_SCRIPT_PATH=%s\n' "$GAMESCOPE_SCRIPT_PATH"
 fi
 
-unset _gamescope_env_script _gamescope_env_dir _gamescope_env_build
+unset _gamescope_env_script _gamescope_env_dir _gamescope_env_repo _gamescope_env_build

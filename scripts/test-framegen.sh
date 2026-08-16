@@ -3,9 +3,9 @@
 # test-framegen.sh — drive gamescope compositor-side frame generation for testing.
 #
 # Usage:
-#   ./test-framegen.sh gpus                            List GPUs and their vendor:device IDs.
-#   ./test-framegen.sh bench [gpu]                     GPU-only shader microbenchmark (no display).
-#   ./test-framegen.sh run [gpu] [mode] [res] [-- app args]
+#   ./scripts/test-framegen.sh gpus                    List GPUs and their vendor:device IDs.
+#   ./scripts/test-framegen.sh bench [gpu]             GPU-only shader microbenchmark (no display).
+#   ./scripts/test-framegen.sh run [gpu] [mode] [res] [-- app args]
 #                                                       Nested run + cadence summary.
 #
 #   gpu  : auto | nvidia | amd | intel | <vendor:device>   (default: auto)
@@ -21,13 +21,14 @@
 #   PIPELINE=warp      motion pipeline: warp | checked | learned | predict | guided
 #
 # Examples:
-#   ./test-framegen.sh bench amd
-#   ./test-framegen.sh run auto motion 1440
-#   DURATION=12 ./test-framegen.sh run 1002:1234 extrapolate 1080 -- vkgears
+#   ./scripts/test-framegen.sh bench amd
+#   ./scripts/test-framegen.sh run auto motion 1440
+#   DURATION=12 ./scripts/test-framegen.sh run 1002:1234 extrapolate 1080 -- vkgears
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Always use the checkout's environment wrapper. It supplies locally compiled
 # dependencies when GAMESCOPE_LOCAL_PREFIX is set and keeps the selected build's
@@ -38,7 +39,7 @@ source "$SCRIPT_DIR/env-gamescope-local.sh"
 
 # Use exactly the requested local build. Falling through to a system binary or a
 # different build tree makes benchmark and cadence comparisons meaningless.
-BIN="${GAMESCOPE_BIN:-$SCRIPT_DIR/$GAMESCOPE_BUILD_DIR/src/gamescope}"
+BIN="${GAMESCOPE_BIN:-$REPO_ROOT/$GAMESCOPE_BUILD_DIR/src/gamescope}"
 
 require_binary() {
     if [[ ! -x "$BIN" ]]; then
@@ -61,7 +62,7 @@ resolve_gpu() {
         *) echo "error: unknown gpu '$gpu' (use auto|nvidia|amd|intel|<vendor:device>)" >&2; return 1 ;;
     esac
     if [[ -z "$id" ]]; then
-        echo "error: no GPU matching '$gpu' found (try './test-framegen.sh gpus')" >&2
+        echo "error: no GPU matching '$gpu' found (try './scripts/test-framegen.sh gpus')" >&2
         return 1
     fi
     echo "$id"

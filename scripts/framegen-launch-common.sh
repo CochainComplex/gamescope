@@ -17,7 +17,7 @@ framegen_require_device_ids()
 {
 	if [[ -z "${RENDER_DEV:-}" || -z "${PRESENT_DEV:-}" ]]; then
 		framegen_die \
-			"set RENDER_DEV and PRESENT_DEV to PCI vendor:device IDs (run ./test-framegen.sh gpus)"
+			"set RENDER_DEV and PRESENT_DEV to PCI vendor:device IDs (run ./scripts/test-framegen.sh gpus)"
 		return
 	fi
 

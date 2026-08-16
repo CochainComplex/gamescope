@@ -25,13 +25,19 @@
             "type" : "promptString",
             "password": true,
         },
+        {
+            "id": "remote_repo",
+            "description": "Remote gamescope checkout path",
+            "type": "promptString",
+            "default": "gamescope_local"
+        },
     ],
     "configurations": [
         {
             "name": "Attach to Gamescope (Remote)",
             "type": "cppdbg",
             "request": "attach",
-            "program": "/home/steamos/gamescope_local/build.local/src/gamescope",
+            "program": "${input:remote_repo}/build.local/src/gamescope",
             "processId": "${input:gamescope_pid}",
             "pipeTransport": {
                 "debuggerPath": "/usr/bin/gdb",
@@ -46,7 +52,7 @@
                 "pipeCwd": "${workspaceFolder}"
             },
             "sourceFileMap": {
-                "/home/steamos/gamescope_local": "${workspaceFolder}"
+                "${input:remote_repo}": "${workspaceFolder}"
             },
             "MIMode": "gdb",
             "setupCommands": [

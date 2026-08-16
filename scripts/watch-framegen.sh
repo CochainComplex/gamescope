@@ -7,7 +7,7 @@ usage()
 	cat <<'EOF'
 Usage:
   RENDER_DEV=vendor:device! PRESENT_DEV=vendor:device \
-    ./watch-framegen.sh [mode] [multiplier] [windows] [WxH] [refresh] [-- client [args...]]
+    ./scripts/watch-framegen.sh [mode] [multiplier] [windows] [WxH] [refresh] [-- client [args...]]
 
 Arguments:
   mode        motion | extrapolate | blend  (default: motion)
@@ -21,7 +21,7 @@ on PRESENT_DEV. Pass a client after `--`; otherwise vkmark is used. APP remains
 available for compatibility, but cannot preserve complex shell quoting.
 
 This nested path is useful for visual and functional checks. Its cadence also
-contains the parent compositor's jitter; use run-framegen-native.sh from a text
+contains the parent compositor's jitter; use scripts/run-framegen-native.sh from a text
 VT for direct DRM/KMS pacing tests.
 EOF
 }
@@ -32,10 +32,10 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=env-gamescope-local.sh
+# shellcheck source=scripts/env-gamescope-local.sh
 source "$SCRIPT_DIR/env-gamescope-local.sh"
 # shellcheck source=scripts/framegen-launch-common.sh
-source "$SCRIPT_DIR/scripts/framegen-launch-common.sh"
+source "$SCRIPT_DIR/framegen-launch-common.sh"
 
 framegen_parse_launch_args 3 1000 3840x2160 120 "$@"
 mode="$FRAMEGEN_MODE"

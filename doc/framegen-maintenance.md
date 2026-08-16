@@ -270,10 +270,12 @@ profile as the writable test destination.
 **Documentation, launchers, comments, and compile-time guards:**
 
 ```sh
-bash -n env-gamescope-local.sh test-framegen.sh \
-  scripts/framegen-launch-common.sh watch-framegen.sh run-framegen-native.sh
-shellcheck -x env-gamescope-local.sh test-framegen.sh \
-  scripts/framegen-launch-common.sh watch-framegen.sh run-framegen-native.sh
+bash -n scripts/env-gamescope-local.sh scripts/test-framegen.sh \
+  scripts/framegen-launch-common.sh scripts/watch-framegen.sh \
+  scripts/run-framegen-native.sh
+shellcheck -x scripts/env-gamescope-local.sh scripts/test-framegen.sh \
+  scripts/framegen-launch-common.sh scripts/watch-framegen.sh \
+  scripts/run-framegen-native.sh
 PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
   python3 -m py_compile scripts/framegen-net-train.py \
     scripts/framegen-net-eval.py scripts/framegen-color-eval.py
@@ -291,12 +293,12 @@ git diff --check
 **C++, shader, resource, queue, or scheduling changes:**
 
 ```sh
-GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
+GAMESCOPE_BUILD_DIR=build-perf ./scripts/env-gamescope-local.sh \
   ninja -C build-perf
-GAMESCOPE_BUILD_DIR=build-perf ./env-gamescope-local.sh \
+GAMESCOPE_BUILD_DIR=build-perf ./scripts/env-gamescope-local.sh \
   meson test -C build-perf --print-errorlogs
 GAMESCOPE_BUILD_DIR=build-perf PIPELINE=guided \
-  ./test-framegen.sh bench vendor:device
+  ./scripts/test-framegen.sh bench vendor:device
 ```
 
 Also run a nested functional test and a native DRM/KMS pacing test. Check debug

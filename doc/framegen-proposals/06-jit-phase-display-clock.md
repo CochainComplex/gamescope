@@ -230,7 +230,7 @@ What this fixes and what it doesn't:
   `jit deadline skip … headroom=…`; correlate with the
   existing `vblank slot=real|generated|repeat` classification.
 - **Cadence test**: vkmark or a game capped to 45 fps on a 60 Hz output
-  (`run-framegen-native.sh`); count `slot=repeat` holes and discarded predictions
+  (`scripts/run-framegen-native.sh`); count `slot=repeat` holes and discarded predictions
   with JIT off vs on — discards should drop sharply and generated phases should
   track 0.75/1.5 instead of 0.5.
 - **Keep-up test**: content at refresh rate; after four observations, generation
