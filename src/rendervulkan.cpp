@@ -478,7 +478,7 @@ struct {
 	{ DRM_FORMAT_XRGB8888, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB, 4, false, false },
 	{ DRM_FORMAT_ABGR8888, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB, 4, true, false },
 	{ DRM_FORMAT_XBGR8888, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB, 4, false, false },
-	{ DRM_FORMAT_RGB565, VK_FORMAT_R5G6B5_UNORM_PACK16, VK_FORMAT_R5G6B5_UNORM_PACK16, 1, false, false },
+	{ DRM_FORMAT_RGB565, VK_FORMAT_R5G6B5_UNORM_PACK16, VK_FORMAT_R5G6B5_UNORM_PACK16, 2, false, false },
 	{ DRM_FORMAT_NV12, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, 0, false, false },
 	{ DRM_FORMAT_ABGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, 8, true, false },
 	{ DRM_FORMAT_XBGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, 8, false, false },
@@ -1179,19 +1179,28 @@ bool CVulkanDevice::createDevice()
 	if ( bFramegenOwnFamily && m_queueFamily == m_generalQueueFamily )
 		queueCreateInfos[1] = queueCreateInfos[2];
 
+	// Drop the global-priority chain from the submitted create-infos, starting at
+	// nFirst. Naming individual queues by index is not robust here: the framegen
+	// entry is compacted from [2] into [1] above when the compositor and general
+	// families coincide, so only [0] (always the compositor family) has a fixed
+	// meaning. Entries past queueCreateInfoCount are not submitted at all.
+	const auto clearQueuePriorities = [&]( uint32_t nFirst )
+	{
+		for ( uint32_t i = nFirst; i < deviceCreateInfo.queueCreateInfoCount; i++ )
+			queueCreateInfos[i].pNext = nullptr;
+	};
+
 	VkResult res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
 	if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() && m_bSupportsGlobalPriority )
 	{
-		fprintf(stderr, "vkCreateDevice failed with a high-priority queue (general + compute). Falling back to regular priority (general).\n");
-		queueCreateInfos[1].pNext = nullptr;
+		fprintf(stderr, "vkCreateDevice failed with high-priority queues. Falling back to regular priority for the secondary queues.\n");
+		clearQueuePriorities( 1 );
 		res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
-
 
 		if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() )
 		{
-			fprintf(stderr, "vkCreateDevice failed with a high-priority queue (compute). Falling back to regular priority (all).\n");
-			queueCreateInfos[0].pNext = nullptr;
-			queueCreateInfos[2].pNext = nullptr;
+			fprintf(stderr, "vkCreateDevice still failed. Falling back to regular priority for all queues.\n");
+			clearQueuePriorities( 0 );
 			res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
 		}
 	}
@@ -2774,7 +2783,10 @@ void CVulkanCmdBuffer::emitExternalAcquireBarriers()
 			.oldLayout = state.discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
 			.newLayout = VK_IMAGE_LAYOUT_GENERAL,
 			.srcQueueFamilyIndex = externalQueue,
-			.dstQueueFamilyIndex = m_queueFamily,
+			// A concurrent image has no owning family to acquire into; the
+			// non-external side must be VK_QUEUE_FAMILY_IGNORED
+			// (VUID-VkImageMemoryBarrier-image-04071).
+			.dstQueueFamilyIndex = image->concurrentSharing() ? VK_QUEUE_FAMILY_IGNORED : m_queueFamily,
 			.image = image->vkImage(),
 			.subresourceRange = subResRange,
 		} );
@@ -2989,6 +3001,18 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		if (image->queueFamily == VK_QUEUE_FAMILY_IGNORED)
 			image->queueFamily = m_queueFamily;
 
+		// A VK_SHARING_MODE_CONCURRENT image has no owning family to transfer, so
+		// naming one is invalid: both indices must be VK_QUEUE_FAMILY_IGNORED
+		// unless the other side is EXTERNAL/FOREIGN, in which case only the
+		// non-external side must be IGNORED (VUID-VkImageMemoryBarrier-image-04071
+		// / -04072). Release/acquire against FOREIGN stays a real transfer for
+		// exclusive images.
+		const bool bConcurrent = image->concurrentSharing();
+		const uint32_t srcQueueFamily = state.needsImport ? externalQueue
+			: bConcurrent ? VK_QUEUE_FAMILY_IGNORED : image->queueFamily;
+		const uint32_t dstQueueFamily = isExport ? externalQueue
+			: bConcurrent ? VK_QUEUE_FAMILY_IGNORED : m_queueFamily;
+
 		VkImageMemoryBarrier memoryBarrier =
 		{
 			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2996,8 +3020,8 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 			.dstAccessMask = !flush || bInternalFlush ? read_bits | write_bits : 0u,
 			.oldLayout = state.discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
 			.newLayout = isPresent ? GetBackend()->GetPresentLayout() : VK_IMAGE_LAYOUT_GENERAL,
-			.srcQueueFamilyIndex = isExport ? image->queueFamily : state.needsImport ? externalQueue : image->queueFamily,
-			.dstQueueFamilyIndex = isExport ? externalQueue : state.needsImport ? m_queueFamily : m_queueFamily,
+			.srcQueueFamilyIndex = srcQueueFamily,
+			.dstQueueFamilyIndex = dstQueueFamily,
 			.image = image->vkImage(),
 			.subresourceRange = subResRange
 		};
@@ -3217,17 +3241,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	// history/output/present rings, motion fields, and the composited output
 	// images used as history in output-space mode. Rather than thread explicit
 	// queue-family ownership-transfer barrier pairs through every one of those
-	// hand-offs (the barrier emitters use VK_QUEUE_FAMILY_IGNORED throughout),
-	// declare those images VK_SHARING_MODE_CONCURRENT over the families
-	// involved: correct by construction, at the cost of losing some drivers'
-	// compressed layouts on this path only. Client-imported dma-bufs (pDMA) keep
-	// VK_SHARING_MODE_EXCLUSIVE and are never accessed on the framegen family -
-	// their FOREIGN acquire barriers only ever transfer ownership to the
-	// compositor family, and imported-image interop on a secondary family is
-	// exactly what the Intel quirk above is about.
+	// hand-offs, declare exactly those images (flags.bFramegenShared) VK_SHARING_MODE_CONCURRENT
+	// over the families involved: correct by construction, at the cost of losing
+	// some drivers' compressed layouts on those images. Everything framegen never
+	// touches - cursors, LUTs, mura, screenshot and PipeWire targets - stays
+	// VK_SHARING_MODE_EXCLUSIVE and keeps compression. Client-imported dma-bufs
+	// (pDMA) are never accessed on the framegen family either - their FOREIGN
+	// acquire barriers only ever transfer ownership to the compositor family, and
+	// imported-image interop on a secondary family is exactly what the Intel
+	// quirk above is about.
 	uint32_t nSharedQueueFamilies[3] = {};
 	uint32_t nSharedQueueFamilyCount = 0;
-	if ( pDMA == nullptr && g_device.framegenFamilySplit() )
+	if ( pDMA == nullptr && flags.bFramegenShared && g_device.framegenFamilySplit() )
 	{
 		const auto addFamily = [&]( uint32_t nFamily )
 		{
@@ -3263,6 +3288,8 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.queueFamilyIndexCount = nSharedQueueFamilyCount,
 		.pQueueFamilyIndices = nSharedQueueFamilyCount != 0 ? nSharedQueueFamilies : nullptr,
 	};
+
+	m_bConcurrentSharing = imageInfo.sharingMode == VK_SHARING_MODE_CONCURRENT;
 
 	assert( imageInfo.format != VK_FORMAT_UNDEFINED );
 
@@ -4646,6 +4673,9 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	outputImageflags.bTransferSrc = true; // for screenshots
 	outputImageflags.bSampled = true; // for pipewire blits
 	outputImageflags.bOutputImage = true;
+	// Output-space frame generation retains these as history and samples them on
+	// the framegen queue, which may be a different family than the compositor.
+	outputImageflags.bFramegenShared = true;
 
 	const uint32_t nRing = vulkan_framegen_is_enabled()
 		? gamescope::framegen::output_ring_size_for_multiplier( g_nFramegenMultiplier )
@@ -5747,9 +5777,15 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	window.resetsHitch += events.resetsHitch;
 	window.resetsRing += events.resetsRing;
 	window.resetsChain += events.resetsChain;
-	if ( events.realWaits != 0
-		&& window.realWaitDuringGenerated < UINT32_MAX - events.realWaits )
-		window.realWaitDuringGenerated += (uint32_t)events.realWaits;
+	if ( events.realWaits != 0 )
+	{
+		// events.realWaits is 64-bit: compute the sum in 64-bit and saturate,
+		// so a count past UINT32_MAX cannot wrap the subtraction and silently
+		// stop accumulating.
+		const uint64_t ulRealWaits = (uint64_t)window.realWaitDuringGenerated + events.realWaits;
+		window.realWaitDuringGenerated = ulRealWaits > UINT32_MAX
+			? UINT32_MAX : (uint32_t)ulRealWaits;
+	}
 	window.copyBytes += events.copyBytes;
 }
 
@@ -7865,6 +7901,7 @@ static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> 
 	// usage or modifier selection. Only the active E2 path copies these images.
 	createFlags.bTransferSrc = framegen_color_probe_requested();
 	createFlags.bOutputImage = true;
+	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
@@ -7879,6 +7916,7 @@ static bool framegen_create_base_texture( gamescope::OwningRc<CVulkanTexture> *p
 	CVulkanTexture::createFlags createFlags;
 	createFlags.bStorage = true;
 	createFlags.bSampled = true;
+	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
@@ -7891,6 +7929,7 @@ static bool framegen_create_base_history_texture( gamescope::OwningRc<CVulkanTex
 	CVulkanTexture::createFlags createFlags;
 	createFlags.bSampled = true;
 	createFlags.bTransferDst = true;
+	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
@@ -8103,7 +8142,17 @@ static bool framegen_base_record_copy( gamescope::Rc<CVulkanTexture> pBaseFrame,
 	// transitions ahead of the copy. On the composite queue that ordering is
 	// implicit (in-order submission on the same queue).
 	if ( bSplitFamily )
+	{
+		// Write-after-read across queues: this copy overwrites the older history
+		// slot, which the last generation batch on the framegen queue sampled as
+		// previousReal. Nothing else orders the two queues, so take an explicit
+		// framegen-timeline wait. Zero-cost elsewhere - the non-split path never
+		// reaches here, and addFramegenDependency is a no-op without a dedicated
+		// queue.
+		if ( g_framegenHistory.lastFramegenWorkSeqNo != 0 )
+			g_device.addFramegenDependency( pCmdBuffer.get(), g_framegenHistory.lastFramegenWorkSeqNo );
 		g_framegenHistory.lastBaseIngestSeqNo = g_device.submit( std::move( pCmdBuffer ) );
+	}
 	else
 		g_framegenHistory.lastFramegenWorkSeqNo =
 			g_device.submitFramegen( std::move( pCmdBuffer ), ulCompositeSeqNo, -1, 0, 0 );
@@ -8449,6 +8498,7 @@ static bool framegen_create_intermediate( gamescope::OwningRc<CVulkanTexture> *p
 	createFlags.bTransferSrc = framegen_record_dir() != nullptr
 		|| g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict;
 	createFlags.bTransferDst = g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict;
+	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
@@ -8460,6 +8510,7 @@ static bool framegen_create_luma_reservoir( gamescope::OwningRc<CVulkanTexture> 
 	CVulkanTexture::createFlags createFlags;
 	createFlags.bSampled = true;
 	createFlags.bTransferDst = true;
+	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
@@ -9228,6 +9279,7 @@ static bool framegen_color_probe_prepare( uint32_t width, uint32_t height, uint3
 		CVulkanTexture::createFlags flags;
 		flags.bMappable = true;
 		flags.bTransferDst = true;
+		flags.bFramegenShared = true;
 		*ppTex = new CVulkanTexture();
 		return ( *ppTex )->BInit( width, height, 1u, drmFormat, flags )
 			&& ( *ppTex )->mappedData() != nullptr;
@@ -9857,6 +9909,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 			CVulkanTexture::createFlags accumFlags;
 			accumFlags.bStorage = true;
 			accumFlags.bTransferSrc = true;
+			accumFlags.bFramegenShared = true;
 			g_framegenMotion.statsAccum = new CVulkanTexture();
 			bAllocated = g_framegenMotion.statsAccum->BInit(
 				gamescope::framegen::k_uAdaptationStatsCount,
@@ -9866,6 +9919,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 				CVulkanTexture::createFlags readbackFlags;
 				readbackFlags.bMappable = true;
 				readbackFlags.bTransferDst = true;
+				readbackFlags.bFramegenShared = true;
 				g_framegenMotion.statsReadback = new CVulkanTexture();
 				bAllocated = g_framegenMotion.statsReadback->BInit(
 					gamescope::framegen::k_uAdaptationStatsCount,
@@ -9896,12 +9950,14 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 				gpuFlags.bStorage = true;
 				gpuFlags.bTransferDst = true;
 				gpuFlags.bTransferSrc = true;
+				gpuFlags.bFramegenShared = true;
 				g_framegenMotion.netWeightsGpu = new CVulkanTexture();
 				bNetOk = g_framegenMotion.netWeightsGpu->BInit( k_uFramegenNetTexW, k_uFramegenNetTexH, 1u, DRM_FORMAT_R32F, gpuFlags );
 
 				CVulkanTexture::createFlags stagingFlags;
 				stagingFlags.bMappable = true;
 				stagingFlags.bTransferSrc = true;
+				stagingFlags.bFramegenShared = true;
 				g_framegenMotion.netWeightsUpload = new CVulkanTexture();
 				bNetOk = bNetOk && g_framegenMotion.netWeightsUpload->BInit( k_uFramegenNetTexW, k_uFramegenNetTexH, 1u, DRM_FORMAT_R32F, stagingFlags )
 					&& g_framegenMotion.netWeightsUpload->mappedData() != nullptr;
@@ -9932,12 +9988,14 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 					CVulkanTexture::createFlags priorFlags;
 					priorFlags.bSampled = true;
 					priorFlags.bTransferDst = true;
+					priorFlags.bFramegenShared = true;
 					g_framegenMotion.netWeightsPrior = new CVulkanTexture();
 					bool bOnlineOk = g_framegenMotion.netWeightsPrior->BInit( k_uFramegenNetTexW, k_uFramegenNetTexH, 1u, DRM_FORMAT_R32F, priorFlags );
 
 					CVulkanTexture::createFlags stateFlags;
 					stateFlags.bSampled = true;
 					stateFlags.bStorage = true;
+					stateFlags.bFramegenShared = true;
 					g_framegenMotion.netState = new CVulkanTexture();
 					bOnlineOk = bOnlineOk && g_framegenMotion.netState->BInit( k_uFramegenNetFloats, 4u, 1u, DRM_FORMAT_R32F, stateFlags );
 
@@ -9953,6 +10011,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 						CVulkanTexture::createFlags readbackFlags;
 						readbackFlags.bMappable = true;
 						readbackFlags.bTransferDst = true;
+						readbackFlags.bFramegenShared = true;
 						g_framegenMotion.netProfileReadback = new CVulkanTexture();
 						bOnlineOk = g_framegenMotion.netProfileReadback->BInit( k_uFramegenNetTexW, k_uFramegenNetTexH, 1u, DRM_FORMAT_R32F, readbackFlags )
 							&& g_framegenMotion.netProfileReadback->mappedData() != nullptr;
@@ -9996,6 +10055,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 				CVulkanTexture::createFlags flags;
 				flags.bMappable = true;
 				flags.bTransferDst = true;
+				flags.bFramegenShared = true;
 				*ppTex = new CVulkanTexture();
 				return ( *ppTex )->BInit( w, h, 1u, fmt, flags ) && ( *ppTex )->mappedData() != nullptr;
 			};
@@ -10813,8 +10873,15 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	const uint32_t nCostKey = bDeadlineCostKeying
 		? gamescope::framegen::deadline_work_class_cost_key( eDeadlineWorkClass )
 		: (uint32_t)slots.size();
+	// Split-family base mode ingests the new history on the COMPOSITE queue, at a
+	// scratch-timeline point strictly later than the composite this batch was
+	// planned against. Waiting on the composite alone would let the framegen
+	// queue sample previousReal/currentReal while that copy is still writing it.
+	// lastBaseIngestSeqNo is zero on every other path, so this is a no-op there.
+	const uint64_t ulWaitCompositeSeqNo =
+		std::max( ulCompositeSeqNo, g_framegenHistory.lastBaseIngestSeqNo );
 	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ),
-		ulCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey );
+		ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey );
 	g_framegenHistory.lastFramegenWorkSeqNo = ulSeqNo;
 
 	for ( const SlotPlan_t &slot : slots )

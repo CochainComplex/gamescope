@@ -141,6 +141,7 @@ public:
 			bExportable = false;
 			bOutputImage = false;
 			bColorAttachment = false;
+			bFramegenShared = false;
 			imageType = VK_IMAGE_TYPE_2D;
 		}
 
@@ -154,6 +155,11 @@ public:
 		bool bExportable : 1;
 		bool bOutputImage : 1;
 		bool bColorAttachment : 1;
+		// Touched by both the compositor and the frame-generation queue. Only
+		// matters when those live in different queue families
+		// (CVulkanDevice::framegenFamilySplit()), where it selects
+		// VK_SHARING_MODE_CONCURRENT instead of explicit ownership transfers.
+		bool bFramegenShared : 1;
 		VkImageType imageType;
 	};
 
@@ -183,6 +189,10 @@ public:
 	inline VkImage vkImage() { return m_vkImage; }
 	inline bool outputImage() { return m_bOutputImage; }
 	inline bool externalImage() { return m_bExternal; }
+	// True when the VkImage was created VK_SHARING_MODE_CONCURRENT. Such images
+	// must never name a concrete queue family in an image memory barrier
+	// (VUID-VkImageMemoryBarrier-image-04071/04072).
+	inline bool concurrentSharing() const { return m_bConcurrentSharing; }
 	inline bool deviceLocal() const { return m_bDeviceLocal; }
 	inline bool deviceLocalStagingImage() const { return m_bDeviceLocalStagingImage; }
 	inline const char *renderOrigin() const { return m_renderOrigin.data(); }
@@ -219,6 +229,7 @@ public:
 private:
 	bool m_bInitialized = false;
 	bool m_bExternal = false;
+	bool m_bConcurrentSharing = false;
 	bool m_bOutputImage = false;
 	bool m_bDeviceLocal = false;
 	bool m_bDeviceLocalStagingImage = false;
