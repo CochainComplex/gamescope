@@ -9107,6 +9107,15 @@ steamcompmgr_main(int argc, char **argv)
 		if ( cv_adaptive_sync_ignore_overlay )
 			nIgnoredOverlayRepaints = 0;
 
+		// Invariant: g_bFramegenEarlyGeneratedInFlight is true for exactly the
+		// one pass that follows an early generated commit. That commit blocks
+		// until its page flip, so it is no longer in flight by the time we get
+		// here, and any real frame latched above is one it held back — count
+		// that, then clear unconditionally so the flag can never carry over and
+		// fire against an unrelated later frame.
+		if ( std::exchange( g_bFramegenEarlyGeneratedInFlight, false ) && hasRepaint )
+			vulkan_framegen_metrics_note_real_wait();
+
 		for ( auto &iter : g_VirtualConnectorFocuses )
 		{
 			global_focus_t *pPaintFocus = &iter.second;
@@ -9266,16 +9275,8 @@ steamcompmgr_main(int argc, char **argv)
 				// the fixed-refresh timer, in-flight, or retry conditions.
 				if ( ulFixedCommitDeadlineNs != 0u )
 				{
-					// The early generated commit below blocks until its page
-					// flip, so a real frame that becomes ready in the meantime
-					// is only seen here on the following pass. Count it: it was
-					// held back by the reservation the generated commit made.
-					const bool bEarlyGeneratedWasInFlight =
-						std::exchange( g_bFramegenEarlyGeneratedInFlight, false );
 					if ( hasRepaint )
 					{
-						if ( bEarlyGeneratedWasInFlight )
-							vulkan_framegen_metrics_note_real_wait();
 						// Test this before all generated-commit state: queued real
 						// work has absolute priority and reaches the normal paint path.
 						g_bFramegenCommitDeadline = false;
