@@ -53,11 +53,16 @@ jobs:
           fi
           # Secret scan over tracked files. Vendored trees are excluded: they are
           # upstream code we do not author, and their test fixtures trip the
-          # patterns without being our credentials.
-          secret_patterns='glpat-|ghp_|AKIA[0-9A-Z]{16}|PERSONAL_ACCESS_TOKEN=|-----BEGIN (RSA|OPENSSH|EC) PRIVATE KEY-----'
-          if git grep -nIE "$secret_patterns" -- \
+          # patterns without being our credentials. This workflow stays in
+          # scope; only lines tagged secret-scan-definition (the pattern list
+          # itself) are dropped from the results.
+          secret_patterns='glpat-|github_pat_|ghp_|gho_|ghs_|ghu_|ghr_|xoxb-|xoxp-|AKIA[0-9A-Z]{16}|PERSONAL_ACCESS_TOKEN=|-----BEGIN [A-Z ]*PRIVATE KEY( BLOCK)?-----' # secret-scan-definition
+          matches="$(git grep -nIE "$secret_patterns" -- \
             . ':(exclude)thirdparty/*' ':(exclude)subprojects/*' \
-            ':(exclude)src/reshade/*' ':(exclude).github/workflows/main.yml'; then
+            ':(exclude)src/reshade/*' \
+            | grep -v 'secret-scan-definition' || true)"
+          if [ -n "$matches" ]; then
+            printf '%s\n' "$matches" >&2
             echo 'Possible secret found in a tracked file.' >&2
             exit 1
           fi

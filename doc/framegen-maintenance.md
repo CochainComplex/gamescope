@@ -327,3 +327,8 @@ an image-quality gain that introduces cadence misses is not a net improvement.
   invalidation, and flip-priority changes.
 - Documentation distinguishes measured results from hypotheses and nested tests
   from native DRM/KMS validation.
+
+The CI secret scan is defence-in-depth for tracked files only. The realistic
+leak channel is runtime logs: umu and other game launchers can dump the entire
+environment, tokens included, and those logs are never committed, so the scan
+never sees them. Scrub logs before sharing them anywhere.

@@ -1,0 +1,5 @@
+/.claude/
+/native-run.sh
+/native-run.log
+/build/
+/build-*/
