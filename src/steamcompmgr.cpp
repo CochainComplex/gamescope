@@ -9402,7 +9402,15 @@ steamcompmgr_main(int argc, char **argv)
 				const char *pszSlotType = !bShouldPaint
 					? "repeat"
 					: ( vulkan_framegen_has_pending_generated_frame() ? "generated" : "real" );
-				xwm_log.infof( "framegen: vblank slot=%s", pszSlotType );
+				// Attribute a repeat taken while the queue still held content:
+				// which arbiter condition declined it, and whether the front's
+				// own display target was still in the future at this vblank.
+				double flFrontTargetDeltaMs = 0.0;
+				const size_t uPending = vulkan_framegen_pending_queue_debug( &flFrontTargetDeltaMs );
+				xwm_log.infof( "framegen: vblank slot=%s pending=%zu due=%d ready=%d hasRepaint=%d overlayOnly=%d front_target_delta_ms=%.3f",
+					pszSlotType, uPending, (int)vulkan_framegen_generated_frame_due(),
+					(int)vulkan_framegen_generated_frame_ready(), (int)hasRepaint,
+					(int)hasRepaintNonBasePlane, flFrontTargetDeltaMs );
 			}
 
 			// Absolute-deadline causal pacing: this vblank is going to a

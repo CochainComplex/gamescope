@@ -651,14 +651,39 @@ struct BidirQueueShedPlan_t
 	return std::min( ringCapacity, latencyCapacity );
 }
 
-// A future display target is a pacing hint only while the queue has room. Once
-// the hard ceiling is reached the next display opportunity must present or drop
-// its front; otherwise the queue itself can prevent the composite which would
-// have advanced the timeline.
-[[nodiscard]] constexpr bool bidir_queue_forces_drain(
-	size_t depth, size_t hardCapacity )
+// The pending queue is a presentation timeline, not a buffer: it only has to
+// hold the display slots that can actually drain before the next real frame
+// replans it. That is one real interval — gapVblanks display opportunities —
+// plus the real endpoint that closes it. Planning deeper only builds GPU work
+// the very next replan sheds, which is how the queue used to sit pinned at its
+// hard ceiling with ~40% of generation thrown away. The ring/latency ceiling
+// remains an upper bound on top of it.
+[[nodiscard]] constexpr size_t bidir_pending_target(
+	size_t hardCapacity, uint32_t gapVblanks )
 {
-	return depth != 0u && depth >= hardCapacity;
+	return std::min( hardCapacity,
+		static_cast<size_t>( std::max( 1u, gapVblanks ) ) + 1u );
+}
+
+// A future display target is a pacing hint while the queue is still on plan.
+// Forced drain exists for one hazard: pending entries pin output-ring slots, so
+// a queue at the ring-derived ceiling can starve the composite that would have
+// advanced the timeline. It relieves that, plus the matching case of a queue
+// holding more entries than the plan says can drain (the cadence sped up under
+// it) — never a queue that is merely as deep as its plan intends.
+//
+// In steady state plannedTarget <= hardCapacity and the planner sheds to
+// plannedTarget, so this is false and the per-slot display targets are what
+// decide when a frame flips. plannedTarget == 0 means no real interval has been
+// measured yet and keeps the original ceiling-only rule.
+[[nodiscard]] constexpr bool bidir_queue_forces_drain(
+	size_t depth, size_t hardCapacity, size_t plannedTarget )
+{
+	if ( depth == 0u )
+		return false;
+	const size_t plan = plannedTarget != 0u
+		? std::min( plannedTarget, hardCapacity ) : hardCapacity;
+	return depth >= hardCapacity || depth > plan;
 }
 
 // Select entries to remove until capacity is met. Generated work is disposable

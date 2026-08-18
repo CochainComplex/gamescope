@@ -479,6 +479,11 @@ bool vulkan_framegen_generated_frame_due();
 // True when a generated frame is pending AND its GPU work has completed, so it
 // can be presented this vblank without stalling scanout. Non-consuming.
 bool vulkan_framegen_generated_frame_ready();
+// Diagnostic only (framegen debug logging): pending queue depth, and out the
+// front entry's display target relative to the next vblank in ms — negative
+// means its slot has already passed. Lets the present arbiter's vblank-slot
+// line attribute a hardware repeat taken while the queue still held content.
+size_t vulkan_framegen_pending_queue_debug( double *pflFrontTargetDeltaMs );
 // Consumes the front generated frame. pPresentFrameInfo is the live frame the
 // present path just assembled (paint_all's current layer stack): in base-layer
 // mode (#02) the generated pre-upscale base is substituted into it and pushed

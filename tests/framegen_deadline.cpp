@@ -1139,8 +1139,67 @@ TEST_CASE( "bidir pressure has a ring-derived hard ceiling and ordered shedding"
 	CHECK( endpointShed.endpoints == 2u );
 	REQUIRE( endpointShed.newestRetainedEndpoint.has_value() );
 	CHECK( *endpointShed.newestRetainedEndpoint == 4u );
-	CHECK_FALSE( bidir_queue_forces_drain( 5u, 6u ) );
-	CHECK( bidir_queue_forces_drain( 6u, 6u ) );
+	// No measured interval yet: the ceiling-only rule, exactly as before.
+	CHECK_FALSE( bidir_queue_forces_drain( 5u, 6u, 0u ) );
+	CHECK( bidir_queue_forces_drain( 6u, 6u, 0u ) );
+	CHECK_FALSE( bidir_queue_forces_drain( 0u, 6u, 0u ) );
+}
+
+TEST_CASE( "bidir plans one real interval of timeline, not the whole ceiling", "[framegen][deadline]" )
+{
+	// gapVblanks display opportunities plus the endpoint that closes them.
+	CHECK( bidir_pending_target( 8u, 3u ) == 4u );
+	CHECK( bidir_pending_target( 8u, 1u ) == 2u );
+	// The ring/latency ceiling still dominates a very slow client.
+	CHECK( bidir_pending_target( 8u, 20u ) == 8u );
+	CHECK( bidir_pending_target( 0u, 3u ) == 0u );
+	// A degenerate gap still leaves room for the bracketing endpoint pair.
+	CHECK( bidir_pending_target( 8u, 0u ) == 2u );
+
+	// Admission math the planner runs: the room left for interpolations once
+	// this interval's own real endpoints are accounted for. At 40 fps into
+	// 120 Hz (gap 3) that is exactly the multiplier-3 pair of interpolations.
+	constexpr size_t hardCapacity = bidir_pending_hard_capacity( 10u, 3u );
+	CHECK( hardCapacity == 8u );
+	const auto room = []( size_t target, size_t pending, size_t incoming ) {
+		const size_t committed = pending + incoming;
+		return target > committed ? target - committed : 0u;
+	};
+	const size_t target = bidir_pending_target( hardCapacity, 3u );
+	CHECK( target == 4u );
+	CHECK( room( target, 1u, 1u ) == 2u );
+	// A queue that has not drained admits nothing rather than building work the
+	// shed would immediately throw away.
+	CHECK( room( target, 4u, 1u ) == 0u );
+	// The old flat ceiling admitted work on every one of those frames; that is
+	// the over-subscription this replaces.
+	CHECK( room( hardCapacity, 4u, 1u ) == 3u );
+}
+
+TEST_CASE( "bidir forced drain relieves over-subscription, not a full plan", "[framegen][deadline]" )
+{
+	constexpr size_t hardCapacity = bidir_pending_hard_capacity( 10u, 3u );
+	const size_t target = bidir_pending_target( hardCapacity, 3u );
+	REQUIRE( target == 4u );
+
+	// A queue sitting at exactly its gap-limited target is on schedule: the
+	// per-slot display targets decide when it flips, not the drain valve.
+	for ( size_t depth = 1u; depth <= target; depth++ )
+		CHECK_FALSE( bidir_queue_forces_drain( depth, hardCapacity, target ) );
+
+	// Deeper than the plan can drain before the next replan (the cadence sped
+	// up under it), or at the ring ceiling, and the valve engages.
+	CHECK( bidir_queue_forces_drain( target + 1u, hardCapacity, target ) );
+	CHECK( bidir_queue_forces_drain( hardCapacity, hardCapacity, target ) );
+
+	// A slow client whose interval alone fills the ring is genuinely at the
+	// ownership bound; the valve must still fire there.
+	const size_t ringLimited = bidir_pending_target( hardCapacity, 32u );
+	REQUIRE( ringLimited == hardCapacity );
+	CHECK( bidir_queue_forces_drain( hardCapacity, hardCapacity, ringLimited ) );
+
+	// An empty queue never forces anything.
+	CHECK_FALSE( bidir_queue_forces_drain( 0u, hardCapacity, target ) );
 }
 
 TEST_CASE( "bidir 46 fps into 120 Hz remains bounded for 1000 frames", "[framegen][deadline]" )
@@ -1151,20 +1210,28 @@ TEST_CASE( "bidir 46 fps into 120 Hz remains bounded for 1000 frames", "[framege
 	constexpr uint32_t multiplier = 2u;
 	constexpr size_t hardCapacity =
 		bidir_pending_hard_capacity( ringImages, multiplier );
+	// The planner admits one real interval of timeline, so the queue is bounded
+	// well below the ring ceiling and the drain valve stays disengaged.
+	constexpr uint32_t gapVblanks = static_cast<uint32_t>(
+		( sourceIntervalNs + displayIntervalNs - 1u ) / displayIntervalNs );
+	constexpr size_t pendingTarget =
+		bidir_pending_target( hardCapacity, gapVblanks );
 	std::vector<BidirQueueEntry_t> queue;
 	uint64_t nextVblankNs = displayIntervalNs;
 	size_t maxDepth = 0u;
 	size_t compositeBlockingStates = 0u;
+	size_t forcedDrains = 0u;
 
 	for ( uint64_t frame = 1u; frame <= 1'000u; frame++ )
 	{
 		const uint64_t sourceReadyNs = frame * sourceIntervalNs;
 		while ( nextVblankNs <= sourceReadyNs )
 		{
+			const bool forced = bidir_queue_forces_drain(
+				queue.size(), hardCapacity, pendingTarget );
+			forcedDrains += forced;
 			if ( !queue.empty()
-				&& ( queue.front().targetNs <= nextVblankNs
-					|| bidir_queue_forces_drain(
-						queue.size(), hardCapacity ) ) )
+				&& ( queue.front().targetNs <= nextVblankNs || forced ) )
 				queue.erase( queue.begin() );
 			nextVblankNs += displayIntervalNs;
 		}
@@ -1185,7 +1252,7 @@ TEST_CASE( "bidir 46 fps into 120 Hz remains bounded for 1000 frames", "[framege
 		queue.insert( queue.end(), incoming.begin(), incoming.end() );
 		std::ranges::sort( queue, {}, &BidirQueueEntry_t::targetNs );
 		const BidirQueueShedPlan_t shed =
-			plan_bidir_queue_shed( queue, hardCapacity );
+			plan_bidir_queue_shed( queue, pendingTarget );
 		for ( auto it = shed.indices.rbegin(); it != shed.indices.rend(); ++it )
 			queue.erase( queue.begin() + *it );
 
@@ -1193,7 +1260,7 @@ TEST_CASE( "bidir 46 fps into 120 Hz remains bounded for 1000 frames", "[framege
 		// One non-queue ring owner models ordinary backend/history ownership;
 		// the second reserved image must remain acquirable by this composite.
 		compositeBlockingStates += queue.size() + 1u >= ringImages;
-		REQUIRE( queue.size() <= hardCapacity );
+		REQUIRE( queue.size() <= pendingTarget );
 		REQUIRE( std::ranges::any_of( queue,
 			[&]( const BidirQueueEntry_t &entry ) {
 				return entry.kind == BidirSlotKind_t::RealEndpoint
@@ -1201,8 +1268,12 @@ TEST_CASE( "bidir 46 fps into 120 Hz remains bounded for 1000 frames", "[framege
 			} ) );
 	}
 
-	CHECK( maxDepth <= hardCapacity );
+	CHECK( maxDepth <= pendingTarget );
+	CHECK( maxDepth < hardCapacity );
 	CHECK( compositeBlockingStates == 0u );
+	// The whole point of the gap-limited plan: pacing is decided by each entry's
+	// display target, never by the emergency valve.
+	CHECK( forcedDrains == 0u );
 }
 
 TEST_CASE( "VRR midpoint wake compensates tagged backend present lead", "[framegen][deadline]" )

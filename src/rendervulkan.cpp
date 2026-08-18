@@ -6627,6 +6627,12 @@ struct FramegenHistory_t
 	uint64_t ulBidirDisplayChainGeneration = 0;
 	uint64_t ulBidirGridTargetNs = 0;
 	uint64_t ulBidirGridWakeNs = 0;
+	// Gap-limited pending depth the planner last admitted to (one real interval
+	// of display slots plus its closing endpoint, capped by the ring ceiling).
+	// The drain valve compares against this, not against the raw ceiling, so a
+	// queue that is exactly as deep as planned still flips on its own targets.
+	// 0 = no real interval measured yet in this epoch.
+	size_t uBidirPendingTarget = 0;
 	bool bBidirProvenanceInitialized = false;
 	bool bBidirSourceTimestampsReliable = false;
 	struct BidirFeedbackEndpoint_t
@@ -7340,6 +7346,17 @@ static size_t framegen_bidir_pending_hard_capacity()
 			g_framegenHistory.nDegradeSteps ).multiplier );
 }
 
+// True when the queue is over-subscribed relative to what can still drain —
+// either at the ring-derived ceiling, or deeper than the interval the planner
+// last admitted for. Everything else flips on its own display target.
+static bool framegen_bidir_queue_forces_drain()
+{
+	return gamescope::framegen::bidir_queue_forces_drain(
+		g_framegenHistory.pending.size(),
+		framegen_bidir_pending_hard_capacity(),
+		g_framegenHistory.uBidirPendingTarget );
+}
+
 static bool framegen_output_matches( const gamescope::OwningRc<CVulkanTexture> &pTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
 {
 	return pTexture != nullptr
@@ -7522,6 +7539,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 
 static __attribute__((noinline)) void framegen_net_profile_consume();
 static void framegen_net_profile_flush();
+static void framegen_net_profile_join_writer();
 
 void vulkan_framegen_reset( const char *reason )
 {
@@ -7576,18 +7594,46 @@ void vulkan_framegen_shutdown()
 	// (drmModeRmFB on native KMS). As file-scope statics they would otherwise
 	// outlive the backend, which steamcompmgr_exit destroys — so drop them here,
 	// while the backend and its KMS fd are still valid.
-	//
-	// This also joins the net-profile writer thread before any Vulkan/DRM
-	// teardown instead of leaving it to the atexit flush, which runs after.
-	if ( g_framegenHistory.lastFramegenWorkSeqNo != 0
-		&& !g_device.hasCompletedFramegen( g_framegenHistory.lastFramegenWorkSeqNo ) )
-		g_device.waitFramegen( g_framegenHistory.lastFramegenWorkSeqNo );
-	if ( g_framegenHistory.lastBaseIngestSeqNo != 0
-		&& !g_device.hasCompleted( g_framegenHistory.lastBaseIngestSeqNo ) )
-		g_device.wait( g_framegenHistory.lastBaseIngestSeqNo );
+
+	// Step 1: the net-profile writer thread, unconditionally and before any
+	// other teardown. It is the one framegen worker that can still be running,
+	// and it logs through the file-scope vk_log. The atexit flush is far too
+	// late — it runs after the backend is gone.
+	framegen_net_profile_join_writer();
+
+	// Step 2: drain the device. The two token waits this used to do
+	// (lastFramegenWorkSeqNo, lastBaseIngestSeqNo) cover only the framegen and
+	// base-ingest submissions. They do NOT cover genReadSeqNo — which pins
+	// output-ring slots for the in-flight batch — nor the composite-timeline
+	// points (ulCompositeSeqNo) that every pending bidir queue entry carries.
+	// Destroying those images while the device may still reference them is a
+	// textbook double-free/heap-corruption source. waitIdle retires the scratch
+	// timeline to its last submitted value and, when one exists, the dedicated
+	// framegen timeline too, then recycles the command buffers. Teardown is not
+	// a hot path; there is no reason to be surgical here.
+	if ( g_device.device() != VK_NULL_HANDLE )
+		g_device.waitIdle();
+
+	// Every readback is now guaranteed complete, so the final checkpoint is
+	// consumable rather than skipped.
 	framegen_net_profile_consume();
 	framegen_net_profile_flush();
 	framegen_color_probe_consume();
+
+	// Step 3: release the presentation timeline and the retained ring slots
+	// explicitly, and before the images they point into. In bidir the pending
+	// queue IS the timeline and its bReal entries reference composite output
+	// images, so it is by far the largest late-release set; making the order
+	// explicit beats leaving it implicit in the aggregate assignment below.
+	g_framegenHistory.pending.clear();
+	g_framegenHistory.bidirLastOutput = nullptr;
+	g_framegenHistory.bidirFeedbackEndpoints.clear();
+	g_framegenHistory.previousReal = nullptr;
+	g_framegenHistory.currentReal = nullptr;
+	g_framegenHistory.genReadA = nullptr;
+	g_framegenHistory.genReadB = nullptr;
+	g_framegenHistory.genReadReference = nullptr;
+	g_framegenHistory.genReadSeqNo = 0;
 
 	g_framegenHistory = {};
 	g_framegenMotion = {};
@@ -7596,6 +7642,10 @@ void vulkan_framegen_shutdown()
 	g_output.framegenPresentImages.clear();
 	g_output.framegenCursorHistoryImages.clear();
 	g_device.framegenGarbageCollect();
+	// framegen_net_profile_consume above can re-arm the writer; its flush joins
+	// again and writes inline, so this is normally a no-op. Repeating it makes
+	// "no framegen thread survives this function" true by construction.
+	framegen_net_profile_join_writer();
 }
 
 bool vulkan_framegen_has_pending_generated_frame()
@@ -7706,9 +7756,7 @@ bool vulkan_framegen_generated_frame_due()
 	if ( !vulkan_framegen_bidir_active() )
 		return true;
 	return front.ulTargetFlipNs <= GetVBlankTimer().GetNextVBlank( 0 )
-		|| gamescope::framegen::bidir_queue_forces_drain(
-			g_framegenHistory.pending.size(),
-			framegen_bidir_pending_hard_capacity() );
+		|| framegen_bidir_queue_forces_drain();
 }
 
 bool vulkan_framegen_generated_frame_ready()
@@ -7721,6 +7769,20 @@ bool vulkan_framegen_generated_frame_ready()
 	// always ready: its composite completed at its own paint.
 	return g_framegenHistory.pending.front().bReal
 		|| g_device.hasCompletedFramegen( g_framegenHistory.pending.front().seqNo );
+}
+
+size_t vulkan_framegen_pending_queue_debug( double *pflFrontTargetDeltaMs )
+{
+	if ( pflFrontTargetDeltaMs != nullptr )
+	{
+		const uint64_t ulTargetNs = g_framegenHistory.pending.empty()
+			? 0u : g_framegenHistory.pending.front().ulTargetFlipNs;
+		*pflFrontTargetDeltaMs = ulTargetNs != 0u
+			? gamescope::framegen::signed_ns_delta(
+				ulTargetNs, GetVBlankTimer().GetNextVBlank( 0 ) ) / 1.0e6
+			: 0.0;
+	}
+	return g_framegenHistory.pending.size();
 }
 
 gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const struct FrameInfo_t *pPresentFrameInfo )
@@ -7912,16 +7974,16 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_take_front( const gamescope:
 	{
 		FramegenHistory_t::PendingGenerated_t front =
 			g_framegenHistory.pending.front();
-		const bool bForceDrain =
-			gamescope::framegen::bidir_queue_forces_drain(
-				g_framegenHistory.pending.size(),
-				framegen_bidir_pending_hard_capacity() );
+		const bool bForceDrain = framegen_bidir_queue_forces_drain();
 		if ( front.ulTargetFlipNs != 0u
 			&& front.ulTargetFlipNs > ulOpportunityNs && !bForceDrain )
 			break;
 
 		// Interpolation is disposable and never slides to a later display
 		// opportunity. Endpoints remain ordered and may catch up after a hitch.
+		// A frame dropped here was generated and then never shown, exactly like
+		// one shed at plan time, so it counts into disc= too — no generated
+		// frame may vanish uncounted.
 		if ( !front.bReal
 			&& ( ( front.ulTargetFlipNs != 0u
 					&& front.ulTargetFlipNs < ulOpportunityNs )
@@ -7929,6 +7991,7 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_take_front( const gamescope:
 		{
 			g_framegenHistory.pending.erase(
 				g_framegenHistory.pending.begin() );
+			framegen_metrics_note_discard( 1 );
 			continue;
 		}
 
@@ -10023,6 +10086,16 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 		g_bFramegenNetWriteInFlight = false;
 }
 
+// The checkpoint writer's only lifetime proof. It logs through the file-scope
+// vk_log, so it must never outlive teardown (or, at exit, the LogScope itself).
+// Joining has no polling timeout, so this is unconditionally safe to call, and
+// vulkan_framegen_shutdown calls it before touching anything else.
+static void framegen_net_profile_join_writer()
+{
+	if ( g_framegenNetWriteThread.joinable() )
+		g_framegenNetWriteThread.join();
+}
+
 // Flush any unsaved learning. Called from vulkan_framegen_reset — every mode,
 // resolution and teardown change funnels through it — and via atexit, so runs
 // shorter than the checkpoint interval persist too (the old cadence-only write
@@ -10031,10 +10104,9 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 static void framegen_net_profile_flush()
 {
 	// The atomic is the cheap scheduling gate; the thread object is the lifetime
-	// proof. Joining has no polling timeout and guarantees an older checkpoint
-	// cannot rename over the newer synchronous flush below.
-	if ( g_framegenNetWriteThread.joinable() )
-		g_framegenNetWriteThread.join();
+	// proof. Joining guarantees an older checkpoint cannot rename over the newer
+	// synchronous flush below.
+	framegen_net_profile_join_writer();
 	if ( framegen_net_profile_path() == nullptr || g_framegenNetLiveWeights.size() != k_uFramegenNetFloats )
 		return;
 	if ( g_ulFramegenNetLiveProgress == g_ulFramegenNetSavedProgress.load() )
@@ -12165,10 +12237,44 @@ static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
 	if ( !plan.validEpoch )
 		return false;
 
+	// The number of display opportunities this real interval actually offers.
+	// It bounds both the submitted batch's cost key and — via
+	// bidir_pending_target — how deep the queue is allowed to be planned.
+	const uint64_t sourceSpanNs = ulCurrentSourceNs - ulPreviousSourceNs;
+	const uint32_t nGapVblanks = std::max<uint32_t>( 1u,
+		static_cast<uint32_t>( std::min<uint64_t>( UINT32_MAX,
+			( sourceSpanNs + ulVblankIntervalNs - 1u )
+				/ ulVblankIntervalNs ) ) );
+	const size_t uIncomingEndpoints = std::ranges::count_if(
+		plan.slots,
+		[&]( const gamescope::framegen::BidirSlot_t &slot ) {
+			return slot.kind == gamescope::framegen::BidirSlotKind_t::RealEndpoint
+				&& ( slot.endpointFrameId == endpoints[ 1 ].realFrameId
+					|| ( bEstablished
+						&& slot.endpointFrameId == endpoints[ 0 ].realFrameId ) );
+		} );
+	// One real interval of timeline, never more than the ring/latency ceiling.
+	// Refilling to the flat ceiling every real frame is what pinned the queue
+	// at capacity: it kept the drain valve permanently engaged (which disables
+	// the per-slot display-target gate) and made the capacity shed the
+	// steady-state regulator instead of an exception.
+	const size_t uMaxPending = gamescope::framegen::bidir_pending_target(
+		framegen_bidir_pending_hard_capacity( eff.multiplier ), nGapVblanks );
+	g_framegenHistory.uBidirPendingTarget = uMaxPending;
+	// Admission: what the queue can still take once this interval's own real
+	// endpoints are in. Work that would not fit is never built or submitted —
+	// GPU work never planned beats GPU work planned and then shed.
+	const size_t uCommitted = g_framegenHistory.pending.size() + uIncomingEndpoints;
+	const size_t uRoom = uMaxPending > uCommitted ? uMaxPending - uCommitted : 0u;
+
 	std::vector<FramegenSlotRequest_t> requests;
 	const uint64_t ulNowNs = get_time_in_nanos();
 	for ( const gamescope::framegen::BidirSlot_t &slot : plan.slots )
 	{
+		// plan.slots is ordered by display target, so the admitted prefix is the
+		// run that keeps the timeline dense from the next opportunity onward.
+		if ( requests.size() >= uRoom )
+			break;
 		if ( slot.kind != gamescope::framegen::BidirSlotKind_t::Generated
 			|| slot.endpointFrameId != endpoints[ 1 ].realFrameId
 			|| !bAllowGeneration || ulNowNs >= slot.wakeNs )
@@ -12189,16 +12295,6 @@ static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
 		} );
 	}
 
-	const size_t uIncomingEndpoints = std::ranges::count_if(
-		plan.slots,
-		[&]( const gamescope::framegen::BidirSlot_t &slot ) {
-			return slot.kind == gamescope::framegen::BidirSlotKind_t::RealEndpoint
-				&& ( slot.endpointFrameId == endpoints[ 1 ].realFrameId
-					|| ( bEstablished
-						&& slot.endpointFrameId == endpoints[ 0 ].realFrameId ) );
-		} );
-	const size_t uMaxPending = framegen_bidir_pending_hard_capacity(
-		eff.multiplier );
 	const size_t uExistingGenerated = std::ranges::count_if(
 		g_framegenHistory.pending,
 		[]( const FramegenHistory_t::PendingGenerated_t &entry ) {
@@ -12257,11 +12353,6 @@ static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
 
 	if ( !requests.empty() )
 	{
-		const uint64_t sourceSpanNs = ulCurrentSourceNs - ulPreviousSourceNs;
-		const uint32_t nGapVblanks = std::max<uint32_t>( 1u,
-			static_cast<uint32_t>( std::min<uint64_t>( UINT32_MAX,
-				( sourceSpanNs + ulVblankIntervalNs - 1u )
-					/ ulVblankIntervalNs ) ) );
 		framegen_submit_planned( requests.data(),
 			static_cast<uint32_t>( requests.size() ), nGapVblanks,
 			eff, ulCompositeSeqNo, nMaxDegradeSteps, false );
@@ -12310,9 +12401,11 @@ static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
 	if ( FramegenDebugShouldLog( s_uBidirDeadlineDebugLogCounter ) )
 	{
 		vk_log.infof( "framegen: bidir epoch=%" PRIu64
-			" candidates=%zu pending=%zu/%zu shed_gen=%zu shed_real=%zu%s",
+			" candidates=%zu pending=%zu/%zu gap=%u room=%zu forced=%d"
+			" shed_gen=%zu shed_real=%zu%s",
 			g_framegenHistory.bidirEpoch.epoch, requests.size(),
 			g_framegenHistory.pending.size(), uMaxPending,
+			nGapVblanks, uRoom, (int)framegen_bidir_queue_forces_drain(),
 			shed.generated, shed.endpoints,
 			bEstablished ? " established" : "" );
 	}
