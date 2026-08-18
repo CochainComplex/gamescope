@@ -9335,6 +9335,41 @@ steamcompmgr_main(int argc, char **argv)
 									bShouldPaint = false;
 							}
 						}
+						else if ( bShouldPaint )
+						{
+							// The early-commit gate declined this slot (plain
+							// vblank before the commit deadline, front not due,
+							// a present still in flight, or a real frame
+							// imminent) but the pass is already painting for an
+							// unrelated reason — an overlay-only repaint, or a
+							// forced repaint. Letting it through would hand the
+							// backend a paint that unconditionally consumes the
+							// pending generated frame (the non-bidir consume has
+							// no due check): the prediction would flip outside
+							// its planned slot, the real-arrival yield would be
+							// defeated, and the overlay update would be eaten —
+							// its repaint flags cleared below even though the
+							// overlay pixels never reached the screen. Hold the
+							// paint back instead, spending the same bounded
+							// overlay-defer budget so a steadily updating overlay
+							// is never starved: once the budget is gone the
+							// prediction is dropped and the paint proceeds.
+							if ( nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay )
+							{
+								bFramegenDeferOverlay = true;
+								nFramegenDeferredOverlay++;
+								bShouldPaint = false;
+								// A forced repaint has already been taken out of
+								// g_bForceRepaint by the exchange above; re-arm
+								// it so the request survives the deferral. No
+								// nudge is needed, the next vblank pass picks it
+								// up.
+								if ( bForceRepaint )
+									g_bForceRepaint = true;
+							}
+							else
+								vulkan_framegen_discard_generated_frame( "superseded_by_overlay" );
+						}
 					}
 				}
 				else
