@@ -260,7 +260,9 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 {
 	if ( steps < 1'000u )
 		std::snprintf( dst, capacity, "%llu", static_cast<unsigned long long>( steps ) );
-	else if ( steps < 1'000'000u )
+	// Branch on the ROUNDED value: 999'950..999'999 round up to 1000.0k, which
+	// belongs in the "m" branch.
+	else if ( steps + 50u < 1'000'000u )
 	{
 		const uint64_t tenths = ( steps + 50u ) / 100u;
 		std::snprintf( dst, capacity, "%llu.%lluk",

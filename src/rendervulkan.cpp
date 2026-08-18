@@ -2060,9 +2060,10 @@ std::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer( bool bFramegenQu
 	if (unusedCmdBufs.empty())
 	{
 		VkCommandBuffer rawCmdBuffer;
+		const VkCommandPool cmdPool = bSplit ? m_framegenCommandPool : m_commandPool;
 		VkCommandBufferAllocateInfo commandBufferAllocateInfo = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-			.commandPool = bSplit ? m_framegenCommandPool : m_commandPool,
+			.commandPool = cmdPool,
 			.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 			.commandBufferCount = 1
 		};
@@ -2076,7 +2077,8 @@ std::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer( bool bFramegenQu
 
 		cmdBuffer = std::make_unique<CVulkanCmdBuffer>(this, rawCmdBuffer,
 			bSplit ? m_framegenQueue : queue(),
-			bSplit ? m_framegenQueueFamily : queueFamily());
+			bSplit ? m_framegenQueueFamily : queueFamily(),
+			cmdPool);
 	}
 	else
 	{
@@ -2367,8 +2369,10 @@ void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
 	m_pendingCmdBufs.erase(m_pendingCmdBufs.begin(), completedEnd);
 }
 
-CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily)
-	: m_cmdBuffer(cmdBuffer), m_device(parent), m_queue(queue), m_queueFamily(queueFamily)
+CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily, VkCommandPool cmdPool)
+	: m_cmdBuffer(cmdBuffer), m_device(parent)
+	, m_cmdPool(cmdPool != VK_NULL_HANDLE ? cmdPool : parent->commandPool())
+	, m_queue(queue), m_queueFamily(queueFamily)
 {
 	m_textureRefs.reserve( k_uInitialTrackedTextureCapacity );
 	m_textureState.reserve( k_uInitialTrackedTextureCapacity );
@@ -2379,7 +2383,7 @@ CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuf
 
 CVulkanCmdBuffer::~CVulkanCmdBuffer()
 {
-	m_device->vk.FreeCommandBuffers(m_device->device(), m_device->commandPool(), 1, &m_cmdBuffer);
+	m_device->vk.FreeCommandBuffers(m_device->device(), m_cmdPool, 1, &m_cmdBuffer);
 }
 
 void CVulkanCmdBuffer::reset()
@@ -8063,6 +8067,13 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<
 		if ( FramegenDebugShouldLog( s_uSnapDebugLogCounter ) )
 			vk_log.infof( "framegen: bidir timeline snapped to live, dropped %zu pending frame(s)",
 				g_framegenHistory.pending.size() );
+		// No generated frame may vanish uncounted (see framegen_bidir_take_front):
+		// the abandoned entries were generated and never shown, so they are discards.
+		const size_t nDroppedGenerated = std::count_if(
+			g_framegenHistory.pending.begin(), g_framegenHistory.pending.end(),
+			[]( const FramegenHistory_t::PendingGenerated_t &entry ) { return !entry.bReal; } );
+		if ( nDroppedGenerated != 0 )
+			framegen_metrics_note_discard( nDroppedGenerated );
 		g_framegenHistory.pending.clear();
 	}
 	g_framegenHistory.bidirLastOutput = pComposite;
@@ -9079,6 +9090,13 @@ static const FramegenMetricsWindow_t &framegen_metrics_last_closed_window()
 	return g_framegenMetrics.windows[nLast];
 }
 
+// The history is right-aligned into a sparkline-sized array, so the ring must
+// hold at least as many windows as the sparkline shows or the destination
+// offset below underflows.
+static_assert( std::tuple_size_v<decltype( g_framegenMetrics.windows )>
+	>= gamescope::framegen::k_nFramegenHudSparklineSamples,
+	"metrics window ring must cover the HUD sparkline width" );
+
 template <typename ValueFn>
 static std::array<double, gamescope::framegen::k_nFramegenHudSparklineSamples>
 framegen_metrics_window_history( ValueFn value )
@@ -9189,8 +9207,9 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 		.generated = window.generated,
 		.repeats = window.repeats,
 		.ladderSteps = g_framegenHistory.nDegradeSteps,
-		.ladderMaxSteps = gamescope::framegen::max_degrade_steps(
-			g_eFramegenMode, g_eFramegenPipeline, 2 ),
+		// Must match the ceiling the active path actually drives nDegradeSteps
+		// with, or the HUD can report a rung above its own maximum.
+		.ladderMaxSteps = framegen_max_degrade_steps(),
 		.ladderHold = g_framegenHistory.nDegradeHold,
 		.ladderRecoveryStreak = g_framegenHistory.recovery.streak,
 		.ladderRecoveryBackoffDecisions =
@@ -11117,7 +11136,12 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		pCmdBuffer->copyImage( g_framegenMotion.mvField, g_framegenMotion.recField );
 		pCmdBuffer->copyImage( g_framegenMotion.mvFieldRevChk, g_framegenMotion.recFieldRev );
 	}
-	if ( bMotion && !bReuseMotion && g_framegenMotion.mvFieldNet != nullptr )
+	// Gate on the effective (post-degradation) pipeline, not just allocation:
+	// once the ladder drops below the net-bearing rung the refiner's inputs
+	// (mvFieldRevChk) are no longer written, and bNetActive must stay false so
+	// the training dispatches below stand down with it.
+	if ( bMotion && !bReuseMotion && framegen_net_requested( eff.pipeline )
+		&& g_framegenMotion.mvFieldNet != nullptr )
 		framegen_record_net( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height, bBidir );
 	// B4: with the field final, record the adaptation probe — the warps below
 	// read its verdict in this same batch, the CPU next batch.
@@ -13439,7 +13463,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// check below correctly never takes it.
 	const bool bSingleSlotPacing = bVrrHybrid;
 	const uint32_t nCurGenForLadder = gamescope::framegen::ladder_generated_count(
-		nGapSlots, curEffForLadder.multiplier, bSingleSlotPacing );
+		nGapSlots, curEffForLadder.multiplier, bSingleSlotPacing,
+		g_device.hasFramegenQueue() );
 	const uint64_t ulCurRungCostNs = g_device.framegenRungCostNs( g_framegenHistory.nDegradeSteps, nCurGenForLadder );
 	const uint32_t uCurRungSamples = g_device.framegenRungSampleCount( g_framegenHistory.nDegradeSteps, nCurGenForLadder );
 	const uint32_t nRecoveryHold = g_framegenHistory.nDegradeHold;
@@ -13459,7 +13484,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		// (a coarser cadence / fewer inserted frames) for zero GPU saving.
 		const FramegenEffective_t nextEff = framegen_effective_config( g_framegenHistory.nDegradeSteps + 1 );
 		const uint32_t nNextGen = gamescope::framegen::ladder_generated_count(
-			nGapSlots, nextEff.multiplier, bSingleSlotPacing );
+			nGapSlots, nextEff.multiplier, bSingleSlotPacing,
+			g_device.hasFramegenQueue() );
 		if ( gamescope::framegen::degradation_reduces_work(
 			curEffForLadder, nextEff, nCurGenForLadder, nNextGen ) )
 		{
@@ -13492,7 +13518,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			const uint32_t nRicherGen =
 				gamescope::framegen::ladder_generated_count(
 					nRicherGapSlots, richerEff.multiplier,
-					bSingleSlotPacing );
+					bSingleSlotPacing, g_device.hasFramegenQueue() );
 			rungCosts[ nRicherRung ] = {
 				g_device.framegenRungCostNs( nRicherRung, nRicherGen ),
 				g_device.framegenRungSampleCount( nRicherRung, nRicherGen ),

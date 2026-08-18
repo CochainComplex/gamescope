@@ -473,8 +473,12 @@ void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentT
 	uint64_t ulActualFlipNs, uint64_t ulBackendSequence, bool bPresented, bool bTimestampValid );
 void vulkan_framegen_drain_present_feedback();
 bool vulkan_framegen_has_pending_generated_frame();
-// True when the queue front owns the current fixed-grid opportunity, or when
-// the non-grid VRR wake deadline has arrived.
+// True when the pending queue front may be presented at this opportunity.
+// Non-bidir (causal/default and the classic fallback): any pending frame is due
+// — its queue front already represents the next opportunity. Bidir: due only
+// when the front's own slot logic says so (its target flip is at or before the
+// next vblank, or the queue is forcing a drain). A non-grid VRR mid-interval
+// front is instead due once its wake deadline has arrived.
 bool vulkan_framegen_generated_frame_due();
 // True when a generated frame is pending AND its GPU work has completed, so it
 // can be presented this vblank without stalling scanout. Non-consuming.
@@ -1349,7 +1353,9 @@ struct TextureState
 class CVulkanCmdBuffer
 {
 public:
-	CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily);
+	// cmdPool is the pool cmdBuffer was allocated from; it must be freed back to
+	// that same pool. VK_NULL_HANDLE keeps the historical default (commandPool()).
+	CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily, VkCommandPool cmdPool = VK_NULL_HANDLE);
 	~CVulkanCmdBuffer();
 	CVulkanCmdBuffer(const CVulkanCmdBuffer& other) = delete;
 	CVulkanCmdBuffer(CVulkanCmdBuffer&& other) = delete;
@@ -1428,6 +1434,9 @@ private:
 
 	VkCommandBuffer m_cmdBuffer;
 	CVulkanDevice *m_device;
+	// The pool this buffer was allocated from; vkFreeCommandBuffers must use it
+	// (the framegen queue family split allocates from a separate pool).
+	VkCommandPool m_cmdPool;
 
 	VkQueue m_queue;
 	uint32_t m_queueFamily;
