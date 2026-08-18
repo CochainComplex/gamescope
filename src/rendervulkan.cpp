@@ -6577,6 +6577,12 @@ struct FramegenHistory_t
 		// the framegen timeline = always ready) and it must never be dropped
 		// by the generated-frame discard paths.
 		bool bReal = false;
+		// Output-space cursor split: both history endpoints this frame was
+		// predicted from were cursor-free composites, so the live cursor still
+		// has to be composited on top at present time. Carried per entry (not
+		// read off the live history) so a frame planned before a fallback can
+		// never end up with two cursors, or none.
+		bool bCursorFree = false;
 	};
 	std::vector<PendingGenerated_t> pending;
 
@@ -6679,6 +6685,15 @@ struct FramegenHistory_t
 	bool bBaseLayer = false;
 	gamescope::OwningRc<CVulkanTexture> baseHistory[2];
 	uint32_t nBaseHistoryNext = 0;
+	// Output-space cursor split: whether previousReal / currentReal hold a
+	// composite with NO cursor in it. True both when the split ran and when the
+	// stack simply carried no cursor layer (hidden/grabbed pointer) - in both
+	// cases prediction is cursor-free and the live cursor may be late-composited
+	// onto generated frames. Shifted alongside previousReal/currentReal.
+	bool bCursorFreePrevious = false;
+	bool bCursorFreeCurrent = false;
+	// Rolling index into g_output.framegenCursorHistoryImages.
+	uint32_t nNextCursorHistoryIndex = 0;
 	// Rolling index into g_output.framegenPresentImages for the next late
 	// overlay composite target (base mode only).
 	uint32_t nNextPresentIndex = 0;
@@ -6860,6 +6875,7 @@ static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMax
 static void framegen_clear_vrr_midpoint_state( bool bClearPending );
 static bool framegen_format_supports_sampled_storage( uint32_t drmFormat );
 static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo );
+static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo );
 
 static const char *framegen_color_record_dir()
 {
@@ -7039,6 +7055,77 @@ static bool framegen_base_layer_usable( const struct FrameInfo_t *pFrameInfo )
 			vk_log.infof( "framegen: base-layer path unavailable for format 0x%" PRIX32 " (no sampled+storage support), using output-space generation", uBaseFormat );
 	}
 	return s_bFormatSupported;
+}
+
+// Output-space cursor cadence. gamescope has no hardware cursor plane: the
+// pointer is a normal composited layer (zpos == g_zposCursor) and in
+// output-space mode the finished composite — cursor baked in — is what becomes
+// framegen history, so every generated frame shows a warped copy of a cursor
+// position that is one real frame old. The fix is two halves that only make
+// sense together: the real composite keeps the cursor OUT of the recorded
+// history image, and each generated frame gets the CURRENT cursor composited
+// on top at present time. GAMESCOPE_FRAMEGEN_CURSOR=0 disables both halves and
+// restores the previous behaviour exactly (including generated-frame image
+// usage flags, see framegen_create_output_texture).
+static bool framegen_cursor_split_enabled()
+{
+	static const bool s_bEnabled = []()
+	{
+		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_CURSOR" );
+		return pszEnv == nullptr || env_to_bool( pszEnv );
+	}();
+	return s_bEnabled;
+}
+
+// The cursor is painted last by steamcompmgr, but not unconditionally last:
+// mura correction (Steam Deck OLED) appends a plane above it. Both halves of
+// the split draw the cursor as the topmost layer, so they only engage when it
+// really is the top of the stack; anything else keeps today's single-pass
+// behaviour. Returns the layer index, or -1.
+static int framegen_cursor_top_layer_index( const struct FrameInfo_t *pFrameInfo )
+{
+	if ( pFrameInfo == nullptr || pFrameInfo->layerCount < 2 )
+		return -1;
+	const int nLast = pFrameInfo->layerCount - 1;
+	if ( pFrameInfo->layers[ nLast ].zpos != (int)g_zposCursor
+		|| pFrameInfo->layers[ nLast ].tex == nullptr )
+		return -1;
+	return nLast;
+}
+
+// True when the stack carries a cursor layer anywhere. A composite with no
+// cursor at all is already cursor-free history and needs no split.
+static bool framegen_frame_has_cursor_layer( const struct FrameInfo_t *pFrameInfo )
+{
+	if ( pFrameInfo == nullptr )
+		return false;
+	for ( int i = 0; i < pFrameInfo->layerCount; i++ )
+	{
+		if ( pFrameInfo->layers[ i ].zpos == (int)g_zposCursor
+			&& pFrameInfo->layers[ i ].tex != nullptr )
+			return true;
+	}
+	return false;
+}
+
+// Overlay-only repaints — a HUD tick, or the pointer moving across an
+// otherwise idle scene — re-composite unchanged game content and are NOT
+// recorded as history: framegen_record_real_frame drops them on exactly this
+// predicate. Testing it before compositing keeps the split's second pass off
+// every such repaint, which is what makes a mouse sweep over a paused game free
+// again. The shared predicate is reused rather than copied, and a disagreement
+// would be harmless in both directions (one wasted pass, or one frame of
+// today's baked-in cursor).
+static bool framegen_composite_records_history( const struct FrameInfo_t *pFrameInfo )
+{
+	const CVulkanTexture *pBaseTexture = pFrameInfo->layerCount > 0
+		? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
+	const uint64_t ulBaseCommitID = pFrameInfo->layerCount > 0
+		? pFrameInfo->layers[ 0 ].ulCommitID : 0u;
+	return pBaseTexture == nullptr
+		|| gamescope::framegen::is_new_real_frame_content(
+			{ g_framegenHistory.ulLastBaseCommitID, g_framegenHistory.pLastBaseTexture },
+			{ ulBaseCommitID, pBaseTexture } );
 }
 
 // Bidirectional interpolation (B3): generated frames sit BETWEEN the two real
@@ -7474,6 +7561,7 @@ void vulkan_framegen_reset( const char *reason )
 	g_device.framegenResetRungCosts();
 	g_output.framegenOutputImages.clear();
 	g_output.framegenPresentImages.clear();
+	g_output.framegenCursorHistoryImages.clear();
 	g_framegenMotion = {};
 	g_framegenColorProbe = {};
 }
@@ -7506,6 +7594,7 @@ void vulkan_framegen_shutdown()
 	g_framegenColorProbe = {};
 	g_output.framegenOutputImages.clear();
 	g_output.framegenPresentImages.clear();
+	g_output.framegenCursorHistoryImages.clear();
 	g_device.framegenGarbageCollect();
 }
 
@@ -7705,6 +7794,12 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 	gamescope::Rc<CVulkanTexture> pResult = front.tex;
 	if ( g_framegenHistory.bBaseLayer )
 		pResult = framegen_base_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
+	// Output-space cursor split: this frame was predicted from cursor-free
+	// history, so the pointer it should be showing is the LIVE one, composited
+	// now, not a motion-warped copy of where it was a real frame ago. Returns
+	// front.tex untouched when the live stack has no cursor layer.
+	else if ( front.bCursorFree && !front.bReal )
+		pResult = framegen_cursor_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
 
 	if ( pResult != nullptr )
 	{
@@ -7919,6 +8014,12 @@ static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> 
 	// An incompatible/ignored capture request must not alter production image
 	// usage or modifier selection. Only the active E2 path copies these images.
 	createFlags.bTransferSrc = framegen_color_probe_requested();
+	// Output-space cursor split only: the present-time cursor composite samples
+	// the generated frame as its base layer. Kept behind the same switch as the
+	// feature so GAMESCOPE_FRAMEGEN_CURSOR=0 leaves usage flags and modifier
+	// selection byte-for-byte as before. The output ring itself already runs
+	// flippable+storage+sampled, so the combination is not new here.
+	createFlags.bSampled = framegen_cursor_split_enabled();
 	createFlags.bOutputImage = true;
 	createFlags.bFramegenShared = true;
 
@@ -8044,6 +8145,190 @@ static bool framegen_ensure_present_pool()
 	return true;
 }
 
+// Rotating acquire shared by every framegen-owned image pool. Selection is by
+// actual Vulkan/backend ownership (IsInUse covers history pins, the read pins
+// held by an in-flight generation batch, unretired command buffers and backend
+// scanout refs) rather than by blindly cycling: writing an image somebody still
+// reads is a correctness bug, and skipping the frame's extra pass is not.
+static gamescope::Rc<CVulkanTexture> framegen_acquire_pool_image(
+	std::vector<gamescope::OwningRc<CVulkanTexture>> &pool, uint32_t &nNext )
+{
+	const uint32_t nSize = (uint32_t)pool.size();
+	for ( uint32_t nProbe = 0; nProbe < nSize; nProbe++ )
+	{
+		const uint32_t idx = nNext % nSize;
+		nNext++;
+		CVulkanTexture *pCandidate = pool[ idx ].get();
+		if ( pCandidate != nullptr && !pCandidate->IsInUse() )
+			return pCandidate;
+	}
+	return nullptr;
+}
+
+// Cursor-free history targets for the output-space cursor split. Sampled by
+// every generation shader (as previousReal/currentReal) and by the second
+// composite pass, written as a storage image by the first pass, and copied by
+// the held-out colour probe, so: storage + sampled + transferSrc. Never
+// flippable — a cursor-free frame is a prediction input, not a scanout buffer.
+// bFramegenShared is mandatory: the framegen queue may live on another family
+// (see the split-family rules around framegen_create_base_history_texture).
+static bool framegen_create_cursor_history_texture( gamescope::OwningRc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
+{
+	CVulkanTexture::createFlags createFlags;
+	createFlags.bStorage = true;
+	createFlags.bSampled = true;
+	createFlags.bTransferSrc = true;
+	createFlags.bFramegenShared = true;
+
+	*ppTexture = new CVulkanTexture();
+	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
+}
+
+// Four is the smallest depth that covers the steady state plus one frame of
+// slack: two images are held as previousReal/currentReal, one may still be
+// pinned as a read input of an in-flight generation batch that history has
+// already moved past, and one is being written by this composite. If they are
+// somehow all busy the caller simply does not split this frame — the composite
+// then bakes the cursor exactly as it does today, and PendingGenerated_t
+// ::bCursorFree keeps the present side in step.
+static constexpr size_t k_nFramegenCursorHistoryPool = 4;
+
+static gamescope::Rc<CVulkanTexture> framegen_acquire_cursor_history_image( uint32_t width, uint32_t height, uint32_t drmFormat )
+{
+	if ( g_output.framegenCursorHistoryImages.size() != k_nFramegenCursorHistoryPool )
+		g_output.framegenCursorHistoryImages.resize( k_nFramegenCursorHistoryPool );
+
+	for ( auto &pImage : g_output.framegenCursorHistoryImages )
+	{
+		if ( framegen_output_matches( pImage, width, height, drmFormat ) )
+			continue;
+		// A live image of the wrong size can still be referenced by history or
+		// an in-flight batch; dropping this slot's owning ref is safe (the Rc
+		// holders keep it alive), the reallocation below just gives us a fresh
+		// one for the new geometry.
+		if ( !framegen_create_cursor_history_texture( &pImage, width, height, drmFormat ) )
+		{
+			g_output.framegenCursorHistoryImages.clear();
+			return nullptr;
+		}
+	}
+
+	return framegen_acquire_pool_image( g_output.framegenCursorHistoryImages,
+		g_framegenHistory.nNextCursorHistoryIndex );
+}
+
+// Two-layer present-time composite used by both halves of the output-space
+// cursor split: an already-output-space base image with the live cursor drawn
+// on top.
+//
+// HDR contract. Layer 0 is the finished composite (real frame) or the
+// generated frame, both of which already left the full shaper + 3D LUT + output
+// transfer function pipeline. It is therefore declared PASSTHRU (the shader's
+// apply_layer_color_mgmt returns immediately, and the passthru degamma is the
+// identity) and applyOutputColorMgmt is cleared so encodeOutputColor is the
+// identity too — the output encoding is applied exactly once, never twice, and
+// no value is dragged through a transfer function it has already been through.
+// The cursor layer is copied VERBATIM (colorspace, ctm, alpha mode, opacity,
+// filter, scale/offset) and the frame's shaper/3D LUTs stay bound, so it gets
+// precisely the colour management a single-pass composite would give it. The
+// one difference from single-pass is that the cursor's own alpha is blended in
+// output space instead of blend space: nothing is clipped and no range is lost
+// (that is what would degrade HDR), only the ramp of a semi-transparent cursor
+// edge differs — and it differs the same way on real and generated frames,
+// which is what matters for temporal consistency. It is also what a hardware
+// cursor plane does on KMS, where the cursor blends after the CRTC pipeline.
+static void framegen_build_cursor_overlay_frame_info( struct FrameInfo_t *pOut,
+	const gamescope::Rc<CVulkanTexture> &pBase,
+	const struct FrameInfo_t::Layer_t &cursorLayer,
+	const struct FrameInfo_t *pSource )
+{
+	*pOut = FrameInfo_t{};
+	pOut->applyOutputColorMgmt = false;
+	pOut->outputEncodingEOTF = pSource->outputEncodingEOTF;
+	pOut->allowVRR = pSource->allowVRR;
+	for ( uint32_t i = 0; i < EOTF_Count; i++ )
+	{
+		pOut->shaperLut[ i ] = pSource->shaperLut[ i ];
+		pOut->lut3D[ i ] = pSource->lut3D[ i ];
+	}
+
+	pOut->layerCount = 2;
+
+	FrameInfo_t::Layer_t &base = pOut->layers[ 0 ];
+	base.tex = pBase;
+	base.zpos = g_zposBase;
+	base.scale = vec2_t{ 1.0f, 1.0f };
+	base.offset = vec2_t{ 0.0f, 0.0f };
+	base.opacity = 1.0f;
+	base.filter = GamescopeUpscaleFilter::NEAREST;
+	base.blackBorder = false;
+	base.applyColorMgmt = false;
+	base.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU;
+	base.eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
+
+	pOut->layers[ 1 ] = cursorLayer;
+	// Compositor-owned layers carry no commit back-pointers; the import staging
+	// pass keys off these, and a stale pointer here would be a lifetime bug.
+	pOut->layers[ 1 ].pCommitTexture = nullptr;
+	pOut->layers[ 1 ].pStagedCopyCount = nullptr;
+}
+
+// Second half of the output-space cursor split: draw the CURRENT cursor onto a
+// generated frame at present time. Mirrors framegen_base_present_composite —
+// same present-image pool, same realtime-queue submission, same host wait
+// before the image can be flipped — and, critically, the same pOutputOverride
+// contract: a non-null override keeps this composite out of
+// framegen_record_real_frame (no history poisoning) and off the output ring.
+// Returns the generated frame unchanged when there is nothing to draw, so a
+// frame with no cursor costs literally nothing.
+static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo )
+{
+	const int nCursorLayer = framegen_cursor_top_layer_index( pPresentFrameInfo );
+	if ( nCursorLayer < 0 )
+		return pGeneratedOutput;
+
+	if ( !framegen_ensure_present_pool() || g_output.framegenPresentImages.empty()
+		|| g_output.framegenPresentImages[ 0 ] == nullptr )
+		return pGeneratedOutput;
+
+	// The present pool tracks the CURRENT output; a generated frame planned
+	// before a mode switch no longer matches it. Presenting the raw generated
+	// frame is what happens today, so that is the safe answer.
+	if ( g_output.framegenPresentImages[ 0 ]->width() != pGeneratedOutput->width()
+		|| g_output.framegenPresentImages[ 0 ]->height() != pGeneratedOutput->height() )
+		return pGeneratedOutput;
+
+	gamescope::Rc<CVulkanTexture> pTarget = framegen_acquire_pool_image(
+		g_output.framegenPresentImages, g_framegenHistory.nNextPresentIndex );
+	if ( pTarget == nullptr )
+	{
+		static uint64_t s_uCursorPoolPressureDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uCursorPoolPressureDebugLogCounter ) )
+			vk_log.infof( "framegen: cursor late-composite pool pressure pool=%zu", g_output.framegenPresentImages.size() );
+		return pGeneratedOutput;
+	}
+
+	FrameInfo_t cursorFrameInfo;
+	framegen_build_cursor_overlay_frame_info( &cursorFrameInfo, pGeneratedOutput,
+		pPresentFrameInfo->layers[ nCursorLayer ], pPresentFrameInfo );
+
+	auto pCmdBuffer = g_device.commandBuffer();
+	g_device.addFramegenDependency( pCmdBuffer.get(), ulFramegenSeqNo );
+	std::optional<uint64_t> oSeqNo = vulkan_composite( &cursorFrameInfo, nullptr, false, pTarget, false, std::move( pCmdBuffer ) );
+	if ( !oSeqNo )
+		return pGeneratedOutput;
+	// Same wait the real composition path performs before its flip: the commit
+	// must never scan out a half-written image. One two-layer full-screen blit.
+	vulkan_wait( *oSeqNo, true );
+
+	static uint64_t s_uCursorCompositeDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uCursorCompositeDebugLogCounter ) )
+		vk_log.infof( "framegen: cursor late composite %ux%u",
+			pTarget->width(), pTarget->height() );
+
+	return pTarget;
+}
+
 // #02 late overlay composite: turn a generated BASE frame into a scanout-ready
 // output image by running it through the same composite pipeline a real frame
 // uses — FSR EASU/RCAS (or NIS/blit), shaper + 3D LUTs, and every CURRENT
@@ -8077,18 +8362,8 @@ static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope:
 	// commits. Select by actual Vulkan/backend ownership rather than blindly
 	// cycling the three-image pool; if all targets are acquired, repeating the
 	// last scanout is preferable to compositing into a live buffer.
-	gamescope::Rc<CVulkanTexture> pTarget;
-	for ( size_t nProbe = 0; nProbe < g_output.framegenPresentImages.size(); nProbe++ )
-	{
-		const uint32_t idx = g_framegenHistory.nNextPresentIndex % (uint32_t)g_output.framegenPresentImages.size();
-		g_framegenHistory.nNextPresentIndex++;
-		CVulkanTexture *pCandidate = g_output.framegenPresentImages[ idx ].get();
-		if ( pCandidate != nullptr && !pCandidate->IsInUse() )
-		{
-			pTarget = pCandidate;
-			break;
-		}
-	}
+	gamescope::Rc<CVulkanTexture> pTarget = framegen_acquire_pool_image(
+		g_output.framegenPresentImages, g_framegenHistory.nNextPresentIndex );
 	if ( pTarget == nullptr )
 	{
 		static uint64_t s_uPresentPressureDebugLogCounter = 0;
@@ -10921,6 +11196,12 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 			: ( bDeadlineCostKeying
 				? g_framegenHistory.causalAnchor.realFrameId : 0u );
 		entry.phase = slot.phase;
+		// Only when BOTH endpoints this batch interpolated/extrapolated from
+		// were cursor-free may the present side draw the live cursor: if either
+		// still had one baked in, the warped copy is already in the pixels and
+		// a second one would double it.
+		entry.bCursorFree = g_framegenHistory.bCursorFreePrevious
+			&& g_framegenHistory.bCursorFreeCurrent;
 		entry.bProvisional = bExplicitProvisional
 			|| ( bDeadlineCostKeying && ulAnchorRealFrameId == 0u
 				&& !g_framegenHistory.causalAnchor.correctedFlipNs.has_value() );
@@ -12562,7 +12843,11 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 	return true;
 }
 
-static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo )
+// bCursorFreeRealFrame: output-space mode only — pRealFrame carries no cursor,
+// either because the composite split it out (vulkan_composite) or because the
+// stack had no cursor layer to begin with. It is the caller's verdict, not a
+// property recomputable here: pFrameInfo still describes the FULL stack.
+static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo, bool bCursorFreeRealFrame )
 {
 	if ( !vulkan_framegen_is_enabled() || !pRealFrame || !pFrameInfo )
 		return;
@@ -12934,11 +13219,18 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	{
 		if ( !framegen_base_record_copy( pHistoryFrame, ulCompositeSeqNo ) )
 			return;
+		// Base mode composites the live cursor onto every generated frame in
+		// framegen_base_present_composite already; the output-space split is
+		// inert here and must never claim otherwise.
+		g_framegenHistory.bCursorFreePrevious = false;
+		g_framegenHistory.bCursorFreeCurrent = false;
 	}
 	else
 	{
 		g_framegenHistory.previousReal = g_framegenHistory.currentReal;
 		g_framegenHistory.currentReal = pRealFrame;
+		g_framegenHistory.bCursorFreePrevious = g_framegenHistory.bCursorFreeCurrent;
+		g_framegenHistory.bCursorFreeCurrent = bCursorFreeRealFrame;
 	}
 	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId - 1;
 
@@ -13501,6 +13793,50 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		compositeImage = partial ? g_output.outputImagesPartialOverlay[ g_output.nOutImage ] : g_output.outputImages[ g_output.nOutImage ];
 	}
 
+	// Output-space cursor split, first half. Only a composite that will actually
+	// be recorded as framegen history is a candidate — the same conditions the
+	// framegen_record_real_frame call at the bottom of this function uses — and
+	// only in output-space mode (base mode already late-composites the live
+	// cursor), never under bidir (bidir queues history images as pending REAL
+	// frames and flips them directly, so history MUST stay the flippable ring
+	// image with the cursor in it) and never while the held-out colour probe is
+	// capturing (it retains history images across frames on its own schedule).
+	//
+	// When it engages, everything below composites the stack WITHOUT the cursor
+	// into an owned image, and the second pass at the end of the recording block
+	// draws the live cursor from that image into the real scanout target.
+	const bool bCursorSplitCandidate = framegen_cursor_split_enabled()
+		&& vulkan_framegen_is_enabled()
+		&& !GetBackend()->UsesVulkanSwapchain()
+		&& !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr
+		&& !vulkan_framegen_bidir_active()
+		&& framegen_color_record_dir() == nullptr
+		&& !framegen_base_layer_usable( frameInfo )
+		&& framegen_composite_records_history( frameInfo );
+	const int nCursorSplitLayer = bCursorSplitCandidate
+		? framegen_cursor_top_layer_index( frameInfo ) : -1;
+	gamescope::Rc<CVulkanTexture> pCursorScanoutImage;
+	FrameInfo_t::Layer_t cursorSplitLayer;
+	if ( nCursorSplitLayer >= 0 && compositeImage != nullptr )
+	{
+		gamescope::Rc<CVulkanTexture> pCursorFreeImage = framegen_acquire_cursor_history_image(
+			compositeImage->width(), compositeImage->height(), compositeImage->drmFormat() );
+		if ( pCursorFreeImage != nullptr )
+		{
+			cursorSplitLayer = frameInfo->layers[ nCursorSplitLayer ];
+			frameInfo->layerCount--;
+			pCursorScanoutImage = compositeImage;
+			compositeImage = std::move( pCursorFreeImage );
+		}
+	}
+	const bool bCursorSplit = pCursorScanoutImage != nullptr;
+	// True whenever the image handed to framegen carries no cursor: either the
+	// split ran, or the pointer is hidden/grabbed and there was never one to
+	// split out. A cursor that is present but not the topmost layer (mura
+	// correction sits above it) keeps today's baked-in behaviour.
+	const bool bCursorFreeHistory = bCursorSplitCandidate
+		&& ( bCursorSplit || !framegen_frame_has_cursor_layer( frameInfo ) );
+
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 	// Off the real-frame critical path: the staging copy goes out as its own
 	// submission now, so the composite recorded below (and the flip that waits on
@@ -13666,6 +14002,42 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 	}
 
+	// Output-space cursor split, second half of the real frame. The pass above
+	// produced the cursor-free composite in an owned image; draw the live cursor
+	// from there into the actual scanout target. Recorded into the SAME command
+	// buffer as the composite — one submission, no extra fence, no change to the
+	// seqno the flip and the framegen scheduler wait on — and the command
+	// buffer's own image-state tracking inserts the read-after-write barrier, as
+	// it already does between EASU and RCAS. See
+	// framegen_build_cursor_overlay_frame_info for the colour-management
+	// contract; EOTF_Count is the pipeline key for "output encoding already
+	// applied, do not apply it again".
+	gamescope::Rc<CVulkanTexture> pFramegenHistoryImage = compositeImage;
+	if ( bCursorSplit )
+	{
+		FrameInfo_t cursorFrameInfo;
+		framegen_build_cursor_overlay_frame_info( &cursorFrameInfo, compositeImage,
+			cursorSplitLayer, frameInfo );
+
+		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, cursorFrameInfo.layerCount, cursorFrameInfo.ycbcrMask(), 0u, cursorFrameInfo.colorspaceMask(), EOTF_Count ));
+		bind_all_layers(cmdBuffer.get(), &cursorFrameInfo);
+		cmdBuffer->bindTarget(pCursorScanoutImage);
+		cmdBuffer->uploadConstants<BlitPushData_t>(&cursorFrameInfo);
+
+		const int pixelsPerGroup = 8;
+
+		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
+
+		// Everything after this point — pipewire capture, the framegen HUD, the
+		// returned/flipped image, the output ring advance — must see the real
+		// scanout target again. Only framegen keeps the cursor-free one.
+		compositeImage = std::move( pCursorScanoutImage );
+		// Restore the caller's layer stack before anything else reads it;
+		// framegen_record_real_frame keys scene changes on layerCount and must
+		// keep seeing the true count.
+		frameInfo->layerCount++;
+	}
+
 	if ( pPipewireTexture != nullptr )
 	{
 
@@ -13736,7 +14108,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// composites (streaming captures run their own vulkan_screenshot pass),
 	// which use screenshot color management and must not enter history.
 	if ( !GetBackend()->UsesVulkanSwapchain() && !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
-		framegen_record_real_frame( compositeImage, frameInfo, sequence );
+		framegen_record_real_frame( pFramegenHistoryImage, frameInfo, sequence, bCursorFreeHistory );
 
 	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
 	{

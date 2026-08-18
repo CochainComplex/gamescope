@@ -700,6 +700,16 @@ struct VulkanOutput_t
 	// Only one is ever consumed per present; 3 covers scanout + in-flight +
 	// margin. Allocated lazily by framegen_ensure_present_pool.
 	std::vector<gamescope::OwningRc<CVulkanTexture>> framegenPresentImages;
+	// Output-space cursor split: gamescope has no hardware cursor plane, so the
+	// cursor is just another composited layer and would otherwise be baked into
+	// framegen history and warped on every generated frame. When the layer stack
+	// carries a cursor, the real composite writes everything EXCEPT the cursor
+	// into one of these owned, output-sized images (that is what framegen
+	// predicts from) and a second two-layer pass draws the live cursor on top
+	// into the real scanout target. Deliberately NOT flippable - they are
+	// prediction inputs, never scanout buffers. Allocated lazily by
+	// framegen_acquire_cursor_history_image, and only for cursor-bearing frames.
+	std::vector<gamescope::OwningRc<CVulkanTexture>> framegenCursorHistoryImages;
 };
 
 
