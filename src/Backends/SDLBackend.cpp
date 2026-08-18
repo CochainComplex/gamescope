@@ -22,6 +22,9 @@
 #include "refresh_rate.h"
 
 #include "sdlscancodetable.hpp"
+#include "log.hpp"
+
+static LogScope sdl_log( "sdl" );
 
 static int g_nOldNestedRefresh = 0;
 static bool g_bWindowFocused = true;
@@ -161,6 +164,7 @@ namespace gamescope
 		virtual bool SupportsPlaneHardwareCursor() const override;
 
         virtual bool SupportsTearing() const override;
+		virtual bool SupportsFramegen() const override;
 		virtual bool UsesVulkanSwapchain() const override;
 
 		virtual bool IsSessionBased() const override;
@@ -340,14 +344,40 @@ namespace gamescope
 
 	int CSDLConnector::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
 	{
+		// Base-layer mode (#02, mandatory on a swapchain backend): the consume runs
+		// the late overlay composite against the live layer stack paint_all just
+		// assembled and returns an output-sized, fully colour-managed image.
+		// Mirrors CDRMBackend::Present / CWaylandConnector::Present, except that
+		// this backend cannot flip it — it composites it into the acquired
+		// swapchain image instead.
+		if ( gamescope::Rc<CVulkanTexture> pGeneratedFrame = vulkan_framegen_consume_generated_frame( pFrameInfo ) )
+		{
+			static uint64_t s_uGeneratedPresentDebugLogCounter = 0;
+			if ( FramegenDebugShouldLog( s_uGeneratedPresentDebugLogCounter ) )
+				sdl_log.infof( "framegen: SDL presenting generated frame" );
+
+			if ( !vulkan_present_framegen_frame_to_window( pGeneratedFrame, pFrameInfo ) )
+				return -EINVAL;
+
+			GetVBlankTimer().UpdateWasCompositing( true );
+			GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
+
+			return 0;
+		}
+
 		// TODO: Resolve const crap
 		std::optional oCompositeResult = vulkan_composite( (FrameInfo_t *)pFrameInfo, nullptr, false );
 		if ( !oCompositeResult )
 			return -EINVAL;
 
-		vulkan_present_to_window();
+		// Associates the real frame's presentation tag with the composite that
+		// produced it, as the DRM and nested-Wayland present paths do.
+		vulkan_framegen_note_present_composite_seqno( *oCompositeResult );
 
-		// TODO: Hook up PresentationFeedback.
+		// PresentationFeedback is hooked up inside vulkan_present_to_window():
+		// this backend's completion signal is VK_KHR_present_wait, published from
+		// the present-wait thread.
+		vulkan_present_to_window();
 
 		// Wait for the composite result on our side *after* we
 		// commit the buffer to the compositor to avoid a bubble.
@@ -485,6 +515,19 @@ namespace gamescope
 	bool CSDLBackend::SupportsTearing() const
 	{
 		return false;
+	}
+	bool CSDLBackend::SupportsFramegen() const
+	{
+		// Generated frames are composited into the acquired swapchain image and
+		// presented through vkQueuePresentKHR; completion feedback comes from
+		// VK_KHR_present_wait, which gamescope already enables and already uses to
+		// drive the vblank clock on this backend.
+		//
+		// Framegen necessarily runs in base-layer mode here: the output "ring" IS
+		// the swapchain, and its images belong to the presentation engine between
+		// present and re-acquire, so they cannot be retained as prediction history
+		// (see framegen_owns_output_ring() in rendervulkan.cpp).
+		return true;
 	}
 	bool CSDLBackend::UsesVulkanSwapchain() const
 	{

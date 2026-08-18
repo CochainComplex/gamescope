@@ -233,6 +233,26 @@ static bool framegen_backend_supported()
 	return GetBackend() != nullptr && GetBackend()->SupportsFramegen();
 }
 
+// True when the compositor owns the output image ring. On a Vulkan-swapchain
+// backend the "ring" IS the swapchain: g_output.nOutImage comes from
+// vkAcquireNextImageKHR and the images belong to the presentation engine
+// between present and re-acquire, so framegen must neither select/advance the
+// index nor retain one of those images as prediction history.
+//
+// Deliberately NOT the predicate that decides whether framegen runs at all —
+// that is IBackend::SupportsFramegen(). Headless and OpenVR also report
+// UsesVulkanSwapchain() == false, so deriving enablement from this would have
+// switched framegen on for them by accident.
+static bool framegen_owns_output_ring()
+{
+	return GetBackend() != nullptr && !GetBackend()->UsesVulkanSwapchain();
+}
+
+// Set by vulkan_framegen_shutdown() before framegen state is torn down. The
+// swapchain present-wait thread is detached and never joined, so it must stop
+// publishing display feedback across teardown.
+static std::atomic<bool> g_bFramegenFeedbackShutdown = { false };
+
 static constexpr mat3x4 g_rgb2yuv_srgb_to_bt601_limited = {{
   { 0.257f, 0.504f, 0.098f, 0.0625f },
   { -0.148f, -0.291f, 0.439f, 0.5f },
@@ -4324,6 +4344,92 @@ bool acquire_next_image( void )
 static std::atomic<uint64_t> g_currentPresentWaitId = {0u};
 static std::mutex present_wait_lock;
 
+// Framegen present feedback on a Vulkan-swapchain backend. The DRM backend gets
+// this from the page-flip handler and nested Wayland from
+// wp_presentation_feedback; here the source is VK_KHR_present_wait, which is
+// already enabled and already drives the vblank clock below. All that was
+// missing is the association between the framegen presentation tag taken at
+// present time and the presentId the waiter completes.
+//
+// Deliberately NOT guarded by present_wait_lock, even though the design sketch
+// suggested it: the waiter holds that lock across a WaitForPresentKHR of up to
+// one second, so the compositor thread would stall on it at every present.
+// Lock order where both are held is present_wait_lock -> present_tag_lock.
+static constexpr size_t k_nPresentWaitTagRing = 16;
+struct PresentWaitTag_t
+{
+	gamescope::FramegenPresentTag_t tag = {};
+	uint64_t ulPresentId = 0;   // 0 == slot free / already published
+};
+static std::array<PresentWaitTag_t, k_nPresentWaitTagRing> g_PresentWaitTags;
+static std::mutex present_tag_lock;
+
+static void framegen_note_present_queued()
+{
+	if ( GetBackend() == nullptr )
+		return;
+	if ( gamescope::IBackendConnector *pConnector = GetBackend()->GetCurrentConnector() )
+		pConnector->PresentationFeedback().m_uQueuedPresents++;
+}
+
+static void framegen_note_present_completed( uint32_t nCount )
+{
+	if ( nCount == 0u || GetBackend() == nullptr )
+		return;
+	if ( gamescope::IBackendConnector *pConnector = GetBackend()->GetCurrentConnector() )
+		pConnector->PresentationFeedback().m_uCompletedPresents += nCount;
+}
+
+// Publishes every stored tag with an id at or below ulUpToPresentId. The tag
+// whose id matches exactly carries the measured completion time; any older id
+// the waiter skipped past (it only ever waits for the newest) WAS presented but
+// has no timestamp of its own, so it is published with bTimestampValid = false
+// rather than a fabricated time. Counters (real=/gen=/fill=) need only
+// bPresented; every timing consumer honours bTimestampValid.
+static void framegen_publish_present_wait_tags( uint64_t ulUpToPresentId, uint64_t ulFlipNs )
+{
+	if ( g_bFramegenFeedbackShutdown.load() )
+		return;
+
+	uint32_t nPublished = 0;
+	{
+		std::scoped_lock lock( present_tag_lock );
+		for ( PresentWaitTag_t &slot : g_PresentWaitTags )
+		{
+			if ( slot.ulPresentId == 0 || slot.ulPresentId > ulUpToPresentId )
+				continue;
+
+			const bool bExact = ( slot.ulPresentId == ulUpToPresentId );
+			vulkan_framegen_publish_present_feedback( slot.tag,
+				bExact ? ulFlipNs : 0u, slot.ulPresentId, true, bExact );
+			slot.ulPresentId = 0;
+			nPublished++;
+		}
+	}
+	framegen_note_present_completed( nPublished );
+}
+
+// Swapchain teardown/resize: nothing that is still pending will ever complete on
+// the old swapchain, so retire the tags as not-presented instead of orphaning
+// them (which would leak CurrentPresentsInFlight upward forever).
+static void framegen_flush_present_wait_tags()
+{
+	uint32_t nFlushed = 0;
+	{
+		std::scoped_lock lock( present_tag_lock );
+		for ( PresentWaitTag_t &slot : g_PresentWaitTags )
+		{
+			if ( slot.ulPresentId == 0 )
+				continue;
+			if ( !g_bFramegenFeedbackShutdown.load() )
+				vulkan_framegen_publish_present_feedback( slot.tag, 0u, 0u, false, false );
+			slot.ulPresentId = 0;
+			nFlushed++;
+		}
+	}
+	framegen_note_present_completed( nFlushed );
+}
+
 extern void mangoapp_output_update( uint64_t vblanktime );
 static void present_wait_thread_func( void )
 {
@@ -4341,8 +4447,17 @@ static void present_wait_thread_func( void )
 
 			if (present_wait_id != 0)
 			{
-				g_device.vk.WaitForPresentKHR( g_device.device(), g_output.swapChain, present_wait_id, 1'000'000'000lu );
+				// Null only if the driver lied about VK_KHR_present_wait after
+				// device creation enabled it. Skipping the wait degrades this to
+				// a present-nudged clock instead of dereferencing null; the
+				// framegen feedback published below is then approximate, and
+				// vulkan_present_to_window has already flagged it as such.
+				if ( g_device.vk.WaitForPresentKHR != nullptr )
+					g_device.vk.WaitForPresentKHR( g_device.device(), g_output.swapChain, present_wait_id, 1'000'000'000lu );
 				uint64_t vblanktime = get_time_in_nanos();
+				// Before MarkVBlank: the re-armed vblank timer wakes the
+				// compositor, which drains the mailbox on its next iteration.
+				framegen_publish_present_wait_tags( present_wait_id, vblanktime );
 				GetVBlankTimer().MarkVBlank( vblanktime, true );
 				mangoapp_output_update( vblanktime );
 			}
@@ -4420,16 +4535,116 @@ void vulkan_present_to_window( void )
 		.pImageIndices = &g_output.nOutImage,
 	};
 
+	// Framegen presentation tag, taken at the same point the DRM backend takes it
+	// (immediately before the commit) and stamped with the same submit time. Only
+	// taken while framegen is actually enabled, so a plain swapchain present is
+	// byte-for-byte what it always was.
+	const bool bFramegenPresent = vulkan_framegen_is_enabled();
+	gamescope::FramegenPresentTag_t framegenTag = {};
+	// If present_wait is unavailable we cannot measure completion at all. Publish
+	// synchronously instead, snapped to the refresh grid (raw "now" is
+	// systematically about one interval early and would poison the cadence
+	// anchor) and flagged bTimestampValid = false. That keeps real=/gen=/fill=
+	// correct while every timing field honestly reports "not measured". Never
+	// pass true here.
+	const bool bApproximateFeedback = bFramegenPresent && g_device.vk.WaitForPresentKHR == nullptr;
+	if ( bFramegenPresent )
+	{
+		framegenTag = vulkan_framegen_take_present_tag();
+		framegenTag.ulCommitSubmitNs = get_time_in_nanos();
+	}
+
 	if ( g_device.vk.QueuePresentKHR( g_device.queue(), &presentInfo ) == VK_SUCCESS )
 	{
+		if ( bApproximateFeedback )
+		{
+			framegen_note_present_queued();
+			vulkan_framegen_publish_present_feedback( framegenTag,
+				GetVBlankTimer().GetNextVBlank( 0 ), presentId, true, false );
+			framegen_note_present_completed( 1 );
+		}
+		else if ( bFramegenPresent )
+		{
+			uint32_t nEvicted = 0;
+			{
+				std::scoped_lock lock( present_tag_lock );
+				PresentWaitTag_t &slot = g_PresentWaitTags[ presentId % k_nPresentWaitTagRing ];
+				if ( slot.ulPresentId != 0 )
+				{
+					// The ring wrapped past a tag the waiter never got to. It was
+					// presented; we simply have no time for it.
+					vulkan_framegen_publish_present_feedback( slot.tag, 0u, slot.ulPresentId, true, false );
+					nEvicted++;
+				}
+				slot = { framegenTag, presentId };
+			}
+			framegen_note_present_completed( nEvicted );
+			framegen_note_present_queued();
+		}
+
 		g_currentPresentWaitId = presentId;
 		g_currentPresentWaitId.notify_all();
 	}
 	else
+	{
+		if ( bFramegenPresent )
+			vulkan_framegen_publish_present_feedback( framegenTag, 0u, 0u, false, false );
 		vulkan_remake_swapchain();
+	}
 
 	while ( !acquire_next_image() )
 		vulkan_remake_swapchain();
+}
+
+// Swapchain analogue of CDRMBackend::Present's direct flip of the generated
+// texture. A swapchain image cannot be blitted into — vulkan_make_swapchain
+// requests SAMPLED | STORAGE | TRANSFER_SRC, no TRANSFER_DST — so the generated,
+// already output-sized and output-encoded frame is written with a one-layer
+// compute composite instead. That is not a workaround: it is the identical
+// colour path a real frame takes, so HDR and colour management are preserved by
+// construction, and it is the only way to get the framegen HUD onto a generated
+// frame.
+bool vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFrame, const struct FrameInfo_t *pPresentFrameInfo )
+{
+	if ( pFrame == nullptr || pPresentFrameInfo == nullptr
+		|| g_output.outputImages.empty()
+		|| g_output.nOutImage >= g_output.outputImages.size()
+		|| g_output.outputImages[ g_output.nOutImage ] == nullptr )
+		return false;
+
+	FrameInfo_t blitFrameInfo = {};
+	blitFrameInfo.applyOutputColorMgmt = false;   // pFrame already carries the output encoding
+	blitFrameInfo.outputEncodingEOTF = pPresentFrameInfo->outputEncodingEOTF;
+	blitFrameInfo.layerCount = 1;
+
+	FrameInfo_t::Layer_t *pBaseLayer = &blitFrameInfo.layers[ 0 ];
+	pBaseLayer->scale.x = 1.0;
+	pBaseLayer->scale.y = 1.0;
+	pBaseLayer->opacity = 1.0;
+	pBaseLayer->zpos = g_zposBase;
+	pBaseLayer->eAlphaBlendingMode = ALPHA_BLENDING_MODE_NONE;
+	pBaseLayer->tex = pFrame;
+	pBaseLayer->applyColorMgmt = false;
+	pBaseLayer->filter = GamescopeUpscaleFilter::NEAREST;
+	pBaseLayer->ctm = nullptr;
+	pBaseLayer->colorspace = pPresentFrameInfo->outputEncodingEOTF == EOTF_PQ
+		? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+
+	// pOutputOverride == the acquired swapchain image keeps this composite out of
+	// framegen_record_real_frame and off the ring index, exactly as
+	// framegen_base_present_composite does. bForceFramegenHud opts the HUD back in
+	// because this composite IS the presented frame.
+	std::optional<uint64_t> oSeqNo = vulkan_composite( &blitFrameInfo, nullptr, false,
+		g_output.outputImages[ g_output.nOutImage ], false, nullptr, true );
+	if ( !oSeqNo )
+		return false;
+
+	// Present first, wait after: the composite submit and the present both go to
+	// g_device.queue(), so the present is already ordered behind the blit and the
+	// wait is only for our own bookkeeping. Same ordering the real path uses.
+	vulkan_present_to_window();
+	vulkan_wait( *oSeqNo, true );
+	return true;
 }
 
 gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size)
@@ -4653,6 +4868,9 @@ bool vulkan_remake_swapchain( void )
 	VulkanOutput_t *pOutput = &g_output;
 	g_device.waitIdle();
 	g_device.vk.QueueWaitIdle( g_device.queue() );
+	// Nothing still pending on the old swapchain will ever complete; retire the
+	// tags rather than orphan them.
+	framegen_flush_present_wait_tags();
 	vulkan_framegen_reset( "swapchain_remake" );
 
 	pOutput->outputImages.clear();
@@ -7024,7 +7242,11 @@ bool vulkan_framegen_vrr_hybrid_active()
 static bool framegen_base_layer_enabled()
 {
 	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_BASE" ) );
-	return s_bEnabled;
+	// A Vulkan-swapchain backend has no compositor-owned output ring, so
+	// output-space history is not representable there at all: it would pin a
+	// presentation-engine-owned image and sample it after re-acquire. Base-layer
+	// generation is therefore mandatory, not opt-in, on those backends.
+	return s_bEnabled || !framegen_owns_output_ring();
 }
 
 bool vulkan_framegen_base_layer_active()
@@ -7195,6 +7417,12 @@ static float framegen_bidir_endpoint_trace_strength( GamescopeFramegenPipeline e
 bool vulkan_framegen_bidir_active()
 {
 	return framegen_bidir_enabled()
+		// Bidir substitutes vulkan_get_last_output_image() into the flip, i.e. it
+		// presents ring images directly. On a swapchain backend those are
+		// presentation-engine-owned and there is no flip to substitute into.
+		// !bBaseLayer below already covers it once base mode latches; this closes
+		// the first-frame window and documents why.
+		&& framegen_owns_output_ring()
 		&& g_eFramegenMode == GamescopeFramegenMode::Motion
 		&& !vulkan_framegen_vrr_hybrid_requested()
 		&& !g_framegenHistory.bBaseLayer;
@@ -7590,6 +7818,15 @@ void vulkan_framegen_reset( const char *reason )
 
 void vulkan_framegen_shutdown()
 {
+	// Step 0, unconditionally and before the early-out: the swapchain
+	// present-wait thread is detached and never joined (and must not be — that is
+	// a separate, larger change). It publishes into the display-feedback mailbox,
+	// which is a self-contained mutex + POD ring that never touches framegen
+	// state, so a late publish is safe by construction; this flag simply stops it
+	// from happening at all across and after teardown.
+	g_bFramegenFeedbackShutdown = true;
+	framegen_flush_present_wait_tags();
+
 	if ( !vulkan_framegen_is_enabled() )
 		return;
 
@@ -8083,17 +8320,25 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<
 static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
 {
 	CVulkanTexture::createFlags createFlags;
-	createFlags.bFlippable = true;
+	// Flippable forces bExportable, the scanout WSI hint, a dmabuf export and an
+	// ImportDmabufToBackend() round trip. That is what these images are FOR on a
+	// backend that scans out or hands off dmabufs. A Vulkan-swapchain backend
+	// never flips them — they are sampled into the acquired swapchain image — so
+	// there it is pure allocation cost and one more way BInit can fail.
+	createFlags.bFlippable = framegen_owns_output_ring();
 	createFlags.bStorage = true;
 	// An incompatible/ignored capture request must not alter production image
 	// usage or modifier selection. Only the active E2 path copies these images.
 	createFlags.bTransferSrc = framegen_color_probe_requested();
-	// Output-space cursor split only: the present-time cursor composite samples
-	// the generated frame as its base layer. Kept behind the same switch as the
-	// feature so GAMESCOPE_FRAMEGEN_CURSOR=0 leaves usage flags and modifier
-	// selection byte-for-byte as before. The output ring itself already runs
-	// flippable+storage+sampled, so the combination is not new here.
-	createFlags.bSampled = framegen_cursor_split_enabled();
+	// Two independent reasons to be sampleable:
+	//  - output-space cursor split: the present-time cursor composite samples the
+	//    generated frame as its base layer. Kept behind the same switch as the
+	//    feature so GAMESCOPE_FRAMEGEN_CURSOR=0 leaves usage flags and modifier
+	//    selection byte-for-byte as before on ring-owning backends.
+	//  - swapchain backends: the generated-frame present composites this image
+	//    into the acquired swapchain image, so it is ALWAYS a sampled source
+	//    there and must not depend on the cursor-split env var.
+	createFlags.bSampled = framegen_cursor_split_enabled() || !framegen_owns_output_ring();
 	createFlags.bOutputImage = true;
 	createFlags.bFramegenShared = true;
 
@@ -12998,12 +13243,16 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_CLASSIC=1 restored the temporary classic batch path for A/B (scheduled for deletion in Step 5)" );
 		if ( framegen_bidir_enabled() )
 		{
-			if ( g_eFramegenMode == GamescopeFramegenMode::Motion && !vulkan_framegen_vrr_hybrid_requested() )
+			if ( !framegen_owns_output_ring() )
+				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored on a Vulkan-swapchain backend — bidir presents output-ring images directly by flip substitution, and swapchain images are owned by the presentation engine between present and re-acquire" );
+			else if ( g_eFramegenMode == GamescopeFramegenMode::Motion && !vulkan_framegen_vrr_hybrid_requested() )
 				vk_log.infof( "framegen: bidirectional interpolation requested (B3) — generated frames interpolate between the two real frames; real-frame presentation is delayed up to one interval" );
 			else
 				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored (requires motion mode and is incompatible with VRR-hybrid pacing)" );
 		}
-		if ( framegen_base_layer_enabled() )
+		if ( !framegen_owns_output_ring() )
+			vk_log.infof( "framegen: base-layer generation forced (#02) — a Vulkan-swapchain backend has no compositor-owned output ring, so history keys on the client's buffer and generated frames are late-composited into the acquired swapchain image" );
+		else if ( framegen_base_layer_enabled() )
 			vk_log.infof( "framegen: base-layer generation + late overlay composite requested (#02) — predicting on the pre-upscale game layer, overlays/cursor composite fresh onto generated frames" );
 		if ( g_eFramegenMode == GamescopeFramegenMode::Motion )
 		{
@@ -13111,6 +13360,20 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// composited output; the dims/mode-keyed reset inside ensure_resources
 	// mediates any live switch between the two, so they never mix in a scene.
 	const bool bBaseLayer = framegen_base_layer_usable( pFrameInfo );
+	if ( !bBaseLayer && !framegen_owns_output_ring() )
+	{
+		// Hard bail-out, not a fallback. Output-space history would retain
+		// pRealFrame — a swapchain image the presentation engine owns after
+		// present and whose contents are undefined after re-acquire. Stay
+		// dormant for this scene rather than corrupt it.
+		static bool s_bLoggedSwapchainBaseUnavailable = false;
+		if ( !s_bLoggedSwapchainBaseUnavailable )
+		{
+			vk_log.infof( "framegen: disabled — a Vulkan-swapchain backend requires base-layer generation, but layer 0 cannot take it (ycbcr, non-base zpos, active ReShade, or a base format without sampled+storage support)" );
+			s_bLoggedSwapchainBaseUnavailable = true;
+		}
+		return;
+	}
 	const gamescope::Rc<CVulkanTexture> &pHistoryFrame = bBaseLayer ? pFrameInfo->layers[ 0 ].tex : pRealFrame;
 
 	if ( !framegen_ensure_resources( pHistoryFrame->width(), pHistoryFrame->height(), pHistoryFrame->drmFormat(), bBaseLayer ) )
@@ -13764,7 +14027,7 @@ static void stage_base_imports_in_own_submission( struct FrameInfo_t *pFrameInfo
 		g_device.noteStagingSubmission( ulSeqNo, nQuerySlot );
 }
 
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer )
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool bForceFramegenHud )
 {
 	// Bidir (B3): each composite decides afresh whether it queued its real
 	// frame; a composite that never records (overlay-only, partial, screenshot)
@@ -13851,7 +14114,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		compositeImage = pOutputOverride;
 	else
 	{
-		if ( vulkan_framegen_is_enabled() && !GetBackend()->UsesVulkanSwapchain() )
+		if ( vulkan_framegen_is_enabled() && framegen_owns_output_ring() )
 		{
 			framegen_release_completed_read_pins();
 			if ( vulkan_framegen_bidir_active() )
@@ -13926,7 +14189,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// draws the live cursor from that image into the real scanout target.
 	const bool bCursorSplitCandidate = framegen_cursor_split_enabled()
 		&& vulkan_framegen_is_enabled()
-		&& !GetBackend()->UsesVulkanSwapchain()
+		&& framegen_owns_output_ring()
 		&& !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr
 		&& !vulkan_framegen_bidir_active()
 		&& framegen_color_record_dir() == nullptr
@@ -14208,11 +14471,18 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// composites and base-layer late composites are identified by their capture
 	// or override target and deliberately never enter this path; the direct
 	// pipewire copy above also happens before the HUD is drawn.
+	//
+	// bForceFramegenHud is the one deliberate exception: a swapchain backend
+	// presents a generated frame by compositing it into the acquired swapchain
+	// image with pOutputOverride set, and that IS the frame that reaches the
+	// display. Without the opt-in the HUD would only be drawn on real frames
+	// and would visibly strobe at half the presented rate. No existing caller
+	// passes true, so DRM / nested Wayland are unchanged.
 	int nFramegenHudSlot = -1;
 	if ( framegen_hud_level() != 0u
-		&& !GetBackend()->UsesVulkanSwapchain()
-		&& !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr
-		&& vulkan_framegen_is_enabled() )
+		&& vulkan_framegen_is_enabled()
+		&& ( bForceFramegenHud
+			|| ( !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr ) ) )
 	{
 		nFramegenHudSlot = framegen_hud_record(
 			cmdBuffer.get(), compositeImage, frameInfo );
@@ -14226,10 +14496,14 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// The pPipewireTexture slot is only used by screenshot-style side
 	// composites (streaming captures run their own vulkan_screenshot pass),
 	// which use screenshot color management and must not enter history.
-	if ( !GetBackend()->UsesVulkanSwapchain() && !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
+	// Swapchain backends record too: framegen_record_real_frame is where base-layer
+	// history is taken from layer 0 (the client's buffer), which is exactly what a
+	// swapchain backend must key on. It early-outs when framegen is disabled, and
+	// refuses output-space history when the compositor does not own the ring.
+	if ( !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
 		framegen_record_real_frame( pFramegenHistoryImage, frameInfo, sequence, bCursorFreeHistory );
 
-	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
+	if ( framegen_owns_output_ring() && pOutputOverride == nullptr && increment )
 	{
 		// Remember the slot we just composited into before advancing off it; the
 		// skip below means it is not always nOutImage-1.

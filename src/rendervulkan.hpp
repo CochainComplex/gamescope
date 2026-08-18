@@ -456,7 +456,11 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb );
 
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr );
+// bForceFramegenHud: draw the framegen HUD even though this is an override
+// composite. Only the swapchain generated-frame present passes true (see
+// vulkan_present_framegen_frame_to_window); every other caller keeps the
+// default and therefore the historical behaviour.
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr, bool bForceFramegenHud = false );
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 bool vulkan_framegen_is_enabled();
@@ -563,6 +567,12 @@ gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, 
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 
 void vulkan_present_to_window( void );
+// Vulkan-swapchain backends: composite an already-finished, output-sized framegen
+// frame into the acquired swapchain image (one one-layer pass plus the framegen
+// HUD) and present it. The swapchain analogue of CDRMBackend::Present's direct
+// flip of the generated texture — swapchain images have no TRANSFER_DST, so this
+// is a composite rather than a blit, which also keeps the colour pipeline intact.
+bool vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFrame, const struct FrameInfo_t *pPresentFrameInfo );
 
 void vulkan_garbage_collect( void );
 bool vulkan_remake_swapchain( void );
