@@ -9196,6 +9196,12 @@ steamcompmgr_main(int argc, char **argv)
 
 			bool bShouldPaint = false;
 
+			// Framegen: true when this pass paints because a GENERATED frame is
+			// being committed, rather than because real content changed. Only the
+			// framegen arbiter below can set it, so with framegen disabled (or with
+			// nothing pending) it stays false and this pass behaves exactly as before.
+			bool bFramegenGeneratedPaint = false;
+
 			//if ( GetBackend()->IsVisible() )
 			if ( true )
 			{
@@ -9314,6 +9320,7 @@ steamcompmgr_main(int argc, char **argv)
 							if ( bReady && ( !bOverlayOnly || bLateOverlayComposite || nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay ) )
 							{
 								bShouldPaint = true;
+								bFramegenGeneratedPaint = true;
 								g_bFramegenEarlyGeneratedInFlight = true;
 								if ( bOverlayOnly && !bLateOverlayComposite )
 								{
@@ -9363,6 +9370,7 @@ steamcompmgr_main(int argc, char **argv)
 						if ( bReady && ( !bOverlayOnly || bLateOverlayComposite || nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay ) )
 						{
 							bShouldPaint = true;
+							bFramegenGeneratedPaint = true;
 							if ( bOverlayOnly && !bLateOverlayComposite )
 							{
 								bFramegenDeferOverlay = true;
@@ -9409,6 +9417,20 @@ steamcompmgr_main(int argc, char **argv)
 
 			if ( bShouldPaint )
 			{
+				// Framegen cursor freshness: a generated-frame commit is triggered
+				// by the commit-deadline timer (fixed-refresh) or the mid-interval
+				// hybrid timer, not by the vblank, so the cursor position latched
+				// by the vblank-gated UpdatePosition() above can be up to a whole
+				// refresh interval old by the time this layer stack is assembled.
+				// Re-sample it here so the stack paint_all builds — which the
+				// backend late-composites onto the generated frame in base-layer
+				// mode — carries the cursor where it actually is at commit time.
+				// This only re-reads wlserver's latest pointer position; it does
+				// not paint, wake, or re-time anything, so pacing and the
+				// scheduler's decisions are untouched.
+				if ( bFramegenGeneratedPaint && pPaintFocus->cursor )
+					pPaintFocus->cursor->UpdatePosition();
+
 				paint_all( pPaintFocus, eFlipType == FlipType::Async );
 
 				bPainted = true;
