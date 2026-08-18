@@ -3,6 +3,7 @@
 #include "../rendervulkan.hpp"
 #include "query_ring.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace
@@ -153,6 +154,104 @@ void CVulkanDevice::framegenTimestampEnd( CVulkanCmdBuffer *pCmdBuffer, int nSlo
 		return;
 
 	vk.CmdWriteTimestamp( pCmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_framegenQueryPool, (uint32_t)nSlot * 2 + 1 );
+}
+
+// Record the opening timestamp of a dual-GPU staging-copy submission. Same ring
+// discipline as framegenTimestampBegin, against the composite-family pool.
+int CVulkanDevice::stagingTimestampBegin( CVulkanCmdBuffer *pCmdBuffer )
+{
+	if ( m_stagingQueryPool == VK_NULL_HANDLE || m_uStagingQueryRingDepth == 0 || pCmdBuffer == nullptr )
+		return -1;
+
+	uint64_t uOccupiedMask = 0;
+	for ( const auto &[ seqNo, nPendingSlot ] : m_stagingQuerySlotBySeqNo )
+	{
+		(void)seqNo;
+		if ( nPendingSlot < 64 )
+			uOccupiedMask |= uint64_t{ 1 } << nPendingSlot;
+	}
+
+	const std::optional selection = gamescope::framegen::select_query_ring_slot(
+		m_uStagingQueryHead, m_uStagingQueryRingDepth, uOccupiedMask );
+	if ( !selection )
+		return -1;
+
+	const uint32_t nSlot = selection->slot;
+	m_uStagingQueryHead = selection->nextHead;
+
+	VkCommandBuffer raw = pCmdBuffer->rawBuffer();
+	vk.CmdResetQueryPool( raw, m_stagingQueryPool, nSlot * 2, 2 );
+	vk.CmdWriteTimestamp( raw, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_stagingQueryPool, nSlot * 2 );
+	return (int)nSlot;
+}
+
+// Record the closing timestamp of a staging-copy submission (BOTTOM_OF_PIPE).
+// Must be called while the command buffer is still recording, before submit().
+void CVulkanDevice::stagingTimestampEnd( CVulkanCmdBuffer *pCmdBuffer, int nSlot )
+{
+	if ( nSlot < 0 || m_stagingQueryPool == VK_NULL_HANDLE || pCmdBuffer == nullptr )
+		return;
+
+	vk.CmdWriteTimestamp( pCmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		m_stagingQueryPool, (uint32_t)nSlot * 2 + 1 );
+}
+
+void CVulkanDevice::noteStagingSubmission( uint64_t ulSeqNo, int nSlot )
+{
+	if ( nSlot < 0 || m_stagingQueryPool == VK_NULL_HANDLE )
+		return;
+
+	m_stagingQuerySlotBySeqNo.emplace_back( ulSeqNo, (uint32_t)nSlot );
+}
+
+// Harvest every staging-copy timestamp pair whose submission has completed and
+// hand the caller the accumulated sum / count / max, resetting the accumulator
+// so metrics windows see disjoint deltas. Returns false when nothing has been
+// measured since the last drain (copy_ms_* then stays 0.0).
+//
+// This never waits: the scratch timeline counter is only *read*, and queries are
+// read without VK_QUERY_RESULT_WAIT_BIT and only for seqNos at or below that
+// counter, i.e. submissions the GPU has already finished.
+bool CVulkanDevice::drainStagingCopyTiming( uint64_t &ulSumNs, uint64_t &ulSamples, uint64_t &ulMaxNs )
+{
+	if ( !m_stagingQuerySlotBySeqNo.empty() )
+	{
+		uint64_t currentSeqNo = 0;
+		vk_check( vk.GetSemaphoreCounterValue( device(), m_scratchTimelineSemaphore, &currentSeqNo ) );
+		cache_timeline_completion( m_submissionCompletedSeqNo, currentSeqNo );
+
+		auto completedEnd = m_stagingQuerySlotBySeqNo.begin();
+		while ( completedEnd != m_stagingQuerySlotBySeqNo.end()
+			&& completedEnd->first <= currentSeqNo )
+		{
+			const uint32_t nSlot = completedEnd->second;
+			uint64_t ts[2] = { 0, 0 };
+			const VkResult res = vk.GetQueryPoolResults( device(), m_stagingQueryPool, nSlot * 2, 2,
+				sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT );
+			// Timestamps wrap at timestampValidBits; modular subtraction keeps a
+			// wrap-crossing copy valid, same as the framegen readback above.
+			const uint64_t ulTimestampMask = m_uStagingTimestampValidBits >= 64
+				? UINT64_MAX : ( ( 1ull << m_uStagingTimestampValidBits ) - 1ull );
+			const uint64_t ulGpuTicks = ( ts[1] - ts[0] ) & ulTimestampMask;
+			if ( res == VK_SUCCESS && ulGpuTicks != 0 )
+			{
+				const uint64_t ulGpuNs = (uint64_t)( double( ulGpuTicks ) * m_flStagingTimestampPeriodNs );
+				m_ulStagingCopySumNs += ulGpuNs;
+				m_ulStagingCopySamples++;
+				m_ulStagingCopyMaxNs = std::max( m_ulStagingCopyMaxNs, ulGpuNs );
+			}
+			++completedEnd;
+		}
+		m_stagingQuerySlotBySeqNo.erase( m_stagingQuerySlotBySeqNo.begin(), completedEnd );
+	}
+
+	if ( m_ulStagingCopySamples == 0 )
+		return false;
+
+	ulSumNs = std::exchange( m_ulStagingCopySumNs, uint64_t{ 0 } );
+	ulSamples = std::exchange( m_ulStagingCopySamples, uint64_t{ 0 } );
+	ulMaxNs = std::exchange( m_ulStagingCopyMaxNs, uint64_t{ 0 } );
+	return true;
 }
 
 void CVulkanDevice::framegenResetRungCosts()

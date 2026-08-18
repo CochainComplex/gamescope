@@ -1019,6 +1019,22 @@ public:
 	int framegenTimestampBegin( CVulkanCmdBuffer *pCmdBuffer );
 	void framegenTimestampEnd( CVulkanCmdBuffer *pCmdBuffer, int nSlot );
 
+	// Dual-GPU staging copies (the client's non-DEVICE_LOCAL base import copied
+	// into a DEVICE_LOCAL staging image) are recorded in their own command buffer
+	// and submitted on the composite queue, ahead of the composite that samples
+	// the staged image. Bracket that submission with GPU timestamps exactly like
+	// a framegen batch, but from a separate pool: the framegen pool is created
+	// for whichever family records generation work, which is not necessarily the
+	// composite family. Begin records a pool reset + TOP_OF_PIPE write and
+	// returns the ring slot (-1 when unavailable); End records BOTTOM_OF_PIPE;
+	// noteStagingSubmission associates the slot with the scratch-timeline seqNo.
+	// drainStagingCopyTiming harvests only slots whose submission has already
+	// completed and never waits, so it cannot stall a frame.
+	int stagingTimestampBegin( CVulkanCmdBuffer *pCmdBuffer );
+	void stagingTimestampEnd( CVulkanCmdBuffer *pCmdBuffer, int nSlot );
+	void noteStagingSubmission( uint64_t ulSeqNo, int nSlot );
+	bool drainStagingCopyTiming( uint64_t &ulSumNs, uint64_t &ulSamples, uint64_t &ulMaxNs );
+
 	void garbageCollect();
 	// bFramegen dispatches draw from a separate descriptor-set ring so a
 	// generation batch that is still pending on the framegen queue can never have
@@ -1269,6 +1285,23 @@ protected:
 	uint64_t m_aFramegenRungCostNs[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
 	uint32_t m_aFramegenRungSamples[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
 	uint64_t m_ulFramegenLastRawGpuTimeNs = 0;
+
+	// Same ring discipline for the dual-GPU staging copy, always on the composite
+	// queue family. Separate pool + validity because a dedicated framegen queue
+	// can live on another family. Zero-initialised state means "not measured":
+	// copy_ms_* then reports 0.0 rather than an estimate. Compositor-thread only.
+	VkQueryPool m_stagingQueryPool = VK_NULL_HANDLE;
+	uint32_t m_uStagingQueryRingDepth = 0;
+	uint32_t m_uStagingQueryHead = 0;
+	uint32_t m_uStagingTimestampValidBits = 0;
+	double m_flStagingTimestampPeriodNs = 0.0;
+	// scratch-timeline seqNo -> query ring slot, consumed once that seqNo has
+	// completed. A staging copy carries no batch shape, so unlike the framegen
+	// association this is just the slot.
+	std::vector<std::pair<uint64_t, uint32_t>> m_stagingQuerySlotBySeqNo;
+	uint64_t m_ulStagingCopySumNs = 0;
+	uint64_t m_ulStagingCopySamples = 0;
+	uint64_t m_ulStagingCopyMaxNs = 0;
 
 private:
 	std::vector<VkExtensionProperties> m_supportedExts;

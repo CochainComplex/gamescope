@@ -1760,6 +1760,37 @@ bool CVulkanDevice::createScratchResources()
 				m_uFramegenQueryRingDepth = 0;
 			}
 		}
+
+		// Second, independent ring for the dual-GPU staging copy. That copy is
+		// always recorded on the composite queue family, which is not necessarily
+		// the family the pool above was created for, so it needs its own support
+		// check and pool. If this family cannot timestamp, staging copies simply
+		// run unmeasured and copy_ms_* stays 0.0.
+		const bool bStagingTimestampsUsable = m_queueFamily < nQueueFamilyCount
+			&& queueFamilyProps[ m_queueFamily ].timestampValidBits > 0
+			&& physProps.limits.timestampPeriod != 0.0f;
+		if ( bStagingTimestampsUsable )
+		{
+			// At most one staging submission per composite, and its result is
+			// harvested on the next metrics drain; four slots give several frames
+			// of slack before round-robin comes back to an unread one.
+			m_uStagingQueryRingDepth = 4;
+			const VkQueryPoolCreateInfo queryPoolInfo = {
+				.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+				.queryType = VK_QUERY_TYPE_TIMESTAMP,
+				.queryCount = m_uStagingQueryRingDepth * 2,
+			};
+			if ( vk.CreateQueryPool( device(), &queryPoolInfo, nullptr, &m_stagingQueryPool ) == VK_SUCCESS )
+			{
+				m_uStagingTimestampValidBits = queueFamilyProps[ m_queueFamily ].timestampValidBits;
+				m_flStagingTimestampPeriodNs = physProps.limits.timestampPeriod;
+			}
+			else
+			{
+				m_stagingQueryPool = VK_NULL_HANDLE;
+				m_uStagingQueryRingDepth = 0;
+			}
+		}
 	}
 
 	return true;
@@ -5680,6 +5711,13 @@ struct FramegenMetricsWindow_t
 	// device-local) base buffer into a device-local staging image, counted where
 	// the copy is recorded. This is the throughput cost of the cross-GPU route.
 	uint64_t copyBytes = 0;
+	// Measured GPU time of those staging copies, from timestamp pairs around the
+	// dedicated staging submission. Sum/count rather than a running average so a
+	// window's copy_ms_avg is the true mean of the copies that landed in it; all
+	// three stay 0 when the composite family cannot timestamp.
+	uint64_t copyGpuNsSum = 0;
+	uint64_t copyGpuSamples = 0;
+	uint64_t copyGpuNsMax = 0;
 	FramegenMetricsLatencyDistribution_t flipIntervals;
 	FramegenMetricsDistribution_t deadlineErrors;
 	FramegenMetricsDistribution_t realCommitLeads;
@@ -5695,6 +5733,9 @@ struct FramegenMetricsPendingEvents_t
 	uint64_t resetsRing = 0, resetsChain = 0;
 	uint64_t realWaits = 0;
 	uint64_t copyBytes = 0;
+	uint64_t copyGpuNsSum = 0;
+	uint64_t copyGpuSamples = 0;
+	uint64_t copyGpuNsMax = 0;
 };
 static FramegenMetricsPendingEvents_t g_framegenMetricsPendingEvents;
 
@@ -5748,10 +5789,26 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 			? UINT32_MAX : (uint32_t)ulRealWaits;
 	}
 	window.copyBytes += events.copyBytes;
+	window.copyGpuNsSum += events.copyGpuNsSum;
+	window.copyGpuSamples += events.copyGpuSamples;
+	window.copyGpuNsMax = std::max( window.copyGpuNsMax, events.copyGpuNsMax );
 }
 
 static void framegen_metrics_flush_events()
 {
+	// Harvest whatever staging-copy timestamps have completed since the last
+	// flush. Non-blocking by construction (see drainStagingCopyTiming), and the
+	// results join the same pending-event batch as copy_bytes so both land in the
+	// same window.
+	uint64_t ulCopySumNs = 0, ulCopySamples = 0, ulCopyMaxNs = 0;
+	if ( g_device.drainStagingCopyTiming( ulCopySumNs, ulCopySamples, ulCopyMaxNs ) )
+	{
+		g_framegenMetricsPendingEvents.copyGpuNsSum += ulCopySumNs;
+		g_framegenMetricsPendingEvents.copyGpuSamples += ulCopySamples;
+		g_framegenMetricsPendingEvents.copyGpuNsMax =
+			std::max( g_framegenMetricsPendingEvents.copyGpuNsMax, ulCopyMaxNs );
+	}
+
 	framegen_metrics_add_events( g_framegenMetrics.current, g_framegenMetricsPendingEvents );
 	framegen_metrics_add_events( g_framegenMetrics.total, g_framegenMetricsPendingEvents );
 	g_framegenMetricsPendingEvents = {};
@@ -5842,12 +5899,13 @@ static void framegen_metrics_log( const char *pszLabel,
 		viableLead.ready ? viableLead.leadNs / 1.0e6 : 0.0,
 		window.realWaitDuringGenerated,
 		framegen_metrics_fill_rate( window ), window.copyBytes,
-		// The staging copies are recorded into the composite command buffer,
-		// which has no timestamp query-pool ring (only the framegen submission
-		// path does). Measuring them would mean adding a pool plus a completion
-		// harvest to the composite submit path, so the GPU time is reported as
-		// zero rather than estimated: copy_ms_* is "not measured", not "free".
-		0.0, 0.0,
+		// Real GPU time of the staging copies, from the timestamp pair around
+		// their dedicated submission. Still exactly 0.0 when nothing was measured
+		// (single-GPU route, or a composite family without timestamp support):
+		// copy_ms_* remains "not measured", never an estimate.
+		window.copyGpuSamples != 0
+			? (double)window.copyGpuNsSum / (double)window.copyGpuSamples / 1.0e6 : 0.0,
+		(double)window.copyGpuNsMax / 1.0e6,
 		srcFlip.p50(), srcFlip.p95() );
 }
 
@@ -13224,6 +13282,77 @@ static bool stage_non_device_local_base_imports( struct FrameInfo_t *pFrameInfo,
 	return bCopied;
 }
 
+// Record the dual-GPU staging copies into their OWN command buffer and submit it
+// on the composite queue, ahead of (and separate from) the composite that
+// samples the staged image. Previously the copy rode inside the composite
+// command buffer, so a slow PCIe read of a host-visible client import sat
+// directly in front of the composite the flip waits on; splitting it lets the
+// GPU start the copy while the CPU is still recording the rest of the composite.
+//
+// Synchronization:
+//  - Client readiness: the composite command buffer carries the caller's acquire
+//    waits, and the copy now performs the first read of that client image, so the
+//    waits are duplicated onto the staging submission (submitInternal already
+//    includes TRANSFER in the wait stage mask for exactly this reason). Only the
+//    waits are duplicated; the caller's release signals stay on the composite
+//    submission, which is submitted after this one on the same queue.
+//  - Copy -> composite (RAW): both submissions are on the composite queue, so
+//    submission order supplies execution order, and this command buffer's end()
+//    flush barrier (ALL_COMMANDS, TRANSFER_WRITE -> read|write) supplies memory
+//    visibility. The composite's first use of the staged image is therefore a
+//    clean first use needing no barrier - the same cross-command-buffer contract
+//    emitSync2Barriers() and framegen_base_record_copy() already rely on.
+//  - Reuse (WAR): AcquireDeviceLocalStagingImage only hands out a pool image with
+//    a zero refcount. An image a previous composite still reads is referenced by
+//    that command buffer's m_textureRefs until resetCmdBuffers() retires it on
+//    timeline completion (and by the commit's pCommitTexture slot), so it is
+//    skipped and the pool grows instead. Back-to-back frames cannot stomp it.
+//
+// No dual-GPU staged copy exists on the single-GPU route (the base import is
+// already DEVICE_LOCAL, so frame_has_non_device_local_base_import is false and
+// this returns before allocating anything), leaving that path byte-identical.
+static void stage_base_imports_in_own_submission( struct FrameInfo_t *pFrameInfo,
+	CVulkanCmdBuffer *pCompositeCmdBuffer )
+{
+	if ( !frame_has_non_device_local_base_import( pFrameInfo ) )
+		return;
+
+	std::unique_ptr<CVulkanCmdBuffer> pStageCommandBuffer = g_device.commandBuffer();
+	if ( !pStageCommandBuffer )
+	{
+		// Out of command buffers: keep the frame correct by falling back to the
+		// old inline recording rather than sampling an unwritten staging image.
+		// With no buffer to fall back into either, skip staging entirely — the
+		// layers keep pointing at the client import, exactly as before.
+		if ( pCompositeCmdBuffer != nullptr )
+			stage_non_device_local_base_imports( pFrameInfo, pCompositeCmdBuffer );
+		return;
+	}
+
+	if ( pCompositeCmdBuffer != nullptr )
+	{
+		for ( const VulkanTimelinePoint_t &dependency : pCompositeCmdBuffer->GetExternalDependencies() )
+			pStageCommandBuffer->AddDependency( dependency.pTimelineSemaphore, dependency.ulPoint );
+	}
+
+	// Only measure when someone reads the metrics line; the drain that consumes
+	// these slots runs on the same gate.
+	const int nQuerySlot = framegen_metrics_enabled()
+		? g_device.stagingTimestampBegin( pStageCommandBuffer.get() ) : -1;
+
+	const bool bCopied = stage_non_device_local_base_imports( pFrameInfo, pStageCommandBuffer.get() );
+	if ( bCopied )
+		g_device.stagingTimestampEnd( pStageCommandBuffer.get(), nQuerySlot );
+
+	// Submit even when nothing was recorded (a duplicated fade layer, or a source
+	// with no usable staging image): an empty submission is far cheaper than
+	// destroying a command buffer that would otherwise be recycled, and it keeps
+	// the seqNo association below unconditional.
+	const uint64_t ulSeqNo = g_device.submit( std::move( pStageCommandBuffer ) );
+	if ( bCopied )
+		g_device.noteStagingSubmission( ulSeqNo, nQuerySlot );
+}
+
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer )
 {
 	// Bidir (B3): each composite decides afresh whether it queued its real
@@ -13271,23 +13400,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 
 	// ReShade records its own submission before the normal composite command
-	// buffer. Stage first in that case so the effect also samples DEVICE_LOCAL;
-	// duplicate only the acquire waits, while the caller's release signals stay
-	// attached to the final composite submission.
-	if ( !g_reshade_effect.empty() && frame_has_non_device_local_base_import( frameInfo ) )
-	{
-		std::unique_ptr<CVulkanCmdBuffer> pStageCommandBuffer = g_device.commandBuffer();
-		if ( pStageCommandBuffer )
-		{
-			if ( pInCommandBuffer )
-			{
-				for ( const VulkanTimelinePoint_t &dependency : pInCommandBuffer->GetExternalDependencies() )
-					pStageCommandBuffer->AddDependency( dependency.pTimelineSemaphore, dependency.ulPoint );
-			}
-			if ( stage_non_device_local_base_imports( frameInfo, pStageCommandBuffer.get() ) )
-				g_device.submit( std::move( pStageCommandBuffer ) );
-		}
-	}
+	// buffer, so it must be staged here (earlier than the non-ReShade path below)
+	// for the effect to sample DEVICE_LOCAL too.
+	if ( !g_reshade_effect.empty() )
+		stage_base_imports_in_own_submission( frameInfo, pInCommandBuffer.get() );
 
 	g_pLastReshadeEffect = nullptr;
 	if (!g_reshade_effect.empty())
@@ -13386,8 +13502,13 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
+	// Off the real-frame critical path: the staging copy goes out as its own
+	// submission now, so the composite recorded below (and the flip that waits on
+	// it) no longer contains the cross-GPU copy inline. Kept here rather than
+	// beside the ReShade pre-stage above so an early return from the output-ring
+	// acquisition still leaves frameInfo untouched, exactly as before.
 	if ( g_reshade_effect.empty() )
-		stage_non_device_local_base_imports( frameInfo, cmdBuffer.get() );
+		stage_base_imports_in_own_submission( frameInfo, cmdBuffer.get() );
 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
