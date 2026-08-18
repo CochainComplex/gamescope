@@ -1,4 +1,9 @@
 /.claude/
+/.wolf/
+/.codex/
+/.opencode/
+/AGENTS.md
+/CLAUDE.md
 /native-run.sh
 /native-run.log
 /build/
