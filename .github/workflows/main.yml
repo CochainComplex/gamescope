@@ -28,10 +28,10 @@ jobs:
         run: |
           bash -n scripts/env-gamescope-local.sh scripts/test-framegen.sh \
             scripts/framegen-launch-common.sh scripts/watch-framegen.sh \
-            scripts/run-framegen-native.sh
+            scripts/run-framegen-native.sh scripts/framegen-doctor.sh
           shellcheck -x scripts/env-gamescope-local.sh scripts/test-framegen.sh \
             scripts/framegen-launch-common.sh scripts/watch-framegen.sh \
-            scripts/run-framegen-native.sh
+            scripts/run-framegen-native.sh scripts/framegen-doctor.sh
           PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
             python3 -m py_compile scripts/framegen-net-train.py \
               scripts/framegen-net-eval.py scripts/framegen-color-eval.py
@@ -45,6 +45,7 @@ jobs:
             doc/framegen-maintenance.md doc/framegen-proposals \
             scripts/env-gamescope-local.sh scripts/test-framegen.sh \
             scripts/watch-framegen.sh scripts/run-framegen-native.sh \
+            scripts/framegen-doctor.sh \
             scripts/framegen-\*.py \
             scripts/framegen-launch-common.sh src/framegen \
             tests/test_framegen.cpp; then

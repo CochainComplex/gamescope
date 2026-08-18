@@ -50,8 +50,6 @@ GAMESCOPE_BUILD_DIR=build-perf \
 GAMESCOPE_FRAMEGEN_BIDIR=1 \
 GAMESCOPE_FRAMEGEN_NET="$FRAMEGEN_BEST_PROFILE" \
 GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0 \
-GAMESCOPE_FRAMEGEN_RESERVOIR=1 \
-GAMESCOPE_FRAMEGEN_SHADING=1 \
 GAMESCOPE_FRAMEGEN_DEBUG_EVERY=60 \
 ./scripts/env-gamescope-local.sh \
 gamescope --expose-wayland --backend wayland \
@@ -69,9 +67,8 @@ gamescope --expose-wayland --backend wayland \
 ```
 
 The frozen command is repeatable and cannot modify the accepted profile.
-Reservoir and shading remain enabled for the complete Guided configuration,
-although their causal passes are not scheduled while bidirectional mode is
-active.
+Reservoir and shading are omitted here on purpose: bidirectional mode forces
+both off, so setting them in this recipe would be inert.
 
 ### Optional cadence-locked variant
 

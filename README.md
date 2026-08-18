@@ -215,9 +215,11 @@ check.
 - Single-GPU use competes with the game and is not recommended for a saturated
   render GPU.
 - The VRR hybrid path exists but has not been validated on a VRR panel.
-- Cursor motion does not advance on generated frames in the default output-space
-  path: the cursor moves with real composites. Base-layer mode composites the
-  cursor late, so it does advance there.
+- Cursor motion advances on generated frames in both the default output-space
+  path and base-layer mode: the cursor is kept out of framegen history and
+  composited live at present time. `GAMESCOPE_FRAMEGEN_CURSOR=0` restores the
+  old behavior, where the cursor is baked into history and only moves with
+  real composites.
 - An overlay-only repaint can be held back up to four vblanks so a ready
   generated frame can fill the slot instead.
 - A late generated frame is dropped. Overload appears as repeated display slots,
