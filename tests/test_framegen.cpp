@@ -1,6 +1,7 @@
 #include "framegen/adaptation.hpp"
 #include "framegen/atomic_file.hpp"
 #include "framegen/dispatch_policy.hpp"
+#include "framegen/metrics.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
@@ -22,6 +23,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 using gamescope::framegen::EffectiveConfig;
 using gamescope::framegen::effective_config;
@@ -743,6 +745,80 @@ static void test_query_ring_selection()
 	CHECK( selection && selection->slot == 63 && selection->nextHead == 0 );
 }
 
+static void test_metrics_distribution()
+{
+	using gamescope::framegen::MetricsDistribution;
+	using gamescope::framegen::MetricsLatencyDistribution;
+
+	// Both variants keep 250 us resolution; only the range differs.
+	CHECK( MetricsDistribution::k_ulStepNs == 250'000ull );
+	CHECK( MetricsLatencyDistribution::k_ulStepNs == 250'000ull );
+	CHECK_NEAR( MetricsDistribution::k_flFullScaleMs, 16.0, 1e-9 );
+	CHECK_NEAR( MetricsLatencyDistribution::k_flFullScaleMs, 64.0, 1e-9 );
+
+	// Empty distributions report zero, not a bucket edge.
+	const MetricsDistribution empty;
+	CHECK( empty.p50() == 0.0 && empty.p95() == 0.0 );
+	CHECK( empty.average() == 0.0 && empty.stddev() == 0.0 );
+
+	// GPU-time scale still resolves 250 us steps: each sample lands in its own
+	// bucket and percentile() reports that bucket's upper edge.
+	MetricsDistribution gpu;
+	gpu.add( 100'000ull );   // bucket 0 -> 0.25 ms
+	gpu.add( 300'000ull );   // bucket 1 -> 0.50 ms
+	gpu.add( 600'000ull );   // bucket 2 -> 0.75 ms
+	gpu.add( 4'000'000ull ); // bucket 16 -> 4.25 ms
+	CHECK_NEAR( gpu.p50(), 0.50, 1e-9 );
+	CHECK_NEAR( gpu.p95(), 4.25, 1e-9 );
+	CHECK_NEAR( gpu.min, 0.10, 1e-9 );
+	CHECK_NEAR( gpu.max, 4.00, 1e-9 );
+	CHECK( gpu.n == 4 );
+
+	// The defect being fixed: a presentation latency past 16 ms saturates the
+	// narrow distribution at exactly full scale, indistinguishable from a real
+	// 16 ms sample.
+	MetricsDistribution saturated;
+	saturated.add( 30'000'000ull );
+	CHECK_NEAR( saturated.p50(), 16.0, 1e-9 );
+	CHECK_NEAR( saturated.p95(), 16.0, 1e-9 );
+
+	// The wide variant resolves the same sample into its true bucket:
+	// 30 ms / 250 us = bucket 120, upper edge 30.25 ms.
+	MetricsLatencyDistribution latency;
+	latency.add( 30'000'000ull );
+	CHECK_NEAR( latency.p50(), 30.25, 1e-9 );
+	CHECK_NEAR( latency.p95(), 30.25, 1e-9 );
+	CHECK_NEAR( latency.max, 30.0, 1e-9 );
+
+	// A 60 Hz flip interval is above the old full scale and must not collapse
+	// onto 16.00: 16.667 ms / 250 us = bucket 66, upper edge 16.75 ms.
+	MetricsLatencyDistribution vblank60;
+	vblank60.add( 16'666'666ull );
+	CHECK_NEAR( vblank60.p95(), 16.75, 1e-9 );
+
+	// Ceil-rank percentile semantics are unchanged: 100 samples, the 50th
+	// smallest decides p50 and the 95th decides p95.
+	MetricsLatencyDistribution ranked;
+	for ( uint64_t i = 0; i < 90; i++ )
+		ranked.add( 20'000'000ull ); // bucket 80 -> 20.25 ms
+	for ( uint64_t i = 0; i < 10; i++ )
+		ranked.add( 45'000'000ull ); // bucket 180 -> 45.25 ms
+	CHECK_NEAR( ranked.p50(), 20.25, 1e-9 );
+	CHECK_NEAR( ranked.p95(), 45.25, 1e-9 );
+
+	// Past 64 ms the wide variant still clamps into the last bucket and prints
+	// full scale, exactly as the narrow one did at 16 ms.
+	MetricsLatencyDistribution overflow;
+	overflow.add( 70'000'000ull );
+	CHECK_NEAR( overflow.p95(), 64.0, 1e-9 );
+	CHECK_NEAR( overflow.max, 70.0, 1e-9 );
+
+	// Resetting is a plain value assignment: the type stays trivially copyable.
+	CHECK( std::is_trivially_copyable<MetricsLatencyDistribution>::value );
+	latency = {};
+	CHECK( latency.n == 0 && latency.p95() == 0.0 && latency.max == 0.0 );
+}
+
 int main()
 {
 	test_degradation_policy();
@@ -757,6 +833,7 @@ int main()
 	test_dispatch_policy();
 	test_push_constant_encoding();
 	test_query_ring_selection();
+	test_metrics_distribution();
 	return g_bPassed ? 0 : 1;
 }
 

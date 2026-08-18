@@ -48,6 +48,7 @@
 #include "framegen/deadline.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/hud.hpp"
+#include "framegen/metrics.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
 #include "framegen/policy.hpp"
@@ -5647,55 +5648,15 @@ struct DisplayFeedbackMailbox_t
 static DisplayFeedbackMailbox_t g_displayFeedbackMailbox;
 
 static constexpr uint64_t k_ulFramegenMetricsWindowNs = 5'000'000'000ull;
-static constexpr uint64_t k_ulFramegenMetricsHistogramStepNs = 250'000ull;
-static constexpr size_t k_nFramegenMetricsHistogramBuckets = 64;
 
-struct FramegenMetricsDistribution_t
-{
-	uint64_t n = 0;
-	double sum = 0.0;
-	double sumSquares = 0.0;
-	double min = std::numeric_limits<double>::max();
-	double max = 0.0;
-	std::array<uint64_t, k_nFramegenMetricsHistogramBuckets> histogram = {};
-
-	void add( uint64_t ulNs )
-	{
-		const double flMs = ulNs / 1.0e6;
-		n++;
-		sum += flMs;
-		sumSquares += flMs * flMs;
-		min = std::min( min, flMs );
-		max = std::max( max, flMs );
-		const size_t nBucket = std::min<size_t>(
-			ulNs / k_ulFramegenMetricsHistogramStepNs,
-			k_nFramegenMetricsHistogramBuckets - 1 );
-		histogram[ nBucket ]++;
-	}
-
-	double average() const { return n != 0 ? sum / n : 0.0; }
-	double stddev() const
-	{
-		return n != 0 ? std::sqrt( std::max( 0.0,
-			sumSquares / n - average() * average() ) ) : 0.0;
-	}
-	double percentile( uint32_t nPercent ) const
-	{
-		if ( n == 0 )
-			return 0.0;
-		const uint64_t nRank = ( n * nPercent + 99u ) / 100u;
-		uint64_t nSeen = 0;
-		for ( size_t i = 0; i < histogram.size(); i++ )
-		{
-			nSeen += histogram[ i ];
-			if ( nSeen >= nRank )
-				return ( i + 1 ) * k_ulFramegenMetricsHistogramStepNs / 1.0e6;
-		}
-		return 16.0;
-	}
-	double p50() const { return percentile( 50u ); }
-	double p95() const { return percentile( 95u ); }
-};
+// 250 us x 64 = 16 ms full scale: sub-vblank timing accuracy (deadline error,
+// commit lead), which cannot plausibly run past the range without the sample
+// already being rejected upstream.
+using FramegenMetricsDistribution_t = gamescope::framegen::MetricsDistribution;
+// 250 us x 256 = 64 ms full scale, same resolution: wall-clock presentation
+// latency. A 60 Hz flip interval is 16.67 ms on its own, so the narrow
+// distribution reported exactly 16.00 for these and hid the real tail.
+using FramegenMetricsLatencyDistribution_t = gamescope::framegen::MetricsLatencyDistribution;
 
 struct FramegenMetricsWindow_t
 {
@@ -5719,12 +5680,12 @@ struct FramegenMetricsWindow_t
 	// device-local) base buffer into a device-local staging image, counted where
 	// the copy is recorded. This is the throughput cost of the cross-GPU route.
 	uint64_t copyBytes = 0;
-	FramegenMetricsDistribution_t flipIntervals;
+	FramegenMetricsLatencyDistribution_t flipIntervals;
 	FramegenMetricsDistribution_t deadlineErrors;
 	FramegenMetricsDistribution_t realCommitLeads;
 	// Source-ready -> actual-flip latency of REAL presents: how long a client
 	// frame waited between being acquirable and actually reaching the screen.
-	FramegenMetricsDistribution_t realSourceToFlip;
+	FramegenMetricsLatencyDistribution_t realSourceToFlip;
 };
 
 struct FramegenMetricsPendingEvents_t
@@ -5838,10 +5799,10 @@ static double framegen_metrics_fill_rate( const FramegenMetricsWindow_t &window 
 static void framegen_metrics_log( const char *pszLabel,
 	const FramegenMetricsWindow_t &window )
 {
-	const FramegenMetricsDistribution_t &flip = window.flipIntervals;
+	const FramegenMetricsLatencyDistribution_t &flip = window.flipIntervals;
 	const FramegenMetricsDistribution_t &deadline = window.deadlineErrors;
 	const FramegenMetricsDistribution_t &lead = window.realCommitLeads;
-	const FramegenMetricsDistribution_t &srcFlip = window.realSourceToFlip;
+	const FramegenMetricsLatencyDistribution_t &srcFlip = window.realSourceToFlip;
 	const uint64_t ulVblankIntervalNs =
 		g_framegenPresentState.displayTiming.key.intervalNs;
 	const gamescope::framegen::FixedRefreshPresentLead_t viableLead =
