@@ -242,12 +242,17 @@ struct FixedCadenceAdmission
 // Timestamp costs are keyed by the exact number of outputs in the batch. JIT
 // and VRR hybrid always use one; classic pacing is bounded by gap and multiplier.
 // Precondition: multiplier >= 2.
+// Without a dedicated framegen queue the submitter emits at most one generated
+// frame per gap (see generated_slots_for_gap), so the cost key must be clamped
+// the same way or the ladder reads a rung slot that is never written.
 [[nodiscard]] constexpr uint32_t ladder_generated_count( uint32_t gapSlots,
-	uint32_t multiplier, bool singleSlotPacing )
+	uint32_t multiplier, bool singleSlotPacing, bool dedicatedQueue = true )
 {
-	return singleSlotPacing
-		? 1u
-		: std::min( gapSlots, std::max( 1u, multiplier - 1u ) );
+	if ( singleSlotPacing )
+		return 1u;
+	const uint32_t generated =
+		std::min( gapSlots, std::max( 1u, multiplier - 1u ) );
+	return dedicatedQueue ? generated : std::min( generated, 1u );
 }
 
 [[nodiscard]] constexpr bool keep_up_interval_eligible( uint64_t cadenceNs,
@@ -579,17 +584,18 @@ evaluate_deadline_miss_hysteresis(
 	uint64_t currentRungCostNs, uint32_t currentRungSamples,
 	uint64_t vblankIntervalNs )
 {
-	if ( maxDegradeSteps == 0u
+	// Drain the hold before any gate: at the bottom rung (or while costs are
+	// missing/immature) the gates below would otherwise return early forever and
+	// the hold would never reach zero, permanently blocking recovery.
+	const bool bHeld = state.holdFrames > 0u;
+	if ( bHeld )
+		state.holdFrames--;
+	if ( bHeld
+		|| maxDegradeSteps == 0u
 		|| currentRungCostNs == 0u
 		|| currentRungSamples < k_uDeadlineMinSamples
 		|| state.degradeSteps >= maxDegradeSteps )
 		return { state, false };
-
-	if ( state.holdFrames > 0u )
-	{
-		state.holdFrames--;
-		return { state, false };
-	}
 
 	const uint64_t deadlineNs =
 		( vblankIntervalNs * k_uDeadlinePercent ) / 100u;

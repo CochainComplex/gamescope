@@ -236,6 +236,25 @@ TEST_CASE( "framegen HUD sparkline mapping is monotone and saturated",
 	CHECK( static_cast<uint8_t>( sparkline[11] ) == 0x08u );
 }
 
+TEST_CASE( "framegen HUD step formatting rounds within its own unit",
+	"[framegen][hud]" )
+{
+	auto formatted = []( uint64_t steps ) {
+		char buffer[32] = {};
+		framegen_hud_format_steps( buffer, sizeof( buffer ), steps );
+		return std::string( buffer );
+	};
+
+	CHECK( formatted( 0u ) == "0" );
+	CHECK( formatted( 999u ) == "999" );
+	CHECK( formatted( 1'000u ) == "1.0k" );
+	CHECK( formatted( 999'949u ) == "999.9k" );
+	// Rounding must not push the "k" branch past its own unit.
+	CHECK( formatted( 999'950u ) == "1.0m" );
+	CHECK( formatted( 999'999u ) == "1.0m" );
+	CHECK( formatted( 1'000'000u ) == "1.0m" );
+}
+
 TEST_CASE( "framegen HUD sparkline maps empty windows to the shortest bar",
 	"[framegen][hud]" )
 {
@@ -1723,9 +1742,17 @@ TEST_CASE( "native recovery preserves evidence across phase-short decisions",
 	REQUIRE( state.streak == k_uDeadlineRecoveryHeadroomDecisions - 1u );
 
 	// The renderer skips a phase-only shortfall without feeding it to the
-	// recovery controller. The next normal-phase decision completes the streak.
+	// recovery controller. Had it been fed, the short remaining budget would show
+	// no headroom and wipe the accumulated streak — that is exactly what skipping
+	// avoids. The next normal-phase decision then completes the streak.
+	const LadderRecoveryEvaluation_t ifFedShortBudget = evaluate_ladder_recovery(
+		state, 1u, 0u,
+		currentCostNs, k_uDeadlineMinSamples,
+		richerCostNs, k_uDeadlineMinSamples, shortRemainingBudgetNs );
+	CHECK_FALSE( ifFedShortBudget.tryRecover );
+	CHECK( ifFedShortBudget.state.streak == 0u );
+
 	const RecoveryState_t afterShortDecision = state;
-	CHECK( afterShortDecision.streak == state.streak );
 	const LadderRecoveryEvaluation_t recovered = evaluate_ladder_recovery(
 		afterShortDecision, 1u, 0u,
 		currentCostNs, k_uDeadlineMinSamples,

@@ -586,6 +586,13 @@ static void test_scheduling_policy()
 			CHECK( ladder_generated_count( gap - 1u, multiplier, false )
 				== expectedGenerated );
 			CHECK( ladder_generated_count( gap - 1u, multiplier, true ) == 1u );
+			// The ladder's cost key must name the batch shape the submitter
+			// actually emits, including the no-dedicated-queue single-slot clamp
+			// — otherwise costs are recorded at one key and read at another.
+			CHECK( ladder_generated_count( gap - 1u, multiplier, false, false )
+				== generated_slots_for_gap( gap, multiplier, false ) );
+			CHECK( ladder_generated_count( gap - 1u, multiplier, false, true )
+				== expectedGenerated );
 		}
 	}
 
@@ -622,6 +629,44 @@ static void test_scheduling_policy()
 	DeadlineLadderState committed = commit_deadline_degradation( evaluation.state );
 	CHECK( committed.degradeSteps == 3u );
 	CHECK( committed.holdFrames == k_uDeadlineHoldFrames );
+
+	// The hold must drain even at the bottom rung, where no further degradation
+	// is possible: this function is the classic path's only drainer, and a stuck
+	// nDegradeHold blocks ladder recovery forever.
+	{
+		constexpr uint32_t maxSteps = 7u;
+		constexpr uint32_t holdFrames = 3u;
+		DeadlineLadderState bottom = { maxSteps, holdFrames };
+		for ( uint32_t i = holdFrames; i > 0u; i-- )
+		{
+			CHECK( bottom.holdFrames == i );
+			const DeadlineLadderEvaluation drain = evaluate_deadline_ladder(
+				bottom, maxSteps, interval, k_uDeadlineMinSamples, interval );
+			CHECK( !drain.tryDegrade );
+			CHECK( drain.state.degradeSteps == maxSteps );
+			bottom = drain.state;
+		}
+		CHECK( bottom.holdFrames == 0u );
+		// A recovery evaluation is no longer hold-blocked once drained.
+		RecoveryState_t recovery;
+		recovery.decisionsSinceClimb = recovery.backoffDecisions;
+		recovery.streak = k_uDeadlineRecoveryHeadroomDecisions - 1u;
+		const uint64_t budgetNs = deadline_budget_ns( interval );
+		const LadderRecoveryEvaluation_t unblocked = evaluate_ladder_recovery(
+			recovery, maxSteps, bottom.holdFrames,
+			budgetNs / 4u, k_uDeadlineMinSamples,
+			budgetNs / 2u, k_uDeadlineMinSamples, budgetNs );
+		CHECK( unblocked.tryRecover );
+
+		// Costs missing / immature must also drain rather than latch the hold.
+		DeadlineLadderState immature = { 0u, 2u };
+		immature = evaluate_deadline_ladder(
+			immature, maxSteps, 0u, 0u, interval ).state;
+		CHECK( immature.holdFrames == 1u );
+		immature = evaluate_deadline_ladder(
+			immature, 0u, interval, k_uDeadlineMinSamples, interval ).state;
+		CHECK( immature.holdFrames == 0u );
+	}
 
 	const EffectiveConfig motionLearned = {
 		GamescopeFramegenMode::Motion, 4u, GamescopeFramegenPipeline::Learned };
