@@ -12,4 +12,7 @@ namespace gamescope
 
     int MakeTempFile( char ( &pszOutPath )[ PATH_MAX ], const char *pszTemplate, bool bDeferUnlink = false );
     FILE *MakeTempFile( char ( &pszOutPath )[ PATH_MAX ], const char *pszTemplate, const char *pszMode, bool bDeferUnlink = false );
+
+    // Unlinks deferred temp files now, for exits that skip static destructors.
+    void UnlinkDeferredTempFiles();
 }

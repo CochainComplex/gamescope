@@ -10,6 +10,8 @@
 #include "framegen/scheduling.hpp"
 #include "framegen/settings.hpp"
 #include "framegen/temporal.hpp"
+#include "refresh_rate.h"
+#include "Utils/FaultInjection.h"
 
 #include <algorithm>
 #include <array>
@@ -44,6 +46,21 @@ static void check( bool bCondition, const char *pszExpression, int nLine )
 #define CHECK( expression ) check( static_cast<bool>( expression ), #expression, __LINE__ )
 #define CHECK_NEAR( actual, expected, tolerance ) \
 	CHECK( std::fabs( ( actual ) - ( expected ) ) <= ( tolerance ) )
+
+static void test_fps_limit_policy()
+{
+	using gamescope::ResolveFPSLimit;
+
+	CHECK( ResolveFPSLimit( 30, 0, true ) == 30 );
+	CHECK( ResolveFPSLimit( 30, 120, false ) == 30 ); // Refresh-only override.
+	CHECK( ResolveFPSLimit( 30, 40, true ) == 40 );
+	CHECK( ResolveFPSLimit( 30, 0, true ) == 30 ); // Clear combined override.
+	CHECK( ResolveFPSLimit( 0, 40, true ) == 40 );
+	CHECK( ResolveFPSLimit( 0, 120, false ) == 0 );
+	CHECK( ResolveFPSLimit( 0, 0, true ) == 0 ); // Explicitly disable simple cap.
+	CHECK( ResolveFPSLimit( -1, 0, true ) == 0 );
+	CHECK( ResolveFPSLimit( 30, -1, true ) == 30 );
+}
 
 static void test_degradation_policy()
 {
@@ -298,11 +315,18 @@ static void test_numeric_settings_contract()
 
 	CHECK( !parse_uint32_setting( nullptr, true ).has_value() );
 	CHECK( !parse_uint32_setting( "", true ).has_value() );
+	CHECK( !parse_uint32_setting( "-18446744073709551615", false ).has_value() );
+	CHECK( !parse_uint32_setting( "-1", false ).has_value() );
+	CHECK( !parse_uint32_setting( "-0", true ).has_value() );
+	CHECK( !parse_uint32_setting( "+1", false ).has_value() );
+	CHECK( !parse_uint32_setting( " 1", false ).has_value() );
+	CHECK( !parse_uint32_setting( "1 ", false ).has_value() );
 	CHECK( !parse_uint32_setting( "0", false ).has_value() );
 	CHECK( parse_uint32_setting( "0", true ).value_or( 1u ) == 0u );
 	CHECK( parse_uint32_setting( "4294967295", false ).value_or( 0u ) == UINT32_MAX );
 	CHECK( !parse_uint32_setting( "4294967296", false ).has_value() );
-	CHECK( !parse_uint32_setting( "-1", false ).has_value() );
+	CHECK( !parse_uint32_setting( "18446744073709551616", false ).has_value() );
+	CHECK( !parse_uint32_setting( "0x10", false ).has_value() );
 	CHECK( !parse_uint32_setting( "12suffix", false ).has_value() );
 	CHECK( parse_uint32_setting( "12", false ).value_or( 0u ) == 12u );
 
@@ -517,9 +541,9 @@ static void test_scheduling_policy()
 	CHECK( early.trained );
 	CHECK( !early.predictionOverdue );
 	CHECK( early.predictedReadyNs == 110'000'000u );
-	CHECK( early.safetyMarginNs == interval / k_uCadenceArrivalGuardDivisor );
+	CHECK( early.safetyMarginNs == cadence_arrival_guard_ns( interval ) );
 	CHECK( early.deadlineHeadroomNs
-		== 1'000'000u - interval / k_uCadenceArrivalGuardDivisor );
+		== 1'000'000u - cadence_arrival_guard_ns( interval ) );
 	const FixedCadenceAdmission tight = fixed_cadence_admission(
 		100'000'000u, cadence, 100'100'000u, 110'200'000u, interval );
 	CHECK( tight.generateBackup );
@@ -545,6 +569,79 @@ static void test_scheduling_policy()
 	CHECK( !leaves_empty_vblank( 20'000'000u, 0u, interval ) );
 	CHECK( !leaves_empty_vblank( 24'999'999u, 10'000'000u, interval ) );
 	CHECK( leaves_empty_vblank( 25'000'000u, 10'000'000u, interval ) );
+
+	// Arrival guard: 250 us floor, T/32 above it.
+	CHECK( cadence_arrival_guard_ns( 0u ) == k_ulCadenceArrivalGuardMinNs );
+	CHECK( cadence_arrival_guard_ns( 8'000'000u ) == k_ulCadenceArrivalGuardMinNs );
+	CHECK( cadence_arrival_guard_ns( 16'666'667u ) == 16'666'667u / 32u );
+	CHECK( cadence_arrival_guard_ns( 50'000'000u ) == 50'000'000u / 32u );
+
+	// Nested fixed-grid slots: one due rule, one planner guard. V is a
+	// lattice point, w the compositor's wake for it, s a submit before w.
+	{
+		constexpr uint64_t T = 16'666'667u;
+		constexpr uint64_t V = 1'000'000'000'000u;
+		constexpr uint64_t w = V - 2'000'000u;
+		constexpr uint64_t s = w - 1'000'000u;
+		const uint64_t guard = cadence_arrival_guard_ns( T );
+
+		// One grid step ahead is not due; inside T/2 it is.
+		CHECK( !fixed_grid_slot_due( V + T, s, V, w, T ) );
+		CHECK( fixed_grid_slot_due( V, s, V, w, T ) );
+		CHECK( fixed_grid_slot_due( V + T / 2u, s, V, w, T ) );
+		CHECK( fixed_grid_slot_due( V - T / 2u, s, V, w, T ) );
+		CHECK( !fixed_grid_slot_due( V + T / 2u + 1u, s, V, w, T ) );
+		// Lattice jitter between plan and arbitration never makes the next
+		// index due, and never hides the slot's own index.
+		for ( const int64_t j : { -int64_t( T / 2u - 1u ), int64_t( -1 ), int64_t( 0 ), int64_t( 1 ),
+			int64_t( T / 2u - 1u ) } )
+		{
+			const uint64_t opportunity = uint64_t( int64_t( V ) + j );
+			CHECK( !fixed_grid_slot_due( V + T, s, opportunity, w, T ) );
+			CHECK( fixed_grid_slot_due( opportunity, s, V, w, T ) );
+		}
+		// Submitted at or after the wake: never due, so never a miss; it slides
+		// by exactly one opportunity.
+		CHECK( !fixed_grid_slot_due( V, w, V, w, T ) );
+		CHECK( !fixed_grid_slot_due( V, w + 1u, V, w, T ) );
+		CHECK( fixed_grid_slot_due( V, w + 1u, V + T, w + T, T ) );
+		// Reached and submitted before the wake: due, which is the only
+		// capacity-evidence predicate (a due, not-ready front is a miss).
+		CHECK( fixed_grid_slot_due( V, w - 1u, V, w, T ) );
+
+		// Planner clause (a): outside the woken opportunity's due window.
+		const uint64_t farWake = V + 10u * T;
+		CHECK( !fixed_grid_slot_submittable( V, farWake, V, s, T, guard ) );
+		CHECK( !fixed_grid_slot_submittable( V + T / 2u, farWake, V, s, T, guard ) );
+		CHECK( fixed_grid_slot_submittable( V + T / 2u + 1u, farWake, V, s, T, guard ) );
+		// Clause (b): the slot's wake is more than the guard away.
+		const uint64_t now = V + 3'000'000u;
+		CHECK( !fixed_grid_slot_submittable( V + T, now + guard, V, now, T, guard ) );
+		CHECK( !fixed_grid_slot_submittable( V + T, now - 1u, V, now, T, guard ) );
+		CHECK( fixed_grid_slot_submittable( V + T, now + guard + 1u, V, now, T, guard ) );
+		// Saturation: no wrap near UINT64_MAX.
+		CHECK( !fixed_grid_slot_submittable( UINT64_MAX, UINT64_MAX, UINT64_MAX - 1u, s, T, guard ) );
+		CHECK( !fixed_grid_slot_submittable( V + T, UINT64_MAX, V, UINT64_MAX - 1u, T, guard ) );
+		CHECK( fixed_grid_slot_due( UINT64_MAX, s, UINT64_MAX - 1u, w, T ) );
+
+		// The invariant: a slot the planner admits is due at its own
+		// opportunity whenever the armed wake lies within the guard of the
+		// estimate, and never at the already-woken one.
+		const uint64_t slot = V + T;
+		const uint64_t estWake = slot - 2'000'000u;
+		for ( uint64_t planNow = estWake - guard - 4'000'000u; planNow <= estWake; planNow += 50'000u )
+		{
+			if ( !fixed_grid_slot_submittable( slot, estWake, V, planNow, T, guard ) )
+			{
+				CHECK( planNow + guard >= estWake );
+				continue;
+			}
+			for ( uint64_t armedWake = estWake - guard + 1u; armedWake <= estWake + T; armedWake += 25'000u )
+				CHECK( fixed_grid_slot_due( slot, planNow, slot, armedWake, T ) );
+			for ( uint64_t submit : { planNow, w - 1u, w + 1u } )
+				CHECK( !fixed_grid_slot_due( slot, submit, V, w, T ) );
+		}
+	}
 
 	for ( uint32_t confidence = 0u;
 		confidence <= k_uCadenceConfidenceRequired; confidence++ )
@@ -680,6 +777,50 @@ static void test_scheduling_policy()
 	CHECK( degradation_reduces_work( motionChecked, extrapolate4, 3u, 3u ) );
 	CHECK( degradation_reduces_work( extrapolate4, extrapolate3, 3u, 2u ) );
 	CHECK( !degradation_reduces_work( extrapolate4, extrapolate3, 1u, 1u ) );
+}
+
+static void test_provisional_nested_slot_keep()
+{
+	// The feedback discard keeps a provisional nested slot exactly when its
+	// corrected replacement could no longer be submitted.
+	using gamescope::framegen::fixed_grid_slot_submittable;
+	constexpr uint64_t T = 16'666'667u;
+	constexpr uint64_t V = 5'000'000'000u;	// the vblank the compositor woke for
+	constexpr uint64_t n = 4'990'000'000u;	// now
+	constexpr uint64_t g = gamescope::framegen::cadence_arrival_guard_ns( T );
+	constexpr uint64_t far = n + 10u * T;
+
+	// Inside the woken opportunity's due window: kept, whatever the wake.
+	CHECK( !fixed_grid_slot_submittable( V + T / 2u, far, V, n, T, g ) );
+	// Past it: kept while the wake is within the guard, discarded beyond.
+	CHECK( !fixed_grid_slot_submittable( V + T / 2u + 1u, n + g, V, n, T, g ) );
+	CHECK( fixed_grid_slot_submittable( V + T / 2u + 1u, n + g + 1u, V, n, T, g ) );
+	CHECK( fixed_grid_slot_submittable( V + T, far, V, n, T, g ) );
+	// A wake below the wake offset saturates to 0: kept.
+	CHECK( !fixed_grid_slot_submittable( V + T, 0u, V, n, T, g ) );
+}
+
+static void test_bidir_queue_ordering()
+{
+	using gamescope::framegen::bidir_target_after;
+	constexpr uint64_t T = 16'666'667u;
+	constexpr uint64_t opp = 7'000'000'000u;
+
+	// Nothing queued ahead: the candidate itself.
+	CHECK( bidir_target_after( opp, 0u, T ) == opp );
+	// Otherwise the later of the candidate and one vblank after the queued target.
+	CHECK( bidir_target_after( opp, opp - 3u * T, T ) == opp );
+	CHECK( bidir_target_after( opp, opp - T, T ) == opp );
+	CHECK( bidir_target_after( opp, opp + 2u * T, T ) == opp + 3u * T );
+	CHECK( bidir_target_after( 1u, UINT64_MAX - 1u, T ) == UINT64_MAX );
+	// QueueBehind pushes behind each other stay sorted, one vblank apart.
+	uint64_t back = opp + T;
+	for ( int i = 0; i < 5; i++ )
+	{
+		const uint64_t next = bidir_target_after( opp, back, T );
+		CHECK( next > back && next - back >= T );
+		back = next;
+	}
 }
 
 static void test_dispatch_policy()
@@ -864,8 +1005,85 @@ static void test_metrics_distribution()
 	CHECK( latency.n == 0 && latency.p95() == 0.0 && latency.max == 0.0 );
 }
 
+static void test_metrics_source_latency_distribution()
+{
+	using gamescope::framegen::MetricsSourceLatencyDistribution;
+
+	// Real-frame -> flip latency includes a delayed real's whole bidir delay:
+	// 1 ms buckets up to 256 ms.
+	CHECK( MetricsSourceLatencyDistribution::k_ulStepNs == 1'000'000ull );
+	CHECK_NEAR( MetricsSourceLatencyDistribution::k_flFullScaleMs, 256.0, 1e-9 );
+
+	// A delay past the 64 ms flip-interval range lands in its own bucket.
+	MetricsSourceLatencyDistribution delayed;
+	delayed.add( 119'500'000ull );	// bucket 119 -> 120 ms
+	CHECK_NEAR( delayed.p50(), 120.0, 1e-9 );
+	CHECK_NEAR( delayed.max, 119.5, 1e-9 );
+
+	// Past full scale the percentiles saturate and the exact max still tells.
+	MetricsSourceLatencyDistribution overflow;
+	overflow.add( 300'000'000ull );
+	CHECK_NEAR( overflow.p95(), 256.0, 1e-9 );
+	CHECK_NEAR( overflow.max, 300.0, 1e-9 );
+
+	// A one-interval bidir delay and a backlog tail resolve apart.
+	MetricsSourceLatencyDistribution ranked;
+	for ( uint64_t i = 0; i < 90; i++ )
+		ranked.add( 40'000'000ull );	// bucket 40 -> 41 ms
+	for ( uint64_t i = 0; i < 10; i++ )
+		ranked.add( 130'000'000ull );	// bucket 130 -> 131 ms
+	CHECK_NEAR( ranked.p50(), 41.0, 1e-9 );
+	CHECK_NEAR( ranked.p95(), 131.0, 1e-9 );
+
+	CHECK( std::is_trivially_copyable<MetricsSourceLatencyDistribution>::value );
+	ranked = {};
+	CHECK( ranked.n == 0 && ranked.p95() == 0.0 && ranked.max == 0.0 );
+}
+
+static void test_fault_injection_grammar()
+{
+	using gamescope::FaultInjection_t;
+	using gamescope::ParseFaultInjection;
+	using gamescope::ParseFaultInjectionCode;
+
+	auto unlimited = ParseFaultInjection( "error", "error" );
+	CHECK( unlimited && unlimited->bUnlimited && unlimited->nCode == 0 );
+	auto counted = ParseFaultInjection( "error-pumped:30", "error-pumped" );
+	CHECK( counted && !counted->bUnlimited && counted->ulRemaining == 30 );
+	auto timeout = ParseFaultInjection( "timeout:40", "timeout" );
+	CHECK( timeout && timeout->ulRemaining == 40 );
+
+	// Kinds never match by prefix, and counts are strict positive decimals.
+	CHECK( !ParseFaultInjection( "error-pumped", "error" ) );
+	CHECK( !ParseFaultInjection( "error", "error-pumped" ) );
+	CHECK( !ParseFaultInjection( "", "error" ) );
+	for ( const char *pszSpec : { "error:", "error:0", "error:-1", "error:+1", "error: 1",
+		"error:1 ", "error:1x", "error:1:2", "error:18446744073709551616" } )
+		CHECK( !ParseFaultInjection( pszSpec, "error" ) );
+
+	auto code = ParseFaultInjectionCode( "error:-1000001004:1", "error" );
+	CHECK( code && code->nCode == -1000001004 && !code->bUnlimited && code->ulRemaining == 1 );
+	auto codeUnlimited = ParseFaultInjectionCode( "error:-4", "error" );
+	CHECK( codeUnlimited && codeUnlimited->nCode == -4 && codeUnlimited->bUnlimited );
+
+	// VK_SUCCESS and positive status codes would fabricate completions.
+	for ( const char *pszSpec : { "error", "error:", "error:0", "error:-0", "error:2", "error:+2",
+		"error:-4:", "error:-4:0", "error:-4x", "error:-2147483649", "error:-4:1:1", "timeout:-4" } )
+		CHECK( !ParseFaultInjectionCode( pszSpec, "error" ) );
+
+	FaultInjection_t forever;
+	for ( int i = 0; i < 3; i++ )
+		CHECK( forever.Consume() && !forever.Exhausted() );
+
+	FaultInjection_t finite = *ParseFaultInjection( "error:2", "error" );
+	CHECK( finite.Consume() && !finite.Exhausted() );
+	CHECK( finite.Consume() && finite.Exhausted() );
+	CHECK( !finite.Consume() && finite.Exhausted() );
+}
+
 int main()
 {
+	test_fps_limit_policy();
 	test_degradation_policy();
 	test_learned_net_layout();
 	test_names();
@@ -875,10 +1093,14 @@ int main()
 	test_adaptation_policy();
 	test_temporal_policy();
 	test_scheduling_policy();
+	test_provisional_nested_slot_keep();
+	test_bidir_queue_ordering();
 	test_dispatch_policy();
 	test_push_constant_encoding();
 	test_query_ring_selection();
 	test_metrics_distribution();
+	test_metrics_source_latency_distribution();
+	test_fault_injection_grammar();
 	return g_bPassed ? 0 : 1;
 }
 

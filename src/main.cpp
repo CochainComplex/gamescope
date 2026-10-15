@@ -531,8 +531,27 @@ static float parse_float(const char *str, const char *optionName)
 
 struct sigaction handle_signal_action = {};
 
+// Async-signal-safe: raw write(2) and _exit(2). gamescopereaper observes
+// our death and terminates the children.
+static void handle_shutdown_alarm( int )
+{
+	static constexpr char k_szMessage[] = "gamescope: shutdown watchdog: compositor did not exit within 5 s, terminating\n";
+	[[maybe_unused]] ssize_t nWritten = write( STDERR_FILENO, k_szMessage, sizeof( k_szMessage ) - 1 );
+	_exit( 128 + SIGTERM );
+}
+
+// Signal handlers call this, so the flag must be lock-free.
+static std::atomic< bool > s_bShutdownRequested{ false };
+static_assert( std::atomic< bool >::is_always_lock_free );
+
 void ShutdownGamescope()
 {
+	// Every shutdown path funnels through here, so the first request arms the
+	// watchdog and a stalled shutdown is bounded wherever it started. Later
+	// requests only nudge again.
+	if ( !s_bShutdownRequested.exchange( true ) )
+		alarm( 5 );
+
 	g_bRun = false;
 
 	nudge_steamcompmgr();
@@ -760,6 +779,18 @@ int g_argc;
 char **g_argv;
 
 extern char **environ;
+
+// Every exit once Vulkan may be initialized goes through here. It skips atexit
+// handlers and static destructors: the NVIDIA driver unmaps itself from its own
+// exit handler, which runs before the destructors of file-scope Vulkan owners
+// (g_device's command buffers, cached textures) that would then call into it.
+// The kernel reclaims GPU resources; deferred temp files are removed here.
+void gamescope_exit( int nStatus )
+{
+	gamescope::UnlinkDeferredTempFiles();
+	fflush( nullptr );
+	_exit( nStatus );
+}
 
 int main(int argc, char **argv)
 {
@@ -1069,6 +1100,11 @@ int main(int argc, char **argv)
 
 	g_ForcedNV12ColorSpace = parse_colorspace_string( getenv( "GAMESCOPE_NV12_COLORSPACE" ) );
 
+	// Backend bring-up can already request shutdown, which arms the watchdog.
+	struct sigaction shutdown_alarm_action = {};
+	shutdown_alarm_action.sa_handler = handle_shutdown_alarm;
+	sigaction( SIGALRM, &shutdown_alarm_action, nullptr );
+
 	switch ( eCurrentBackend )
 	{
 #if HAVE_DRM
@@ -1104,7 +1140,7 @@ int main(int argc, char **argv)
 	if ( !GetBackend() )
 	{
 		fprintf( stderr, "Failed to create backend.\n" );
-		return 1;
+		gamescope_exit( 1 );
 	}
 
 	UpdateCompatEnvVars();
@@ -1112,7 +1148,7 @@ int main(int argc, char **argv)
 	if ( !vulkan_init_formats() )
 	{
 		fprintf( stderr, "vulkan_init_formats failed\n" );
-		return 1;
+		gamescope_exit( 1 );
 	}
 
 	// Frame-generation GPU microbenchmark: with a Vulkan device and the framegen
@@ -1122,13 +1158,13 @@ int main(int argc, char **argv)
 	if ( getenv( "GAMESCOPE_FRAMEGEN_BENCHMARK" ) )
 	{
 		vulkan_framegen_benchmark();
-		return 0;
+		gamescope_exit( 0 );
 	}
 
 	if ( !vulkan_make_output() )
 	{
 		fprintf( stderr, "vulkan_make_output failed\n" );
-		return 1;
+		gamescope_exit( 1 );
 	}
 
 	// Prevent our clients from connecting to the parent compositor
@@ -1157,7 +1193,7 @@ int main(int argc, char **argv)
 		if ( g_nNestedWidth != 0 )
 		{
 			fprintf( stderr, "Cannot specify -w without -h\n" );
-			return 1;
+			gamescope_exit( 1 );
 		}
 		g_nNestedWidth = g_nOutputWidth;
 		g_nNestedHeight = g_nOutputHeight;
@@ -1168,7 +1204,7 @@ int main(int argc, char **argv)
 	if ( !wlserver_init() )
 	{
 		fprintf( stderr, "Failed to initialize wlserver\n" );
-		return 1;
+		gamescope_exit( 1 );
 	}
 
 	gamescope_xwayland_server_t *base_server = wlserver_get_xwayland_server(0);
@@ -1204,8 +1240,6 @@ int main(int argc, char **argv)
 	}
 #endif
 
-	std::thread steamCompMgrThread( steamCompMgrThreadRun, argc, argv );
-
 	handle_signal_action.sa_handler = handle_signal;
 	sigaction(SIGHUP, &handle_signal_action, nullptr);
 	sigaction(SIGINT, &handle_signal_action, nullptr);
@@ -1214,12 +1248,22 @@ int main(int argc, char **argv)
 	sigaction(SIGUSR1, &handle_signal_action, nullptr);
 	sigaction(SIGUSR2, &handle_signal_action, nullptr);
 
+	std::thread steamCompMgrThread( steamCompMgrThreadRun, argc, argv );
+
 	wlserver_run();
 
 	steamCompMgrThread.join();
 
+	// Only the children are left. Like upstream, wait for them without a
+	// time limit (a game may still be saving). Mark shutdown as requested
+	// before disarming the watchdog, so a request that lands in between
+	// cannot re-arm it.
+	s_bShutdownRequested = true;
+	alarm( 0 );
 	gamescope::Process::KillAllChildren( getpid(), SIGTERM );
 	gamescope::Process::WaitForAllChildren();
+
+	gamescope_exit( 0 );
 }
 
 static void steamCompMgrThreadRun(int argc, char **argv)

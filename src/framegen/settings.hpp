@@ -65,7 +65,7 @@ parse_color_probe_sweep_setting( const char *value )
 [[nodiscard]] inline std::optional<uint32_t> parse_uint32_setting(
 	const char *value, bool allowZero )
 {
-	if ( value == nullptr || *value == '\0' )
+	if ( value == nullptr || *value < '0' || *value > '9' )
 		return std::nullopt;
 
 	errno = 0;

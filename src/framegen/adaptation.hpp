@@ -9,7 +9,7 @@
 namespace gamescope::framegen
 {
 
-// Shared B4 counter and policy contract. The GPU writes exactly this many
+// Shared adaptation counter and policy contract. The GPU writes exactly this many
 // R32_UINT values; the renderer copies them only after the submission retires.
 inline constexpr uint32_t k_uAdaptationStatsCount = 96u;
 inline constexpr uint32_t k_uAdaptationMaxTotal = 4u * 1024u * 1024u;
@@ -61,7 +61,7 @@ struct AdaptationState
 };
 
 // Decode the completed GPU counter image without acquiring any ownership of
-// the mapped memory. Counter indices are the public B4 layout documented by
+// the mapped memory. Counter indices are the public adaptation layout documented by
 // cs_framegen_motion_stats.comp. Invalid total counts reject the entire sample;
 // absent noise and percentile evidence use the existing negative sentinel.
 [[nodiscard]] inline std::optional<AdaptationMeasurement> decode_adaptation_stats(
@@ -191,6 +191,6 @@ inline void update_adaptation_state( AdaptationState &state,
 }
 
 static_assert( k_uAdaptationStatsCount == 96u,
-	"B4 CPU readback must match the shader counter image" );
+	"adaptation CPU readback must match the shader counter image" );
 
 } // namespace gamescope::framegen

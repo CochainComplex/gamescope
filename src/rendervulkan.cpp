@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cerrno>
 #include <fcntl.h>
+#include <pthread.h>
 #include <random>
 #include <unistd.h>
 #include <stdio.h>
@@ -12,9 +13,11 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <thread>
+#include <vector>
 #include <dlfcn.h>
 #include "vulkan_include.h"
 #include "Utils/Algorithm.h"
@@ -42,7 +45,9 @@
 #include "steamcompmgr.hpp"
 #include "vblankmanager.hpp"
 #include "log.hpp"
+#include "Utils/FaultInjection.h"
 #include "Utils/Process.h"
+#include "Utils/SwapchainPolicy.h"
 #include "framegen/adaptation.hpp"
 #include "framegen/atomic_file.hpp"
 #include "framegen/deadline.hpp"
@@ -128,15 +133,43 @@ private:
 
 } // namespace
 
+static LogScope vk_log("vulkan");
+static std::mutex g_FramegenSettingLogLock;
+static std::vector<std::string> g_LoggedFramegenSettings;
+
+template<typename T, typename Parse>
+static T framegen_setting( const char *pszName, T nDefault, Parse parse, const char *pszDefault = nullptr )
+{
+	const char *pszValue = getenv( pszName );
+	if ( pszValue == nullptr )
+		return nDefault;
+	if ( const std::optional<T> oValue = parse( pszValue ) )
+		return *oValue;
+
+	// Settings are cached by their callers; repeated reads still log once per name.
+	std::scoped_lock lock( g_FramegenSettingLogLock );
+	if ( std::find( g_LoggedFramegenSettings.begin(), g_LoggedFramegenSettings.end(), pszName ) == g_LoggedFramegenSettings.end() )
+	{
+		g_LoggedFramegenSettings.emplace_back( pszName );
+		char szDefault[32];
+		if ( pszDefault == nullptr )
+		{
+			snprintf( szDefault, sizeof( szDefault ), "%g", double( nDefault ) );
+			pszDefault = szDefault;
+		}
+		vk_log.errorf( "framegen: ignoring invalid %s=\"%s\" (using %s)", pszName, pszValue, pszDefault );
+	}
+	return nDefault;
+}
+
 static uint32_t framegen_hud_level()
 {
-	static const uint32_t s_uLevel = []()
-	{
-		const auto parsed = gamescope::framegen::parse_uint32_setting(
-			getenv( "GAMESCOPE_FRAMEGEN_HUD" ), true );
-		return parsed.has_value() && ( *parsed == 1u || *parsed == 2u )
-			? *parsed : 0u;
-	}();
+	static const uint32_t s_uLevel = framegen_setting( "GAMESCOPE_FRAMEGEN_HUD", 0u,
+		[]( const char *pszValue ) -> std::optional<uint32_t>
+		{
+			const auto nValue = gamescope::framegen::parse_uint32_setting( pszValue, true );
+			return nValue && *nValue <= 2u ? nValue : std::nullopt;
+		} );
 	return s_uLevel;
 }
 
@@ -151,13 +184,12 @@ enum class FramegenHudCorner : uint32_t
 
 static uint32_t framegen_hud_scale( uint32_t uOutputHeight )
 {
-	static const uint32_t s_uOverride = []()
-	{
-		const auto parsed = gamescope::framegen::parse_uint32_setting(
-			getenv( "GAMESCOPE_FRAMEGEN_HUD_SCALE" ), false );
-		return parsed.has_value() && *parsed >= 1u && *parsed <= 6u
-			? *parsed : 0u;
-	}();
+	static const uint32_t s_uOverride = framegen_setting( "GAMESCOPE_FRAMEGEN_HUD_SCALE", 0u,
+		[]( const char *pszValue ) -> std::optional<uint32_t>
+		{
+			const auto nValue = gamescope::framegen::parse_uint32_setting( pszValue, false );
+			return nValue && *nValue <= 6u ? nValue : std::nullopt;
+		}, "automatic scale (2-4, based on output height)" );
 	return s_uOverride != 0u ? s_uOverride
 		: std::clamp( uOutputHeight / 720u, 2u, 4u );
 }
@@ -248,9 +280,8 @@ static bool framegen_owns_output_ring()
 	return GetBackend() != nullptr && !GetBackend()->UsesVulkanSwapchain();
 }
 
-// Set by vulkan_framegen_shutdown() before framegen state is torn down. The
-// swapchain present-wait thread is detached and never joined, so it must stop
-// publishing display feedback across teardown.
+// Set by vulkan_framegen_shutdown() after joining the swapchain waiter and
+// before framegen state is torn down; no feedback is consumed across teardown.
 static std::atomic<bool> g_bFramegenFeedbackShutdown = { false };
 
 static constexpr mat3x4 g_rgb2yuv_srgb_to_bt601_limited = {{
@@ -349,8 +380,6 @@ std::span<const uint64_t> GetSupportedSampleModifiers( uint32_t uDrmFormat )
 
 	return std::span<const uint64_t>{ iter->second.begin(), iter->second.end() };
 }
-
-static LogScope vk_log("vulkan");
 
 static void vk_errorf(VkResult result, const char *fmt, ...) {
 	static char buf[1024];
@@ -2391,7 +2420,7 @@ void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
 
 CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily, VkCommandPool cmdPool)
 	: m_cmdBuffer(cmdBuffer), m_device(parent)
-	, m_cmdPool(cmdPool != VK_NULL_HANDLE ? cmdPool : parent->commandPool())
+	, m_cmdPool(cmdPool)
 	, m_queue(queue), m_queueFamily(queueFamily)
 {
 	m_textureRefs.reserve( k_uInitialTrackedTextureCapacity );
@@ -3954,7 +3983,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	return true;
 }
 
-bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t height, VkFormat format )
+bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t height, VkFormat format, VkResult *pResult )
 {
 	m_drmFormat = VulkanFormatToDRM( format );
 	m_vkImage = image;
@@ -3986,6 +4015,8 @@ bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t
 	};
 
 	VkResult res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_srgbView);
+	if ( pResult != nullptr )
+		*pResult = res;
 	if ( res != VK_SUCCESS ) {
 		vk_errorf( res, "vkCreateImageView failed" );
 		return false;
@@ -4000,6 +4031,8 @@ bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t
 	createInfo.format = ToSrgbVulkanFormat( format );
 
 	res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_linearView);
+	if ( pResult != nullptr )
+		*pResult = res;
 	if ( res != VK_SUCCESS ) {
 		vk_errorf( res, "vkCreateImageView failed" );
 		return false;
@@ -4330,19 +4363,45 @@ bool vulkan_init_formats()
 	return true;
 }
 
-bool acquire_next_image( void )
+// Only a successful acquire plus fence completion permits output-image access.
+static bool g_bSwapchainImageAcquired = false;
+static std::atomic<bool> g_bVulkanOutputFailed = false;
+
+static bool vulkan_has_acquired_swapchain_image()
 {
-	VkResult res = g_device.vk.AcquireNextImageKHR( g_device.device(), g_output.swapChain, UINT64_MAX, VK_NULL_HANDLE, g_output.acquireFence, &g_output.nOutImage );
-	if ( res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR )
-		return false;
-	if ( g_device.vk.WaitForFences( g_device.device(), 1, &g_output.acquireFence, false, UINT64_MAX ) != VK_SUCCESS )
-		return false;
-	return g_device.vk.ResetFences( g_device.device(), 1, &g_output.acquireFence ) == VK_SUCCESS;
+	return !g_bVulkanOutputFailed && g_bSwapchainImageAcquired
+		&& g_output.nOutImage < g_output.outputImages.size()
+		&& g_output.outputImages[ g_output.nOutImage ] != nullptr;
+}
+
+// Returns the first failure of acquire, fence wait or fence reset. SUBOPTIMAL
+// still acquired an image; the present that follows reports it again.
+static VkResult acquire_next_image( void )
+{
+	g_bSwapchainImageAcquired = false;
+	VkResult nResult = g_device.vk.AcquireNextImageKHR( g_device.device(), g_output.swapChain, UINT64_MAX, VK_NULL_HANDLE, g_output.acquireFence, &g_output.nOutImage );
+	if ( nResult == VK_SUBOPTIMAL_KHR )
+		nResult = VK_SUCCESS;
+	if ( nResult == VK_SUCCESS )
+		nResult = g_device.vk.WaitForFences( g_device.device(), 1, &g_output.acquireFence, false, UINT64_MAX );
+	if ( nResult == VK_SUCCESS )
+		nResult = g_device.vk.ResetFences( g_device.device(), 1, &g_output.acquireFence );
+	g_bSwapchainImageAcquired = nResult == VK_SUCCESS;
+	return nResult;
 }
 
 
 static std::atomic<uint64_t> g_currentPresentWaitId = {0u};
+static std::atomic<uint64_t> g_ulPresentWaitWakeGeneration = {0u};
 static std::mutex present_wait_lock;
+static std::atomic<uint32_t> g_nPendingSwapchainRemakes = {0u};
+// Guarded by present_wait_lock; an id from a retired swapchain is never retried
+// on its replacement, even if a new present overtakes the reset to id zero.
+static uint64_t g_ulPresentWaitSwapchainGeneration = 0;
+static std::atomic<bool> g_bPresentWaitRemakeRequested = {false};
+static constexpr uint64_t k_ulPresentWaitSliceNs = 250'000'000u;
+static constexpr uint64_t k_ulPresentWaitMarkNs = 1'000'000'000u;
+static constexpr uint64_t k_ulPresentWaitStallNs = 2'000'000'000u;
 
 // Framegen present feedback on a Vulkan-swapchain backend. The DRM backend gets
 // this from the page-flip handler and nested Wayland from
@@ -4351,10 +4410,20 @@ static std::mutex present_wait_lock;
 // missing is the association between the framegen presentation tag taken at
 // present time and the presentId the waiter completes.
 //
+// This swapchain uses FIFO: completion of present id N proves that every
+// earlier id was presented in order. framegen_publish_present_wait_tags relies
+// on that ordering; mailbox/immediate modes cannot use this cumulative proof.
+// The exact id's timestamp is host-observed completion time, not scanout time.
+// Consumers use it as the best available measurement on swapchain backends;
+// earlier completed ids have no individual timestamp and never borrow N's.
+//
 // Deliberately NOT guarded by present_wait_lock, even though the design sketch
-// suggested it: the waiter holds that lock across a WaitForPresentKHR of up to
-// one second, so the compositor thread would stall on it at every present.
-// Lock order where both are held is present_wait_lock -> present_tag_lock.
+// suggested it: the waiter holds that lock across a WaitForPresentKHR slice of
+// up to 250 ms, so the compositor thread would stall on it at every present.
+// Lock order: present_wait_lock -> present_tag_lock -> feedback mailbox mutex.
+static constexpr VkPresentModeKHR k_eSwapchainPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+static_assert( k_eSwapchainPresentMode == VK_PRESENT_MODE_FIFO_KHR || k_eSwapchainPresentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+	"cumulative present-wait tag retirement requires ordered presentation" );
 static constexpr size_t k_nPresentWaitTagRing = 16;
 struct PresentWaitTag_t
 {
@@ -4363,6 +4432,18 @@ struct PresentWaitTag_t
 };
 static std::array<PresentWaitTag_t, k_nPresentWaitTagRing> g_PresentWaitTags;
 static std::mutex present_tag_lock;
+// Reads hold either present_wait_lock or present_tag_lock; writes hold both.
+static bool g_bPresentWaitFailed = false;
+static std::mutex present_wait_thread_lock;
+static std::jthread g_PresentWaitThread;
+
+static void present_wait_wake()
+{
+	// Publish state before changing this value: atomic::wait only wakes when
+	// its compared value changes, including when no new present exists at stop.
+	g_ulPresentWaitWakeGeneration.fetch_add( 1u );
+	g_ulPresentWaitWakeGeneration.notify_all();
+}
 
 static void framegen_note_present_queued()
 {
@@ -4381,8 +4462,8 @@ static void framegen_note_present_completed( uint32_t nCount )
 }
 
 // Publishes every stored tag with an id at or below ulUpToPresentId. The tag
-// whose id matches exactly carries the measured completion time; any older id
-// the waiter skipped past (it only ever waits for the newest) WAS presented but
+// whose id matches exactly carries the host-observed completion time; any older
+// id the waiter skipped past when selecting its next target WAS presented but
 // has no timestamp of its own, so it is published with bTimestampValid = false
 // rather than a fabricated time. Counters (real=/gen=/fill=) need only
 // bPresented; every timing consumer honours bTimestampValid.
@@ -4409,10 +4490,18 @@ static void framegen_publish_present_wait_tags( uint64_t ulUpToPresentId, uint64
 	framegen_note_present_completed( nPublished );
 }
 
-// Swapchain teardown/resize: nothing that is still pending will ever complete on
-// the old swapchain, so retire the tags as not-presented instead of orphaning
-// them (which would leak CurrentPresentsInFlight upward forever).
-static void framegen_flush_present_wait_tags()
+// Accepted by the driver, completion unmeasurable: presented, no timestamp.
+static void framegen_publish_presented_untimed( const gamescope::FramegenPresentTag_t &tag, uint64_t ulPresentId )
+{
+	vulkan_framegen_publish_present_feedback( tag, GetVBlankTimer().GetNextVBlank( 0 ), ulPresentId, true, false );
+}
+
+// Retires every stored tag instead of orphaning it (which would leak
+// CurrentPresentsInFlight upward forever). bPresented: the driver accepted
+// them and only their completion is unmeasurable (waits disabled after a
+// transient wait result). Otherwise nothing still pending will ever complete
+// (swapchain teardown, terminal shutdown) and they retire as not presented.
+static void framegen_flush_present_wait_tags( bool bPresented )
 {
 	uint32_t nFlushed = 0;
 	{
@@ -4422,7 +4511,12 @@ static void framegen_flush_present_wait_tags()
 			if ( slot.ulPresentId == 0 )
 				continue;
 			if ( !g_bFramegenFeedbackShutdown.load() )
-				vulkan_framegen_publish_present_feedback( slot.tag, 0u, 0u, false, false );
+			{
+				if ( bPresented )
+					framegen_publish_presented_untimed( slot.tag, slot.ulPresentId );
+				else
+					vulkan_framegen_publish_present_feedback( slot.tag, 0u, 0u, false, false );
+			}
 			slot.ulPresentId = 0;
 			nFlushed++;
 		}
@@ -4430,39 +4524,322 @@ static void framegen_flush_present_wait_tags()
 	framegen_note_present_completed( nFlushed );
 }
 
-extern void mangoapp_output_update( uint64_t vblanktime );
-static void present_wait_thread_func( void )
+// Caller holds present_wait_lock. Stop accepting tags before flushing so a
+// failed swapchain cannot accumulate entries or evict them as presented.
+static void present_wait_disable( bool bTagsPresented )
 {
-	uint64_t present_wait_id = 0;
-
-	while (true)
 	{
-		g_currentPresentWaitId.wait(present_wait_id);
+		std::scoped_lock lock( present_tag_lock );
+		g_bPresentWaitFailed = true;
+	}
+	framegen_flush_present_wait_tags( bTagsPresented );
+}
+
+// Caller holds present_wait_lock. No tag or image survives a terminal output failure.
+static void vulkan_request_output_shutdown()
+{
+	g_bVulkanOutputFailed = true;
+	g_currentPresentWaitId = 0;
+	g_bPresentWaitRemakeRequested = false;
+	present_wait_disable( false );
+	// Clears g_bRun before the wake below, which the waiter rechecks.
+	ShutdownGamescope();
+	present_wait_wake();
+}
+
+// Compositor thread only (and the main thread during init). An episode of
+// transient failures ends only when an image reaches the swapchain or a resize
+// explains it; an acquire alone proves nothing.
+static gamescope::SwapchainRecovery_t g_SwapchainRecovery;
+
+// Caller holds present_wait_lock. Only the first terminal result shuts down.
+static void vulkan_fail_output_locked( const char *pszWhat, VkResult nResult )
+{
+	if ( g_bVulkanOutputFailed )
+		return;
+	vk_log.errorf( "%s failed (VkResult %d); requesting shutdown", pszWhat, int( nResult ) );
+	vulkan_request_output_shutdown();
+}
+
+static void vulkan_fail_output( const char *pszWhat, VkResult nResult )
+{
+	std::scoped_lock lock( present_wait_lock );
+	vulkan_fail_output_locked( pszWhat, nResult );
+}
+
+// The single sink for results of compositor-side swapchain operations; the
+// outcome depends only on the VkResult. True iff Ok. Transient: retried by
+// the next composite; past the recovery budget it is terminal.
+static bool vulkan_handle_swapchain_result( const char *pszWhat, VkResult nResult )
+{
+	switch ( gamescope::ClassifySwapchainResult( nResult ) )
+	{
+		case gamescope::SwapchainStatus_t::Ok:
+			return true;
+		case gamescope::SwapchainStatus_t::Transient:
+			if ( !g_SwapchainRecovery.NoteTransient( get_time_in_nanos() ) )
+				break;
+			// Also nudges the compositor; the next composite remakes and retries.
+			force_repaint();
+			return false;
+		case gamescope::SwapchainStatus_t::Terminal:
+			break;
+	}
+	vulkan_fail_output( pszWhat, nResult );
+	return false;
+}
+
+static void vulkan_note_swapchain_progress( bool bNotPresentableLogged )
+{
+	if ( bNotPresentableLogged )
+		vk_log.infof( "swapchain: surface usable again" );
+}
+
+// After a failed swapchain operation: the output failed for good, or
+// vulkan_handle_swapchain_result arranged a retry.
+static gamescope::SwapchainImage_t vulkan_swapchain_failure()
+{
+	return g_bVulkanOutputFailed ? gamescope::SwapchainImage_t::NotPresentable
+		: gamescope::SwapchainImage_t::Transient;
+}
+
+static gamescope::SwapchainImage_t vulkan_remake_swapchain();
+
+gamescope::SwapchainImage_t vulkan_acquire_swapchain_image( bool bRemakeBeforeAcquire )
+{
+	if ( g_bVulkanOutputFailed )
+		return gamescope::SwapchainImage_t::NotPresentable;
+
+	if ( bRemakeBeforeAcquire )
+	{
+		// Nothing is acquired from the old swapchain again, even when the remake
+		// stops early: the next attempt remakes as well.
+		g_bSwapchainImageAcquired = false;
+		const gamescope::SwapchainImage_t eRemake = vulkan_remake_swapchain();
+		if ( eRemake != gamescope::SwapchainImage_t::Ready )
+			return eRemake;
+	}
+
+	return vulkan_handle_swapchain_result( "swapchain acquire", acquire_next_image() )
+		? gamescope::SwapchainImage_t::Ready : vulkan_swapchain_failure();
+}
+
+struct PresentWaitInjection_t
+{
+	gamescope::FaultInjection_t injection;
+	VkResult nResult = VK_TIMEOUT;
+};
+// Only the owned waiter reads or mutates injection state. Finite budgets span
+// swapchain recreation, so an injected error episode can actually recover.
+static PresentWaitInjection_t g_PresentWaitInjection;
+
+static VKAPI_ATTR VkResult VKAPI_CALL present_wait_injected_wait( VkDevice device, VkSwapchainKHR swapchain, uint64_t ulPresentId, uint64_t ulTimeoutNs )
+{
+	if ( g_PresentWaitInjection.injection.Consume() )
+		return g_PresentWaitInjection.nResult;
+	return g_device.vk.WaitForPresentKHR != nullptr
+		? g_device.vk.WaitForPresentKHR( device, swapchain, ulPresentId, ulTimeoutNs ) : VK_SUCCESS;
+}
+
+static PFN_vkWaitForPresentKHR present_wait_select_wait_function()
+{
+	const char *pszInjection = getenv( "GAMESCOPE_DEBUG_PRESENT_WAIT_INJECT" );
+	if ( pszInjection == nullptr )
+		return g_device.vk.WaitForPresentKHR;
+
+	if ( auto timeout = gamescope::ParseFaultInjection( pszInjection, "timeout" ) )
+		g_PresentWaitInjection = { .injection = *timeout, .nResult = VK_TIMEOUT };
+	// Only negative codes parse: a fabricated success would fake completions.
+	else if ( auto error = gamescope::ParseFaultInjectionCode( pszInjection, "error" ) )
+		g_PresentWaitInjection = { .injection = *error, .nResult = VkResult( error->nCode ) };
+	else
+	{
+		vk_log.errorf( "present_wait: invalid fault injection (%s); ignoring", pszInjection );
+		return g_device.vk.WaitForPresentKHR;
+	}
+
+	vk_log.warnf( "present_wait: fault injection active (%s)", pszInjection );
+	return present_wait_injected_wait;
+}
+
+extern void mangoapp_output_update( uint64_t vblanktime );
+static void present_wait_thread_func( std::stop_token stopToken )
+{
+	pthread_setname_np( pthread_self(), "gamescope-pwait" );
+	std::stop_callback stopWake( stopToken, present_wait_wake );
+	// Select once: with the environment unset the hot path calls the driver's
+	// original function pointer directly, without an injection branch or wrapper.
+	const PFN_vkWaitForPresentKHR pWaitForPresent = present_wait_select_wait_function();
+	uint64_t ulWakeGeneration = 0;
+	uint64_t ulSwapchainGeneration = 0;
+	uint64_t ulPresentWaitId = 0;
+	uint64_t ulCompletedPresentId = 0;
+	uint64_t ulTimeoutNs = 0;
+	// Waited on this swapchain since the vblank clock was last marked. A present
+	// that stays incomplete re-marks the clock after every second of waiting, so
+	// the vblank timer keeps a recent anchor through a stall.
+	uint64_t ulSinceMarkNs = 0;
+	bool bRetry = false;
+	bool bStalled = false;
+	gamescope::PresentWaitRecovery_t recovery;
+	// Any recreation re-enables waits, and resize drags recreate many times per
+	// second: a driver failing on each fresh swapchain logs once per budget.
+	gamescope::BudgetLimiter_t againLog;
+	std::optional<std::chrono::steady_clock::time_point> oSleepUntil;
+
+	while ( true )
+	{
+		// Error back-off never holds the swapchain lock, including on retry/retirement.
+		if ( oSleepUntil )
+		{
+			if ( stopToken.stop_requested() || !g_bRun )
+				return;
+			std::this_thread::sleep_until( *oSleepUntil );
+			oSleepUntil.reset();
+			if ( stopToken.stop_requested() || !g_bRun )
+				return;
+		}
+		if ( !bRetry )
+			g_ulPresentWaitWakeGeneration.wait( ulWakeGeneration );
+		bRetry = false;
 
 		// Lock to make sure swapchain destruction is waited on and that
 		// it's for this swapchain.
 		{
 			std::unique_lock lock(present_wait_lock);
-			present_wait_id = g_currentPresentWaitId.load();
+			// Snapshot the wake generation before reading the id or stop state,
+			// so a publication racing those reads cannot be lost at the next wait.
+			ulWakeGeneration = g_ulPresentWaitWakeGeneration.load();
+			if ( stopToken.stop_requested() || !g_bRun )
+				return;
+			if ( ulSwapchainGeneration != g_ulPresentWaitSwapchainGeneration )
+			{
+				ulSwapchainGeneration = g_ulPresentWaitSwapchainGeneration;
+				ulPresentWaitId = 0;
+				ulCompletedPresentId = 0;
+				ulTimeoutNs = 0;
+				ulSinceMarkNs = 0;
+			}
+			// A remake announces itself before taking this lock. Hand it the
+			// lock instead of repeatedly re-waiting on a timed-out old present;
+			// its completed state change will wake the atomic wait above.
+			if ( g_nPendingSwapchainRemakes.load() != 0u )
+				continue;
+			// Waits stay disabled until a recreation. Woken once per present, so
+			// this re-arms the recreation request after the budget without spinning.
+			if ( g_bPresentWaitFailed )
+			{
+				if ( recovery.NoteDisabledWake( get_time_in_nanos() ) )
+				{
+					vk_log.infof( "present_wait: still disabled; requesting swapchain recreation" );
+					g_bPresentWaitRemakeRequested = true;
+				}
+				continue;
+			}
 
-			if (present_wait_id != 0)
+			if ( ulPresentWaitId == 0 )
+				ulPresentWaitId = g_currentPresentWaitId.load();
+			if ( ulPresentWaitId != 0 && ulPresentWaitId > ulCompletedPresentId )
 			{
 				// Null only if the driver lied about VK_KHR_present_wait after
 				// device creation enabled it. Skipping the wait degrades this to
 				// a present-nudged clock instead of dereferencing null; the
 				// framegen feedback published below is then approximate, and
 				// vulkan_present_to_window has already flagged it as such.
-				if ( g_device.vk.WaitForPresentKHR != nullptr )
-					g_device.vk.WaitForPresentKHR( g_device.device(), g_output.swapChain, present_wait_id, 1'000'000'000lu );
-				uint64_t vblanktime = get_time_in_nanos();
+				const auto waitStart = std::chrono::steady_clock::now();
+				VkResult nResult = VK_SUCCESS;
+				if ( pWaitForPresent != nullptr )
+					nResult = pWaitForPresent( g_device.device(), g_output.swapChain, ulPresentWaitId, k_ulPresentWaitSliceNs );
+				// Joining protects backend lifetime; this check also suppresses
+				// feedback/timer work when shutdown arrives during the driver call.
+				if ( stopToken.stop_requested() || !g_bRun )
+					return;
+				const uint64_t vblanktime = get_time_in_nanos();
+				const gamescope::PresentWaitAction_t eAction = recovery.NoteWaitResult( nResult, vblanktime );
+				if ( eAction != gamescope::PresentWaitAction_t::Retry )
+					ulTimeoutNs = 0;
+				switch ( eAction )
+				{
+					case gamescope::PresentWaitAction_t::Retry:
+						// An immediately returning timeout (injected or driver) backs off
+						// to the end of the slice; after a real slice expiry this is a
+						// no-op.
+						oSleepUntil = waitStart + std::chrono::nanoseconds( k_ulPresentWaitSliceNs );
+						ulTimeoutNs = std::min( ulTimeoutNs + k_ulPresentWaitSliceNs, k_ulPresentWaitStallNs );
+						if ( ulTimeoutNs >= k_ulPresentWaitStallNs && !bStalled )
+						{
+							vk_log.infof( "present_wait: no completion for %.1f s (stalled)", double( ulTimeoutNs ) / 1e9 );
+							bStalled = true;
+						}
+						// Re-anchor the vblank clock without publishing tags or
+						// learning anything from a flip that did not happen.
+						ulSinceMarkNs += k_ulPresentWaitSliceNs;
+						if ( ulSinceMarkNs >= k_ulPresentWaitMarkNs )
+						{
+							GetVBlankTimer().MarkVBlank( vblanktime, true );
+							mangoapp_output_update( vblanktime );
+							ulSinceMarkNs = 0;
+						}
+						// Keep the tags pending and retry even if the id is unchanged.
+						// The bounded Vulkan timeout supplies the back-off. Release
+						// this lock on every retry, then recheck shutdown/remake and
+						// keep waiting on this id until it completes or is retired.
+						bRetry = true;
+						continue;
+					case gamescope::PresentWaitAction_t::Publish:
+						break;
+					// Transient. Nothing is dropped: the compositor presents the frame
+					// it already rendered and remakes before its next acquire. The
+					// stored tags were accepted by the driver: presented, untimed.
+					// No slice sleep: a remake or the next present wakes the waiter.
+					case gamescope::PresentWaitAction_t::DisableAndRemake:
+						present_wait_disable( true );
+						vk_log.errorf( "present_wait: VkResult %d; requesting swapchain recreation", int( nResult ) );
+						g_bPresentWaitRemakeRequested = true;
+						continue;
+					case gamescope::PresentWaitAction_t::Disable:
+						present_wait_disable( true );
+						if ( againLog.Allow( vblanktime ) )
+							vk_log.infof( "present_wait: VkResult %d again; waits stay disabled until a swapchain recreation", int( nResult ) );
+						continue;
+					case gamescope::PresentWaitAction_t::Fail:
+						// The shutdown wake ends the loop at the next lock.
+						vulkan_fail_output_locked( "present wait", nResult );
+						continue;
+				}
+				if ( bStalled )
+				{
+					vk_log.infof( "present_wait: recovered after stall" );
+					bStalled = false;
+				}
 				// Before MarkVBlank: the re-armed vblank timer wakes the
 				// compositor, which drains the mailbox on its next iteration.
-				framegen_publish_present_wait_tags( present_wait_id, vblanktime );
+				framegen_publish_present_wait_tags( ulPresentWaitId, vblanktime );
 				GetVBlankTimer().MarkVBlank( vblanktime, true );
 				mangoapp_output_update( vblanktime );
+				ulSinceMarkNs = 0;
+				ulCompletedPresentId = ulPresentWaitId;
+				ulPresentWaitId = 0;
+				// A newer id may have arrived during a sliced retry before the
+				// generation snapshot above. Process it without waiting for a wake.
+				bRetry = g_currentPresentWaitId.load() > ulCompletedPresentId;
 			}
+			else
+				ulPresentWaitId = 0;
 		}
 	}
+}
+
+void vulkan_present_wait_shutdown()
+{
+	// Serialize ownership, but never hold present_wait_lock across join: the
+	// worker needs it to observe stop and leave its final Vulkan timeout slice.
+	std::scoped_lock lock( present_wait_thread_lock );
+	if ( !g_PresentWaitThread.joinable() )
+		return;
+	g_PresentWaitThread.request_stop();
+	g_PresentWaitThread.join();
+	vk_log.infof( "present_wait: waiter joined" );
 }
 
 void vulkan_update_swapchain_hdr_metadata( VulkanOutput_t *pOutput )
@@ -4497,29 +4874,71 @@ void vulkan_update_swapchain_hdr_metadata( VulkanOutput_t *pOutput )
 	g_device.vk.SetHdrMetadataEXT(g_device.device(), 1, &g_output.swapChain, &metadata);
 }
 
-void vulkan_present_to_window( void )
+// Composites dispatch over currentOutputWidth/Height; the swapchain must match.
+static bool vulkan_swapchain_matches_composite()
 {
+	return !g_output.outputImages.empty() && g_output.outputImages[ 0 ] != nullptr
+		&& g_output.outputImages[ 0 ]->width() == currentOutputWidth
+		&& g_output.outputImages[ 0 ]->height() == currentOutputHeight;
+}
+
+// The SDL thread published an output size the compositor has not adopted.
+static bool vulkan_output_resize_pending()
+{
+	return currentOutputWidth != g_nOutputWidth || currentOutputHeight != g_nOutputHeight;
+}
+
+// The HDR metadata the base layer's content asks for; null asks for none.
+static std::shared_ptr<gamescope::BackendBlob> vulkan_wanted_hdr_metadata()
+{
+	wlserver_vk_swapchain_feedback *feedback = steamcompmgr_get_base_layer_swapchain_feedback();
+	return feedback ? feedback->hdr_metadata_blob : nullptr;
+}
+
+gamescope::SwapchainImage_t vulkan_prepare_swapchain_image()
+{
+	// Before the composite target is selected: every rendered/presented image
+	// must come from the swapchain that still owns it. Outside an acquire call,
+	// holding no image means the last attempt failed; retrying always remakes,
+	// so nothing is acquired twice after a half-failed acquire. Vulkan clears
+	// HDR metadata only by recreating the swapchain.
+	const bool bRemake = !vulkan_has_acquired_swapchain_image() || !vulkan_swapchain_matches_composite()
+		|| ( g_output.swapchainHDRMetadata && !vulkan_wanted_hdr_metadata() );
+	switch ( gamescope::SwapchainNextStep( bRemake, vulkan_output_resize_pending() ) )
+	{
+		case gamescope::SwapchainStep_t::Keep:
+			return gamescope::SwapchainImage_t::Ready;
+		case gamescope::SwapchainStep_t::AwaitResize:
+			force_repaint();
+			return gamescope::SwapchainImage_t::Transient;
+		case gamescope::SwapchainStep_t::Remake:
+			break;
+	}
+	const gamescope::SwapchainImage_t eImage = vulkan_acquire_swapchain_image( true );
+	if ( eImage != gamescope::SwapchainImage_t::Ready || vulkan_swapchain_matches_composite() )
+		return eImage;
+	// The SDL thread published a new size during this iteration; the
+	// compositor's size check remakes on the next one.
+	force_repaint();
+	return gamescope::SwapchainImage_t::Transient;
+}
+
+static bool framegen_present_tracking_enabled();
+
+bool vulkan_present_to_window( void )
+{
+	if ( !vulkan_has_acquired_swapchain_image() )
+		return false;
 	static uint64_t s_lastPresentId = 0;
 
 	uint64_t presentId = ++s_lastPresentId;
-	
-	auto feedback = steamcompmgr_get_base_layer_swapchain_feedback();
-	if (feedback && feedback->hdr_metadata_blob)
-	{
-		if ( feedback->hdr_metadata_blob != g_output.swapchainHDRMetadata )
-		{
-			g_output.swapchainHDRMetadata = feedback->hdr_metadata_blob;
-			vulkan_update_swapchain_hdr_metadata( &g_output );
-		}
-	}
-	else if ( g_output.swapchainHDRMetadata != nullptr )
-	{
-		// Only way to clear hdr metadata for a swapchain in Vulkan
-		// is to recreate the swapchain.
-		g_output.swapchainHDRMetadata = nullptr;
-		vulkan_remake_swapchain();
-	}
 
+	const std::shared_ptr<gamescope::BackendBlob> pWantedHDRMetadata = vulkan_wanted_hdr_metadata();
+	if ( pWantedHDRMetadata && pWantedHDRMetadata != g_output.swapchainHDRMetadata )
+	{
+		g_output.swapchainHDRMetadata = pWantedHDRMetadata;
+		vulkan_update_swapchain_hdr_metadata( &g_output );
+	}
 
 	VkPresentIdKHR presentIdInfo = {
 		.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
@@ -4536,10 +4955,10 @@ void vulkan_present_to_window( void )
 	};
 
 	// Framegen presentation tag, taken at the same point the DRM backend takes it
-	// (immediately before the commit) and stamped with the same submit time. Only
-	// taken while framegen is actually enabled, so a plain swapchain present is
-	// byte-for-byte what it always was.
-	const bool bFramegenPresent = vulkan_framegen_is_enabled();
+	// (immediately before the commit) and stamped with the same submit time.
+	// Only while presents are tracked (framegen, or the opt-in metrics that give
+	// the framegen-OFF baseline); otherwise this is upstream's present.
+	const bool bTrackPresent = framegen_present_tracking_enabled();
 	gamescope::FramegenPresentTag_t framegenTag = {};
 	// If present_wait is unavailable we cannot measure completion at all. Publish
 	// synchronously instead, snapped to the refresh grid (raw "now" is
@@ -4547,53 +4966,90 @@ void vulkan_present_to_window( void )
 	// anchor) and flagged bTimestampValid = false. That keeps real=/gen=/fill=
 	// correct while every timing field honestly reports "not measured". Never
 	// pass true here.
-	const bool bApproximateFeedback = bFramegenPresent && g_device.vk.WaitForPresentKHR == nullptr;
-	if ( bFramegenPresent )
+	const bool bApproximateFeedback = bTrackPresent && g_device.vk.WaitForPresentKHR == nullptr;
+	if ( bTrackPresent )
 	{
 		framegenTag = vulkan_framegen_take_present_tag();
 		framegenTag.ulCommitSubmitNs = get_time_in_nanos();
 	}
 
-	if ( g_device.vk.QueuePresentKHR( g_device.queue(), &presentInfo ) == VK_SUCCESS )
+	g_bSwapchainImageAcquired = false;
+	const VkResult nPresentResult = g_device.vk.QueuePresentKHR( g_device.queue(), &presentInfo );
+	const bool bPresented = gamescope::ClassifySwapchainResult( nPresentResult ) == gamescope::SwapchainStatus_t::Ok;
+	bool bSuboptimalRemake = false;
+	if ( bPresented )
 	{
+		vulkan_note_swapchain_progress( g_SwapchainRecovery.NoteProgress() );
+		bSuboptimalRemake = g_SwapchainRecovery.NotePresented( nPresentResult, get_time_in_nanos() );
+
 		if ( bApproximateFeedback )
 		{
 			framegen_note_present_queued();
-			vulkan_framegen_publish_present_feedback( framegenTag,
-				GetVBlankTimer().GetNextVBlank( 0 ), presentId, true, false );
+			framegen_publish_presented_untimed( framegenTag, presentId );
 			framegen_note_present_completed( 1 );
 		}
-		else if ( bFramegenPresent )
+		else if ( bTrackPresent )
 		{
-			uint32_t nEvicted = 0;
+			// Account before exposing a tag that the waiter can immediately retire.
+			framegen_note_present_queued();
+			uint32_t nRetired = 0;
 			{
 				std::scoped_lock lock( present_tag_lock );
-				PresentWaitTag_t &slot = g_PresentWaitTags[ presentId % k_nPresentWaitTagRing ];
-				if ( slot.ulPresentId != 0 )
+				if ( g_bPresentWaitFailed )
 				{
-					// The ring wrapped past a tag the waiter never got to. It was
-					// presented; we simply have no time for it.
-					vulkan_framegen_publish_present_feedback( slot.tag, 0u, slot.ulPresentId, true, false );
-					nEvicted++;
+					// As without VK_KHR_present_wait.
+					framegen_publish_presented_untimed( framegenTag, presentId );
+					nRetired++;
 				}
-				slot = { framegenTag, presentId };
+				else
+				{
+					PresentWaitTag_t &slot = g_PresentWaitTags[ presentId % k_nPresentWaitTagRing ];
+					if ( slot.ulPresentId != 0 )
+					{
+						// Ring eviction proves no completion, during a stall or even
+						// before its threshold. Only a completed later FIFO id can
+						// certify earlier tags; lost evidence is retired as unknown.
+						vulkan_framegen_publish_present_feedback( slot.tag, 0u, slot.ulPresentId, false, false );
+						nRetired++;
+					}
+					slot = { framegenTag, presentId };
+				}
 			}
-			framegen_note_present_completed( nEvicted );
-			framegen_note_present_queued();
+			framegen_note_present_completed( nRetired );
 		}
 
 		g_currentPresentWaitId = presentId;
-		g_currentPresentWaitId.notify_all();
+		present_wait_wake();
 	}
 	else
 	{
-		if ( bFramegenPresent )
+		if ( bTrackPresent )
 			vulkan_framegen_publish_present_feedback( framegenTag, 0u, 0u, false, false );
-		vulkan_remake_swapchain();
+		// Keeps the scene scheduled until a fresh composite actually presents.
+		vulkan_handle_swapchain_result( "present", nPresentResult );
 	}
 
-	while ( !acquire_next_image() )
-		vulkan_remake_swapchain();
+	// Remake before the next acquire after a failed present, after a transient
+	// reported by the waiter (only the compositor may destroy the swapchain), or
+	// on a SUBOPTIMAL present the remake limit allows. While a published resize
+	// is pending that remake is left to the compositor's size check; holding no
+	// image makes any earlier paint remake instead. A swapchain that is still
+	// SUBOPTIMAL after a remake presents correctly and is kept.
+	const bool bWaiterRemake = g_bPresentWaitRemakeRequested.exchange( false );
+	switch ( gamescope::SwapchainNextStep( !bPresented || bWaiterRemake || bSuboptimalRemake, vulkan_output_resize_pending() ) )
+	{
+		case gamescope::SwapchainStep_t::Keep:
+			vulkan_acquire_swapchain_image( false );
+			break;
+		case gamescope::SwapchainStep_t::Remake:
+			vulkan_acquire_swapchain_image( true );
+			break;
+		case gamescope::SwapchainStep_t::AwaitResize:
+			// Raised after this present, so only a later live composite services it.
+			force_repaint();
+			break;
+	}
+	return bPresented;
 }
 
 // Swapchain analogue of CDRMBackend::Present's direct flip of the generated
@@ -4604,13 +5060,16 @@ void vulkan_present_to_window( void )
 // colour path a real frame takes, so HDR and colour management are preserved by
 // construction, and it is the only way to get the framegen HUD onto a generated
 // frame.
-bool vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFrame, const struct FrameInfo_t *pPresentFrameInfo )
+int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFrame, const struct FrameInfo_t *pPresentFrameInfo )
 {
-	if ( pFrame == nullptr || pPresentFrameInfo == nullptr
-		|| g_output.outputImages.empty()
-		|| g_output.nOutImage >= g_output.outputImages.size()
-		|| g_output.outputImages[ g_output.nOutImage ] == nullptr )
-		return false;
+	if ( pFrame == nullptr || pPresentFrameInfo == nullptr )
+		return -EAGAIN;
+
+	// This path passes an explicit output override to vulkan_composite, so
+	// reconcile before that override can retain an old swapchain image.
+	const gamescope::SwapchainImage_t eImage = vulkan_prepare_swapchain_image();
+	if ( eImage != gamescope::SwapchainImage_t::Ready )
+		return gamescope::SwapchainImagePresentErrno( eImage );
 
 	FrameInfo_t blitFrameInfo = {};
 	blitFrameInfo.applyOutputColorMgmt = false;   // pFrame already carries the output encoding
@@ -4637,14 +5096,14 @@ bool vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFra
 	std::optional<uint64_t> oSeqNo = vulkan_composite( &blitFrameInfo, nullptr, false,
 		g_output.outputImages[ g_output.nOutImage ], false, nullptr, true );
 	if ( !oSeqNo )
-		return false;
+		return -EINVAL;
 
 	// Present first, wait after: the composite submit and the present both go to
 	// g_device.queue(), so the present is already ordered behind the blit and the
 	// wait is only for our own bookkeeping. Same ordering the real path uses.
-	vulkan_present_to_window();
+	const bool bPresented = vulkan_present_to_window();
 	vulkan_wait( *oSeqNo, true );
-	return true;
+	return bPresented ? 0 : -EAGAIN;
 }
 
 gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size)
@@ -4752,9 +5211,10 @@ bool vulkan_supports_hdr10()
 
 extern bool g_bOutputHDREnabled;
 
-bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
+// Index of the swapchain format in surfaceFormats for the output colour space,
+// or surfaceFormats.size() if the surface offers none.
+static uint32_t vulkan_find_swapchain_format( const VulkanOutput_t *pOutput )
 {
-	uint32_t imageCount = pOutput->surfaceCaps.minImageCount + 1;
 	uint32_t formatCount = pOutput->surfaceFormats.size();
 	uint32_t surfaceFormat = formatCount;
 	VkColorSpaceKHR preferredColorSpace = g_bOutputHDREnabled ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
@@ -4788,9 +5248,20 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
 				break;
 		}
 	}
-	
-	if ( surfaceFormat == formatCount )
-		return false;
+
+	return surfaceFormat;
+}
+
+// extent comes from SwapchainExtentForOutput for these caps.
+static VkResult vulkan_make_swapchain( VulkanOutput_t *pOutput, const VkSurfaceCapabilitiesKHR &caps, VkExtent2D extent )
+{
+	pOutput->surfaceCaps = caps;
+	VkResult nResult;
+
+	uint32_t imageCount = caps.minImageCount + 1;
+	const uint32_t surfaceFormat = vulkan_find_swapchain_format( pOutput );
+	if ( surfaceFormat == pOutput->surfaceFormats.size() )
+		return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
 	VkFormat eVkFormat = pOutput->surfaceFormats[ surfaceFormat ].format;
 	pOutput->uOutputFormat = VulkanFormatToDRM( pOutput->surfaceFormats[ surfaceFormat ].format );
@@ -4817,26 +5288,32 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
 		.minImageCount = imageCount,
 		.imageFormat = eVkFormat,
 		.imageColorSpace = pOutput->surfaceFormats[surfaceFormat].colorSpace,
-		.imageExtent = {
-			.width = g_nOutputWidth,
-			.height = g_nOutputHeight,
-		},
+		.imageExtent = extent,
 		.imageArrayLayers = 1,
 		.imageUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 		.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
 		.preTransform = pOutput->surfaceCaps.currentTransform,
 		.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-		.presentMode = VK_PRESENT_MODE_FIFO_KHR,
+		.presentMode = k_eSwapchainPresentMode,
 		.clipped = VK_TRUE,
 	};
 
-	if (g_device.vk.CreateSwapchainKHR( g_device.device(), &createInfo, nullptr, &pOutput->swapChain) != VK_SUCCESS ) {
-		return false;
+	nResult = g_device.vk.CreateSwapchainKHR( g_device.device(), &createInfo, nullptr, &pOutput->swapChain );
+	if ( nResult != VK_SUCCESS )
+	{
+		pOutput->swapChain = VK_NULL_HANDLE;
+		return nResult;
 	}
 
-	g_device.vk.GetSwapchainImagesKHR( g_device.device(), pOutput->swapChain, &imageCount, nullptr );
+	nResult = g_device.vk.GetSwapchainImagesKHR( g_device.device(), pOutput->swapChain, &imageCount, nullptr );
+	if ( nResult != VK_SUCCESS )
+		return nResult;
+	if ( imageCount == 0 )
+		return VK_ERROR_INITIALIZATION_FAILED;
 	std::vector<VkImage> swapchainImages( imageCount );
-	g_device.vk.GetSwapchainImagesKHR( g_device.device(), pOutput->swapChain, &imageCount, swapchainImages.data() );
+	nResult = g_device.vk.GetSwapchainImagesKHR( g_device.device(), pOutput->swapChain, &imageCount, swapchainImages.data() );
+	if ( nResult != VK_SUCCESS )
+		return nResult;
 
 	pOutput->outputImages.resize(imageCount);
 
@@ -4844,38 +5321,78 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
 	{
 		pOutput->outputImages[i] = new CVulkanTexture();
 
-		if ( !pOutput->outputImages[i]->BInitFromSwapchain(swapchainImages[i], g_nOutputWidth, g_nOutputHeight, eVkFormat))
-			return false;
+		if ( !pOutput->outputImages[i]->BInitFromSwapchain(swapchainImages[i], extent.width, extent.height, eVkFormat, &nResult ) )
+			return nResult;
 	}
 
 	VkFenceCreateInfo fenceInfo = {
 		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
 	};
 
-	g_device.vk.CreateFence( g_device.device(), &fenceInfo, nullptr, &pOutput->acquireFence );
+	nResult = g_device.vk.CreateFence( g_device.device(), &fenceInfo, nullptr, &pOutput->acquireFence );
+	if ( nResult != VK_SUCCESS )
+		return nResult;
 
-	vulkan_update_swapchain_hdr_metadata(pOutput);
-
-	return true;
+	return VK_SUCCESS;
 }
 
-bool vulkan_remake_swapchain( void )
+// Also the initial creation. Ready iff a swapchain of the published output size
+// exists. NotPresentable: the surface cannot back that size yet (the old
+// swapchain is kept, never acquired from), or the output failed; Transient: the
+// result has been classified and a retry arranged.
+static gamescope::SwapchainImage_t vulkan_remake_swapchain()
 {
-	std::unique_lock lock(present_wait_lock);
-	g_currentPresentWaitId = 0;
-	g_currentPresentWaitId.notify_all();
-
 	VulkanOutput_t *pOutput = &g_output;
-	g_device.waitIdle();
-	g_device.vk.QueueWaitIdle( g_device.queue() );
-	// Nothing still pending on the old swapchain will ever complete; retire the
-	// tags rather than orphan them.
-	framegen_flush_present_wait_tags();
-	vulkan_framegen_reset( "swapchain_remake" );
+	// The SDL thread publishes the output size; read it once.
+	const uint32_t uWidth = g_nOutputWidth;
+	const uint32_t uHeight = g_nOutputHeight;
+
+	// The surface size changes with the window, so every (re)creation re-queries it.
+	VkSurfaceCapabilitiesKHR caps = {};
+	if ( !vulkan_handle_swapchain_result( "surface query",
+		g_device.vk.GetPhysicalDeviceSurfaceCapabilitiesKHR( g_device.physDev(), pOutput->surface, &caps ) ) )
+		return vulkan_swapchain_failure();
+
+	// Waiting for the window costs no drain, reset or budget. A map, an SDL
+	// expose or size publish, or the compositor's size check retries.
+	const std::optional<VkExtent2D> oExtent = gamescope::SwapchainExtentForOutput( caps, uWidth, uHeight );
+	if ( !oExtent )
+	{
+		if ( g_SwapchainRecovery.NoteNotPresentable( get_time_in_nanos() ) )
+		{
+			vk_log.infof( "swapchain: surface %ux%u cannot back output %ux%u; waiting",
+				caps.currentExtent.width, caps.currentExtent.height, uWidth, uHeight );
+		}
+		return gamescope::SwapchainImage_t::NotPresentable;
+	}
+
+	g_nPendingSwapchainRemakes++;
+	std::unique_lock lock(present_wait_lock);
+	g_nPendingSwapchainRemakes--;
+	g_currentPresentWaitId = 0;
+	g_ulPresentWaitSwapchainGeneration++;
+
+	// Without a swapchain nothing references its images (init, or a failed
+	// creation), so there is nothing to drain or retire.
+	if ( pOutput->swapChain != VK_NULL_HANDLE )
+	{
+		g_device.waitIdle();
+		g_device.vk.QueueWaitIdle( g_device.queue() );
+		// Nothing still pending on the old swapchain will ever complete; retire the
+		// tags rather than orphan them.
+		framegen_flush_present_wait_tags( false );
+		vulkan_framegen_reset( "swapchain_remake" );
+	}
 
 	pOutput->outputImages.clear();
 
+	// Each replacement allocates a fresh acquire fence. The queue drain above
+	// also retires its use, so repeated recovery must release the old handle.
+	g_device.vk.DestroyFence( g_device.device(), pOutput->acquireFence, nullptr );
+	pOutput->acquireFence = VK_NULL_HANDLE;
 	g_device.vk.DestroySwapchainKHR( g_device.device(), pOutput->swapChain, nullptr );
+	pOutput->swapChain = VK_NULL_HANDLE;
+	pOutput->swapchainHDRMetadata = nullptr; // it belonged to the destroyed swapchain
 
 	// Delete screenshot/capture textures to be remade if needed
 	for (auto& pScreenshotTexture : pOutput->pScreenshotTextures)
@@ -4883,9 +5400,25 @@ bool vulkan_remake_swapchain( void )
 	for (auto& pCaptureTexture : pOutput->pCaptureTextures)
 		pCaptureTexture = nullptr;
 
-	bool bRet = vulkan_make_swapchain( pOutput );
-	assert( bRet ); // Something has gone horribly wrong!
-	return bRet;
+	const VkResult nResult = vulkan_make_swapchain( pOutput, caps, *oExtent );
+	if ( nResult == VK_SUCCESS )
+	{
+		std::scoped_lock tagLock( present_tag_lock );
+		if ( g_bPresentWaitFailed )
+		{
+			g_bPresentWaitFailed = false;
+			vk_log.infof( "present_wait: re-enabled after swapchain recreation" );
+		}
+		g_bPresentWaitRemakeRequested = false;
+	}
+	present_wait_wake();
+	// A terminal result takes this lock to request shutdown.
+	lock.unlock();
+
+	if ( !vulkan_handle_swapchain_result( "swapchain creation", nResult ) )
+		return vulkan_swapchain_failure();
+	vulkan_note_swapchain_progress( g_SwapchainRecovery.NoteCreated( *oExtent ) );
+	return gamescope::SwapchainImage_t::Ready;
 }
 
 // The classic output ring is 3 (ping/pong plus one for partial composition).
@@ -4984,6 +5517,8 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 
 bool vulkan_remake_output_images()
 {
+	if ( g_bVulkanOutputFailed )
+		return false;
 	VulkanOutput_t *pOutput = &g_output;
 	g_device.waitIdle();
 	vulkan_framegen_reset( "output_images_remade" );
@@ -4997,7 +5532,12 @@ bool vulkan_remake_output_images()
 		pCaptureTexture = nullptr;
 
 	bool bRet = vulkan_make_output_images( pOutput );
-	assert( bRet );
+	if ( !bRet )
+	{
+		std::scoped_lock lock( present_wait_lock );
+		vk_log.errorf( "output image recreation failed; requesting shutdown" );
+		vulkan_request_output_shutdown();
+	}
 	return bRet;
 }
 
@@ -5009,13 +5549,6 @@ bool vulkan_make_output()
 	
 	if ( GetBackend()->UsesVulkanSwapchain() )
 	{
-		result = g_device.vk.GetPhysicalDeviceSurfaceCapabilitiesKHR( g_device.physDev(), pOutput->surface, &pOutput->surfaceCaps );
-		if ( result != VK_SUCCESS )
-		{
-			vk_errorf( result, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed" );
-			return false;
-		}
-		
 		uint32_t formatCount = 0;
 		result = g_device.vk.GetPhysicalDeviceSurfaceFormatsKHR( g_device.physDev(), pOutput->surface, &formatCount, nullptr );
 		if ( result != VK_SUCCESS )
@@ -5052,11 +5585,19 @@ bool vulkan_make_output()
 			}
 		}
 		
-		if ( !vulkan_make_swapchain( pOutput ) )
-			return false;
+		// Output-format readers need it even while the first creation waits.
+		const uint32_t surfaceFormat = vulkan_find_swapchain_format( pOutput );
+		if ( surfaceFormat < pOutput->surfaceFormats.size() )
+			pOutput->uOutputFormat = VulkanFormatToDRM( pOutput->surfaceFormats[ surfaceFormat ].format );
 
-		while ( !acquire_next_image() )
-			vulkan_remake_swapchain();
+		// Initial creation classifies exactly like a remake: only a terminal
+		// failure fails init. Anything else is retried by the first composite.
+		if ( vulkan_acquire_swapchain_image( true ) != gamescope::SwapchainImage_t::Ready
+			&& g_bVulkanOutputFailed )
+		{
+			vk_log.errorf( "cannot create the initial swapchain; initialization failed" );
+			return false;
+		}
 	}
 	else
 	{
@@ -5185,8 +5726,8 @@ bool vulkan_init( VkInstance instance, VkSurfaceKHR surface )
 
 	if ( GetBackend()->UsesVulkanSwapchain() )
 	{
-		std::thread present_wait_thread( present_wait_thread_func );
-		present_wait_thread.detach();
+		std::scoped_lock lock( present_wait_thread_lock );
+		g_PresentWaitThread = std::jthread( present_wait_thread_func );
 	}
 
 	s_bInitted = true;
@@ -5683,7 +6224,7 @@ struct FramegenMotionResources_t
 	// fields above as scratch, so these are the only extra allocations.
 	gamescope::OwningRc<CVulkanTexture> mvFieldFwd;
 	gamescope::OwningRc<CVulkanTexture> mvFieldRev;
-	// Bidirectional interpolation (B3, only when active): the CHECKED reverse
+	// Bidirectional interpolation (only when active): the CHECKED reverse
 	// field the bidir warp gathers the previous frame along. The raw reverse
 	// field above is a check INPUT and stays as-is; this is the symmetric
 	// check's output (reverse vectors whose round trip through the forward
@@ -5715,7 +6256,7 @@ struct FramegenMotionResources_t
 	gamescope::OwningRc<CVulkanTexture> lumaReservoir[2];
 	uint64_t uLumaReservoirFrameId[2] = {};
 	bool bLumaReservoirAllocTried = false;
-	// Self-supervised adaptation (B4): the 96x1 R32_UINT counter image the
+	// Self-supervised adaptation: the 96x1 R32_UINT counter image the
 	// stats probe atomically accumulates into (applied to the motion field in
 	// the same batch), and its host-mapped linear copy the CPU parses one batch
 	// later to auto-calibrate thresholds. 384 bytes
@@ -5723,7 +6264,7 @@ struct FramegenMotionResources_t
 	// bind the accumulator unconditionally.
 	gamescope::OwningRc<CVulkanTexture> statsAccum;
 	gamescope::OwningRc<CVulkanTexture> statsReadback;
-	// Learned field refinement (Stage C, only with a loaded weights blob): the
+	// Learned field refinement (only with a loaded weights blob): the
 	// net's refined copies of both checked fields (a conv reads an apron of
 	// raw neighbors, so refinement can never be in place — see
 	// framegen_motion_field()), the sampled weight texture and the host-
@@ -5738,7 +6279,7 @@ struct FramegenMotionResources_t
 	gamescope::OwningRc<CVulkanTexture> netWeightsUpload;
 	bool bNetWeightsUploaded = false;
 	bool bNetAllocTried = false;
-	// In-situ learning (C2, only with GAMESCOPE_FRAMEGEN_NET_ONLINE): the
+	// In-situ learning (only with GAMESCOPE_FRAMEGEN_NET_ONLINE): the
 	// immutable prior the fast weights decay toward, the optimizer state
 	// (fast weights / Adam m / Adam v / served EMA, one row each), the
 	// per-tile gradient slices the training pass writes and the optimizer
@@ -5774,7 +6315,7 @@ struct FramegenMotionResources_t
 static FramegenMotionResources_t g_framegenMotion;
 static constexpr uint32_t k_uFramegenMotionDownscale = 8;
 
-// Full-colour held-out validation (Gap E2). In capture mode, endpoint frames
+// Full-colour held-out validation. In capture mode, endpoint frames
 // A/C and one exact intermediate reference B are retained; B is hidden from the
 // estimator, and three paired predictions of B from A/C are copied beside exact
 // B into host-visible images. The default offset/span is the consecutive A/B/C
@@ -5906,15 +6447,23 @@ static constexpr uint64_t k_ulFramegenMetricsWindowNs = 5'000'000'000ull;
 // commit lead), which cannot plausibly run past the range without the sample
 // already being rejected upstream.
 using FramegenMetricsDistribution_t = gamescope::framegen::MetricsDistribution;
-// 250 us x 256 = 64 ms full scale, same resolution: wall-clock presentation
-// latency. A 60 Hz flip interval is 16.67 ms on its own, so the narrow
+// 250 us x 256 = 64 ms full scale, same resolution: wall-clock flip intervals.
+// A 60 Hz flip interval is 16.67 ms on its own, so the narrow
 // distribution reported exactly 16.00 for these and hid the real tail.
 using FramegenMetricsLatencyDistribution_t = gamescope::framegen::MetricsLatencyDistribution;
+// 1 ms x 256 = 256 ms full scale: real-frame -> flip latency, which includes a
+// delayed real's whole bidir delay.
+using FramegenMetricsSourceLatencyDistribution_t = gamescope::framegen::MetricsSourceLatencyDistribution;
 
 struct FramegenMetricsWindow_t
 {
 	uint64_t real = 0, generated = 0, delayedReal = 0, repeats = 0;
 	uint64_t discards = 0, slowDrops = 0, admissionSkips = 0, resets = 0;
+	// Queued real frames dropped before they were shown, and bidir timelines
+	// re-primed (the delay changed, or a backlog was superseded).
+	uint64_t droppedReals = 0, reprimes = 0;
+	// The longest bidir delay D planned with (0: none).
+	uint64_t bidirDelayNsMax = 0;
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 	uint64_t resetsRing = 0, resetsChain = 0;
 	// Feedback that arrived as "discarded" (window hidden/occluded at the host):
@@ -5943,14 +6492,19 @@ struct FramegenMetricsWindow_t
 	FramegenMetricsLatencyDistribution_t flipIntervals;
 	FramegenMetricsDistribution_t deadlineErrors;
 	FramegenMetricsDistribution_t realCommitLeads;
-	// Source-ready -> actual-flip latency of REAL presents: how long a client
-	// frame waited between being acquirable and actually reaching the screen.
-	FramegenMetricsLatencyDistribution_t realSourceToFlip;
+	// Live reals: source-ready -> actual flip, how long a client frame waited
+	// between being acquirable and actually reaching the screen. Delayed (bidir)
+	// reals: record -> actual flip, the bidir delay alone, to compare with the
+	// source interval.
+	FramegenMetricsSourceLatencyDistribution_t realSourceToFlip;
+	FramegenMetricsSourceLatencyDistribution_t delayedRealRecordToFlip;
 };
 
 struct FramegenMetricsPendingEvents_t
 {
 	uint64_t repeats = 0, discards = 0, slowDrops = 0, admissionSkips = 0, resets = 0;
+	uint64_t droppedReals = 0, reprimes = 0;
+	uint64_t bidirDelayNsMax = 0;
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 	uint64_t resetsRing = 0, resetsChain = 0;
 	uint64_t realWaits = 0;
@@ -5973,17 +6527,9 @@ struct FramegenMetricsState_t
 };
 static FramegenMetricsState_t g_framegenMetrics;
 
-static void framegen_metrics_shutdown();
-
 static bool framegen_metrics_enabled()
 {
-	static const bool s_bEnabled = []()
-	{
-		const bool bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_METRICS" ) );
-		if ( bEnabled )
-			atexit( framegen_metrics_shutdown );
-		return bEnabled;
-	}();
+	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_METRICS" ) );
 	return s_bEnabled;
 }
 
@@ -5994,6 +6540,9 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	window.discards += events.discards;
 	window.slowDrops += events.slowDrops;
 	window.admissionSkips += events.admissionSkips;
+	window.droppedReals += events.droppedReals;
+	window.reprimes += events.reprimes;
+	window.bidirDelayNsMax = std::max( window.bidirDelayNsMax, events.bidirDelayNsMax );
 	window.resets += events.resets;
 	window.resetsCut += events.resetsCut;
 	window.resetsGrid += events.resetsGrid;
@@ -6036,17 +6585,19 @@ static void framegen_metrics_flush_events()
 	g_framegenMetricsPendingEvents = {};
 }
 
-// Source-ready timestamps of in-flight real frames, keyed by the present tag's
-// real frame id. The tag itself is a backend ABI struct, so the timestamp is
-// carried alongside it here instead. Written from the compositor thread when a
-// real present begins and read when its flip feedback is drained on the same
-// thread; the ring is sized well past the display feedback mailbox depth so a
-// late flip still finds its entry.
+// Source-ready and record timestamps of in-flight real frames, keyed by the
+// present tag's real frame id. The tag itself is a backend ABI struct, so the
+// timestamps are carried alongside it here instead. Written from the compositor
+// thread when a real present begins and read when its flip feedback is drained
+// on the same thread; the ring is sized well past the display feedback mailbox
+// depth so a late flip still finds its entry. The record time is the first
+// paint of the id: a repeat paint of the same content keeps it.
 static constexpr size_t k_nFramegenSourceReadyRing = 64;
 struct FramegenSourceReadyEntry_t
 {
 	uint64_t ulRealFrameId = 0;
 	uint64_t ulSourceReadyNs = 0;
+	uint64_t ulRecordNs = 0;
 };
 static std::array<FramegenSourceReadyEntry_t, k_nFramegenSourceReadyRing>
 	g_framegenSourceReadyRing;
@@ -6055,15 +6606,21 @@ static void framegen_metrics_note_source_ready( uint64_t ulRealFrameId, uint64_t
 {
 	if ( ulRealFrameId == 0 || ulSourceReadyNs == 0 )
 		return;
-	g_framegenSourceReadyRing[ ulRealFrameId % k_nFramegenSourceReadyRing ] =
-		{ ulRealFrameId, ulSourceReadyNs };
+	FramegenSourceReadyEntry_t &entry =
+		g_framegenSourceReadyRing[ ulRealFrameId % k_nFramegenSourceReadyRing ];
+	if ( entry.ulRealFrameId != ulRealFrameId )
+	{
+		entry.ulRealFrameId = ulRealFrameId;
+		entry.ulRecordNs = get_time_in_nanos();
+	}
+	entry.ulSourceReadyNs = ulSourceReadyNs;
 }
 
-static uint64_t framegen_metrics_find_source_ready( uint64_t ulRealFrameId )
+static const FramegenSourceReadyEntry_t *framegen_metrics_find_source_ready( uint64_t ulRealFrameId )
 {
 	const FramegenSourceReadyEntry_t &entry =
 		g_framegenSourceReadyRing[ ulRealFrameId % k_nFramegenSourceReadyRing ];
-	return entry.ulRealFrameId == ulRealFrameId ? entry.ulSourceReadyNs : 0u;
+	return entry.ulRealFrameId == ulRealFrameId ? &entry : nullptr;
 }
 
 // Share of presents that carried fresh content rather than repeating the
@@ -6081,7 +6638,8 @@ static void framegen_metrics_log( const char *pszLabel,
 	const FramegenMetricsLatencyDistribution_t &flip = window.flipIntervals;
 	const FramegenMetricsDistribution_t &deadline = window.deadlineErrors;
 	const FramegenMetricsDistribution_t &lead = window.realCommitLeads;
-	const FramegenMetricsLatencyDistribution_t &srcFlip = window.realSourceToFlip;
+	const FramegenMetricsSourceLatencyDistribution_t &srcFlip = window.realSourceToFlip;
+	const FramegenMetricsSourceLatencyDistribution_t &delayedFlip = window.delayedRealRecordToFlip;
 	const uint64_t ulVblankIntervalNs =
 		g_framegenPresentState.displayTiming.key.intervalNs;
 	const gamescope::framegen::FixedRefreshPresentLead_t viableLead =
@@ -6102,7 +6660,10 @@ static void framegen_metrics_log( const char *pszLabel,
 		// Appended fields. New fields go at the END of this line so existing
 		// log parsers keep working; never reorder the ones above.
 		" fill=%.3f copy_bytes=%" PRIu64 " copy_ms_avg=%.3f copy_ms_max=%.3f"
-		" src_flip_ms_p50=%.3f src_flip_ms_p95=%.3f",
+		" src_flip_ms_p50=%.3f src_flip_ms_p95=%.3f"
+		" reprime=%" PRIu64 " dreal_drop=%" PRIu64 " src_flip_ms_p90=%.3f"
+		" src_flip_ms_fs=%.3f dreal_flip_ms_p50=%.3f dreal_flip_ms_p90=%.3f"
+		" dreal_flip_ms_p95=%.3f dreal_flip_ms_fs=%.3f bidir_delay_ms=%.3f",
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -6128,7 +6689,12 @@ static void framegen_metrics_log( const char *pszLabel,
 		window.copyGpuSamples != 0
 			? (double)window.copyGpuNsSum / (double)window.copyGpuSamples / 1.0e6 : 0.0,
 		(double)window.copyGpuNsMax / 1.0e6,
-		srcFlip.p50(), srcFlip.p95() );
+		srcFlip.p50(), srcFlip.p95(),
+		window.reprimes, window.droppedReals, srcFlip.percentile( 90u ),
+		FramegenMetricsSourceLatencyDistribution_t::k_flFullScaleMs,
+		delayedFlip.p50(), delayedFlip.percentile( 90u ), delayedFlip.p95(),
+		FramegenMetricsSourceLatencyDistribution_t::k_flFullScaleMs,
+		window.bidirDelayNsMax / 1.0e6 );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
@@ -6167,24 +6733,35 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 			case gamescope::FramegenPresentKind_t::Real: window.real++; break;
 			case gamescope::FramegenPresentKind_t::Generated: window.generated++; break;
 			case gamescope::FramegenPresentKind_t::DelayedReal: window.delayedReal++; break;
+			// The held image flipped again: no new content.
+			case gamescope::FramegenPresentKind_t::Hold: window.repeats++; break;
 		}
 	};
 	addKind( g_framegenMetrics.current );
 	addKind( g_framegenMetrics.total );
 	if ( !feedback.bTimestampValid )
 		return;
+	if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real
+		|| feedback.tag.eKind == gamescope::FramegenPresentKind_t::DelayedReal )
+	{
+		// Latency of the real frame the client actually produced, to the moment
+		// it lit up the display: a live real from when its buffer was
+		// acquirable, a delayed real from its record, so the bidir delay is
+		// measured without the source-ready -> record wait live reals also have.
+		const FramegenSourceReadyEntry_t *pEntry =
+			framegen_metrics_find_source_ready( feedback.tag.ulRealFrameId );
+		const bool bDelayed = feedback.tag.eKind == gamescope::FramegenPresentKind_t::DelayedReal;
+		const uint64_t ulFromNs = pEntry == nullptr ? 0u
+			: bDelayed ? pEntry->ulRecordNs : pEntry->ulSourceReadyNs;
+		if ( ulFromNs != 0 && feedback.ulActualFlipNs > ulFromNs )
+		{
+			const uint64_t ulLatencyNs = feedback.ulActualFlipNs - ulFromNs;
+			for ( FramegenMetricsWindow_t *pWindow : { &g_framegenMetrics.current, &g_framegenMetrics.total } )
+				( bDelayed ? pWindow->delayedRealRecordToFlip : pWindow->realSourceToFlip ).add( ulLatencyNs );
+		}
+	}
 	if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real )
 	{
-		// Latency of the real frame the client actually produced: from the
-		// moment its buffer was acquirable to the moment it lit up the display.
-		const uint64_t ulSourceReadyNs =
-			framegen_metrics_find_source_ready( feedback.tag.ulRealFrameId );
-		if ( ulSourceReadyNs != 0 && feedback.ulActualFlipNs > ulSourceReadyNs )
-		{
-			const uint64_t ulLatencyNs = feedback.ulActualFlipNs - ulSourceReadyNs;
-			g_framegenMetrics.current.realSourceToFlip.add( ulLatencyNs );
-			g_framegenMetrics.total.realSourceToFlip.add( ulLatencyNs );
-		}
 		gamescope::IBackend *pBackend = GetBackend();
 		if ( pBackend != nullptr && pBackend->OwnsKMSPresentTiming() )
 		{
@@ -6262,6 +6839,13 @@ void vulkan_framegen_metrics_note_real_wait()
 }
 
 static void framegen_metrics_note_discard( uint64_t n ) { g_framegenMetricsPendingEvents.discards += n; }
+static void framegen_metrics_note_dropped_real( uint64_t n ) { g_framegenMetricsPendingEvents.droppedReals += n; }
+static void framegen_metrics_note_reprime() { g_framegenMetricsPendingEvents.reprimes++; }
+static void framegen_metrics_note_bidir_delay( uint64_t ulDelayNs )
+{
+	g_framegenMetricsPendingEvents.bidirDelayNsMax =
+		std::max( g_framegenMetricsPendingEvents.bidirDelayNsMax, ulDelayNs );
+}
 static void framegen_metrics_note_slow_drop( uint64_t n ) { g_framegenMetricsPendingEvents.slowDrops += n; }
 static void framegen_metrics_note_admission_skip() { g_framegenMetricsPendingEvents.admissionSkips++; }
 enum class FramegenResetReason_t : uint8_t
@@ -6293,7 +6877,6 @@ static void framegen_metrics_note_chain_reset( FramegenResetReason_t reason )
 }
 
 static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback );
-static void framegen_apply_bidir_flip_feedback( const DisplayFeedback_t &feedback );
 static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback );
 
 struct FramegenShadowDecision_t
@@ -6305,7 +6888,7 @@ struct FramegenShadowDecision_t
 	bool bDiscardedByFeedback = false;
 };
 
-// Step 2 is deliberately one-way: this state reads live measurements, but no
+// The shadow is deliberately one-way: this state reads live measurements, but no
 // live pacing, submission, or presentation path reads it. Keeping the ring
 // fixed-size also makes the shadow path allocation-free.
 static constexpr size_t k_nFramegenShadowDecisionCapacity = 8;
@@ -6412,6 +6995,15 @@ static bool framegen_observe_display_chain( uint64_t ulIntervalNs,
 	return bSourceTimestampsReliable;
 }
 
+// A commit framegen scheduled itself: a generated frame, or the held image
+// flipped again at a scheduled opportunity. Its lead is the scheduler's own
+// margin, never a real commit's.
+static bool framegen_kind_is_generated_commit( gamescope::FramegenPresentKind_t eKind )
+{
+	return eKind == gamescope::FramegenPresentKind_t::Generated
+		|| eKind == gamescope::FramegenPresentKind_t::Hold;
+}
+
 static uint64_t framegen_next_present_slot_id()
 {
 	return ++g_framegenPresentState.ulLastSlotId;
@@ -6445,8 +7037,18 @@ static void framegen_select_present_tag( gamescope::FramegenPresentKind_t eKind,
 	tag.ulCommitSubmitNs = 0;
 }
 
+// Present tags and feedback exist for framegen, and for the opt-in metrics
+// (which also give the framegen-OFF baseline). Constant after init, so framegen
+// OFF without metrics does no per-frame present bookkeeping.
+static bool framegen_present_tracking_enabled()
+{
+	return vulkan_framegen_is_enabled() || framegen_metrics_enabled();
+}
+
 void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
 {
+	if ( !framegen_present_tracking_enabled() )
+		return;
 	const CVulkanTexture *pBaseTexture = pFrameInfo != nullptr && pFrameInfo->layerCount > 0
 		? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
 	const gamescope::framegen::RealFrameIdentity_t identity = {
@@ -6501,6 +7103,9 @@ void vulkan_framegen_note_present_composite_seqno( uint64_t ulCompositeSeqNo )
 
 gamescope::FramegenPresentTag_t vulkan_framegen_take_present_tag()
 {
+	// Token 0: drain ignores the tag's feedback.
+	if ( !framegen_present_tracking_enabled() )
+		return {};
 	if ( !g_framegenPresentState.bTagPending )
 		framegen_select_present_tag( gamescope::FramegenPresentKind_t::Real,
 			g_framegenPresentState.ulCurrentRealFrameId, 0, 0, 0 );
@@ -6512,6 +7117,8 @@ gamescope::FramegenPresentTag_t vulkan_framegen_take_present_tag()
 void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentTag_t &tag,
 	uint64_t ulActualFlipNs, uint64_t ulBackendSequence, bool bPresented, bool bTimestampValid )
 {
+	if ( !framegen_present_tracking_enabled() )
+		return;
 	std::scoped_lock lock( g_displayFeedbackMailbox.mutex );
 	if ( g_displayFeedbackMailbox.nCount == k_nDisplayFeedbackMailboxCapacity )
 	{
@@ -6534,6 +7141,8 @@ void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentT
 
 void vulkan_framegen_drain_present_feedback()
 {
+	if ( !framegen_present_tracking_enabled() )
+		return;
 	const bool bMetricsLoggingEnabled = framegen_metrics_enabled();
 	const bool bMetricsCollectionEnabled = bMetricsLoggingEnabled
 		|| framegen_hud_level() != 0u;
@@ -6572,7 +7181,7 @@ void vulkan_framegen_drain_present_feedback()
 			gamescope::IBackend *pBackend = GetBackend();
 			if ( pBackend != nullptr && pBackend->OwnsKMSPresentTiming() )
 			{
-				if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Generated
+				if ( framegen_kind_is_generated_commit( feedback.tag.eKind )
 					&& feedback.tag.ulTargetFlipNs != 0u
 					&& feedback.tag.ulCommitSubmitNs != 0u )
 				{
@@ -6640,7 +7249,7 @@ void vulkan_framegen_drain_present_feedback()
 				// feeding that controlled lead back into the learner would teach
 				// it its own margin. Native KMS learns only from real commits and
 				// rejects the first post-hitch/outlier observation.
-				if ( feedback.tag.eKind != gamescope::FramegenPresentKind_t::Generated )
+				if ( !framegen_kind_is_generated_commit( feedback.tag.eKind ) )
 				{
 					gamescope::framegen::DisplayChainTimingState_t &timing =
 						g_framegenPresentState.displayTiming;
@@ -6692,11 +7301,11 @@ void vulkan_framegen_drain_present_feedback()
 			}
 		}
 
+		// A delayed real's flip feeds metrics and the lead learner above only:
+		// the bidir translation is fixed per establishment, and the anchor and
+		// VRR paths below are for live reals.
 		if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::DelayedReal )
-		{
-			framegen_apply_bidir_flip_feedback( feedback );
 			continue;
-		}
 
 		// A discarded real completion is still identity-bearing cancellation
 		// evidence for VRR; no timestamp-based anchor correction is possible.
@@ -6716,13 +7325,11 @@ void vulkan_framegen_drain_present_feedback()
 				feedback.tag.ulRealFrameId, flErrorMs );
 		}
 
-		// Preserve the Step 2 shadow ring for A/B logging, then apply the same
+		// Record the sample in the shadow ring for its debug log, then apply the same
 		// correlated record to the live causal anchor below. Other policies apply
 		// their typed feedback through the handlers above.
-		const uint64_t ulArrivalGuardNs = std::max(
-			gamescope::framegen::k_ulCadenceArrivalGuardMinNs,
-			g_framegenDeadlineShadow.ulGridIntervalNs
-				/ gamescope::framegen::k_uCadenceArrivalGuardDivisor );
+		const uint64_t ulArrivalGuardNs = gamescope::framegen::cadence_arrival_guard_ns(
+			g_framegenDeadlineShadow.ulGridIntervalNs );
 		const gamescope::framegen::AnchorCorrection_t correction =
 			gamescope::framegen::apply_flip_feedback(
 				g_framegenDeadlineShadow.anchor,
@@ -6777,8 +7384,8 @@ struct FramegenHistory_t
 
 	// Generated frames waiting for their empty vblanks, presented front-first,
 	// one per vblank. Depth is multiplier-1 (x2 -> 1, x4 -> 3). Drained
-	// wholesale the moment a real frame supersedes them — EXCEPT in bidir mode
-	// (B3), where the queue IS the presentation timeline: interpolated slots
+	// wholesale the moment a real frame supersedes them — EXCEPT in bidir mode,
+	// where the queue IS the presentation timeline: interpolated slots
 	// precede the real frame they lead up to (bReal entries), and a new real
 	// frame appends behind them instead of superseding.
 	struct PendingGenerated_t
@@ -6790,7 +7397,12 @@ struct FramegenHistory_t
 		uint64_t ulSlotId = 0;
 		uint64_t ulCompositeSeqNo = 0;
 		uint64_t ulTargetFlipNs = 0;
+		// Bidir: a planned real's display time on its translation (0: none).
+		uint64_t ulIdealFlipNs = 0;
 		uint64_t ulWakeDeadlineNs = 0;
+		// Raw vblank of a nested fixed-grid causal slot; see framegen_front_due.
+		std::optional<uint64_t> oTargetVBlankNs;
+		uint64_t ulSubmitNs = 0;
 		uint64_t ulAnchorRealFrameId = 0;
 		float phase = 0.0f; // fraction of the real-frame interval, for logs
 		bool bProvisional = false;
@@ -6799,6 +7411,7 @@ struct FramegenHistory_t
 		// the framegen timeline = always ready) and it must never be dropped
 		// by the generated-frame discard paths.
 		bool bReal = false;
+		bool bQueuedBehind = false; // queued by QueueBehind, outside the plan
 		// Output-space cursor split: both history endpoints this frame was
 		// predicted from were cursor-free composites, so the live cursor still
 		// has to be composited on top at present time. Carried per entry (not
@@ -6815,7 +7428,7 @@ struct FramegenHistory_t
 	uint64_t currentFrameId = 0;
 	uint64_t previousPresentTimeNs = 0;
 	uint64_t currentPresentTimeNs = 0;
-	// Default display-clock pacing (#06). cadence learns source-buffer readiness
+	// Default display-clock pacing. cadence learns source-buffer readiness
 	// from acquire-fence completion times, before fixed-refresh quantization. Its
 	// bounded trend predicts smooth rate changes and its one-sided late envelope
 	// decides whether the next display slot needs a speculative backup. Backends
@@ -6827,7 +7440,7 @@ struct FramegenHistory_t
 	uint64_t ulCurrentCadenceTimeNs = 0;
 	bool bCadenceUsesSourceTime = false;
 	uint64_t ulCurrentRealVblankNs = 0;
-	// Step 3 causal fixed-refresh state. The provisional anchor is installed
+	// Causal fixed-refresh state. The provisional anchor is installed
 	// when the real composite records; correlated flip feedback replaces it in
 	// this same object and may invalidate pixels already generated from it.
 	gamescope::framegen::RealAnchorState_t causalAnchor;
@@ -6839,35 +7452,23 @@ struct FramegenHistory_t
 	bool bDeadlineSourceTimestampsReliable = false;
 	bool bCausalDeadlineMissed = false;
 	gamescope::framegen::DeadlineMissState_t causalDeadlineMisses;
-	// Fixed-delay bidirectional timeline. Epoch feedback mutates only this
-	// mapping; queued slot targets remain immutable values. Source records are
-	// retained until their tagged delayed-real completion can correct the epoch.
-	gamescope::framegen::BidirEpoch_t bidirEpoch;
+	// Fixed-delay bidirectional timeline (plan_bidir_step). The source/display
+	// translation is set when the timeline is (re-)established and never moved by
+	// flip feedback; queued slot targets are immutable values.
+	gamescope::framegen::BidirTimelineState_t bidir;
 	gamescope::framegen::BidirCutEpisodeState_t bidirCutEpisode;
-	uint64_t ulBidirGridEpoch = 0;
+	// What the translation was established under; a change invalidates it.
 	uint64_t ulBidirGridIntervalNs = 0;
 	uint64_t ulBidirDisplayChainGeneration = 0;
-	uint64_t ulBidirGridTargetNs = 0;
-	uint64_t ulBidirGridWakeNs = 0;
-	// Gap-limited pending depth the planner last admitted to (one real interval
-	// of display slots plus its closing endpoint, capped by the ring ceiling).
-	// The drain valve compares against this, not against the raw ceiling, so a
-	// queue that is exactly as deep as planned still flips on its own targets.
-	// 0 = no real interval measured yet in this epoch.
-	size_t uBidirPendingTarget = 0;
 	bool bBidirProvenanceInitialized = false;
 	bool bBidirSourceTimestampsReliable = false;
-	struct BidirFeedbackEndpoint_t
-	{
-		gamescope::framegen::BidirEndpoint_t endpoint;
-		uint64_t ulEpoch = 0;
-	};
-	std::vector<BidirFeedbackEndpoint_t> bidirFeedbackEndpoints;
+	// The display opportunity the last queue front was shown at: one queue entry
+	// per opportunity. Cleared with the queue.
+	uint64_t ulBidirLastFrontOpportunityNs = 0;
 	gamescope::Rc<CVulkanTexture> bidirLastOutput;
-	// A first exceptional ring reset retains the newest delayed endpoint for a
-	// visible hold. If even that reset cannot free a composite target, the next
-	// attempt releases the hold too, preventing a compositor-owned failure loop.
-	uint32_t nBidirRingPressureFailures = 0;
+	// The newest real frame that entered the bidir timeline, queued or flipped
+	// live; a new translation never queues it again. Real frame ids only grow.
+	uint64_t ulBidirConsumedFrameId = 0;
 	// VRR midpoint work is not submitted until the correlated Real feedback
 	// establishes its non-grid target and lead-compensated wake deadline.
 	uint64_t ulVrrAwaitingRealFrameId = 0;
@@ -6902,7 +7503,7 @@ struct FramegenHistory_t
 	// re-composite the same game content and must not disturb pacing.
 	const CVulkanTexture *pLastBaseTexture = nullptr;
 	uint64_t ulLastBaseCommitID = 0;
-	// Base-layer mode (#02): history and generation run on the pre-upscale
+	// Base-layer mode: history and generation run on the pre-upscale
 	// game layer; previousReal/currentReal then point into baseHistory[] —
 	// two internally-owned base-sized copies — instead of the output ring.
 	// The client's buffer can't be retained zero-copy: its release back to
@@ -6934,7 +7535,7 @@ struct FramegenHistory_t
 	EOTF eLastEOTF = EOTF_Count;
 	// Consecutive real frames slow enough to leave an empty vblank to fill.
 	uint32_t nStableFrames = 0;
-	// Deadline-driven degradation ladder (#04) position: 0 = full startup config,
+	// Deadline-driven degradation ladder position: 0 = full startup config,
 	// each step sheds work (motion pipelines, then extrapolate, then a
 	// multiplier notch). Never
 	// reaches "stop generating" — that is left to the reactive pacing gate below.
@@ -6945,19 +7546,19 @@ struct FramegenHistory_t
 	uint32_t nDegradeSteps = 0;
 	uint32_t nDegradeHold = 0;
 	gamescope::framegen::RecoveryState_t recovery;
-	// Bidir (B3): set by framegen_record_real_frame when the composite that is
+	// Bidir: set by framegen_record_real_frame when the composite that is
 	// being presented right now queued its real frame behind interpolation
 	// slots; consumed by vulkan_framegen_bidir_flip_texture to substitute the
 	// pending front for the flip. Cleared at the top of every vulkan_composite
 	// so a composite that never records (overlay-only, partial, screenshot)
 	// can't inherit a stale verdict.
 	bool bBidirQueuedReal = false;
-	// Bidir (B3): this composite re-rendered the SAME game frame (overlay-only
+	// Bidir: this composite re-rendered the SAME game frame (overlay-only
 	// repaint). While the queue is draining, its flip must show the queue front
 	// — not the recomposite, whose (newest) game content is still queued and
-	// would present out of order. The overlay update rides the next real frame.
+	// would present out of order. Once the queue has drained it is flipped live.
 	bool bBidirSameBaseComposite = false;
-	// Self-supervised adaptation (B4): slow EMAs of the stats-probe readback
+	// Self-supervised adaptation: slow EMAs of the stats-probe readback
 	// and the threshold values derived from them (applied to the NEXT batch's
 	// push constants). -1 = no sample yet / default. The one-batch-in-flight
 	// guarantee makes the mapped readback race-free: it is only parsed after
@@ -6965,12 +7566,12 @@ struct FramegenHistory_t
 	gamescope::framegen::AdaptationState adaptation;
 	uint64_t ulAdaptStatsSeqNo = 0;      // batch whose probe wrote the readback
 	uint64_t ulAdaptConsumedSeqNo = 0;   // last readback folded into the EMAs
-	// Dataset capture (Stage C): batch whose copies filled the recorder
+	// Dataset capture: batch whose copies filled the recorder
 	// readbacks, and the last one flushed to disk — same one-batch-in-flight
 	// race-freedom argument as the adapt pair above.
 	uint64_t ulNetRecordSeqNo = 0;
 	uint64_t ulNetRecordConsumedSeqNo = 0;
-	// Online-learning profile dump (C2): batch whose copy filled the profile
+	// Online-learning profile dump: batch whose copy filled the profile
 	// readback, and the last one written to the profile file.
 	uint64_t ulNetProfileSeqNo = 0;
 	uint64_t ulNetProfileConsumedSeqNo = 0;
@@ -7053,13 +7654,17 @@ static uint64_t framegen_commit_lead_override_ns()
 {
 	static const uint64_t s_ulOverrideNs = []()
 	{
-		const auto value = gamescope::framegen::parse_finite_float_setting(
-			getenv( "GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS" ) );
-		if ( !value.has_value() || *value <= 0.0f )
+		const float flValue = framegen_setting( "GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS", 0.0f,
+			[]( const char *pszValue ) -> std::optional<float>
+			{
+				const auto flParsed = gamescope::framegen::parse_finite_float_setting( pszValue );
+				return flParsed && *flParsed > 0.0f ? flParsed : std::nullopt;
+			}, "automatic present lead" );
+		if ( flValue == 0.0f )
 			return uint64_t{ 0u };
 
 		constexpr double k_flNsPerMs = 1.0e6;
-		const double flMs = *value;
+		const double flMs = flValue;
 		if ( flMs >= std::numeric_limits<uint64_t>::max() / k_flNsPerMs )
 			return std::numeric_limits<uint64_t>::max();
 		return std::max<uint64_t>( 1u,
@@ -7097,8 +7702,9 @@ static uint64_t framegen_predicted_interval_ns()
 		g_framegenHistory.cadence );
 }
 
+static uint64_t framegen_display_interval_ns();
 static bool framegen_refill_idle();
-static bool framegen_causal_submit( uint64_t ulCompositeSeqNo );
+static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionReplan = false );
 static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps );
 static void framegen_clear_vrr_midpoint_state( bool bClearPending );
 static bool framegen_format_supports_sampled_storage( uint32_t drmFormat );
@@ -7114,8 +7720,10 @@ static const char *framegen_color_record_dir()
 
 static uint32_t framegen_color_record_uint( const char *pszName, uint32_t uDefault, bool bAllowZero )
 {
-	return gamescope::framegen::parse_uint32_setting(
-		getenv( pszName ), bAllowZero ).value_or( uDefault );
+	return framegen_setting( pszName, uDefault, [bAllowZero]( const char *pszValue )
+	{
+		return gamescope::framegen::parse_uint32_setting( pszValue, bAllowZero );
+	} );
 }
 
 static uint32_t framegen_color_record_max()
@@ -7150,9 +7758,12 @@ static uint32_t framegen_color_record_offset()
 	static const uint32_t s_uOffset = []()
 	{
 		const uint32_t uSpan = framegen_color_record_span();
-		const uint32_t uOffset = framegen_color_record_uint(
-			"GAMESCOPE_FRAMEGEN_RECORD_COLOR_OFFSET", 1u, false );
-		return uOffset < uSpan ? uOffset : 1u;
+		return framegen_setting( "GAMESCOPE_FRAMEGEN_RECORD_COLOR_OFFSET", 1u,
+			[uSpan]( const char *pszValue ) -> std::optional<uint32_t>
+			{
+				const auto nValue = gamescope::framegen::parse_uint32_setting( pszValue, false );
+				return nValue && *nValue < uSpan ? nValue : std::nullopt;
+			} );
 	}();
 	return s_uOffset;
 }
@@ -7164,9 +7775,8 @@ static float framegen_color_record_phase_tolerance()
 	// let targeted sweeps reject intervals outside OFFSET/SPAN +/- tolerance.
 	static const float s_flTolerance = []()
 	{
-		const auto value = gamescope::framegen::parse_finite_float_setting(
-			getenv( "GAMESCOPE_FRAMEGEN_RECORD_COLOR_PHASE_TOLERANCE" ) );
-		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 1.0f;
+		return std::clamp( framegen_setting( "GAMESCOPE_FRAMEGEN_RECORD_COLOR_PHASE_TOLERANCE", 1.0f,
+			gamescope::framegen::parse_finite_float_setting ), 0.0f, 1.0f );
 	}();
 	return s_flTolerance;
 }
@@ -7187,9 +7797,9 @@ static FramegenColorProbeSweep framegen_color_record_sweep()
 	return s_eSweep;
 }
 
-// Step 5 deletes this temporary A/B escape hatch together with the classic
-// batch planner. Shared-queue devices continue to use that conservative path
-// regardless because one-slot speculation must not block a real composite.
+// GAMESCOPE_FRAMEGEN_CLASSIC selects the classic batch planner on a dedicated
+// queue. Shared-queue devices always use that conservative path because
+// one-slot speculation must not block a real composite.
 static bool framegen_classic_enabled()
 {
 	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_CLASSIC" ) );
@@ -7204,7 +7814,7 @@ static bool framegen_causal_deadline_enabled()
 	return g_device.hasFramegenQueue() && !framegen_classic_enabled();
 }
 
-// VRR hybrid (#01): instead of suppressing adaptive sync, present real frames
+// VRR hybrid: instead of suppressing adaptive sync, present real frames
 // immediately (full VRR latency win) and show the one generated frame via a
 // timer-armed mid-interval flip. Requires the dedicated framegen queue for the
 // same reason causal deadline scheduling does. "Requested" gates the allowVRR decision in steamcompmgr
@@ -7231,7 +7841,7 @@ bool vulkan_framegen_vrr_hybrid_active()
 		&& GetBackend()->GetCurrentConnector()->IsVRRActive();
 }
 
-// Base-layer generation with late overlay composite (#02): generate on the
+// Base-layer generation with late overlay composite: generate on the
 // pre-upscale game layer instead of the final composited output, then push the
 // generated base through the real composite pipeline at present time with the
 // CURRENT overlay stack on top. Overlays, HUDs and the cursor are therefore
@@ -7254,7 +7864,7 @@ bool vulkan_framegen_base_layer_active()
 	return framegen_base_layer_enabled() && g_framegenHistory.bBaseLayer;
 }
 
-// Per-frame dispatcher rung decision for #02 — deliberately a handful of
+// Per-frame dispatcher rung decision for base-layer mode — deliberately a handful of
 // compares plus one cached format-capability probe, so it costs nothing per
 // frame. When the paint config can't take the base path (video underlay in
 // layer 0, YCbCr game buffer, ReShade active — ReShade rewrites layer 0 inside
@@ -7360,7 +7970,7 @@ static bool framegen_composite_records_history( const struct FrameInfo_t *pFrame
 			{ ulBaseCommitID, pBaseTexture } );
 }
 
-// Bidirectional interpolation (B3): generated frames sit BETWEEN the two real
+// Bidirectional interpolation: generated frames sit BETWEEN the two real
 // frames — both are warped toward the slot's phase along the forward and the
 // (already-computed) reverse motion field and blended by confidence, so
 // occlusions take content from the frame that has it and unmatched regions get
@@ -7388,9 +7998,8 @@ static float framegen_bidir_one_sided_strength()
 {
 	static const float s_flStrength = []()
 	{
-		const auto value = gamescope::framegen::parse_finite_float_setting(
-			getenv( "GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION" ) );
-		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 0.0f;
+		return std::clamp( framegen_setting( "GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION", 0.0f,
+			gamescope::framegen::parse_finite_float_setting ), 0.0f, 1.0f );
 	}();
 	return s_flStrength;
 }
@@ -7407,16 +8016,16 @@ static float framegen_bidir_endpoint_trace_strength( GamescopeFramegenPipeline e
 
 	static const float s_flStrength = []()
 	{
-		const auto value = gamescope::framegen::parse_finite_float_setting(
-			getenv( "GAMESCOPE_FRAMEGEN_BIDIR_TRACE" ) );
-		return value.has_value() ? std::clamp( *value, 0.0f, 1.0f ) : 0.0f;
+		return std::clamp( framegen_setting( "GAMESCOPE_FRAMEGEN_BIDIR_TRACE", 0.0f,
+			gamescope::framegen::parse_finite_float_setting ), 0.0f, 1.0f );
 	}();
 	return s_flStrength;
 }
 
 bool vulkan_framegen_bidir_active()
 {
-	return framegen_bidir_enabled()
+	return vulkan_framegen_is_enabled()
+		&& framegen_bidir_enabled()
 		// Bidir substitutes vulkan_get_last_output_image() into the flip, i.e. it
 		// presents ring images directly. On a swapchain backend those are
 		// presentation-engine-owned and there is no flip to substitute into.
@@ -7443,6 +8052,8 @@ static bool framegen_color_probe_active()
 		&& g_uFramegenColorRecordCount < framegen_color_record_max();
 }
 
+// Fixed at startup (command line and backend); a runtime toggle would have to
+// reset g_framegenPresentState, which framegen_present_tracking_enabled gates.
 bool vulkan_framegen_is_enabled()
 {
 	// Only enable on backends that actually present generated frames. Otherwise
@@ -7458,7 +8069,7 @@ bool vulkan_framegen_is_enabled()
 			|| g_eFramegenMode == GamescopeFramegenMode::Motion );
 }
 
-// Deadline-driven degradation ladder (#04). The startup mode/pipeline/multiplier are the
+// Deadline-driven degradation ladder. The startup mode/pipeline/multiplier are the
 // cost ceiling; under GPU-time pressure the ladder sheds work immediately.
 // Slow evidence-gated recovery may jump to the richest measured fitting rung,
 // or re-probe one adjacent cold rung. It NEVER mutates
@@ -7578,15 +8189,34 @@ static size_t framegen_bidir_pending_hard_capacity()
 			g_framegenHistory.nDegradeSteps ).multiplier );
 }
 
-// True when the queue is over-subscribed relative to what can still drain —
-// either at the ring-derived ceiling, or deeper than the interval the planner
-// last admitted for. Everything else flips on its own display target.
 static bool framegen_bidir_queue_forces_drain()
 {
 	return gamescope::framegen::bidir_queue_forces_drain(
 		g_framegenHistory.pending.size(),
-		framegen_bidir_pending_hard_capacity(),
-		g_framegenHistory.uBidirPendingTarget );
+		framegen_bidir_pending_hard_capacity() );
+}
+
+// Empties the pending queue and returns how many entries it dropped. Nothing
+// queued vanishes uncounted: a dropped real is painted content the player never
+// saw, a dropped interpolation was generated and never shown.
+static size_t framegen_clear_pending()
+{
+	std::vector<FramegenHistory_t::PendingGenerated_t> &pending = g_framegenHistory.pending;
+	const size_t nReals = std::ranges::count_if( pending, &FramegenHistory_t::PendingGenerated_t::bReal );
+	const size_t nDropped = pending.size();
+	framegen_metrics_note_dropped_real( nReals );
+	framegen_metrics_note_discard( nDropped - nReals );
+	pending.clear();
+	g_framegenHistory.ulBidirLastFrontOpportunityNs = 0;
+	return nDropped;
+}
+
+// Drops the queued interpolations, keeps the queued reals, and returns how
+// many it dropped for the caller to count.
+static size_t framegen_erase_interpolations()
+{
+	return std::erase_if( g_framegenHistory.pending,
+		[]( const FramegenHistory_t::PendingGenerated_t &entry ) { return !entry.bReal; } );
 }
 
 static bool framegen_output_matches( const gamescope::OwningRc<CVulkanTexture> &pTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
@@ -7641,46 +8271,16 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	if ( g_bFramegenDebug )
 		vk_log.infof( "framegen: history valid=false reason=%s", reason ? reason : "unknown" );
 
-	gamescope::Rc<CVulkanTexture> pRingPressureHold;
-	if ( bRing && vulkan_framegen_bidir_active() )
-	{
-		if ( g_framegenHistory.nBidirRingPressureFailures != UINT32_MAX )
-			g_framegenHistory.nBidirRingPressureFailures++;
-		if ( g_framegenHistory.nBidirRingPressureFailures == 1u )
-		{
-			uint64_t ulNewestRealFrameId = 0u;
-			for ( const FramegenHistory_t::PendingGenerated_t &entry :
-				g_framegenHistory.pending )
-			{
-				if ( entry.bReal && entry.tex != nullptr
-					&& entry.ulPresentRealFrameId >= ulNewestRealFrameId )
-				{
-					ulNewestRealFrameId = entry.ulPresentRealFrameId;
-					pRingPressureHold = entry.tex;
-				}
-			}
-			if ( pRingPressureHold == nullptr )
-				pRingPressureHold = g_framegenHistory.currentReal != nullptr
-					? g_framegenHistory.currentReal
-					: g_framegenHistory.bidirLastOutput;
-		}
-	}
-
 	g_framegenHistory.valid = false;
-	// Bidir (B3): queued REAL frames are actual content the user has not seen
-	// yet — dropping one at a scene change would skip a painted frame (a
-	// visible hitch), so only the interpolations (now-stale predictions) go.
-	// Their ring slots stay protected: the composite ring advance pins slots
-	// referenced by pending real entries. Everything else clears as before.
+	// Under bidir, queued REAL frames are content the player has not seen yet:
+	// dropping one at a scene change would skip a painted frame (a visible
+	// hitch), so only the interpolations (now-stale predictions) go. Their ring
+	// slots stay protected: the composite ring advance pins slots referenced by
+	// pending real entries. Everything else clears as before.
 	if ( vulkan_framegen_bidir_active() && !bRing )
-	{
-		std::erase_if( g_framegenHistory.pending,
-			[]( const FramegenHistory_t::PendingGenerated_t &entry ) { return !entry.bReal; } );
-	}
+		framegen_metrics_note_discard( framegen_erase_interpolations() );
 	else
-	{
-		g_framegenHistory.pending.clear();
-	}
+		framegen_clear_pending();
 	g_framegenHistory.nStableFrames = 0;
 	g_framegenHistory.previousPresentTimeNs = 0;
 	g_framegenHistory.currentPresentTimeNs = 0;
@@ -7704,18 +8304,17 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	// survive this content reset. The shadow retains its independent bias while
 	// dropping only anchors/decisions derived from the invalidated content.
 	framegen_invalidate_deadline_shadow_content();
-	g_framegenHistory.bidirEpoch = {};
+	// The bidir translation goes; its delay envelope and the chain it was
+	// measured on stay, so the first pair after the prime is planned at once.
+	// A grid, chain or provenance change restarts them at the next plan.
+	g_framegenHistory.bidir.epoch = {};
 	g_framegenHistory.bidirCutEpisode = {};
-	g_framegenHistory.ulBidirGridEpoch = 0;
-	g_framegenHistory.ulBidirGridIntervalNs = 0;
-	g_framegenHistory.ulBidirDisplayChainGeneration = 0;
-	g_framegenHistory.ulBidirGridTargetNs = 0;
-	g_framegenHistory.ulBidirGridWakeNs = 0;
-	g_framegenHistory.bBidirProvenanceInitialized = false;
-	g_framegenHistory.bBidirSourceTimestampsReliable = false;
-	g_framegenHistory.bidirFeedbackEndpoints.clear();
+	g_framegenHistory.ulBidirConsumedFrameId = 0;
+	// Ring pressure also releases the last output's ring slot. The next composite
+	// finds an empty queue and no epoch and flips live (SnapLive); this
+	// exceptional path accepts that one-flip skip.
 	if ( bRing )
-		g_framegenHistory.bidirLastOutput = pRingPressureHold;
+		g_framegenHistory.bidirLastOutput = nullptr;
 	g_framegenHistory.ulVrrAwaitingRealFrameId = 0;
 	g_framegenHistory.ulVrrAwaitingCompositeSeqNo = 0;
 	g_framegenHistory.ulVrrAwaitingCadenceNs = 0;
@@ -7733,7 +8332,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	// Forget learned per-rung costs so the new scene is measured afresh rather than
 	// inheriting the old scene's "this rung overruns" verdicts.
 	g_device.framegenResetRungCosts();
-	// B4: the adaptation EMAs describe the old scene's content (noise floor,
+	// The adaptation EMAs describe the old scene's content (noise floor,
 	// round-trip ambiguity); a new scene re-calibrates from the defaults.
 	g_framegenHistory.adaptation = {};
 	g_framegenHistory.ulAdaptStatsSeqNo = 0;
@@ -7742,7 +8341,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	// with the scene (the sample counter itself persists — it names files).
 	g_framegenHistory.ulNetRecordSeqNo = 0;
 	g_framegenHistory.ulNetRecordConsumedSeqNo = 0;
-	// C2: a pending profile snapshot dies with the scene too; the learned
+	// A pending profile snapshot dies with the scene too; the learned
 	// weights themselves persist — they describe the game, not one shot.
 	g_framegenHistory.ulNetProfileSeqNo = 0;
 	g_framegenHistory.ulNetProfileConsumedSeqNo = 0;
@@ -7793,7 +8392,7 @@ void vulkan_framegen_reset( const char *reason )
 		g_device.wait( g_framegenHistory.lastBaseIngestSeqNo );
 	g_device.framegenGarbageCollect();
 
-	// C2: persist unsaved learning before the state textures go away. The latest
+	// Persist unsaved learning before the state textures go away. The latest
 	// health-checked served weights remain cached process-wide and seed the new
 	// state, so resize/format resets do not throw away in-session adaptation.
 	framegen_net_profile_consume();
@@ -7818,17 +8417,25 @@ void vulkan_framegen_reset( const char *reason )
 
 void vulkan_framegen_shutdown()
 {
-	// Step 0, unconditionally and before the early-out: the swapchain
-	// present-wait thread is detached and never joined (and must not be — that is
-	// a separate, larger change). It publishes into the display-feedback mailbox,
-	// which is a self-contained mutex + POD ring that never touches framegen
-	// state, so a late publish is safe by construction; this flag simply stops it
-	// from happening at all across and after teardown.
+	// Persist learning first, even if framegen was turned off live. This is the
+	// authoritative exit flush (gamescope exits without atexit handlers), and it
+	// is CPU-only, so the shutdown watchdog firing during the unbounded drains
+	// below cannot lose the cached weights. It also joins the checkpoint writer,
+	// the one framegen worker that can still be running.
+	framegen_net_profile_flush();
+
+	// The waiter touches the backend through vblank re-arming and counters.
+	// Join before any framegen teardown and before the backend can be destroyed.
+	vulkan_present_wait_shutdown();
 	g_bFramegenFeedbackShutdown = true;
-	framegen_flush_present_wait_tags();
+	framegen_flush_present_wait_tags( false );
 
 	if ( !vulkan_framegen_is_enabled() )
+	{
+		if ( framegen_metrics_enabled() )
+			framegen_metrics_shutdown();
 		return;
+	}
 
 	// Framegen owns output/present ring images, history copies and pending
 	// generated presents. Their CVulkanTexture destructors release backend FBs
@@ -7836,13 +8443,7 @@ void vulkan_framegen_shutdown()
 	// outlive the backend, which steamcompmgr_exit destroys — so drop them here,
 	// while the backend and its KMS fd are still valid.
 
-	// Step 1: the net-profile writer thread, unconditionally and before any
-	// other teardown. It is the one framegen worker that can still be running,
-	// and it logs through the file-scope vk_log. The atexit flush is far too
-	// late — it runs after the backend is gone.
-	framegen_net_profile_join_writer();
-
-	// Step 2: drain the device. The two token waits this used to do
+	// Step 1: drain the device. The two token waits this used to do
 	// (lastFramegenWorkSeqNo, lastBaseIngestSeqNo) cover only the framegen and
 	// base-ingest submissions. They do NOT cover genReadSeqNo — which pins
 	// output-ring slots for the in-flight batch — nor the composite-timeline
@@ -7856,19 +8457,23 @@ void vulkan_framegen_shutdown()
 		g_device.waitIdle();
 
 	// Every readback is now guaranteed complete, so the final checkpoint is
-	// consumable rather than skipped.
+	// consumable rather than skipped. The flush writes only if it advanced the
+	// progress past what the first flush saved.
 	framegen_net_profile_consume();
 	framegen_net_profile_flush();
 	framegen_color_probe_consume();
 
-	// Step 3: release the presentation timeline and the retained ring slots
+	// The session summary, once all GPU work and present feedback are retired.
+	if ( framegen_metrics_enabled() )
+		framegen_metrics_shutdown();
+
+	// Step 2: release the presentation timeline and the retained ring slots
 	// explicitly, and before the images they point into. In bidir the pending
 	// queue IS the timeline and its bReal entries reference composite output
 	// images, so it is by far the largest late-release set; making the order
 	// explicit beats leaving it implicit in the aggregate assignment below.
-	g_framegenHistory.pending.clear();
+	framegen_clear_pending();
 	g_framegenHistory.bidirLastOutput = nullptr;
-	g_framegenHistory.bidirFeedbackEndpoints.clear();
 	g_framegenHistory.previousReal = nullptr;
 	g_framegenHistory.currentReal = nullptr;
 	g_framegenHistory.genReadA = nullptr;
@@ -7979,12 +8584,253 @@ bool vulkan_framegen_real_arrival_blocks_early_commit()
 	return bBlocked;
 }
 
+// The front is due at the opportunity this compositor iteration services
+// (ProcessVBlank precedes arbitration). Native invariant: a front without a
+// nested grid vblank IS the next opportunity: a native causal slot is taken
+// only by its KMS commit deadline
+// (vulkan_framegen_fixed_refresh_commit_deadline_ns), a classic slot fills the
+// next vblank, and VRR-hybrid/bidir fronts are gated before this call.
+static bool framegen_front_due( const FramegenHistory_t::PendingGenerated_t &front )
+{
+	return !front.oTargetVBlankNs
+		|| gamescope::framegen::fixed_grid_slot_due( *front.oTargetVBlankNs, front.ulSubmitNs,
+			g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank,
+			g_SteamCompMgrVBlankTime.ulWakeupTime,
+			g_framegenHistory.ulDeadlineGridIntervalNs );
+}
+
+// A too-slow drop is only taken of a due front (the arbiter's due && !ready, or
+// consume behind due && ready), so it is always capacity evidence: the ladder's
+// deadline miss and recovery streak input.
+static void framegen_note_too_slow( bool bAnchored, size_t nDropped )
+{
+	framegen_metrics_note_slow_drop( nDropped );
+	// Native causal scheduling applies miss hysteresis at the next rung
+	// decision. Other paths retain their established immediate reset.
+	if ( !framegen_native_causal_deadline_path() )
+		framegen_recovery_reset_streak();
+	g_framegenHistory.bCausalDeadlineMissed |= bAnchored;
+}
+
+// What the last bidir paint reported (vulkan_framegen_bidir_take_paint_report).
+// The backends call the flip synchronously inside paint_all on the steamcompmgr
+// thread, which takes the report right after.
+static gamescope::framegen::PaintReport_t s_bidirPaintReport;
+
+// The display opportunity a bidir decision is for: the compositor clock's next
+// vblank, sampled once per decision. Inside a paint it is the begin_present
+// snapshot, or the later vblank when the paint itself overran one, which is
+// then the true flip target. It never depends on a pending present tag.
+static uint64_t framegen_bidir_opportunity_ns()
+{
+	return GetVBlankTimer().GetNextVBlank( 0 );
+}
+
+// What the presenter knows at ulOpportunityNs, for the presenter and the
+// planner alike (bidir_front_inputs). A decision taken before the compositor
+// woke for the opportunity (a paint between vblanks) still had budget left for
+// unfinished work.
+static gamescope::framegen::BidirPresenterView_t framegen_bidir_presenter_view( uint64_t ulOpportunityNs )
+{
+	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
+	return {
+		.opportunityNs = ulOpportunityNs,
+		.lastFrontOpportunityNs = g_framegenHistory.ulBidirLastFrontOpportunityNs,
+		.vblankIntervalNs = ulVblankIntervalNs,
+		.capacity = framegen_bidir_pending_hard_capacity(),
+		.beforeWake = gamescope::framegen::slot_missed_opportunity(
+			g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank, ulOpportunityNs, ulVblankIntervalNs ),
+	};
+}
+
+static gamescope::framegen::BidirQueueEntry_t framegen_bidir_queue_entry( const FramegenHistory_t::PendingGenerated_t &entry )
+{
+	return {
+		.kind = entry.bReal
+			? gamescope::framegen::BidirSlotKind_t::RealEndpoint
+			: gamescope::framegen::BidirSlotKind_t::Generated,
+		.targetNs = entry.ulTargetFlipNs,
+		.realFrameId = entry.ulPresentRealFrameId,
+		.idealNs = entry.ulIdealFlipNs,
+	};
+}
+
+static std::vector<gamescope::framegen::BidirQueueEntry_t> framegen_bidir_queue_entries()
+{
+	std::vector<gamescope::framegen::BidirQueueEntry_t> entries;
+	entries.reserve( g_framegenHistory.pending.size() );
+	for ( const FramegenHistory_t::PendingGenerated_t &entry : g_framegenHistory.pending )
+		entries.push_back( framegen_bidir_queue_entry( entry ) );
+	return entries;
+}
+
+// Sheds queued interpolations, oldest first, until the queue fits capacity, and
+// returns how many it shed. Reals never leave here; the plan drops the reals the
+// display cannot show in time.
+static size_t framegen_bidir_shed_to_capacity( size_t capacity )
+{
+	if ( g_framegenHistory.pending.size() <= capacity )
+		return 0;
+
+	const gamescope::framegen::BidirQueueShedPlan_t plan =
+		gamescope::framegen::plan_bidir_queue_shed( framegen_bidir_queue_entries(), capacity );
+	for ( auto it = plan.indices.rbegin(); it != plan.indices.rend(); ++it )
+		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() + *it );
+
+	// The translation survives a shed: queued targets are values.
+	framegen_metrics_note_discard( plan.indices.size() );
+	return plan.indices.size();
+}
+
+// Whether a queued interpolation's GPU work has finished (reals: always).
+static bool framegen_bidir_entry_completed( const FramegenHistory_t::PendingGenerated_t &entry )
+{
+	return entry.bReal || g_device.hasCompletedFramegen( entry.seqNo );
+}
+
+// Retires every queue front that can never be shown at ulOpportunityNs and
+// returns the front iff it is to be shown there (bidir_front_action). A missed
+// interpolation is a discard; a due one whose GPU work has not finished is
+// capacity evidence once the compositor woke for this opportunity, and a discard
+// before (a paint between vblanks must flip now). A front further behind the
+// opportunity than the queue could ever catch up means presentation was
+// suspended (a hidden window, a stalled output): that timeline is abandoned,
+// never replayed. Idempotent at a fixed opportunity, so the arbiter and its
+// debug log agree.
+static const FramegenHistory_t::PendingGenerated_t *framegen_bidir_due_front( uint64_t ulOpportunityNs )
+{
+	std::vector<FramegenHistory_t::PendingGenerated_t> &pending = g_framegenHistory.pending;
+	const gamescope::framegen::BidirPresenterView_t view = framegen_bidir_presenter_view( ulOpportunityNs );
+	if ( !pending.empty() && gamescope::framegen::bidir_timeline_stale( pending.front().ulTargetFlipNs,
+		ulOpportunityNs, view.capacity, view.vblankIntervalNs ) )
+	{
+		const uint64_t ulBehindNs = ulOpportunityNs - pending.front().ulTargetFlipNs;
+		const size_t nDropped = framegen_clear_pending();
+		g_framegenHistory.bidir.epoch = {};
+		static uint64_t s_uStaleDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uStaleDebugLogCounter ) )
+			vk_log.infof( "framegen: bidir timeline stale (%.1fms behind live), dropped %zu pending frame(s)",
+				ulBehindNs / 1.0e6, nDropped );
+		return nullptr;
+	}
+
+	while ( !pending.empty() )
+	{
+		const FramegenHistory_t::PendingGenerated_t &front = pending.front();
+		switch ( gamescope::framegen::bidir_front_action( gamescope::framegen::bidir_front_inputs(
+			framegen_bidir_queue_entry( front ), framegen_bidir_entry_completed( front ),
+			pending.size(), view ) ) )
+		{
+			case gamescope::framegen::BidirFrontAction_t::Present:
+				return &front;
+			case gamescope::framegen::BidirFrontAction_t::Wait:
+				return nullptr;
+			case gamescope::framegen::BidirFrontAction_t::Discard:
+				framegen_metrics_note_discard( 1 );
+				break;
+			case gamescope::framegen::BidirFrontAction_t::TooSlow:
+			{
+				framegen_note_too_slow( front.ulAnchorRealFrameId != 0u, 1 );
+				static uint64_t s_uTooSlowDebugLogCounter = 0;
+				if ( FramegenDebugShouldLog( s_uTooSlowDebugLogCounter ) )
+					vk_log.infof( "framegen: discarded generated frame id=%" PRIu64 ".%02u reason=generation_too_slow",
+						front.frameId, (unsigned)( front.phase * 100.0f ) );
+				break;
+			}
+		}
+		pending.erase( pending.begin() );
+	}
+	return nullptr;
+}
+
+// A real frame entered the timeline: queued, or flipped live. Every way it can
+// leave again (shown, stale, snapped, superseded, shed, no present image) then
+// leaves it consumed.
+static void framegen_bidir_note_consumed( uint64_t ulRealFrameId )
+{
+	g_framegenHistory.ulBidirConsumedFrameId =
+		std::max( g_framegenHistory.ulBidirConsumedFrameId, ulRealFrameId );
+}
+
+// Shows the queue front at ulOpportunityNs as pImage (its own texture, or that
+// texture under the live base layer or cursor) and returns pImage. A front whose
+// present image could not be made is dropped and counted.
+static gamescope::Rc<CVulkanTexture> framegen_bidir_present_front( gamescope::Rc<CVulkanTexture> pImage, uint64_t ulOpportunityNs )
+{
+	const FramegenHistory_t::PendingGenerated_t front = std::move( g_framegenHistory.pending.front() );
+	g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
+	if ( pImage == nullptr )
+	{
+		if ( front.bReal )
+			framegen_metrics_note_dropped_real( 1 );
+		else
+			framegen_metrics_note_discard( 1 );
+		return nullptr;
+	}
+
+	g_framegenHistory.ulBidirLastFrontOpportunityNs = ulOpportunityNs;
+	g_framegenHistory.bidirLastOutput = pImage;
+	s_bidirPaintReport.presented = front.bReal ? front.ulCompositeSeqNo : 0u;
+	framegen_select_present_tag(
+		front.bReal ? gamescope::FramegenPresentKind_t::DelayedReal
+			: gamescope::FramegenPresentKind_t::Generated,
+		front.ulPresentRealFrameId, front.ulSlotId,
+		front.ulCompositeSeqNo, front.ulTargetFlipNs );
+	static uint64_t s_uPresentedDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uPresentedDebugLogCounter ) )
+		vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u",
+			front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ) );
+	return pImage;
+}
+
+// A generated front whose slot the compositor's opportunity passed by more than
+// half a vblank can never be shown on time; showing it late would put a stale
+// prediction on screen (after a hidden window is restored, say). Retire such
+// fronts. A real, a front without a target or the VRR midpoint (its own timer
+// decides) ends the scan, so this is bounded by the queue length.
+static void framegen_retire_missed_generated_fronts()
+{
+	std::vector<FramegenHistory_t::PendingGenerated_t> &pending = g_framegenHistory.pending;
+	const uint64_t ulOpportunityNs = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
+	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
+	size_t nRetired = 0;
+	while ( nRetired < pending.size() )
+	{
+		const FramegenHistory_t::PendingGenerated_t &front = pending[ nRetired ];
+		const uint64_t ulSlotNs = front.oTargetVBlankNs.value_or( front.ulTargetFlipNs );
+		const bool bVrrMidpoint = g_framegenHistory.ulVrrMidWakeNs != 0u
+			&& front.ulTargetFlipNs == g_framegenHistory.ulVrrMidTargetNs;
+		if ( front.bReal || ulSlotNs == 0u || bVrrMidpoint
+			|| !gamescope::framegen::slot_missed_opportunity( ulSlotNs, ulOpportunityNs, ulVblankIntervalNs ) )
+			break;
+		nRetired++;
+	}
+	if ( nRetired == 0u )
+		return;
+
+	pending.erase( pending.begin(), pending.begin() + nRetired );
+	framegen_metrics_note_discard( nRetired );
+	static uint64_t s_uMissedDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uMissedDebugLogCounter ) )
+		vk_log.infof( "framegen: discarded %zu generated frame(s) reason=missed_opportunity", nRetired );
+}
+
+// Retires fronts that can never be shown before answering (see
+// framegen_bidir_due_front and framegen_retire_missed_generated_fronts). Both are
+// idempotent at a fixed opportunity, so repeated calls agree.
 bool vulkan_framegen_generated_frame_due()
 {
 	if ( !vulkan_framegen_has_pending_generated_frame() )
 		return false;
+	if ( vulkan_framegen_bidir_active() )
+		return framegen_bidir_due_front( framegen_bidir_opportunity_ns() ) != nullptr;
+
+	framegen_retire_missed_generated_fronts();
+	if ( g_framegenHistory.pending.empty() )
+		return false;
 	const FramegenHistory_t::PendingGenerated_t &front =
 		g_framegenHistory.pending.front();
+	// Legacy causal/VRR entries without a target.
 	if ( front.ulTargetFlipNs == 0u )
 		return true;
 	// The non-grid timer already represents W_mid; its target is deliberately
@@ -7992,12 +8838,7 @@ bool vulkan_framegen_generated_frame_due()
 	if ( g_framegenHistory.ulVrrMidWakeNs != 0u
 		&& front.ulTargetFlipNs == g_framegenHistory.ulVrrMidTargetNs )
 		return get_time_in_nanos() >= g_framegenHistory.ulVrrMidWakeNs;
-	// The Step 3 causal/default and classic fallback admission semantics are
-	// unchanged. Their queue front already represents the next opportunity.
-	if ( !vulkan_framegen_bidir_active() )
-		return true;
-	return front.ulTargetFlipNs <= GetVBlankTimer().GetNextVBlank( 0 )
-		|| framegen_bidir_queue_forces_drain();
+	return framegen_front_due( front );
 }
 
 bool vulkan_framegen_generated_frame_ready()
@@ -8026,30 +8867,52 @@ size_t vulkan_framegen_pending_queue_debug( double *pflFrontTargetDeltaMs )
 	return g_framegenHistory.pending.size();
 }
 
+// The image a pending front is flipped as. Base-layer mode holds a pre-upscale
+// BASE frame that is composited through the real pipeline with the live layer
+// stack (fresh overlays, latest cursor). Output-space cursor split: a frame
+// predicted from cursor-free history gets the LIVE pointer composited now, not
+// a motion-warped copy of where it was a real frame ago (front.tex untouched
+// when the live stack has no cursor layer). Otherwise the generated output is
+// scanout-ready as is.
+static gamescope::Rc<CVulkanTexture> framegen_present_image( const FramegenHistory_t::PendingGenerated_t &front,
+	const struct FrameInfo_t *pPresentFrameInfo )
+{
+	if ( g_framegenHistory.bBaseLayer )
+		return framegen_base_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
+	if ( front.bCursorFree && !front.bReal )
+		return framegen_cursor_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
+	return front.tex;
+}
+
 gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const struct FrameInfo_t *pPresentFrameInfo )
 {
 	if ( !vulkan_framegen_has_pending_generated_frame() )
 		return nullptr;
 
-	// Bidir (B3): a paint that carries a NEW game frame must go through the
-	// composite path — that is where history records and the interpolation
-	// batch is planned — so the front is NOT consumed here. The backend's flip
-	// substitution (vulkan_framegen_bidir_flip_texture) presents the front
-	// after the composite has recorded, keeping the delayed timeline intact.
-	// Repaints of unchanged base content (overlay ticks, repeat-vblank fills)
-	// still consume normally below.
-	if ( vulkan_framegen_bidir_active() && pPresentFrameInfo
-		&& pPresentFrameInfo->layerCount > 0
-		&& pPresentFrameInfo->layers[ 0 ].tex != nullptr
-		&& pPresentFrameInfo->layers[ 0 ].tex.get() != g_framegenHistory.pLastBaseTexture )
-		return nullptr;
-	// Overlay-driven composites can enter the backend between scheduled bidir
-	// opportunities. Leave a future queue front untouched; flip substitution
-	// below the composite will explicitly hold the last valid output instead.
-	if ( vulkan_framegen_bidir_active()
-		&& !vulkan_framegen_generated_frame_due() )
-		return nullptr;
+	if ( vulkan_framegen_bidir_active() )
+	{
+		// A paint that carries a NEW game frame must go through the composite
+		// path, where history records and the interpolation batch is planned,
+		// so the front is NOT consumed here. The backend's flip substitution
+		// (vulkan_framegen_bidir_flip_texture) presents the front after the
+		// composite has recorded, keeping the delayed timeline intact. Repaints
+		// of unchanged base content (overlay ticks, repeat-vblank fills) consume
+		// a due front below; a front that is not due stays queued and the flip
+		// substitution holds the last output instead.
+		if ( pPresentFrameInfo && pPresentFrameInfo->layerCount > 0
+			&& pPresentFrameInfo->layers[ 0 ].tex != nullptr
+			&& pPresentFrameInfo->layers[ 0 ].tex.get() != g_framegenHistory.pLastBaseTexture )
+			return nullptr;
+		const uint64_t ulOpportunityNs = framegen_bidir_opportunity_ns();
+		const FramegenHistory_t::PendingGenerated_t *pFront = framegen_bidir_due_front( ulOpportunityNs );
+		if ( pFront == nullptr )
+			return nullptr;
+		return framegen_bidir_present_front( framegen_present_image( *pFront, pPresentFrameInfo ), ulOpportunityNs );
+	}
 
+	framegen_retire_missed_generated_fronts();
+	if ( g_framegenHistory.pending.empty() )
+		return nullptr;
 	FramegenHistory_t::PendingGenerated_t front = g_framegenHistory.pending.front();
 
 	// Generation was submitted in its own command buffer (and, when a dedicated
@@ -8057,26 +8920,18 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 	// waited on it. It normally completes well before the vblank it fills; if the
 	// GPU is behind, presenting now would stall scanout on compute work, so drop
 	// this frame instead — the display simply repeats the last scanned-out frame.
-	// Never stall the present path for a generated frame. Queued real frames
-	// (bidir) are always complete and never take this path.
+	// Never stall the present path for a generated frame.
 	if ( !front.bReal && !g_device.hasCompletedFramegen( front.seqNo ) )
 	{
 		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
-		framegen_metrics_note_slow_drop( 1 );
-		// Native causal scheduling applies miss hysteresis at the next rung
-		// decision. Other paths retain their established immediate reset.
-		if ( !framegen_native_causal_deadline_path() )
-			framegen_recovery_reset_streak();
-		g_framegenHistory.bCausalDeadlineMissed |=
-			front.ulAnchorRealFrameId != 0u;
+		framegen_note_too_slow( front.ulAnchorRealFrameId != 0u, 1 );
 		static uint64_t s_uTooSlowDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uTooSlowDebugLogCounter ) )
 			vk_log.infof( "framegen: discarded generated frame id=%" PRIu64 ".%02u reason=generation_too_slow",
 				front.frameId, (unsigned)( front.phase * 100.0f ) );
 		if ( g_framegenHistory.pending.empty()
 			&& framegen_causal_deadline_enabled()
-			&& !vulkan_framegen_vrr_hybrid_active()
-			&& !vulkan_framegen_bidir_active() )
+			&& !vulkan_framegen_vrr_hybrid_active() )
 			framegen_causal_submit( g_framegenHistory.lastCompositeSeqNo );
 		return nullptr;
 	}
@@ -8089,25 +8944,10 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 	// already-signalled host wait is an avoidable driver round trip at every
 	// generated flip. Framegen uses push constants, so it owns no slice of the
 	// shared upload arena that would need recycling here.
-
-	// Base-layer mode (#02): the pending slot holds a pre-upscale BASE frame;
-	// composite it through the real pipeline with the live layer stack (fresh
-	// overlays, latest cursor) before it can be flipped. Output-space mode returns
-	// the scanout-ready generated output directly.
-	gamescope::Rc<CVulkanTexture> pResult = front.tex;
-	if ( g_framegenHistory.bBaseLayer )
-		pResult = framegen_base_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
-	// Output-space cursor split: this frame was predicted from cursor-free
-	// history, so the pointer it should be showing is the LIVE one, composited
-	// now, not a motion-warped copy of where it was a real frame ago. Returns
-	// front.tex untouched when the live stack has no cursor layer.
-	else if ( front.bCursorFree && !front.bReal )
-		pResult = framegen_cursor_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
+	gamescope::Rc<CVulkanTexture> pResult = framegen_present_image( front, pPresentFrameInfo );
 
 	if ( pResult != nullptr )
 	{
-		if ( vulkan_framegen_bidir_active() )
-			g_framegenHistory.bidirLastOutput = pResult;
 		framegen_select_present_tag(
 			front.bReal ? gamescope::FramegenPresentKind_t::DelayedReal
 				: gamescope::FramegenPresentKind_t::Generated,
@@ -8131,19 +8971,14 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 			// is left to the panel's own LFC instead.
 			framegen_clear_vrr_midpoint_state( false );
 		}
-		else if ( framegen_causal_deadline_enabled()
-			&& !vulkan_framegen_bidir_active() )
+		else if ( framegen_causal_deadline_enabled() )
 		{
 			// Every drained causal slot advances through the same absolute-grid
 			// planner used by real arrivals, feedback, and repeat ticks.
 			framegen_causal_submit( g_framegenHistory.lastCompositeSeqNo );
 		}
-		else if ( !vulkan_framegen_bidir_active() )
+		else
 		{
-			// Bidir never refills a stall with forward extrapolation: the
-			// timeline only ever shows content between two REAL frames, so a
-			// stall is an honest hold on the newest real frame (like no-FG)
-			// rather than a speculative prediction on a different timeline.
 			framegen_refill_idle();
 		}
 	}
@@ -8156,22 +8991,16 @@ void vulkan_framegen_discard_generated_frame( const char *reason )
 	if ( g_framegenHistory.pending.empty() )
 		return;
 
-	// Bidir (B3): only the interpolations are discardable predictions; a queued
-	// REAL frame is painted content the user has not seen and stays queued (the
-	// present decision will show it on the next vblank it wins).
+	// Under bidir only the interpolations are discardable predictions; a queued
+	// REAL frame is painted content the player has not seen and stays queued
+	// (the present decision shows it at the next opportunity it is due).
 	const size_t nBefore = g_framegenHistory.pending.size();
-	if ( reason != nullptr && strcmp( reason, "generation_too_slow" ) == 0
-		&& std::ranges::any_of( g_framegenHistory.pending,
-			[]( const FramegenHistory_t::PendingGenerated_t &entry ) {
-				return entry.ulAnchorRealFrameId != 0u;
-			} ) )
+	const bool bTooSlow = reason != nullptr && strcmp( reason, "generation_too_slow" ) == 0;
+	const bool bAnchored = g_framegenHistory.pending.front().ulAnchorRealFrameId != 0u;
+	const bool bBidir = vulkan_framegen_bidir_active();
+	if ( bBidir )
 	{
-		g_framegenHistory.bCausalDeadlineMissed = true;
-	}
-	if ( vulkan_framegen_bidir_active() )
-	{
-		std::erase_if( g_framegenHistory.pending,
-			[]( const FramegenHistory_t::PendingGenerated_t &entry ) { return !entry.bReal; } );
+		framegen_erase_interpolations();
 	}
 	else
 	{
@@ -8184,137 +9013,185 @@ void vulkan_framegen_discard_generated_frame( const char *reason )
 		framegen_clear_vrr_midpoint_state( false );
 
 	const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
-	if ( nDiscarded > 0u && reason != nullptr
-		&& strcmp( reason, "generation_too_slow" ) == 0
-		&& !framegen_native_causal_deadline_path() )
-		framegen_recovery_reset_streak();
-	if ( reason != nullptr && strcmp( reason, "generation_too_slow" ) == 0 )
-		framegen_metrics_note_slow_drop( nDiscarded );
+	if ( bTooSlow && nDiscarded != 0u )
+		framegen_note_too_slow( bAnchored, nDiscarded );
+	else if ( bBidir )
+		framegen_metrics_note_discard( nDiscarded );
 	static uint64_t s_uDiscardDebugLogCounter = 0;
 	if ( nDiscarded > 0 && FramegenDebugShouldLog( s_uDiscardDebugLogCounter ) )
 		vk_log.infof( "framegen: discarded %zu generated frame(s) reason=%s",
 			nDiscarded, reason ? reason : "unknown" );
 }
 
-// Bidir (B3) flip substitution — see rendervulkan.hpp. In steady state the
-// queue at a real-frame paint reads [prevReal, interp(s), thisReal], so the
-// substituted front is the PREVIOUS real frame: complete long ago, flipped
-// exactly one measured interval after its own composite. The interpolations
-// then win the repeat vblanks in between via the normal consume path.
-// Present the bidir queue front in place of pFallback, or hold the previous
-// real frame when the front's GPU work is still running (normally only the
-// timeline bootstrap, where the interpolation was submitted microseconds ago
-// in this very paint — the previous real is already on screen, so that flip is
-// a visual no-op and the delayed timeline simply starts one vblank later).
-static gamescope::Rc<CVulkanTexture> framegen_bidir_take_front( const gamescope::Rc<CVulkanTexture> &pFallback )
+// A flip that shows no queued entry re-shows the held image, or refreshes the
+// overlays over the frame already on screen. Neither is new content nor
+// endpoint feedback: it is counted as a repeat.
+static void framegen_bidir_select_hold_tag( uint64_t ulOpportunityNs )
 {
-	const uint64_t ulOpportunityNs = g_framegenPresentState.bTagPending
-		? g_framegenPresentState.pendingTag.ulTargetFlipNs
-		: GetVBlankTimer().GetNextVBlank( 0 );
-	while ( !g_framegenHistory.pending.empty() )
-	{
-		FramegenHistory_t::PendingGenerated_t front =
-			g_framegenHistory.pending.front();
-		const bool bForceDrain = framegen_bidir_queue_forces_drain();
-		if ( front.ulTargetFlipNs != 0u
-			&& front.ulTargetFlipNs > ulOpportunityNs && !bForceDrain )
-			break;
+	framegen_select_present_tag( gamescope::FramegenPresentKind_t::Hold,
+		g_framegenPresentState.ulCurrentRealFrameId,
+		framegen_next_present_slot_id(),
+		g_framegenPresentState.ulCurrentRealCompositeSeqNo,
+		ulOpportunityNs );
+}
 
-		// Interpolation is disposable and never slides to a later display
-		// opportunity. Endpoints remain ordered and may catch up after a hitch.
-		// A frame dropped here was generated and then never shown, exactly like
-		// one shed at plan time, so it counts into disc= too — no generated
-		// frame may vanish uncounted.
-		if ( !front.bReal
-			&& ( ( front.ulTargetFlipNs != 0u
-					&& front.ulTargetFlipNs < ulOpportunityNs )
-				|| !g_device.hasCompletedFramegen( front.seqNo ) ) )
-		{
-			g_framegenHistory.pending.erase(
-				g_framegenHistory.pending.begin() );
-			framegen_metrics_note_discard( 1 );
-			continue;
-		}
-
-		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() );
-		// hasCompletedFramegen is the image-readiness proof. Blocking waits remain
-		// reserved for reset and teardown, never a steady-state flip.
-		static uint64_t s_uFlipDebugLogCounter = 0;
-		if ( FramegenDebugShouldLog( s_uFlipDebugLogCounter ) )
-			vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u (bidir flip substitution)",
-				front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ) );
-		framegen_select_present_tag(
-			front.bReal ? gamescope::FramegenPresentKind_t::DelayedReal
-				: gamescope::FramegenPresentKind_t::Generated,
-			front.ulPresentRealFrameId, front.ulSlotId,
-			front.ulCompositeSeqNo, front.ulTargetFlipNs );
-		g_framegenHistory.bidirLastOutput = front.tex;
-		return front.tex;
-	}
+// Flip substitution (see rendervulkan.hpp): present the bidir queue front in
+// place of pFallback when it is due at this opportunity, else hold the last
+// output. In steady state the queue at a real-frame paint reads [prevReal,
+// interp(s), thisReal], so the substituted front is the PREVIOUS real frame,
+// complete long ago and flipped one measured interval after its own composite;
+// the interpolations win the vblanks in between through the consume path.
+static gamescope::Rc<CVulkanTexture> framegen_bidir_take_front( const gamescope::Rc<CVulkanTexture> &pFallback,
+	uint64_t ulOpportunityNs )
+{
+	if ( const FramegenHistory_t::PendingGenerated_t *pFront = framegen_bidir_due_front( ulOpportunityNs ) )
+		return framegen_bidir_present_front( pFront->tex, ulOpportunityNs );
 
 	if ( g_framegenHistory.bidirLastOutput != nullptr )
 	{
-		// This is an explicit hold, not endpoint feedback. Classify it as
-		// generated so it can update backend lead without moving the epoch.
-		framegen_select_present_tag( gamescope::FramegenPresentKind_t::Generated,
-			g_framegenPresentState.ulCurrentRealFrameId,
-			framegen_next_present_slot_id(),
-			g_framegenPresentState.ulCurrentRealCompositeSeqNo,
-			ulOpportunityNs );
+		framegen_bidir_select_hold_tag( ulOpportunityNs );
 		return g_framegenHistory.bidirLastOutput;
 	}
 	return pFallback;
 }
 
-gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<CVulkanTexture> pComposite )
+// Makes entry the composite of the newest real frame, queued outside the plan:
+// the next plan must not queue that frame again.
+static void framegen_bidir_set_live_endpoint( FramegenHistory_t::PendingGenerated_t &entry,
+	const gamescope::Rc<CVulkanTexture> &pComposite )
 {
-	if ( !vulkan_framegen_is_enabled() || !vulkan_framegen_bidir_active() )
-		return pComposite;
+	entry.tex = pComposite;
+	entry.frameId = g_framegenHistory.currentFrameId;
+	entry.ulPresentRealFrameId = g_framegenPresentState.ulCurrentRealFrameId;
+	entry.ulSlotId = framegen_next_present_slot_id();
+	entry.ulCompositeSeqNo = g_framegenPresentState.ulCurrentRealCompositeSeqNo;
+	framegen_bidir_note_consumed( g_framegenPresentState.ulCurrentRealFrameId );
+}
 
-	if ( g_framegenHistory.bBidirQueuedReal )
+static gamescope::Rc<CVulkanTexture> framegen_bidir_select_flip( const gamescope::Rc<CVulkanTexture> &pComposite )
+{
+	using gamescope::framegen::BidirFlip_t;
+	std::vector<FramegenHistory_t::PendingGenerated_t> &pending = g_framegenHistory.pending;
+	const uint64_t ulOpportunityNs = framegen_bidir_opportunity_ns();
+	const size_t nCapacity = framegen_bidir_pending_hard_capacity();
+	switch ( gamescope::framegen::select_bidir_flip( {
+		.queuedReal = std::exchange( g_framegenHistory.bBidirQueuedReal, false ),
+		.sameBase = g_framegenHistory.bBidirSameBaseComposite,
+		.queueEmpty = pending.empty(),
+		.timelineStarted = g_framegenHistory.bidirLastOutput != nullptr
+			|| g_framegenHistory.bidir.epoch.valid,
+		.tailQueuedBehind = !pending.empty() && pending.back().bQueuedBehind,
+		.realsFill = static_cast<size_t>( std::ranges::count_if( pending,
+			&FramegenHistory_t::PendingGenerated_t::bReal ) ) >= nCapacity,
+	} ) )
 	{
-		// This composite recorded a new real frame and queued it behind its
-		// interpolations; present the queue front in its place.
-		g_framegenHistory.bBidirQueuedReal = false;
-		return framegen_bidir_take_front( pComposite );
+		case BidirFlip_t::QueueFront:
+			// This composite queued its real frame behind its interpolations, or
+			// re-rendered the newest real frame while it is still queued (flipping
+			// it now would show content out of order). Present the queue front.
+			return framegen_bidir_take_front( pComposite, ulOpportunityNs );
+		case BidirFlip_t::QueueBehind:
+		{
+			// A new base composited while the delayed timeline still holds queued
+			// content (the prime after an invalidation, a cut or a hitch). It may not
+			// overtake that content and must not be lost: queue it as a real endpoint
+			// behind the retained entries, at the first opportunity after them (the
+			// queue is sorted, so back() holds the latest target). A pending real
+			// entry pins its ring slot (IsInUse); an interpolation makes room for
+			// it at the ring ceiling.
+			framegen_bidir_shed_to_capacity( nCapacity - 1u );
+			static uint64_t s_uQueueBehindDebugLogCounter = 0;
+			if ( FramegenDebugShouldLog( s_uQueueBehindDebugLogCounter ) )
+				vk_log.infof( "framegen: bidir queued new base behind %zu retained", pending.size() );
+			FramegenHistory_t::PendingGenerated_t entry;
+			framegen_bidir_set_live_endpoint( entry, pComposite );
+			// The grid interval can be 0 right after an invalidation.
+			entry.ulTargetFlipNs = gamescope::framegen::bidir_target_after(
+				ulOpportunityNs, pending.back().ulTargetFlipNs,
+				framegen_display_interval_ns() );
+			entry.phase = 1.0f;
+			entry.bReal = true;
+			entry.bQueuedBehind = true;
+			pending.push_back( std::move( entry ) );
+			return framegen_bidir_take_front( pComposite, ulOpportunityNs );
+		}
+		case BidirFlip_t::ReplaceBehind:
+		{
+			// A newer unplanned base supersedes the queued-behind tail, or the
+			// newest real of a queue whose reals fill the ring, before it was
+			// shown: take over its target, so unplanned composites hold at most one
+			// queued-behind entry and the queue drains to live. Dropping the old
+			// texture unpins its ring slot; the newer composite seq carries the
+			// requests the replaced one did. The replaced frame was never shown.
+			static uint64_t s_uReplaceBehindDebugLogCounter = 0;
+			if ( FramegenDebugShouldLog( s_uReplaceBehindDebugLogCounter ) )
+				vk_log.infof( "framegen: bidir replaced queued base behind %zu retained", pending.size() - 1u );
+			framegen_metrics_note_dropped_real( 1 );
+			framegen_bidir_set_live_endpoint( pending.back(), pComposite );
+			pending.back().ulIdealFlipNs = 0;
+			pending.back().bQueuedBehind = true;
+			return framegen_bidir_take_front( pComposite, ulOpportunityNs );
+		}
+		case BidirFlip_t::RefreshLive:
+		{
+			// Nothing is queued and this composite latched no new base: it shows
+			// the frame already on screen with the live overlays and cursor, so
+			// flipping it cannot reorder content. Without this an idle game
+			// would never show an overlay update.
+			g_framegenHistory.bidirLastOutput = pComposite;
+			framegen_bidir_note_consumed( g_framegenPresentState.ulCurrentRealFrameId );
+			framegen_bidir_select_hold_tag( ulOpportunityNs );
+			static uint64_t s_uRefreshDebugLogCounter = 0;
+			if ( FramegenDebugShouldLog( s_uRefreshDebugLogCounter ) )
+				vk_log.infof( "framegen: bidir live refresh (queue drained) id=%" PRIu64,
+					g_framegenPresentState.ulCurrentRealFrameId );
+			return pComposite;
+		}
+		case BidirFlip_t::SnapLive:
+			break;
 	}
-
-	if ( g_framegenHistory.bBidirSameBaseComposite && !g_framegenHistory.pending.empty() )
-	{
-		// Overlay-only recomposite while the queue drains: its game content is
-		// the newest frame, which is still QUEUED — flipping it now would show
-		// content out of order. Present the queue front instead; the overlay
-		// update rides the next real frame's (delayed) composite.
-		return framegen_bidir_take_front( pComposite );
-	}
-
-	// Prime/cut/hitch holds use the same deadline selector. In particular, a
-	// zero-generated interval never falls through to the newest live composite.
-	if ( g_framegenHistory.bidirLastOutput != nullptr
-		|| g_framegenHistory.bidirEpoch.valid )
-		return framegen_bidir_take_front( pComposite );
 
 	// This composite is presenting LIVE (framegen dormant, prime frame after a
 	// scene change, game keeping up with refresh). Anything still pending
 	// belongs to the abandoned delayed timeline and would present BACKWARD in
-	// content time after this flip — drop it.
-	if ( !g_framegenHistory.pending.empty() )
+	// content time after this flip: drop it.
+	if ( !pending.empty() )
 	{
+		const size_t nDropped = framegen_clear_pending();
 		static uint64_t s_uSnapDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uSnapDebugLogCounter ) )
 			vk_log.infof( "framegen: bidir timeline snapped to live, dropped %zu pending frame(s)",
-				g_framegenHistory.pending.size() );
-		// No generated frame may vanish uncounted (see framegen_bidir_take_front):
-		// the abandoned entries were generated and never shown, so they are discards.
-		const size_t nDroppedGenerated = std::count_if(
-			g_framegenHistory.pending.begin(), g_framegenHistory.pending.end(),
-			[]( const FramegenHistory_t::PendingGenerated_t &entry ) { return !entry.bReal; } );
-		if ( nDroppedGenerated != 0 )
-			framegen_metrics_note_discard( nDroppedGenerated );
-		g_framegenHistory.pending.clear();
+				nDropped );
 	}
 	g_framegenHistory.bidirLastOutput = pComposite;
+	framegen_bidir_note_consumed( g_framegenPresentState.ulCurrentRealFrameId );
+	static uint64_t s_uLiveDebugLogCounter = 0;
+	if ( FramegenDebugShouldLog( s_uLiveDebugLogCounter ) )
+		vk_log.infof( "framegen: presented live real frame id=%" PRIu64 ".100", g_framegenHistory.currentFrameId );
 	return pComposite;
+}
+
+gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<CVulkanTexture> pComposite )
+{
+	if ( !vulkan_framegen_bidir_active() )
+		return pComposite;
+
+	s_bidirPaintReport = { .composited = g_framegenPresentState.ulCurrentRealCompositeSeqNo };
+	gamescope::Rc<CVulkanTexture> pFlip = framegen_bidir_select_flip( pComposite );
+	s_bidirPaintReport.verdict = pFlip == pComposite
+		? gamescope::framegen::FlipVerdict_t::Live
+		: gamescope::framegen::FlipVerdict_t::Older;
+	return pFlip;
+}
+
+gamescope::framegen::PaintReport_t vulkan_framegen_bidir_take_paint_report()
+{
+	return std::exchange( s_bidirPaintReport, {} );
+}
+
+bool vulkan_framegen_bidir_queue_drained()
+{
+	return vulkan_framegen_bidir_active() && g_framegenHistory.pending.empty();
 }
 
 static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
@@ -8328,7 +9205,7 @@ static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> 
 	createFlags.bFlippable = framegen_owns_output_ring();
 	createFlags.bStorage = true;
 	// An incompatible/ignored capture request must not alter production image
-	// usage or modifier selection. Only the active E2 path copies these images.
+	// usage or modifier selection. Only active held-out validation copies these images.
 	createFlags.bTransferSrc = framegen_color_probe_requested();
 	// Two independent reasons to be sampleable:
 	//  - output-space cursor split: the present-time cursor composite samples the
@@ -8346,7 +9223,7 @@ static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> 
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
 }
 
-// Base-mode generated frames (#02): written by the generation shaders
+// Base-mode generated frames: written by the generation shaders
 // (storage) and sampled by the late overlay composite as layer 0. Deliberately
 // NOT flippable — they are inputs to the present-time composite, never
 // scanout buffers themselves.
@@ -8361,7 +9238,7 @@ static bool framegen_create_base_texture( gamescope::OwningRc<CVulkanTexture> *p
 	return ( *ppTexture )->BInit( width, height, 1u, drmFormat, createFlags );
 }
 
-// Base-mode history (#02): the copy target for the client's base buffer and
+// Base-mode history: the copy target for the client's base buffer and
 // the sampling source for every generation shader.
 static bool framegen_create_base_history_texture( gamescope::OwningRc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
 {
@@ -8382,8 +9259,11 @@ static bool framegen_ensure_resources( uint32_t width, uint32_t height, uint32_t
 		// The mode is part of the reset key: flipping base<->output-space without a
 		// reset would mix owned-copy history with output-ring history and
 		// mislabel pending frames (a base-sized, non-flippable image must
-		// never reach drm_prepare directly, and vice versa).
-		vulkan_framegen_reset( g_framegenHistory.bBaseLayer != bBaseLayer ? "base_layer_toggle" : "resize_or_format_change" );
+		// never reach drm_prepare directly, and vice versa). A history that a
+		// reset just cleared (width 0) holds nothing to invalidate, so it is
+		// keyed without paying a second reset.
+		if ( g_framegenHistory.width != 0 )
+			vulkan_framegen_reset( g_framegenHistory.bBaseLayer != bBaseLayer ? "base_layer_toggle" : "resize_or_format_change" );
 		g_framegenHistory.width = width;
 		g_framegenHistory.height = height;
 		g_framegenHistory.drmFormat = drmFormat;
@@ -8433,7 +9313,7 @@ static bool framegen_ensure_resources( uint32_t width, uint32_t height, uint32_t
 	return true;
 }
 
-// Late-composite scanout targets (#02): sized to the CURRENT output, which can
+// Late-composite scanout targets: sized to the CURRENT output, which can
 // change independently of the base layer (display mode switch), so this is
 // (re)checked at consume time rather than at record time.
 static bool framegen_ensure_present_pool()
@@ -8648,7 +9528,7 @@ static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescop
 	return pTarget;
 }
 
-// #02 late overlay composite: turn a generated BASE frame into a scanout-ready
+// Late overlay composite: turn a generated BASE frame into a scanout-ready
 // output image by running it through the same composite pipeline a real frame
 // uses — FSR EASU/RCAS (or NIS/blit), shaper + 3D LUTs, and every CURRENT
 // overlay layer blended on top, cursor at its latest position. Overlays are
@@ -8716,7 +9596,7 @@ static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope:
 	return pTarget;
 }
 
-// Refresh base history for a new real frame (#02): rotate the two owned images
+// Refresh base history for a new real frame: rotate the two owned images
 // and copy the client's base buffer into the older one, on the framegen queue
 // so the real frame's composite and present never wait on it. Same-queue
 // ALL_COMMANDS barriers order this copy against the previous generation
@@ -8785,7 +9665,7 @@ static bool framegen_is_float_drm_format( uint32_t drmFormat )
 	// different reason: fp16's 11-bit
 	// mantissa cannot represent 16-bit-deep content, so the fp16 path would
 	// band it. Unreachable in output-space mode (scanout formats are
-	// 8/10-bit), but base-layer mode (#02) generates in the CLIENT's format,
+	// 8/10-bit), but base-layer mode generates in the CLIENT's format,
 	// and 16-bit UNORM swapchains do occur (e.g. the NVIDIA WSI path here).
 	switch ( drmFormat )
 	{
@@ -8860,7 +9740,7 @@ static void framegen_bind_blend( CVulkanCmdBuffer *pCmdBuffer, const gamescope::
 	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pixelsPerGroup ), div_roundup( pTarget->height(), pixelsPerGroup ) );
 }
 
-// ---- Learned field refinement (Stage C) --------------------------------------
+// ---- Learned field refinement -----------------------------------------------
 // A tiny convolutional net (12->16->16->4, 3x3 kernels, ~4.6k parameters)
 // refines the causal checked motion field once per real frame: a bounded flow
 // residual (at most +-2 field texels, tanh-limited in the shader), additive
@@ -8872,7 +9752,7 @@ static void framegen_bind_blend( CVulkanCmdBuffer *pCmdBuffer, const gamescope::
 // The causal path predicts corrections on top of the
 // Stage-B field — a zero-initialized head IS Stage B, so the failure floor is
 // the current behavior. The fourth head never predicts pixels; Guided uses it
-// to gate a separately bounded analytic color trend. B4 closes the field safety loop:
+// to gate a separately bounded analytic color trend. Self-supervised adaptation closes the field safety loop:
 // the stats probe grades the REFINED field, so a net that mispredicts is
 // clamped by the same-batch trust factor and shows up in the adapt log lines.
 // Trained offline, self-supervised, on tensors captured by the recorder below
@@ -8897,7 +9777,7 @@ static const char *framegen_net_weights_path()
 // must fail validation rather than run with silently mismatched channels.
 // The numeric CPU contract is centralized in framegen/net_layout.hpp.
 
-// In-situ learning (C2): GAMESCOPE_FRAMEGEN_NET_ONLINE=1 keeps training the
+// In-situ learning: GAMESCOPE_FRAMEGEN_NET_ONLINE=1 keeps training the
 // refiner on the framegen GPU while it serves — every real frame is a fresh
 // labeled example, so the model tracks the current scene instead of the
 // content some offline blob was fit to. Works with or without a starting
@@ -8915,18 +9795,23 @@ static float framegen_net_online_lr()
 {
 	static const float s_flLr = []()
 	{
-		const auto value = gamescope::framegen::parse_finite_float_setting(
-			getenv( "GAMESCOPE_FRAMEGEN_NET_LR" ) );
-		return value.has_value() && *value > 0.0f && *value <= 0.1f
-			? *value : 3e-4f;
+		return framegen_setting( "GAMESCOPE_FRAMEGEN_NET_LR", 3e-4f,
+			[]( const char *pszValue ) -> std::optional<float>
+			{
+				const auto flValue = gamescope::framegen::parse_finite_float_setting( pszValue );
+				return flValue && *flValue > 0.0f && *flValue <= 0.1f ? flValue : std::nullopt;
+			} );
 	}();
 	return s_flLr;
 }
 
 static uint32_t framegen_net_online_every()
 {
-	static const uint32_t s_uEvery = gamescope::framegen::parse_uint32_setting(
-		getenv( "GAMESCOPE_FRAMEGEN_NET_EVERY" ), false ).value_or( 1u );
+	static const uint32_t s_uEvery = framegen_setting( "GAMESCOPE_FRAMEGEN_NET_EVERY", 1u,
+		[]( const char *pszValue )
+		{
+			return gamescope::framegen::parse_uint32_setting( pszValue, false );
+		} );
 	return s_uEvery;
 }
 
@@ -9082,8 +9967,11 @@ static const char *framegen_record_dir()
 
 static uint32_t framegen_record_max()
 {
-	static const uint32_t s_uMax = gamescope::framegen::parse_uint32_setting(
-		getenv( "GAMESCOPE_FRAMEGEN_RECORD_MAX" ), false ).value_or( 1000u );
+	static const uint32_t s_uMax = framegen_setting( "GAMESCOPE_FRAMEGEN_RECORD_MAX", 1000u,
+		[]( const char *pszValue )
+		{
+			return gamescope::framegen::parse_uint32_setting( pszValue, false );
+		} );
 	return s_uMax;
 }
 
@@ -9202,11 +10090,11 @@ static const FramegenDispatch_t &framegen_dispatch_for_format( uint32_t drmForma
 	return g_framegenDispatch;
 }
 
-// Forward-backward consistency (B2): also estimate the reverse (prev-anchored)
+// Forward-backward consistency: also estimate the reverse (prev-anchored)
 // flow and kill the confidence of forward vectors whose round trip through it
 // does not close. Default on — it targets the disocclusion/mislock fizzle
 // class directly; GAMESCOPE_FRAMEGEN_FB=0 restores the unchecked field for
-// A/B comparison.
+// comparison.
 static bool framegen_fbcheck_enabled( GamescopeFramegenPipeline ePipeline )
 {
 	if ( ePipeline < GamescopeFramegenPipeline::Checked )
@@ -9227,15 +10115,8 @@ static float framegen_fbcheck_tol_base()
 {
 	static const float s_flTolBase = []()
 	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_FB_TOL" );
-		if ( pszEnv != nullptr && *pszEnv != '\0' )
-		{
-			const auto value = gamescope::framegen::parse_finite_float_setting( pszEnv );
-			if ( value.has_value() )
-				return std::clamp( *value, 0.05f, 8.0f );
-			vk_log.errorf( "framegen: GAMESCOPE_FRAMEGEN_FB_TOL is not a finite number; using 0.75" );
-		}
-		return 0.75f;
+		return std::clamp( framegen_setting( "GAMESCOPE_FRAMEGEN_FB_TOL", 0.75f,
+			gamescope::framegen::parse_finite_float_setting ), 0.05f, 8.0f );
 	}();
 	return s_flTolBase;
 }
@@ -9247,7 +10128,7 @@ static constexpr float k_flFramegenFBTolSlope = 0.05f;
 // distance between the current-frame and previous-frame projections of the
 // same flow). Lo leaves room for sub-pixel resample differences on high-
 // frequency detail; Hi is a clearly-different-content kill.
-// GAMESCOPE_FRAMEGEN_AGREE=0 disables the test for A/B attribution.
+// GAMESCOPE_FRAMEGEN_AGREE=0 disables the test for comparison.
 static constexpr float k_flFramegenAgreeLo = 0.12f;
 static constexpr float k_flFramegenAgreeHi = 0.45f;
 static bool framegen_agreement_enabled( GamescopeFramegenPipeline ePipeline )
@@ -9264,7 +10145,7 @@ static bool framegen_agreement_enabled( GamescopeFramegenPipeline ePipeline )
 }
 
 // Guided-only three-frame disocclusion evidence. Default on as part of the
-// Guided pipeline contract; the environment switch exists for live A/B cost
+// Guided pipeline contract; the environment switch exists for live cost
 // and artifact attribution without changing any cheaper pipeline rung.
 static bool framegen_reservoir_enabled( GamescopeFramegenPipeline ePipeline )
 {
@@ -9280,7 +10161,7 @@ static bool framegen_reservoir_enabled( GamescopeFramegenPipeline ePipeline )
 }
 
 // Guided-only learned non-geometric color trend. The switch isolates the
-// final correction for live A/B while leaving the field net and every queue /
+// final correction for live comparison while leaving the field net and every queue /
 // descriptor / timing decision identical.
 static bool framegen_shading_enabled( GamescopeFramegenPipeline ePipeline )
 {
@@ -9295,7 +10176,7 @@ static bool framegen_shading_enabled( GamescopeFramegenPipeline ePipeline )
 	return s_bEnabled;
 }
 
-// ---- Self-supervised online adaptation (B4) ----------------------------------
+// ---- Self-supervised online adaptation --------------------------------------
 // Every real frame is ground truth for the field just estimated from it. A
 // field-res probe pass measures how well that field predicts the actual frame
 // (per-texel warped-luma residual) and reduces the verdicts to a few counters.
@@ -9304,14 +10185,14 @@ static bool framegen_shading_enabled( GamescopeFramegenPipeline ePipeline )
 //   fraction of texels that PASSED every consistency check yet still
 //   mispredicted (regimes where the per-texel checks lie: lighting flashes,
 //   particle chaos, stroboscopic content) — and fade the motion term toward
-//   the safe fallback. Continuous, zero-latency, self-recovering: this is the
-//   pipeline-driven degradation #04's monotonic ladder must not provide (a
+//   the safe fallback. Continuous, zero-latency, self-recovering: this is what
+//   the monotonic pipeline degradation ladder must not provide (a
 //   discrete pipeline rung would either oscillate or, held monotonic, let one
 //   bad interval degrade the whole scene).
 //   CPU, next batch: the readback auto-calibrates the FB tolerance and the
 //   agreement window to the content (see framegen_adapt_consume).
-// Default on in motion mode; GAMESCOPE_FRAMEGEN_ADAPT=0 restores B3 behavior
-// bit-exactly for A/B attribution.
+// Default on in motion mode; GAMESCOPE_FRAMEGEN_ADAPT=0 restores the fixed
+// thresholds bit-exactly for comparison.
 static bool framegen_adapt_enabled( GamescopeFramegenPipeline ePipeline )
 {
 	if ( ePipeline < GamescopeFramegenPipeline::Learned )
@@ -9681,10 +10562,7 @@ static void framegen_adapt_consume( GamescopeFramegenPipeline ePipeline )
 			// interpolation and retain scheduled real endpoints. A classification
 			// that remains asserted keeps suppressing pixels without repeatedly
 			// tearing down the display-clock translation.
-			std::erase_if( h.pending,
-				[]( const FramegenHistory_t::PendingGenerated_t &entry ) {
-					return !entry.bReal;
-				} );
+			framegen_metrics_note_discard( framegen_erase_interpolations() );
 		}
 		if ( cut.invalidateEpoch )
 		{
@@ -9692,8 +10570,7 @@ static void framegen_adapt_consume( GamescopeFramegenPipeline ePipeline )
 			vk_log.infof( "framegen: content scene cut detected (%u/9 sections, histogram distance %.2f); presenting a real endpoint",
 				measurement->changedSections,
 				gamescope::framegen::scene_histogram_distance( *measurement ) );
-			h.bidirEpoch = {};
-			h.bidirFeedbackEndpoints.clear();
+			h.bidir.epoch = {};
 		}
 	}
 	else if ( bSceneCut )
@@ -9919,7 +10796,7 @@ static bool framegen_color_probe_prepare( uint32_t width, uint32_t height, uint3
 	return true;
 }
 
-// E2 CPU half. GSCF v3 stores the three paired full-resolution candidates, the
+// Held-out validation, CPU half. GSCF v3 stores the three paired full-resolution candidates, the
 // swept parameter, and their exact real reference. Rows are tightly repacked
 // from the linear Vulkan images; the evaluator interprets the recorded DRM
 // fourcc and output EOTF. The unchanged header size preserves v1/v2 parsing.
@@ -10033,7 +10910,7 @@ static void framegen_motion_bind_sampler( CVulkanCmdBuffer *pCmdBuffer, uint32_t
 	pCmdBuffer->setSamplerNearest( nSlot, bNearest );
 }
 
-// Self-supervised stats probe (B4), recorded after the motion field is final:
+// Self-supervised stats probe, recorded after the motion field is final:
 // one workgroup zeroes the counter image, a field-size dispatch measures how
 // well the checked field predicts the real frame and accumulates the verdicts
 // (see cs_framegen_motion_stats.comp), and an apply dispatch folds the
@@ -10092,7 +10969,7 @@ static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t 
 	pCmdBuffer->copyImage( g_framegenMotion.statsAccum, g_framegenMotion.statsReadback );
 }
 
-// Learned field refinement (Stage C), recorded with the checked fields final.
+// Learned field refinement, recorded with the checked fields final.
 // The causal path refines only the forward field that advects the newest real
 // frame into the future. Bidir additionally processes the reverse field through
 // the same binding-symmetric network (confidence-veto-only by default). This
@@ -10190,7 +11067,7 @@ static int framegen_luma_reservoir_read_index()
 	return -1;
 }
 
-// In-situ learning step (C2), recorded after the inference dispatches: two
+// In-situ learning step, recorded after the inference dispatches: two
 // gradient passes (one per field direction, each workgroup a hashed training
 // tile writing its slice row) and one optimizer pass folding the slices into
 // Adam and publishing the EMA weights the NEXT batch's inference serves. The
@@ -10353,18 +11230,18 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 // The checkpoint writer's only lifetime proof. It logs through the file-scope
 // vk_log, so it must never outlive teardown (or, at exit, the LogScope itself).
 // Joining has no polling timeout, so this is unconditionally safe to call, and
-// vulkan_framegen_shutdown calls it before touching anything else.
+// vulkan_framegen_shutdown calls it before tearing down framegen resources.
 static void framegen_net_profile_join_writer()
 {
 	if ( g_framegenNetWriteThread.joinable() )
 		g_framegenNetWriteThread.join();
 }
 
-// Flush any unsaved learning. Called from vulkan_framegen_reset — every mode,
-// resolution and teardown change funnels through it — and via atexit, so runs
-// shorter than the checkpoint interval persist too (the old cadence-only write
-// silently dropped them). Pure CPU on the cached copy: safe at any point,
-// including after Vulkan teardown; never touches the GPU.
+// Flush any unsaved learning. Called from vulkan_framegen_reset — every mode
+// and resolution change funnels through it — and from vulkan_framegen_shutdown,
+// so runs shorter than the checkpoint interval persist too (the old
+// cadence-only write silently dropped them). Pure CPU on the cached copy: safe
+// at any point, including after Vulkan teardown; never touches the GPU.
 static void framegen_net_profile_flush()
 {
 	// The atomic is the cheap scheduling gate; the thread object is the lifetime
@@ -10421,11 +11298,6 @@ static void framegen_net_profile_consume()
 	// candidate cannot poison persistence and steady-state readback allocates none.
 	g_framegenNetLiveWeights.swap( g_framegenNetReadbackWeights );
 	g_ulFramegenNetLiveProgress = g_ulFramegenNetProgress;
-
-	// First healthy readback ever: arm the exit flush (only online-learning
-	// sessions reach this point, so plain runs register nothing).
-	static const bool s_bAtExitArmed = []() { atexit( framegen_net_profile_flush ); return true; }();
-	(void)s_bAtExitArmed;
 
 	// Periodic checkpoint, off-thread — an fwrite into a possibly-contended
 	// page cache has no business on the render thread. At most one writer in
@@ -10528,7 +11400,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 			bAllocated = framegen_create_intermediate( &g_framegenMotion.mvFieldHistory, lowW, lowH, uFieldFormat );
 		g_framegenMotion.uMotionHistoryFrameId = 0;
 		g_framegenMotion.uMotionHistoryIntervalNs = 0;
-		// B4 stats are a Learned-pipeline resource. Cheaper pipelines must not fail motion
+		// Adaptation stats are a Learned-pipeline resource. Cheaper pipelines must not fail motion
 		// setup because an adaptation-only image format/allocation failed.
 		g_framegenMotion.statsAccum = nullptr;
 		g_framegenMotion.statsReadback = nullptr;
@@ -10612,7 +11484,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 				}
 				g_framegenMotion.bNetWeightsUploaded = false;
 
-				// In-situ learning state (C2), also once.
+				// In-situ learning state, also once.
 				if ( bNetOk && framegen_net_online_enabled() )
 				{
 					CVulkanTexture::createFlags priorFlags;
@@ -10914,7 +11786,7 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pg ), div_roundup( pTarget->height(), pg ) );
 }
 
-// Bidir (B3) per slot: warp BOTH real frames toward the slot's temporal phase
+// Bidir per slot: warp BOTH real frames toward the slot's temporal phase
 // (current along the checked forward field, previous along the checked reverse
 // field) and blend by confidence x phase proximity; pixels neither direction
 // can vouch for degrade to a phase-correct crossfade inside the shader.
@@ -11103,19 +11975,26 @@ static bool framegen_insert_pending_entry(
 		return true;
 	}
 
+	// Whatever loses the target was never shown: count it.
 	if ( entry.bReal )
 	{
 		if ( !it->bReal
 			|| entry.ulPresentRealFrameId >= it->ulPresentRealFrameId )
 		{
+			if ( !it->bReal )
+				framegen_metrics_note_discard( 1 );
+			else if ( it->ulPresentRealFrameId != entry.ulPresentRealFrameId )
+				framegen_metrics_note_dropped_real( 1 );
 			*it = std::move( entry );
 			return true;
 		}
+		framegen_metrics_note_dropped_real( 1 );
 		return false;
 	}
 
 	// A real endpoint already owns this opportunity. For two generated
 	// candidates, retain the newer interval's pixels.
+	framegen_metrics_note_discard( 1 );
 	if ( it->bReal )
 		return false;
 	if ( entry.frameId >= it->frameId )
@@ -11126,96 +12005,37 @@ static bool framegen_insert_pending_entry(
 	return false;
 }
 
-struct FramegenBidirShedResult_t
+// A shorter bidir delay moved every queued real earlier (pull_bidir_queue): the
+// pending reals take their new targets, and the interpolations planned for the
+// longer delay go the way a shed drops them.
+static void framegen_bidir_retarget( std::span<const gamescope::framegen::BidirQueueEntry_t> retargeted,
+	const gamescope::framegen::DisplayGrid_t &grid )
 {
-	size_t generated = 0;
-	size_t endpoints = 0;
-
-	[[nodiscard]] size_t total() const { return generated + endpoints; }
-};
-
-static void framegen_bidir_resync_to_newest_endpoint()
-{
-	const auto retained = std::ranges::max_element(
-		g_framegenHistory.pending, {},
-		[]( const FramegenHistory_t::PendingGenerated_t &entry ) {
-			return entry.bReal ? entry.ulPresentRealFrameId : 0u;
-		} );
-	std::optional<FramegenHistory_t::BidirFeedbackEndpoint_t> retainedFeedback;
-	uint64_t ulRetainedTargetNs = 0u;
-	if ( retained != g_framegenHistory.pending.end() && retained->bReal )
+	std::vector<FramegenHistory_t::PendingGenerated_t> &pending = g_framegenHistory.pending;
+	framegen_metrics_note_discard( std::erase_if( pending,
+		[]( const FramegenHistory_t::PendingGenerated_t &entry ) { return !entry.bReal; } ) );
+	for ( const gamescope::framegen::BidirQueueEntry_t &real : retargeted )
 	{
-		ulRetainedTargetNs = retained->ulTargetFlipNs;
-		const auto feedback = std::ranges::find_if(
-			g_framegenHistory.bidirFeedbackEndpoints,
-			[&]( const FramegenHistory_t::BidirFeedbackEndpoint_t &record ) {
-				return record.endpoint.realFrameId
-					== retained->ulPresentRealFrameId;
-			} );
-		if ( feedback != g_framegenHistory.bidirFeedbackEndpoints.end() )
-			retainedFeedback = *feedback;
-	}
-
-	g_framegenHistory.ulBidirGridEpoch++;
-	if ( g_framegenHistory.ulBidirGridEpoch == 0u )
-		g_framegenHistory.ulBidirGridEpoch = 1u;
-	g_framegenHistory.bidirFeedbackEndpoints.clear();
-	if ( retainedFeedback && ulRetainedTargetNs != 0u )
-	{
-		g_framegenHistory.bidirEpoch =
-			gamescope::framegen::establish_bidir_epoch(
-				retainedFeedback->endpoint.sourceReadyNs,
-				ulRetainedTargetNs,
-				g_framegenHistory.ulBidirGridEpoch );
-		retainedFeedback->ulEpoch = g_framegenHistory.bidirEpoch.epoch;
-		g_framegenHistory.bidirFeedbackEndpoints.push_back(
-			*retainedFeedback );
-	}
-	else
-	{
-		g_framegenHistory.bidirEpoch = {};
+		const auto it = std::ranges::find( pending, real.realFrameId, &FramegenHistory_t::PendingGenerated_t::ulPresentRealFrameId );
+		if ( it == pending.end() )
+			continue;
+		it->ulTargetFlipNs = real.targetNs;
+		it->ulIdealFlipNs = real.idealNs;
+		it->ulWakeDeadlineNs = grid.wake( gamescope::framegen::grid_index_at_or_after( grid, real.targetNs ) );
 	}
 }
 
-static FramegenBidirShedResult_t framegen_bidir_shed_to_capacity(
-	size_t capacity )
+// Drops a queued real the display cannot show in time; erasing its entry unpins
+// its ring slot.
+static void framegen_bidir_drop_queued_real( uint64_t ulRealFrameId )
 {
-	if ( g_framegenHistory.pending.size() <= capacity )
-		return {};
-
-	std::vector<gamescope::framegen::BidirQueueEntry_t> entries;
-	entries.reserve( g_framegenHistory.pending.size() );
-	for ( const FramegenHistory_t::PendingGenerated_t &entry : g_framegenHistory.pending )
-	{
-		entries.push_back( {
-			.kind = entry.bReal
-				? gamescope::framegen::BidirSlotKind_t::RealEndpoint
-				: gamescope::framegen::BidirSlotKind_t::Generated,
-			.targetNs = entry.ulTargetFlipNs,
-			.realFrameId = entry.ulPresentRealFrameId,
-		} );
-	}
-	const gamescope::framegen::BidirQueueShedPlan_t plan =
-		gamescope::framegen::plan_bidir_queue_shed( entries, capacity );
-	if ( plan.indices.empty() )
-		return {};
-
-	for ( auto it = plan.indices.rbegin(); it != plan.indices.rend(); ++it )
-		g_framegenHistory.pending.erase( g_framegenHistory.pending.begin() + *it );
-
-	if ( plan.endpoints != 0u )
-	{
-		// Dropping a delayed real invalidates feedback ordering from the old
-		// timeline. Anchor a new epoch on the newest endpoint that survived, or
-		// leave it invalid so the next compatible pair re-primes from live time.
-		framegen_bidir_resync_to_newest_endpoint();
-	}
-
-	framegen_metrics_note_discard( plan.indices.size() );
-	return {
-		.generated = plan.generated,
-		.endpoints = plan.endpoints,
-	};
+	std::vector<FramegenHistory_t::PendingGenerated_t> &pending = g_framegenHistory.pending;
+	const auto it = std::ranges::find_if( pending, [&]( const FramegenHistory_t::PendingGenerated_t &entry ) {
+		return entry.bReal && entry.ulPresentRealFrameId == ulRealFrameId; } );
+	if ( it == pending.end() )
+		return;
+	pending.erase( it );
+	framegen_metrics_note_dropped_real( 1 );
 }
 
 static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr, uint64_t ulSingleTargetFlipNs = 0, bool bDeadlineCostKeying = false, uint64_t ulAnchorRealFrameId = 0, bool bExplicitProvisional = false )
@@ -11223,14 +12043,14 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0 )
 		return false;
 
-	// B4: fold the previous batch's adaptation readback into the adaptation state
+	// Fold the previous batch's adaptation readback into the adaptation state
 	// before recording this one, so its thresholds ride these push constants.
 	framegen_adapt_consume( eff.pipeline );
 	// Stage C dataset capture: flush the previous batch's training tensors
 	// under the same completion gate.
 	framegen_record_consume();
 	framegen_color_probe_consume();
-	// C2 online learning: persist the last profile snapshot, if one completed.
+	// Online learning: persist the last profile snapshot, if one completed.
 	framegen_net_profile_consume();
 
 	if ( bClearPending )
@@ -11238,7 +12058,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 
 	// Reserve this interval's output slots up front so an empty batch never
 	// records/submits a command buffer.
-	struct SlotPlan_t { gamescope::Rc<CVulkanTexture> tex; float phase; float strength; uint32_t slotIndex; uint64_t ulTargetFlipNs; uint64_t ulWakeDeadlineNs; };
+	struct SlotPlan_t { gamescope::Rc<CVulkanTexture> tex; float phase; float strength; uint32_t slotIndex; uint64_t ulTargetFlipNs; uint64_t ulWakeDeadlineNs; std::optional<uint64_t> oTargetVBlankNs; };
 	std::vector<SlotPlan_t> slots;
 	slots.reserve( nRequestCount );
 	for ( uint32_t i = 0; i < nRequestCount; i++ )
@@ -11268,7 +12088,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 				: framegen_fixed_slot_target_ns( pRequests[ i ].slotIndex ) );
 		slots.push_back( { std::move( pGenerated ), pRequests[ i ].phase,
 			pRequests[ i ].strength, pRequests[ i ].slotIndex, ulTargetFlipNs,
-			pRequests[ i ].wakeDeadlineNs } );
+			pRequests[ i ].wakeDeadlineNs, pRequests[ i ].targetVBlankNs } );
 	}
 	if ( slots.size() != nRequestCount )
 	{
@@ -11361,15 +12181,15 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	const bool bMotion = bReuseMotion || ( bMotionRequested
 		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(),
 			g_framegenHistory.currentReal->height(), dispatch, eff.pipeline ) );
-	// Held-out E2 samples grade the actual motion path, not its allocation or
+	// Held-out samples grade the actual motion path, not its allocation or
 	// capability fallback. A failed motion setup drops the sample and leaves all
 	// real-frame presentation untouched.
 	if ( pColorProbe != nullptr && !bMotion )
 		return false;
 
-	// Stage C: with the checked fields final, capture the RAW training tensors
+	// With the checked fields final, capture the RAW training tensors
 	// (pre-refinement, pre-trust — what the net must learn to improve on),
-	// then refine both fields through the net. Everything downstream — the B4
+	// then refine both fields through the net. Everything downstream — the adaptation
 	// probe and the warps — binds the refined copies via
 	// framegen_motion_field() once the net has run.
 	const bool bNetRecord = bMotion && !bReuseMotion && g_framegenMotion.recField != nullptr
@@ -11388,13 +12208,13 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	if ( bMotion && !bReuseMotion && framegen_net_requested( eff.pipeline )
 		&& g_framegenMotion.mvFieldNet != nullptr )
 		framegen_record_net( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height, bBidir );
-	// B4: with the field final, record the adaptation probe — the warps below
+	// With the field final, record the adaptation probe — the warps below
 	// read its verdict in this same batch, the CPU next batch.
 	const bool bAdaptProbe = bMotion && !bReuseMotion && framegen_adapt_enabled( eff.pipeline );
 	if ( bAdaptProbe )
 		framegen_record_adapt_probe( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height );
 
-	// C2: train after the probe so a content cut can zero every gradient slice
+	// Train after the probe so a content cut can zero every gradient slice
 	// before Adam sees it. Same-batch inference still used the pre-step weights;
 	// the optimizer publishes only for the next batch. When adaptation is
 	// explicitly disabled, training retains its previous unguarded behavior.
@@ -11496,14 +12316,14 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
 	if ( pColorProbe != nullptr )
 	{
-		// Readback copies deliberately sit after the end timestamp: E2 measures
+		// Readback copies deliberately sit after the end timestamp: held-out validation measures
 		// algorithm cost, not capture-tool traffic. The submission completion still
 		// covers the copies, so mapped memory is never consumed early.
 		for ( uint32_t i = 0; i < k_uFramegenColorProbeCandidates; i++ )
 			pCmdBuffer->copyImage( slots[ i ].tex, g_framegenColorProbe.generatedReadback[ i ] );
 		pCmdBuffer->copyImage( pColorProbe->reference, g_framegenColorProbe.referenceReadback );
 	}
-	// Step 3 reuses the existing small timestamp table, but causal one-slot work
+	// Causal pacing reuses the existing small timestamp table, but causal one-slot work
 	// is keyed by preparation shape instead of the now-constant output count.
 	const uint32_t nCostKey = bDeadlineCostKeying
 		? gamescope::framegen::deadline_work_class_cost_key( eDeadlineWorkClass )
@@ -11518,6 +12338,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ),
 		ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey );
 	g_framegenHistory.lastFramegenWorkSeqNo = ulSeqNo;
+	const uint64_t ulSubmitNs = get_time_in_nanos();
 
 	for ( const SlotPlan_t &slot : slots )
 	{
@@ -11532,6 +12353,8 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		entry.ulCompositeSeqNo = ulCompositeSeqNo;
 		entry.ulTargetFlipNs = slot.ulTargetFlipNs;
 		entry.ulWakeDeadlineNs = slot.ulWakeDeadlineNs;
+		entry.oTargetVBlankNs = slot.oTargetVBlankNs;
+		entry.ulSubmitNs = ulSubmitNs;
 		entry.ulAnchorRealFrameId = ulAnchorRealFrameId != 0u
 			? ulAnchorRealFrameId
 			: ( bDeadlineCostKeying
@@ -11576,7 +12399,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// composite can't reuse a slot the framegen queue is still sampling even
 	// after history is invalidated. The oversubscription guard admits only one
 	// batch at a time, so these always match the current (previousReal,
-	// currentReal) while incomplete. E2 additionally pins its exact held-out
+	// currentReal) while incomplete. Held-out validation additionally pins its exact held-out
 	// reference, for a maximum of three slots only in capture mode.
 	g_framegenHistory.genReadA = g_framegenHistory.previousReal;
 	g_framegenHistory.genReadB = g_framegenHistory.currentReal;
@@ -11611,8 +12434,14 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// a repaint here would present the prediction on the very next wake —
 	// immediately after the real frame — collapsing the midpoint spacing to
 	// ~zero. The timer wake is the (only) present trigger in that mode.
+	//
+	// This is a WAKE, not a composite request: force_repaint() is reserved for
+	// callers that need a fresh composite (ReShade uniforms, exposed window,
+	// connector changes) and participates in the repaint-deferral budget. A
+	// nudge is sufficient here: under VRR every wake arbitrates, and under a
+	// fixed refresh only the vblank timer may present a generated frame.
 	if ( pColorProbe == nullptr && !vulkan_framegen_vrr_hybrid_active() )
-		force_repaint();
+		nudge_steamcompmgr();
 	return true;
 }
 
@@ -11906,10 +12735,30 @@ static void framegen_record_causal_anchor( uint64_t ulRealFrameId,
 	};
 }
 
+// The compositor's wake for a raw vblank, a nested slot's or a bidir opportunity's
+// (0 if it lies before the wake offset).
+static uint64_t framegen_nested_slot_wake_ns( uint64_t ulSlotVBlankNs )
+{
+	const gamescope::VBlankScheduleTime schedule = GetVBlankTimer().CalcNextWakeupTime( true ); // preemptive: no side effect
+	const uint64_t ulOffsetNs = schedule.ulTargetVBlank - schedule.ulScheduledWakeupPoint;
+	return ulSlotVBlankNs > ulOffsetNs ? ulSlotVBlankNs - ulOffsetNs : 0u;
+}
+
+// Nested fixed-grid slot: whether it can still be submitted before the
+// compositor wakes for its raw vblank (fixed_grid_slot_submittable).
+static bool framegen_nested_slot_submittable( uint64_t ulSlotVBlankNs, uint64_t ulNowNs )
+{
+	const uint64_t ulT = g_framegenHistory.ulDeadlineGridIntervalNs;
+	return gamescope::framegen::fixed_grid_slot_submittable( ulSlotVBlankNs,
+		framegen_nested_slot_wake_ns( ulSlotVBlankNs ),
+		g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank, ulNowNs, ulT,
+		gamescope::framegen::cadence_arrival_guard_ns( ulT ) );
+}
+
 // Default fixed-refresh causal path: ask the pure planner for exactly one
 // unused display-grid slot, apply its per-slot budget to the measured work
 // class, then pass its exact phase and target through the common submit path.
-static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
+static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionReplan )
 {
 	if ( !vulkan_framegen_is_enabled() || !framegen_causal_deadline_enabled()
 		|| vulkan_framegen_vrr_hybrid_active() || vulkan_framegen_bidir_active()
@@ -11973,6 +12822,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 				.forwardStrengthCap = k_flFramegenMaxForwardStrength,
 				.sourceTimestampsReliable = g_framegenHistory.bCadenceUsesSourceTime,
 				.dedicatedQueue = true,
+				.skipAtOrPastNextReal = bCorrectionReplan && !bNativeKmsTiming,
 			} );
 	if ( !plan.admit )
 	{
@@ -11988,6 +12838,13 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 
 	const uint64_t ulGridIndex = gamescope::framegen::grid_index_at_or_after(
 		plainGrid, plan.targetNs );
+	const std::optional<uint64_t> oTargetVBlankNs = bNativeKmsTiming
+		? std::nullopt : std::optional<uint64_t>( rawGrid.target( ulGridIndex ) );
+	// Nested: the compositor takes this slot at the raw wake of its vblank. A slot
+	// that can no longer be submitted before that wake is skipped, never slid;
+	// the next planning call (tick or drain) takes the following slot.
+	if ( oTargetVBlankNs && !framegen_nested_slot_submittable( *oTargetVBlankNs, now ) )
+		return false;
 	const uint64_t ulPlainWakeNs = plainGrid.wake( ulGridIndex );
 	const gamescope::framegen::FixedRefreshCommitPlan_t commitPlan =
 		gridCommitPlan.earlyCommit
@@ -12053,6 +12910,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo )
 		.slotIndex = nSlotIndex,
 		.targetFlipNs = plan.targetNs,
 		.wakeDeadlineNs = plan.wakeNs,
+		.targetVBlankNs = oTargetVBlankNs,
 	};
 	const uint32_t nMaxCausalDegradeSteps = gamescope::framegen::max_degrade_steps(
 		g_eFramegenMode, g_eFramegenPipeline, 2 );
@@ -12087,10 +12945,8 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 		|| g_framegenHistory.ulDeadlineGridIntervalNs == 0u )
 		return;
 
-	const uint64_t ulArrivalGuardNs = std::max(
-		gamescope::framegen::k_ulCadenceArrivalGuardMinNs,
-		g_framegenHistory.ulDeadlineGridIntervalNs
-			/ gamescope::framegen::k_uCadenceArrivalGuardDivisor );
+	const uint64_t ulArrivalGuardNs = gamescope::framegen::cadence_arrival_guard_ns(
+		g_framegenHistory.ulDeadlineGridIntervalNs );
 	const gamescope::framegen::AnchorCorrection_t correction =
 		gamescope::framegen::apply_flip_feedback(
 			g_framegenHistory.causalAnchor,
@@ -12110,18 +12966,30 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 	if ( correction.discardProvisional )
 	{
 		const size_t nBefore = g_framegenHistory.pending.size();
+		const uint64_t ulNowNs = get_time_in_nanos();
+		// A provisional slot is discarded only while a corrected replacement can
+		// still be submitted for its opportunity. Later, its pixels are kept: the
+		// replan could only be skipped, and the repeat replacing them is the larger
+		// error (|residual| vs. one slot spacing). Native slots: unchanged.
 		std::erase_if( g_framegenHistory.pending,
 			[&]( const FramegenHistory_t::PendingGenerated_t &entry ) {
 				return !entry.bReal
 					&& gamescope::framegen::discard_pending_provisional_slot(
 						correction, entry.ulAnchorRealFrameId,
-						entry.bProvisional );
+						entry.bProvisional )
+					&& !( entry.oTargetVBlankNs
+						&& !gamescope::framegen::fixed_grid_slot_submittable(
+							*entry.oTargetVBlankNs,
+							framegen_nested_slot_wake_ns( *entry.oTargetVBlankNs ),
+							g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank, ulNowNs,
+							g_framegenHistory.ulDeadlineGridIntervalNs, ulArrivalGuardNs ) );
 			} );
+		const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
 		// The discarded target was computed from the wrong grid phase and is not
 		// authoritative. Re-enter from the corrected anchor so an exact one-vblank
 		// correction can move the next generated phase by that full interval.
-		g_framegenHistory.ulLastPlannedTargetNs = 0u;
-		const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
+		if ( nDiscarded != 0u )
+			g_framegenHistory.ulLastPlannedTargetNs = 0u;
 		framegen_metrics_note_discard( nDiscarded );
 		static uint64_t s_uFeedbackDiscardDebugLogCounter = 0;
 		if ( nBefore != g_framegenHistory.pending.size()
@@ -12133,12 +13001,15 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 		}
 	}
 
+	// A correction replan only replaces the anchor's own slot inside this real
+	// interval; phase >= 1 coincides with the next expected real frame (nested
+	// only) and is left to the repeat tick.
 	if ( g_framegenHistory.pending.empty() )
-		framegen_causal_submit( g_framegenHistory.lastCompositeSeqNo );
+		framegen_causal_submit( g_framegenHistory.lastCompositeSeqNo, true );
 }
 
-// VRR hybrid slot (#01). Plan exactly ONE generated frame at the content
-// midpoint of the measured real-frame interval. This inverts #06: under a
+// VRR hybrid slot. Plan exactly ONE generated frame at the content
+// midpoint of the measured real-frame interval. This inverts display-clock pacing: under a
 // fixed refresh, the deadline planner asks "given the next vblank, what phase is that?"; under
 // active adaptive sync there is no grid — the real frame scanned out on
 // arrival — so we PICK the phase (0.5, the content-correct midpoint, exact by
@@ -12361,87 +13232,29 @@ static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback 
 	}
 }
 
-static void framegen_apply_bidir_flip_feedback( const DisplayFeedback_t &feedback )
-{
-	if ( !vulkan_framegen_bidir_active() || !feedback.bPresented
-		|| !feedback.bTimestampValid
-		|| feedback.tag.eKind != gamescope::FramegenPresentKind_t::DelayedReal )
-		return;
-
-	auto it = std::ranges::find_if(
-		g_framegenHistory.bidirFeedbackEndpoints,
-		[&]( const FramegenHistory_t::BidirFeedbackEndpoint_t &record ) {
-			return record.endpoint.realFrameId == feedback.tag.ulRealFrameId;
-		} );
-	if ( it == g_framegenHistory.bidirFeedbackEndpoints.end() )
-		return;
-
-	if ( it->ulEpoch == g_framegenHistory.bidirEpoch.epoch )
-	{
-		const gamescope::framegen::BidirEpochCorrection_t correction =
-			gamescope::framegen::apply_bidir_endpoint_feedback(
-				g_framegenHistory.bidirEpoch,
-				it->endpoint.sourceReadyNs,
-				feedback.ulActualFlipNs );
-		if ( correction.applied )
-		{
-			g_framegenHistory.bidirEpoch = correction.epoch;
-			static uint64_t s_uBidirFeedbackDebugLogCounter = 0;
-			if ( FramegenDebugShouldLog( s_uBidirFeedbackDebugLogCounter ) )
-				vk_log.infof( "framegen: bidir epoch corrected by delayed real=%" PRIu64,
-					feedback.tag.ulRealFrameId );
-		}
-	}
-
-	std::erase_if( g_framegenHistory.bidirFeedbackEndpoints,
-		[&]( const FramegenHistory_t::BidirFeedbackEndpoint_t &record ) {
-			return record.endpoint.realFrameId <= feedback.tag.ulRealFrameId;
-		} );
-}
-
-static void framegen_bidir_record_feedback_endpoint(
-	const gamescope::framegen::BidirEndpoint_t &endpoint )
-{
-	std::erase_if( g_framegenHistory.bidirFeedbackEndpoints,
-		[&]( const FramegenHistory_t::BidirFeedbackEndpoint_t &record ) {
-			return record.endpoint.realFrameId == endpoint.realFrameId;
-		} );
-	g_framegenHistory.bidirFeedbackEndpoints.push_back( {
-		.endpoint = endpoint,
-		.ulEpoch = g_framegenHistory.bidirEpoch.epoch,
-	} );
-}
-
+// Plans the pair ending at the current real: gathers the plan_bidir_step inputs
+// and applies its outputs (the retargeted and dropped reals, a re-prime, the
+// admitted interpolations, the endpoints and the shed). Record times are the
+// compositor's records of the two reals. Returns false when the pair was not
+// planned; the current real then primes.
 static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
-	uint64_t ulCurrentSourceNs, uint64_t ulLiveTargetNs,
+	uint64_t ulCurrentSourceNs, uint64_t ulPreviousRecordNs, uint64_t ulCurrentRecordNs,
 	uint64_t ulVblankIntervalNs, const FramegenEffective_t &eff,
 	uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps,
 	bool bAllowGeneration, bool bSourceTimestampsReliable )
 {
 	if ( ulPreviousSourceNs == 0u || ulCurrentSourceNs <= ulPreviousSourceNs
-		|| ulLiveTargetNs == 0u || ulVblankIntervalNs == 0u
+		|| ulVblankIntervalNs == 0u
 		|| g_framegenHistory.previousReal == nullptr
 		|| g_framegenHistory.currentReal == nullptr )
 		return false;
 
 	const uint64_t ulDisplayChainGeneration =
 		g_framegenPresentState.displayTiming.generation;
-	const bool bGridChanged = g_framegenHistory.ulBidirGridEpoch == 0u
-		|| g_framegenHistory.ulBidirGridIntervalNs != ulVblankIntervalNs
-		|| g_framegenHistory.ulBidirDisplayChainGeneration
-			!= ulDisplayChainGeneration;
-	const bool bProvenanceChanged =
-		g_framegenHistory.bBidirProvenanceInitialized
-		&& g_framegenHistory.bBidirSourceTimestampsReliable
-			!= bSourceTimestampsReliable;
-	if ( bGridChanged || bProvenanceChanged )
-	{
-		g_framegenHistory.bidirEpoch = {};
-		g_framegenHistory.bidirFeedbackEndpoints.clear();
-		g_framegenHistory.ulBidirGridEpoch++;
-		if ( g_framegenHistory.ulBidirGridEpoch == 0u )
-			g_framegenHistory.ulBidirGridEpoch = 1u;
-	}
+	const bool bInvalidate = g_framegenHistory.ulBidirGridIntervalNs != ulVblankIntervalNs
+		|| g_framegenHistory.ulBidirDisplayChainGeneration != ulDisplayChainGeneration
+		|| ( g_framegenHistory.bBidirProvenanceInitialized
+			&& g_framegenHistory.bBidirSourceTimestampsReliable != bSourceTimestampsReliable );
 	g_framegenHistory.ulBidirGridIntervalNs = ulVblankIntervalNs;
 	g_framegenHistory.ulBidirDisplayChainGeneration =
 		ulDisplayChainGeneration;
@@ -12449,159 +13262,87 @@ static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
 	g_framegenHistory.bBidirSourceTimestampsReliable =
 		bSourceTimestampsReliable;
 
-	bool bEstablished = false;
-	if ( !g_framegenHistory.bidirEpoch.valid )
-	{
-		if ( g_framegenHistory.ulBidirGridEpoch == 0u )
-			g_framegenHistory.ulBidirGridEpoch = 1u;
-		g_framegenHistory.bidirEpoch =
-			gamescope::framegen::establish_bidir_epoch(
-				ulPreviousSourceNs, ulLiveTargetNs,
-				g_framegenHistory.ulBidirGridEpoch );
-		if ( !g_framegenHistory.bidirEpoch.valid )
-			return false;
-
-		const gamescope::VBlankScheduleTime schedule =
-			GetVBlankTimer().CalcNextWakeupTime( true );
-		g_framegenHistory.ulBidirGridTargetNs = ulLiveTargetNs;
-		g_framegenHistory.ulBidirGridWakeNs =
-			schedule.ulScheduledWakeupPoint;
-		if ( schedule.ulTargetVBlank > ulLiveTargetNs )
-		{
-			const uint64_t deltaNs = schedule.ulTargetVBlank - ulLiveTargetNs;
-			if ( deltaNs < g_framegenHistory.ulBidirGridWakeNs )
-				g_framegenHistory.ulBidirGridWakeNs -= deltaNs;
-		}
-		else if ( ulLiveTargetNs > schedule.ulTargetVBlank )
-		{
-			g_framegenHistory.ulBidirGridWakeNs =
-				gamescope::framegen::saturating_add_ns(
-					schedule.ulScheduledWakeupPoint,
-					ulLiveTargetNs - schedule.ulTargetVBlank );
-		}
-		bEstablished = true;
-	}
-
-	const gamescope::framegen::DisplayGrid_t grid = {
-		.D0 = g_framegenHistory.ulBidirGridTargetNs,
-		.W0 = g_framegenHistory.ulBidirGridWakeNs,
-		.T = ulVblankIntervalNs,
+	const std::vector<FramegenHistory_t::PendingGenerated_t> &pending = g_framegenHistory.pending;
+	const uint64_t ulOpportunityNs = framegen_bidir_opportunity_ns();
+	const uint64_t ulNowNs = get_time_in_nanos();
+	const std::vector<gamescope::framegen::BidirQueueEntry_t> queue = framegen_bidir_queue_entries();
+	const gamescope::framegen::BidirEndpoint_t previous = {
+		.realFrameId = g_framegenPresentState.ulPreviousRealFrameId,
+		.sourceReadyNs = ulPreviousSourceNs,
+		.recordNs = ulPreviousRecordNs,
 	};
-	const std::array endpoints = {
-		gamescope::framegen::BidirEndpoint_t{
-			.realFrameId = g_framegenPresentState.ulPreviousRealFrameId,
-			.sourceReadyNs = ulPreviousSourceNs,
-		},
-		gamescope::framegen::BidirEndpoint_t{
-			.realFrameId = g_framegenPresentState.ulCurrentRealFrameId,
-			.sourceReadyNs = ulCurrentSourceNs,
-		},
+	const gamescope::framegen::BidirEndpoint_t current = {
+		.realFrameId = g_framegenPresentState.ulCurrentRealFrameId,
+		.sourceReadyNs = ulCurrentSourceNs,
+		.recordNs = ulCurrentRecordNs,
 	};
-	const uint32_t nPlannerMultiplier = g_device.hasFramegenQueue()
-		? eff.multiplier : 2u;
-	const gamescope::framegen::BidirPlan_t plan =
-		gamescope::framegen::plan_bidir_slots(
-			grid, g_framegenHistory.bidirEpoch, endpoints,
-			nPlannerMultiplier, g_framegenHistory.ulBidirGridEpoch );
-	if ( !plan.validEpoch )
+	const uint64_t ulPreviousDelayNs = g_framegenHistory.bidir.epoch.delayNs;
+	const gamescope::framegen::BidirPlanStep_t step = gamescope::framegen::plan_bidir_step(
+		g_framegenHistory.bidir, {
+			.queue = queue,
+			.previous = previous,
+			.current = current,
+			.wakeNs = framegen_nested_slot_wake_ns( ulOpportunityNs ),
+			.nowNs = ulNowNs,
+			.consumedFrameId = g_framegenHistory.ulBidirConsumedFrameId,
+			.presenter = framegen_bidir_presenter_view( ulOpportunityNs ),
+			.multiplier = g_device.hasFramegenQueue() ? eff.multiplier : 2u,
+			.frontCompleted = pending.empty() || framegen_bidir_entry_completed( pending.front() ),
+			.invalidate = bInvalidate,
+			.allowGeneration = bAllowGeneration,
+		} );
+	g_framegenHistory.bidir = step.state;
+	if ( !step.planned )
 		return false;
 
-	// The number of display opportunities this real interval actually offers.
-	// It bounds both the submitted batch's cost key and — via
-	// bidir_pending_target — how deep the queue is allowed to be planned.
+	// Before anything of this pair is queued: the step's retargets and drops
+	// refer to the queue it saw.
+	if ( step.reestablish == gamescope::framegen::BidirReestablish_t::Shortened )
+		framegen_bidir_retarget( step.retargeted, step.state.grid );
+	for ( const uint64_t ulRealFrameId : step.droppedRealIds )
+		framegen_bidir_drop_queued_real( ulRealFrameId );
+	if ( !step.droppedRealIds.empty() )
+	{
+		static uint64_t s_uDropDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uDropDebugLogCounter ) )
+			vk_log.infof( "framegen: bidir dropped %zu queued real(s) (%s)", step.droppedRealIds.size(),
+				step.backlogDropped ? "backlog did not drain" : "ring full" );
+	}
+	if ( step.reestablish == gamescope::framegen::BidirReestablish_t::Lengthened
+		|| step.reestablish == gamescope::framegen::BidirReestablish_t::Shortened )
+	{
+		framegen_metrics_note_reprime();
+		static uint64_t s_uDelayDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uDelayDebugLogCounter ) )
+			vk_log.infof( "framegen: bidir delay %.1fms -> %.1fms (pair latency %.1fms, ring bound %.1fms), re-primed",
+				ulPreviousDelayNs / 1.0e6, step.state.epoch.delayNs / 1.0e6,
+				step.state.pairLatency.valueNs / 1.0e6, step.state.ringBound.delayNs / 1.0e6 );
+	}
+	framegen_metrics_note_bidir_delay( step.state.epoch.delayNs );
+
+	// The number of display opportunities this real interval offers: the
+	// submitted batch's cost key.
 	const uint64_t sourceSpanNs = ulCurrentSourceNs - ulPreviousSourceNs;
 	const uint32_t nGapVblanks = std::max<uint32_t>( 1u,
 		static_cast<uint32_t>( std::min<uint64_t>( UINT32_MAX,
 			( sourceSpanNs + ulVblankIntervalNs - 1u )
 				/ ulVblankIntervalNs ) ) );
-	const size_t uIncomingEndpoints = std::ranges::count_if(
-		plan.slots,
-		[&]( const gamescope::framegen::BidirSlot_t &slot ) {
-			return slot.kind == gamescope::framegen::BidirSlotKind_t::RealEndpoint
-				&& ( slot.endpointFrameId == endpoints[ 1 ].realFrameId
-					|| ( bEstablished
-						&& slot.endpointFrameId == endpoints[ 0 ].realFrameId ) );
-		} );
-	// One real interval of timeline, never more than the ring/latency ceiling.
-	// Refilling to the flat ceiling every real frame is what pinned the queue
-	// at capacity: it kept the drain valve permanently engaged (which disables
-	// the per-slot display-target gate) and made the capacity shed the
-	// steady-state regulator instead of an exception.
-	const size_t uMaxPending = gamescope::framegen::bidir_pending_target(
-		framegen_bidir_pending_hard_capacity( eff.multiplier ), nGapVblanks );
-	g_framegenHistory.uBidirPendingTarget = uMaxPending;
-	// Admission: what the queue can still take once this interval's own real
-	// endpoints are in. Work that would not fit is never built or submitted —
-	// GPU work never planned beats GPU work planned and then shed.
-	const size_t uCommitted = g_framegenHistory.pending.size() + uIncomingEndpoints;
-	const size_t uRoom = uMaxPending > uCommitted ? uMaxPending - uCommitted : 0u;
 
+	// Work that would not fit under the ring-derived ceiling is never built: GPU
+	// work never planned beats GPU work planned and then shed.
 	std::vector<FramegenSlotRequest_t> requests;
-	const uint64_t ulNowNs = get_time_in_nanos();
-	for ( const gamescope::framegen::BidirSlot_t &slot : plan.slots )
+	requests.reserve( step.admitted.size() );
+	for ( const gamescope::framegen::BidirSlot_t &slot : step.admitted )
 	{
-		// plan.slots is ordered by display target, so the admitted prefix is the
-		// run that keeps the timeline dense from the next opportunity onward.
-		if ( requests.size() >= uRoom )
-			break;
-		if ( slot.kind != gamescope::framegen::BidirSlotKind_t::Generated
-			|| slot.endpointFrameId != endpoints[ 1 ].realFrameId
-			|| !bAllowGeneration || ulNowNs >= slot.wakeNs )
-			continue;
-		if ( std::ranges::any_of( g_framegenHistory.pending,
-			[&]( const FramegenHistory_t::PendingGenerated_t &entry ) {
-				return entry.ulTargetFlipNs == slot.targetNs;
-			} ) )
-			continue;
 		requests.push_back( {
 			.phase = static_cast<float>( slot.phase ),
 			.strength = static_cast<float>( slot.phase ),
 			.slotIndex = static_cast<uint32_t>( std::min<uint64_t>(
 				gamescope::framegen::grid_index_at_or_after(
-					grid, slot.targetNs ), UINT32_MAX ) ),
+					step.state.grid, slot.targetNs ), UINT32_MAX ) ),
 			.targetFlipNs = slot.targetNs,
 			.wakeDeadlineNs = slot.wakeNs,
 		} );
-	}
-
-	const size_t uExistingGenerated = std::ranges::count_if(
-		g_framegenHistory.pending,
-		[]( const FramegenHistory_t::PendingGenerated_t &entry ) {
-			return !entry.bReal;
-		} );
-	size_t uOverflow = g_framegenHistory.pending.size() + requests.size()
-		+ uIncomingEndpoints > uMaxPending
-		? g_framegenHistory.pending.size() + requests.size()
-			+ uIncomingEndpoints - uMaxPending
-		: 0u;
-	FramegenBidirShedResult_t shed;
-	if ( uOverflow != 0u && uExistingGenerated != 0u )
-	{
-		const size_t uDrop = std::min( uOverflow, uExistingGenerated );
-		const FramegenBidirShedResult_t dropped =
-			framegen_bidir_shed_to_capacity(
-				g_framegenHistory.pending.size() - uDrop );
-		shed.generated += dropped.generated;
-		shed.endpoints += dropped.endpoints;
-		uOverflow -= dropped.total();
-	}
-	if ( uOverflow != 0u && !requests.empty() )
-	{
-		const size_t uDrop = std::min( uOverflow, requests.size() );
-		requests.erase( requests.begin(), requests.begin() + uDrop );
-		shed.generated += uDrop;
-		uOverflow -= uDrop;
-		framegen_metrics_note_discard( uDrop );
-	}
-	if ( uOverflow != 0u )
-	{
-		const FramegenBidirShedResult_t dropped =
-			framegen_bidir_shed_to_capacity(
-				g_framegenHistory.pending.size() -
-					std::min( uOverflow, g_framegenHistory.pending.size() ) );
-		shed.generated += dropped.generated;
-		shed.endpoints += dropped.endpoints;
-		uOverflow -= std::min( uOverflow, dropped.total() );
 	}
 
 	// A mature batch estimate must fit before the earliest surviving wake.
@@ -12627,56 +13368,50 @@ static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
 			eff, ulCompositeSeqNo, nMaxDegradeSteps, false );
 	}
 
-	const auto queueEndpoint = [&]( const gamescope::framegen::BidirEndpoint_t &endpoint,
+	const auto queueEndpoint = [&]( const gamescope::framegen::BidirPlannedEndpoint_t &planned,
+		const gamescope::framegen::BidirEndpoint_t &endpoint,
 		const gamescope::Rc<CVulkanTexture> &texture, uint64_t frameId,
 		uint64_t compositeSeqNo ) {
-		const auto slot = std::ranges::find_if( plan.slots,
-			[&]( const gamescope::framegen::BidirSlot_t &candidate ) {
-				return candidate.kind == gamescope::framegen::BidirSlotKind_t::RealEndpoint
-					&& candidate.endpointFrameId == endpoint.realFrameId;
-			} );
-		if ( slot == plan.slots.end() )
-			return;
 		FramegenHistory_t::PendingGenerated_t entry;
 		entry.tex = texture;
 		entry.frameId = frameId;
 		entry.ulPresentRealFrameId = endpoint.realFrameId;
 		entry.ulSlotId = framegen_next_present_slot_id();
 		entry.ulCompositeSeqNo = compositeSeqNo;
-		entry.ulTargetFlipNs = slot->targetNs;
-		entry.ulWakeDeadlineNs = slot->wakeNs;
+		entry.ulTargetFlipNs = planned.targetNs;
+		entry.ulIdealFlipNs = planned.idealNs;
+		entry.ulWakeDeadlineNs = planned.wakeNs;
 		entry.phase = 1.0f;
 		entry.bReal = true;
-		if ( framegen_insert_pending_entry( std::move( entry ) ) )
-			framegen_bidir_record_feedback_endpoint( endpoint );
+		framegen_insert_pending_entry( std::move( entry ) );
+		framegen_bidir_note_consumed( endpoint.realFrameId );
 	};
-	if ( bEstablished )
+	if ( step.previous.queue )
 	{
-		queueEndpoint( endpoints[ 0 ], g_framegenHistory.previousReal,
+		queueEndpoint( step.previous, previous, g_framegenHistory.previousReal,
 			g_framegenHistory.previousFrameId,
 			g_framegenPresentState.ulPreviousRealCompositeSeqNo );
 	}
-	queueEndpoint( endpoints[ 1 ], g_framegenHistory.currentReal,
+	queueEndpoint( step.current, current, g_framegenHistory.currentReal,
 		g_framegenHistory.currentFrameId, ulCompositeSeqNo );
-	const FramegenBidirShedResult_t finalShed =
-		framegen_bidir_shed_to_capacity( uMaxPending );
-	shed.generated += finalShed.generated;
-	shed.endpoints += finalShed.endpoints;
-	if ( shed.endpoints != 0u && finalShed.endpoints == 0u )
-		framegen_bidir_resync_to_newest_endpoint();
+	// A front the presenter shows at this opportunity leaves the queue with this
+	// paint's flip (bBidirQueuedReal below).
+	const size_t nShed = framegen_bidir_shed_to_capacity( step.shedCapacity );
 	g_framegenHistory.bBidirQueuedReal = true;
 
 	static uint64_t s_uBidirDeadlineDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uBidirDeadlineDebugLogCounter ) )
 	{
 		vk_log.infof( "framegen: bidir epoch=%" PRIu64
-			" candidates=%zu pending=%zu/%zu gap=%u room=%zu forced=%d"
-			" shed_gen=%zu shed_real=%zu%s",
-			g_framegenHistory.bidirEpoch.epoch, requests.size(),
-			g_framegenHistory.pending.size(), uMaxPending,
-			nGapVblanks, uRoom, (int)framegen_bidir_queue_forces_drain(),
-			shed.generated, shed.endpoints,
-			bEstablished ? " established" : "" );
+			" candidates=%zu pending=%zu/%zu gap=%u forced=%d"
+			" shed_gen=%zu delay_ms=%.1f envelope_ms=%.1f%s",
+			step.state.epoch.epoch, requests.size(),
+			pending.size(), step.shedCapacity,
+			nGapVblanks, (int)framegen_bidir_queue_forces_drain(),
+			nShed,
+			step.state.epoch.delayNs / 1.0e6,
+			step.state.pairLatency.valueNs / 1.0e6,
+			step.reestablish != gamescope::framegen::BidirReestablish_t::Kept ? " established" : "" );
 	}
 	return true;
 }
@@ -12690,20 +13425,12 @@ static bool framegen_bidir_plan_pair( uint64_t ulPreviousSourceNs,
 void vulkan_framegen_causal_tick()
 {
 	vulkan_framegen_metrics_note_repeat();
-	// VRR and bidir retain their own Step 3 policies. The classic A/B switch and
-	// shared-queue fallback are intentionally no-ops here.
+	// VRR hybrid and bidir plan from real frames only, and the classic and
+	// shared-queue paths refill elsewhere: nothing to do for them here.
 	if ( !framegen_causal_deadline_enabled()
 		|| vulkan_framegen_vrr_hybrid_active() || vulkan_framegen_bidir_active() )
 		return;
 	framegen_causal_submit( g_framegenHistory.lastCompositeSeqNo );
-}
-
-// Keep the old exported symbol during the Step 3 review interval; production
-// callers use the generalized name and the legacy environment variable no
-// longer gates either entry point.
-void vulkan_framegen_jit_tick()
-{
-	vulkan_framegen_causal_tick();
 }
 
 static bool framegen_refill_idle()
@@ -12808,7 +13535,7 @@ void vulkan_framegen_benchmark()
 
 	// Two representative targets: a 10-bit integer format (HDR10/SDR path, where
 	// production runs the fp16 extrapolate shader) and an fp16-float format (scRGB
-	// path, forced to fp32 for precision). Both let us A/B the fp16 vs fp32 shader.
+	// path, forced to fp32 for precision). Both compare the fp16 and fp32 shaders.
 	struct FramegenBenchFormat_t { const char *pszName; uint32_t uDrmFormat; };
 	const FramegenBenchFormat_t formats[] = {
 		{ "ABGR2101010 (int, HDR10/SDR path)", DRM_FORMAT_ABGR2101010 },
@@ -12881,7 +13608,7 @@ void vulkan_framegen_benchmark()
 
 		const FramegenDispatch_t &dispatch = framegen_dispatch_for_format( uDrmFormat );
 
-		// Extrapolate variants on identical images — a direct A/B. (*) marks the
+		// Extrapolate variants on identical images — a direct comparison. (*) marks the
 		// shader the vendor dispatcher actually selects for this GPU + format.
 		double msExtrap32 = timePass( [&]( CVulkanCmdBuffer *cmd ) {
 			framegen_bind_extrapolate( cmd, SHADER_TYPE_FRAMEGEN_EXTRAPOLATE, pOut, g_flFramegenStrength );
@@ -12950,7 +13677,7 @@ void vulkan_framegen_benchmark()
 			} );
 			printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion setup (per real)", msMotionPrep );
 
-			// B4 stats probe (clear + accumulate + 384-byte readback copy) —
+			// Adaptation stats probe (clear + accumulate + 384-byte readback copy) —
 			// recorded after setup in production, so its cost adds to the
 			// per-real tail, not per-slot.
 			if ( framegen_adapt_enabled( g_eFramegenPipeline ) )
@@ -12999,7 +13726,7 @@ void vulkan_framegen_benchmark()
 					"luma reservoir copy (real)", msReservoirUpdate );
 			}
 
-			// Bidir (B3): the setup number above already includes the extra
+			// Bidir: the setup number above already includes the extra
 			// reverse-field check when bidir is active; the two-frame warp is
 			// its own per-slot cost.
 			if ( vulkan_framegen_bidir_active() )
@@ -13035,7 +13762,7 @@ void vulkan_framegen_benchmark()
 	printf( "\n" );
 }
 
-// Gap E2 held-out capture. Real frames still scan out normally. For each A/B/C
+// Held-out capture. Real frames still scan out normally. For each A/B/C
 // sequence (consecutive by default, configurable offset/span), B is retained as
 // ground truth but deliberately omitted from motion history; three invisible
 // slots are generated at B's measured temporal phase from A/C with a paired
@@ -13240,20 +13967,20 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		else if ( g_device.hasFramegenQueue() && framegen_classic_enabled()
 			&& !vulkan_framegen_vrr_hybrid_active()
 			&& !vulkan_framegen_bidir_active() )
-			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_CLASSIC=1 restored the temporary classic batch path for A/B (scheduled for deletion in Step 5)" );
+			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_CLASSIC=1 selected the classic batch path" );
 		if ( framegen_bidir_enabled() )
 		{
 			if ( !framegen_owns_output_ring() )
 				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored on a Vulkan-swapchain backend — bidir presents output-ring images directly by flip substitution, and swapchain images are owned by the presentation engine between present and re-acquire" );
 			else if ( g_eFramegenMode == GamescopeFramegenMode::Motion && !vulkan_framegen_vrr_hybrid_requested() )
-				vk_log.infof( "framegen: bidirectional interpolation requested (B3) — generated frames interpolate between the two real frames; real-frame presentation is delayed up to one interval" );
+				vk_log.infof( "framegen: bidirectional interpolation requested — generated frames interpolate between the two real frames; real frames are shown up to the target delay D (bidir_delay_ms) plus one refresh after they are recorded" );
 			else
 				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored (requires motion mode and is incompatible with VRR-hybrid pacing)" );
 		}
 		if ( !framegen_owns_output_ring() )
-			vk_log.infof( "framegen: base-layer generation forced (#02) — a Vulkan-swapchain backend has no compositor-owned output ring, so history keys on the client's buffer and generated frames are late-composited into the acquired swapchain image" );
+			vk_log.infof( "framegen: base-layer generation forced — a Vulkan-swapchain backend has no compositor-owned output ring, so history keys on the client's buffer and generated frames are late-composited into the acquired swapchain image" );
 		else if ( framegen_base_layer_enabled() )
-			vk_log.infof( "framegen: base-layer generation + late overlay composite requested (#02) — predicting on the pre-upscale game layer, overlays/cursor composite fresh onto generated frames" );
+			vk_log.infof( "framegen: base-layer generation + late overlay composite requested — predicting on the pre-upscale game layer, overlays/cursor composite fresh onto generated frames" );
 		if ( g_eFramegenMode == GamescopeFramegenMode::Motion )
 		{
 			const bool bBidirActive = vulkan_framegen_bidir_active();
@@ -13280,7 +14007,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 						? " + three-real-frame disocclusion reservoir enabled"
 						: " (disocclusion reservoir disabled by GAMESCOPE_FRAMEGEN_RESERVOIR=0)" );
 			if ( framegen_adapt_enabled( g_eFramegenPipeline ) )
-				vk_log.infof( "framegen: self-supervised adaptation active (B4) — each real frame grades the field that predicted it; blend trust follows same-batch, thresholds auto-calibrate next batch (GAMESCOPE_FRAMEGEN_ADAPT=0 disables)" );
+				vk_log.infof( "framegen: self-supervised adaptation active — each real frame grades the field that predicted it; blend trust follows same-batch, thresholds auto-calibrate next batch (GAMESCOPE_FRAMEGEN_ADAPT=0 disables)" );
 			else if ( g_eFramegenPipeline < GamescopeFramegenPipeline::Learned )
 				vk_log.infof( "framegen: self-supervised adaptation not scheduled below the learned pipeline" );
 			else
@@ -13293,10 +14020,10 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				else
 					vk_log.infof( "framegen: learned forward-field refinement active (C) — the net improves causal motion prediction once per real frame (bounded flow residual + evidence-gated confidence)" );
 				if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided && !bBidirActive )
-					vk_log.infof( "framegen: causal shading-persistence head %s — three-frame in-situ supervision, bounded color-trend correction (GAMESCOPE_FRAMEGEN_SHADING=0 disables for A/B)",
+					vk_log.infof( "framegen: causal shading-persistence head %s — three-frame in-situ supervision, bounded color-trend correction (GAMESCOPE_FRAMEGEN_SHADING=0 disables)",
 						framegen_shading_enabled( g_eFramegenPipeline ) ? "enabled" : "disabled" );
 				if ( framegen_net_online_enabled() )
-					vk_log.infof( "framegen: in-situ learning active (C2) — %s (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
+					vk_log.infof( "framegen: in-situ learning active — %s (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
 						bConservativeBidir
 							? "each real frame trains only bidir's conservative confidence output row; geometry heads and shared trunk stay frozen"
 							: "the net keeps training on the framegen GPU against every real frame",
@@ -13317,7 +14044,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			{
 				if ( framegen_color_probe_requested() )
 				{
-					vk_log.infof( "framegen: full-colour held-out validation active (E2) — A/B/C sequences offset=%u span=%u phaseTolerance=%.3f produce paired invisible B predictions (%s 0/0.5/1) on the dedicated queue; generated frames never present; synchronous GSCF writes can perturb capture cadence; up to %u samples write to '%s'",
+					vk_log.infof( "framegen: full-colour held-out validation active — A/B/C sequences offset=%u span=%u phaseTolerance=%.3f produce paired invisible B predictions (%s 0/0.5/1) on the dedicated queue; generated frames never present; synchronous GSCF writes can perturb capture cadence; up to %u samples write to '%s'",
 						framegen_color_record_offset(), framegen_color_record_span(),
 						framegen_color_record_phase_tolerance(),
 						gamescope::framegen::color_probe_sweep_name( framegen_color_record_sweep() ),
@@ -13355,7 +14082,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	if ( framegen_record_color_probe_real( pRealFrame, pFrameInfo, ulCompositeSeqNo ) )
 		return;
 
-	// #02 dispatcher: decide per recorded frame whether the base-layer path
+	// Base-layer dispatcher: decide per recorded frame whether the base-layer path
 	// applies. History then tracks the pre-upscale game buffer instead of the
 	// composited output; the dims/mode-keyed reset inside ensure_resources
 	// mediates any live switch between the two, so they never mix in a scene.
@@ -13470,7 +14197,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	const uint64_t ulPreviousCadenceTimeNs =
 		g_framegenHistory.ulCurrentCadenceTimeNs;
 
-	// Live cadence predictor (#06): acquire-fence completion is the earliest
+	// Live cadence predictor: acquire-fence completion is the earliest
 	// trustworthy observation that the renderer's frame can enter the compositor,
 	// and unlike paint time it has not yet been quantized to a fixed vblank. A
 	// backend without that timestamp falls back to this composite's monotonic time.
@@ -13591,7 +14318,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	// History shift, on every kept real frame (even non-generatable ones) so
 	// the two most recent reals stay fresh and a slowdown resumes generation
-	// without a re-prime. Base mode (#02) copies the client's base buffer into
+	// without a re-prime. Base mode copies the client's base buffer into
 	// an owned image on the framegen queue; output-space mode is the zero-copy
 	// shift — the previous "current" becomes "previous" and the just-composited
 	// output image becomes "current", holding references into the output ring.
@@ -13668,7 +14395,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		{
 			framegen_bidir_plan_pair(
 				ulBidirPreviousSourceNs, ulCadenceTimeNs,
-				g_framegenPresentState.pendingTag.ulTargetFlipNs,
+				ulPrevRealFrameTimeNs, now,
 				ulVblankIntervalNs,
 				framegen_effective_config(
 					g_framegenHistory.nDegradeSteps ),
@@ -13704,7 +14431,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		return;
 	}
 
-	// Deadline-driven degradation (#04): shed one pipeline rung whenever the CURRENT
+	// Deadline-driven degradation: shed one pipeline rung whenever the CURRENT
 	// config's measured GPU cost (see framegenGarbageCollect) overruns the vblank
 	// budget, so a too-slow config never causes a missed generated frame. Evaluated
 	// only here, on frames we actually generate, so the rung it settles on is a rung
@@ -13818,7 +14545,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	const FramegenEffective_t eff = framegen_effective_config( g_framegenHistory.nDegradeSteps );
 	const uint64_t ulPredictedIntervalNs = framegen_predicted_interval_ns();
 
-	// VRR hybrid (#01): the real frame just presented immediately (adaptive
+	// VRR hybrid: the real frame just presented immediately (adaptive
 	// sync — no grid quantization, no added latency), and the one generated
 	// frame is placed at the content midpoint of the measured interval by a
 	// correlated absolute deadline. Keep-up guard: skip when the interval is too
@@ -13847,7 +14574,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	{
 		framegen_bidir_plan_pair(
 			ulBidirPreviousSourceNs, ulCadenceTimeNs,
-			g_framegenPresentState.pendingTag.ulTargetFlipNs,
+			ulPrevRealFrameTimeNs, now,
 			ulVblankIntervalNs, eff, ulCompositeSeqNo,
 			nMaxDegradeSteps, true, bUseSourceCadence );
 		return;
@@ -14029,7 +14756,13 @@ static void stage_base_imports_in_own_submission( struct FrameInfo_t *pFrameInfo
 
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool bForceFramegenHud )
 {
-	// Bidir (B3): each composite decides afresh whether it queued its real
+	// Offscreen overrides do not consume a swapchain image. The generated
+	// window-present path reconciles before selecting its explicit override.
+	if ( !pOutputOverride && GetBackend()->UsesVulkanSwapchain()
+		&& vulkan_prepare_swapchain_image() != gamescope::SwapchainImage_t::Ready )
+		return std::nullopt;
+
+	// Bidir: each composite decides afresh whether it queued its real
 	// frame; a composite that never records (overlay-only, partial, screenshot)
 	// must not inherit the previous verdict at flip-substitution time.
 	g_framegenHistory.bBidirQueuedReal = false;
@@ -14139,9 +14872,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			if ( !nAvailable && vulkan_framegen_bidir_active() )
 			{
 				// The queue is now the only compositor-owned backlog we can shed
-				// without waiting. Release exactly as much as necessary, generated
-				// first and then stale endpoints, checking ownership after each
-				// release so the normal one-interval timeline loses the minimum.
+				// without waiting. Release queued interpolations oldest first,
+				// re-checking ownership after each one; when only reals remain the
+				// invalidation below flushes the timeline, a declared
+				// discontinuity.
 				while ( !nAvailable && g_framegenHistory.pending.size() > 1u )
 				{
 					const size_t nBefore = g_framegenHistory.pending.size();
@@ -14155,8 +14889,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			if ( !nAvailable )
 			{
 				// Exceptional recovery is atomic for bidir: flush its entire
-				// timeline, retain only the newest endpoint as the visible hold, and
-				// invalidate the epoch/history so the next real composite re-primes.
+				// timeline and invalidate; the next composite flips live.
 				// Non-bidir keeps the same history-release behavior.
 				vulkan_framegen_invalidate_history( "real_output_ring_pressure" );
 				nAvailable = framegen_find_available_output_image( g_output.nOutImage );
@@ -14168,11 +14901,13 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 					framegen_log_output_ring_pressure();
 				return std::nullopt;
 			}
-			if ( vulkan_framegen_bidir_active() )
-				g_framegenHistory.nBidirRingPressureFailures = 0u;
 			g_output.nOutImage = *nAvailable;
 		}
-		compositeImage = partial ? g_output.outputImagesPartialOverlay[ g_output.nOutImage ] : g_output.outputImages[ g_output.nOutImage ];
+		const auto &outputImages = partial ? g_output.outputImagesPartialOverlay : g_output.outputImages;
+		if ( g_bVulkanOutputFailed || g_output.nOutImage >= outputImages.size()
+			|| outputImages[ g_output.nOutImage ] == nullptr )
+			return std::nullopt;
+		compositeImage = outputImages[ g_output.nOutImage ];
 	}
 
 	// Output-space cursor split, first half. Only a composite that will actually
@@ -14540,6 +15275,8 @@ bool vulkan_has_drm_props()
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer )
 {
 	const uint32_t nRing = g_output.outputImages.size();
+	if ( g_bVulkanOutputFailed || nRing == 0 )
+		return nullptr;
 
 	// The just-composited image (one step back from the next write slot).
 	// For the classic 3-image ring this is (nOutImage + 2) % 3.
@@ -14559,15 +15296,10 @@ gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool d
 	if ( !defer && vulkan_framegen_is_enabled() )
 		nOutImage = g_output.nLastOutImage;
 
-	if ( partial )
-	{
-
-		//vk_log.infof( "Partial overlay frame: %d", nDeferredImage );
-		return g_output.outputImagesPartialOverlay[ nOutImage ];
-	}
-
-
-	return g_output.outputImages[ nOutImage ];
+	const auto &outputImages = partial ? g_output.outputImagesPartialOverlay : g_output.outputImages;
+	if ( nOutImage >= outputImages.size() )
+		return nullptr;
+	return outputImages[ nOutImage ];
 }
 
 bool vulkan_primary_dev_id(dev_t *id)

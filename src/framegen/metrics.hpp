@@ -18,8 +18,9 @@ namespace gamescope::framegen
 // means a distribution fed samples past full scale reports exactly full scale
 // for its high percentiles with no way to tell that apart from a real value.
 // Size the range for what the field measures: sub-vblank timing accuracy is
-// fine at 16 ms, while wall-clock presentation latency at 60 Hz is >= one
-// vblank by construction and needs the wide variant below.
+// fine at 16 ms, wall-clock flip intervals at 60 Hz are >= one vblank by
+// construction and need 64 ms, and real-frame -> flip latency includes a
+// delayed real's whole bidir delay and needs 256 ms (the three ranges below).
 template < uint64_t StepNs, size_t Buckets >
 struct MetricsDistribution_t
 {
@@ -75,19 +76,25 @@ struct MetricsDistribution_t
 	double p95() const { return percentile( 95u ); }
 };
 
-// Bucket width shared by every metrics distribution: 250 us resolves the
-// sub-millisecond structure of GPU pass and deadline-error timings.
+// Bucket width of the timing and flip-interval distributions: 250 us resolves
+// the sub-millisecond structure of GPU pass and deadline-error timings.
 inline constexpr uint64_t k_ulMetricsHistogramStepNs = 250'000ull;
 // 16 ms full scale. Only for quantities that cannot plausibly run past it.
 inline constexpr size_t k_nMetricsHistogramBuckets = 64;
-// 64 ms full scale at the same resolution, for wall-clock presentation
-// latencies: a 60 Hz flip interval alone is 16.67 ms, and a source-ready ->
-// flip latency adds queueing on top of that.
+// 64 ms full scale at the same resolution, for wall-clock flip intervals: a
+// 60 Hz flip interval alone is 16.67 ms.
 inline constexpr size_t k_nMetricsLatencyHistogramBuckets = 256;
+// 256 ms full scale at 1 ms, for real-frame -> flip latency: a delayed real
+// waits one source interval plus any backlog before its flip, which passes 64 ms
+// at 30-45 fps, and 1 ms resolves that delay against a source interval.
+inline constexpr uint64_t k_ulMetricsSourceLatencyStepNs = 1'000'000ull;
+inline constexpr size_t k_nMetricsSourceLatencyBuckets = 256;
 
 using MetricsDistribution =
 	MetricsDistribution_t< k_ulMetricsHistogramStepNs, k_nMetricsHistogramBuckets >;
 using MetricsLatencyDistribution =
 	MetricsDistribution_t< k_ulMetricsHistogramStepNs, k_nMetricsLatencyHistogramBuckets >;
+using MetricsSourceLatencyDistribution =
+	MetricsDistribution_t< k_ulMetricsSourceLatencyStepNs, k_nMetricsSourceLatencyBuckets >;
 
 } // namespace gamescope::framegen

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 
 namespace gamescope::framegen
 {
@@ -51,6 +52,9 @@ struct SlotRequest
 	// carry the exact grid/non-grid times end to end.
 	uint64_t targetFlipNs = 0;
 	uint64_t wakeDeadlineNs = 0;
+	// Raw vblank of a nested fixed-grid causal slot (fixed_grid_slot_due); no
+	// other slot has one.
+	std::optional<uint64_t> targetVBlankNs = std::nullopt;
 };
 
 [[nodiscard]] constexpr float forward_strength_raw( float phase, float configuredStrength )

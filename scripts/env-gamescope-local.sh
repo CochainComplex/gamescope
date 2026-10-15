@@ -42,6 +42,7 @@ _gamescope_env_prepend LD_LIBRARY_PATH "$GAMESCOPE_LOCAL_PREFIX/lib/x86_64-linux
 
 _gamescope_env_prepend PATH "$_gamescope_env_build/src"
 _gamescope_env_prepend PATH "$GAMESCOPE_LOCAL_PREFIX/bin"
+_gamescope_env_prepend PKG_CONFIG_PATH "$GAMESCOPE_LOCAL_PREFIX/share/pkgconfig"
 _gamescope_env_prepend PKG_CONFIG_PATH "$GAMESCOPE_LOCAL_PREFIX/lib/pkgconfig"
 _gamescope_env_prepend PKG_CONFIG_PATH "$GAMESCOPE_LOCAL_PREFIX/lib/x86_64-linux-gnu/pkgconfig"
 _gamescope_env_prepend CMAKE_PREFIX_PATH "$GAMESCOPE_LOCAL_PREFIX"

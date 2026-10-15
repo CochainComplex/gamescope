@@ -20,8 +20,27 @@ GAMESCOPE_FRAMEGEN_HUD=2 gamescope --expose-wayland --backend wayland --prefer-v
 - `learned`, `predict`, and `guided` are experimental pipelines that add passes and can smear more; the ladder auto-degrades and now auto-recovers.
 - When testing `learned` or later, use `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`.
 - On an iGPU-class present GPU (e.g. an 890M) set `GAMESCOPE_FRAMEGEN_NET_EVERY=2` (train every 2nd frame): pacing stays equal and it played best in our real-game test; `1` on a desktop card.
-- Tune with `GAMESCOPE_FRAMEGEN_HUD=2`: `rates` shows source/generated fps, `ladder` shows effective pipeline/recovery, and `pace` shows hit-rate/jitter sparklines. Add `GAMESCOPE_FRAMEGEN_METRICS=1` for a log summary.
-- Use `GAMESCOPE_FRAMEGEN_BIDIR=1` only when latency does not matter, such as video-like content or benchmarks. It delays every real frame by one interval and felt clearly laggy in play.
+- Tune with `GAMESCOPE_FRAMEGEN_HUD=2`: `rates` shows source/generated fps, `ladder` shows effective pipeline/recovery, and `pace` shows hit-rate/jitter sparklines. Add `GAMESCOPE_FRAMEGEN_METRICS=1` for a log summary; its latency fields are `src_flip_ms_*` for live real frames and `dreal_flip_ms_*` for bidir's delayed real frames (see [framegen-testing.md](framegen-testing.md)).
+- `GAMESCOPE_FRAMEGEN_BIDIR=1` (bidirectional interpolation) is experimental and opt-in. It shows each real frame later than live presentation would, so use it only where the added latency is acceptable, such as video-like content or benchmarks.
+  - T is one refresh interval. Each real frame is planned for the first refresh at or after its record time plus the target delay D = min(round_up(E) + T, D_ring), where round_up() rounds up to whole refresh intervals.
+  - For a source no faster than the display, once settled every real frame is shown at most D + T after gamescope records it, and consecutive real frames are shown within ±T of their record spacing.
+  - E is one latency envelope, sampled once per presenter opportunity, while no real frame waits behind another, as the time from the previous real frame's record to the opportunity that plans the current one. A frame limiter holds a frame before it is recorded, so changing the limit does not change D.
+  - One rule moves E, using the third-highest sample of the last second:
+    - D is first taken once that second is full.
+    - E rises to that sample as soon as it lies above D, that is, when three samples in the second lie above D wherever they fall.
+    - E falls to it once it has stayed at least T below E for 2 s.
+    - Fewer than three high samples in a second never move E.
+    - E restarts only when the refresh interval, the display chain or the timestamp source changes.
+  - D_ring is the longest delay, in whole refresh intervals, whose real frames fit the presentation queue: D_ring = round_down((C − 3) × max(P, T)).
+    - C is the queue's capacity in frames.
+    - 3 leaves room for the current real frame and a burst of two.
+    - (C − 3) × max(P, T) is the third-shortest time that C − 3 consecutive real frame intervals, each counted at least T, spanned in the last second. It is taken both between source-ready times and between records, and the longer of the two counts, so a change of the hold between them (a frame limiter settling, catch-up composites) does not move D_ring.
+    - D_ring falls at once and rises only after it has stayed higher for 2 s.
+    - When the held D exceeds D_ring, D shortens to D_ring at once, as one declared re-prime, and the queued real frames move earlier by the difference.
+  - A source no faster than the display never loses a real frame to the queue's capacity. At the ceiling the queue sheds interpolations and shows its oldest real frame early.
+  - A source faster than the display loses the newest queued real frame each time one more would not fit. Each loss is logged, counted in `dreal_drop`, and is not a re-prime.
+  - Outside a cut, a backlog whose lateness neither shrank nor grew for a second drops only the queued real frames of its excess, newest first. The drop is logged and counted in `dreal_drop`; it keeps D and is not a re-prime.
+  - `bidir_delay_ms` on the `GAMESCOPE_FRAMEGEN_METRICS=1` line reports the largest D in force during each window. Status, measured numbers and limits: [c) Bidirectional](#c-bidirectional--the-smoothest-motion).
 - Nested Wayland is fine for trying it, but heavy scenes make the desktop compositor compete for the present GPU. Native/DRM from a VT, or running as the session compositor, is the real test. x3/x4 only helps when source fps is at most refresh/3; otherwise the scheduler goes dormant.
 
 ## Preferred visual baseline: GravityMark x4
@@ -29,8 +48,9 @@ GAMESCOPE_FRAMEGEN_HUD=2 gamescope --expose-wayland --backend wayland --prefer-v
 This is the accepted, most visually appealing GravityMark configuration from
 live testing: Motion Guided, three generated frames per real frame,
 bidirectional presentation, strength `0.5`, and the frozen learned profile. It
-prioritizes visual smoothness and quality; bidirectional mode adds one real-frame
-interval of latency, so this is not the competitive-latency preset.
+prioritizes visual smoothness and quality; bidirectional mode shows real frames
+later than live (see the bound under Recommended settings), so this is not the
+competitive-latency preset.
 
 Set the two PCI IDs and paths for the machine, then run:
 
@@ -95,6 +115,11 @@ caps the game and therefore adds input latency when the game could otherwise
 render above 30 fps. Keep it optional rather than treating it as a general
 frame-generation default.
 
+The simple limit persists across repaints and display changes. A combined
+refresh override takes precedence while it also controls the FPS cap; clearing
+that override restores the simple limit. `--framerate-limit 0` disables the
+simple limit. The `GAMESCOPE_FPS_LIMIT` X11 property updates this same limit.
+
 The limiter cannot recover a missed client render or a late compositor wakeup.
 In particular, a nested test running without `CAP_SYS_NICE` may still measure
 three/five-vblank pairs or longer gaps around the intended four-vblank cadence.
@@ -119,9 +144,9 @@ keeps the habitual commit-lead EMA, and a late generated flip backs the learned
 lead off automatically. Nested backends keep their existing pacing.
 
 This is intentionally separate from the preferred bidirectional x4 baseline:
-causal mode is low latency; bidirectional mode waits for the next real frame and
-usually has better endpoint evidence. Select causal mode by leaving
-`GAMESCOPE_FRAMEGEN_BIDIR` unset.
+causal mode is low latency; bidirectional mode waits for the next real frame
+(see the bound under Recommended settings) and usually has better endpoint
+evidence. Select causal mode by leaving `GAMESCOPE_FRAMEGEN_BIDIR` unset.
 
 The startup log must contain `causal fixed-refresh deadline scheduling active by
 default`. If it instead reports bidirectional interpolation, the shell still
@@ -193,8 +218,8 @@ Games draw a certain number of frames per second ("fps"). Frame generation
 smoother. A game running at 40 fps can be shown at 80 or 120.
 
 It does **not** make the game respond faster — the extra frames are for
-smoothness, not for lower input lag. (One mode, "bidirectional", even adds a
-tiny bit of lag; more on that below.)
+smoothness, not for lower input lag. (One mode, "bidirectional", adds lag; more
+on that below.)
 
 **How it differs from the game's own FSR/DLSS frame generation:** those get the
 scene's real motion handed to them by the game (motion vectors, depth, and on
@@ -345,7 +370,7 @@ the default. Legend:
 | `render` | vendor of the client dma-buf from its DRM modifier; linear staged buffers show the single other Vulkan device name when known, otherwise other-GPU; linear local buffers show present-GPU |
 | `buffers local` | game frames arrive on the same GPU — zero-copy |
 | `buffers xGPU` | dual-GPU path active: frames are copied once into present-GPU memory |
-| `bidir` | bidirectional interpolation (real frames shown one interval late) |
+| `bidir` | bidirectional interpolation (real frames shown up to D + T after record) |
 | `base` | base-layer mode: compositor overlays and the gamescope cursor composited *after* generation; in-game UI is not separated |
 | `net: off / blob / online` | learned refiner: disabled / offline weights / training while you play |
 | `adapt` | self-supervised adaptation grading each prediction against reality |
@@ -402,6 +427,37 @@ The Guided disocclusion search is on by default and never affects cheaper pipeli
 set `GAMESCOPE_FRAMEGEN_RESERVOIR=0` only for live A/B attribution.
 
 ### c) Bidirectional — the smoothest motion
+Status: experimental and opt-in; its delay rule is the
+`GAMESCOPE_FRAMEGEN_BIDIR=1` note under
+[Recommended settings](#recommended-settings-start-with-these).
+
+Unit tests drive the production planner over:
+- steady, jittered, bimodal and incommensurate cadences;
+- latency steps, pulses and outliers;
+- frame-limiter holds and short source bursts;
+- compositor stalls;
+- a source faster than the display;
+- presents only at composites.
+
+The nested gate (see [framegen-testing.md](framegen-testing.md)), with a client
+held at its 30 fps cap at 60 Hz, measures over three runs:
+- E 45.5-49.4 ms and D 66.7 ms, set by the phase between record and refresh
+  (other runs settle at D 50 ms);
+- generated fill 0.997-1.000 per settled window;
+- each real frame shown 62-70 ms after it is recorded, within D + T;
+- every consecutive pair of real frames (621-622 per run) within ±T of their
+  record spacing;
+- no re-prime and no dropped real frame.
+
+When the latency falls, D shortens after 2 s and the queued real frames move
+earlier. Not validated:
+- native DRM/KMS;
+- HDR output;
+- compositor overlays;
+- a source faster than the display outside the unit tests.
+
+VRR does not apply: requesting both keeps VRR hybrid and ignores bidirectional
+mode.
 ```
 --experimental-framegen --framegen-mode motion --framegen-multiplier 2
 ```
@@ -411,12 +467,14 @@ GAMESCOPE_FRAMEGEN_BIDIR=1 gamescope --prefer-vk-device "$PRESENT_DEV" …
 ```
 Blends *between* two real frames instead of guessing ahead — the smoothest
 result and the best with see-through effects (smoke, glass). **Trade-off: adds
-about one frame of lag**, so avoid it for fast/competitive shooters. Great for
-single-player, racing, scenery. Guided's causal acceleration, guided
+lag** (the target delay D; the rule is under
+[Recommended settings](#recommended-settings-start-with-these) and
+`bidir_delay_ms` reports it), so avoid it for fast/competitive shooters. Great
+for single-player, racing, scenery. Guided's causal acceleration, guided
 reconstruction, disocclusion reservoir and shading-persistence correction do
 not run in this mode; bidirectional interpolation uses two checked endpoint
-fields instead. Bidir phases are timestamp-exact since the deadline timeline.
-`GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0.5` is a separate experimental edge A/B:
+fields instead. Interpolation phases are taken from the real frames' timestamps.
+`GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0.5` is a separate experimental edge setting:
 it lets a clearly surviving checked side retain slightly more authority instead
 of dissolving into the unwarped crossfade. It changes neither motion fields nor
 queue/flip timing, and defaults to `0` because the measured spatial gain is small
@@ -484,12 +542,12 @@ before use (`scripts/framegen-net-train.py` then `scripts/framegen-net-eval.py`)
 |-----------|-----|
 | Just try it, keep it simple | **Motion checked, x2** (b) |
 | Weak display/framegen GPU | **Motion warp, x2** |
-| The smoothest single-player experience | **Bidirectional** (c) |
+| The smoothest single-player experience | **Bidirectional** (c) (experimental) |
 | Competitive / fast shooter (lowest lag) | **Simple** (a), *not* bidirectional |
 | Crisp compositor overlays and cursor | add **Base-layer** (d) |
 | You own a FreeSync/G-Sync monitor | add **VRR** (e) |
 | Try every causal reconstruction pass | **Motion guided + AI** (f), experimental and potentially smearier |
-| Smoothest output, one-frame latency acceptable | **Bidirectional + AI** |
+| Smoothest output, added latency acceptable | **Bidirectional + AI** (experimental) |
 
 Start with `--framegen-multiplier 2`. Try `3` or `4` only if the present card
 can keep up (see limits).
@@ -510,11 +568,12 @@ can keep up (see limits).
   a game console. That's an advanced step.
 
 **Per mode**
-- **Bidirectional** adds ~1 frame of lag — don't use it for reaction-heavy games.
-  At 20 fps that interval alone is ~50 ms. Anti-lag/Reflex must pace the game on
-  the **render GPU** where input is sampled; a Mesa/RADV setting on a downstream
-  AMD presenter cannot reduce an NVIDIA-rendered game's input queue. Generated
-  frames improve motion cadence, not the 20 Hz input sampling rate.
+- **Bidirectional** adds the target delay D of lag (`bidir_delay_ms` reports
+  it) — don't use it for reaction-heavy games. Anti-lag/Reflex must pace the
+  game on the **render GPU** where input is sampled; a Mesa/RADV setting on a
+  downstream AMD presenter cannot reduce an NVIDIA-rendered game's input queue.
+  Generated frames improve motion cadence, not the input sampling rate of a
+  20 fps game (20 Hz).
 - **VRR mode** needs a real VRR (FreeSync/G-Sync) monitor actively in VRR; it
   does nothing on ordinary screens or typical laptop panels.
 - **Base-layer** and **bidirectional** can't be used at the same time. Neither can
@@ -576,4 +635,6 @@ options), see [`framegen-proposals/README.md`](framegen-proposals/README.md).
 For how it works under the hood, see
 [`framegen-architecture.md`](framegen-architecture.md). Maintainers should also
 read [`framegen-maintenance.md`](framegen-maintenance.md) before changing the
-shader, queue, cache, learning, or presentation contracts.*
+shader, queue, cache, learning, or presentation contracts. To smoke-test a build
+in a nested SDL window, including present-wait and SDL fault injection, see
+[`framegen-testing.md`](framegen-testing.md).*

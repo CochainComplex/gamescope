@@ -12,6 +12,10 @@ extern const struct option *gamescope_options;
 
 extern std::atomic< bool > g_bRun;
 
+void ShutdownGamescope();
+// Ends the process; use instead of exit()/return from main once Vulkan may be up.
+[[noreturn]] void gamescope_exit( int nStatus );
+
 extern int g_nNestedWidth;
 extern int g_nNestedHeight;
 extern int g_nNestedRefresh; // mHz

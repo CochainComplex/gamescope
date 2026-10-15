@@ -39,13 +39,14 @@ path; the opt-in **bidir** mode (`GAMESCOPE_FRAMEGEN_BIDIR=1`, §3.3) deliberate
 1. Real frames are **never queued behind** generated work. *(On native KMS a real frame that arrives
    after a generated atomic commit was submitted, but before its page-flip lands, is presented at the
    next vblank. Bidir is the larger exception: it presents each real
-   frame one interval late — the intrinsic cost of interpolating between two reals, hence opt-in.)*
+   frame late by its target delay D (see framegen-howto.md) — the intrinsic cost of interpolating
+   between two reals, hence opt-in.)*
 2. Generated frames are **never** waited on or presented late.
 3. A real frame latching **always** discards any pending generated frame (latency safety).
    *(Bidir preserves queued real frames instead — its pending queue is a presentation timeline, §3.3.)*
 4. Generation is **forward extrapolation** (predict the future beyond the current real frame,
    zero added latency) — *not* interpolation. (The debug-only `blend` mode and the opt-in **bidir**
-   mode are the exceptions — bidir interpolates *between* the two reals and so adds one interval of latency.)
+   mode are the exceptions — bidir interpolates *between* the two reals and so adds latency, bounded by its target delay D.)
 
 ---
 
@@ -76,7 +77,7 @@ Stage-B motion-pipeline knobs (**on whenever their pipeline schedules them**; `=
 - `GAMESCOPE_FRAMEGEN_FB` — forward-backward consistency check (`framegen_fbcheck_enabled`; runs the coarse-to-fine matcher a second time reverse-anchored and kills confidence where the round trip does not close). `=0` disables.
 - `GAMESCOPE_FRAMEGEN_FB_TOL` — float, clamped `[0.05, 8.0]`, default `0.75`; the FB round-trip tolerance in low-res texels (larger = more forgiving = fewer kills).
 - `GAMESCOPE_FRAMEGEN_AGREE` — per-pixel two-source agreement test in the warp (kills `conf` at full res where the two real-frame projections of the flow read different content). `=0` disables.
-- `GAMESCOPE_FRAMEGEN_BIDIR` — truthy int; opt-in **B3 bidirectional interpolation** (`vulkan_framegen_bidir_active`). Generated frames sit *between* the two reals (warp both toward phase `t`, blend by confidence, phase-correct crossfade fallback) instead of extrapolating past the newest. This removes hold-then-jump judder and handles translucency at the cost of presenting each real frame **one interval late** (§0 invariants #1/#4 exception; see §3.3). **Requires motion mode; mutually exclusive with `_VRR_HYBRID`/#01 and `_BASE`/#02**; ignored otherwise with a one-time log.
+- `GAMESCOPE_FRAMEGEN_BIDIR` — truthy int; opt-in **B3 bidirectional interpolation** (`vulkan_framegen_bidir_active`). Generated frames sit *between* the two reals (warp both toward phase `t`, blend by confidence, phase-correct crossfade fallback) instead of extrapolating past the newest. This removes hold-then-jump judder and handles translucency at the cost of presenting each real frame **late by the target delay D** (up to D + T after record; formula in framegen-howto.md) (§0 invariants #1/#4 exception; see §3.3). **Requires motion mode; mutually exclusive with `_VRR_HYBRID`/#01 and `_BASE`/#02**; ignored otherwise with a one-time log.
 - `GAMESCOPE_FRAMEGEN_ADAPT` — **B4 self-supervised adaptation** (`framegen_adapt_enabled`; motion mode). Each real frame grades the field that predicted it (field-res stats probe, measured 20–39 µs per real at 1080p–4K on Radeon 890M); a same-batch apply pass folds a global field-trust factor into the field's confidence and rejects content scene cuts from nine regional luminance histograms, while the next-batch CPU readback auto-calibrates the FB tolerance and agreement window (see §3.4). `=0` disables (B3-bit-exact warps, no probe). An explicit `_FB_TOL` pins the tolerance against auto-calibration.
 - `GAMESCOPE_FRAMEGEN_RESERVOIR` — Guided causal mode only, default on; `=0` disables the three-real-frame screen-space disocclusion resolver for live A/B attribution. It is never allocated or sampled by cheaper pipelines or bidirectional interpolation.
 - `GAMESCOPE_FRAMEGEN_SHADING` — Guided causal mode with the learned net only, default on; `=0` disables fourth-head in-situ supervision and the final bounded color-trend correction for an otherwise-identical net/queue A/B. Cheaper pipelines and bidir never consume the focus map.
@@ -376,9 +377,10 @@ Bidir removes it by generating BETWEEN the two real frames instead of past the n
   **presentation timeline**. The bidir epoch planner appends timestamped interpolations and real
   endpoints even when a source interval contains no intermediate display target, and the backends
   flip `vulkan_framegen_bidir_flip_texture(composite)` — in steady
-  state the queue front at a real paint is the PREVIOUS real frame, so real frames present exactly
-  one interval late (the intrinsic interpolation latency; why it's opt-in). Interps drain on
-  repeat vblanks via the normal consume path. The supersede discard is skipped (steamcompmgr), and
+  state the queue front at a real paint is an older real frame, so each real frame presents at the
+  first refresh at or after its record time plus D (the intrinsic interpolation latency; why it's
+  opt-in). Interps drain on repeat vblanks via the normal consume path. The supersede discard is
+  skipped (steamcompmgr), and
   discard/invalidate paths preserve queued `bReal` entries (painted content the user hasn't seen);
   ring advance pins their slots. Composites outside the timeline snap it back to live: dormant/
   prime/keep-up frames flip immediately and drop stale pending — bidir degrades to zero added
@@ -717,7 +719,7 @@ resume.
    size/offset assertions against the GLSL contract)
    instead of the shared upload arena keep framegen from racing the composite host bump allocator across
    queues. **Under bidir** this still holds at the *generation* level (generation never blocks the
-   composite), but the *presentation* timeline intentionally holds each real frame one interval so the
+   composite), but the *presentation* timeline intentionally holds each real frame for the target delay D so the
    interpolations before it can show first — a scheduling choice, not a generation stall.
 2. **Generated frames never waited on.** All completion checks are **non-blocking**
    `hasCompletedFramegen` peeks (`GetSemaphoreCounterValue ≥ seq`): the present-decision peek,

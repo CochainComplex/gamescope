@@ -13,7 +13,7 @@ if (( $# )); then
 	exit 2
 fi
 
-ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 DOCTOR_TMP=$(mktemp -d "${TMPDIR:-/tmp}/framegen-doctor.XXXXXX") || exit 2
 trap 'rm -rf -- "$DOCTOR_TMP"' EXIT
 
@@ -141,6 +141,16 @@ if command -v pkg-config >/dev/null 2>&1; then
 		warn "catch2-with-main missing; tests disabled, -Denable_tests=false"
 	fi
 fi
+
+# Source: scripts/framegen-launch-common.sh hybrid helpers (sysfs only). Runs
+# before vulkaninfo below, which wakes a suspended dGPU, so the RTD3 state and
+# the endpoint link read are the pre-wake ones.
+# shellcheck source=scripts/framegen-launch-common.sh
+source "$ROOT/scripts/framegen-launch-common.sh"
+printf '\nHYBRID\n'
+HYBRID_RC=0
+( framegen_hybrid_doctor ) || HYBRID_RC=$?
+(( HYBRID_RC != 1 )) || WARNINGS=1
 
 printf '\nGPUS\n'
 

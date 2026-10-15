@@ -176,7 +176,12 @@ namespace gamescope
 				VBlankDebugSpew( ulOffset, ulDrawTime, ulRedZone );
 		}
 
-		const uint64_t ulScheduledWakeupPoint = GetNextVBlank( ulOffset );
+		uint64_t ulScheduledWakeupPoint = GetNextVBlank( ulOffset );
+		// Never wake twice for one vblank: a re-arm right after a wake, with
+		// a draw offset that has since decayed, would otherwise target the
+		// vblank the timer just woke for, and the frame limiter counts wakes.
+		while ( ulScheduledWakeupPoint + ulOffset <= m_ulLastWokenVBlank )
+			ulScheduledWakeupPoint += ulRefreshInterval;
 		const uint64_t ulTargetVBlank = ulScheduledWakeupPoint + ulOffset;
 
 		VBlankScheduleTime schedule =
@@ -200,6 +205,11 @@ namespace gamescope
 			// Force timer re-arm with the new vblank timings.
 			ArmNextVBlank( false );
 		}
+	}
+
+	void CVBlankTimer::MarkPresentation( uint64_t ulNanos )
+	{
+		MarkVBlank( VBlankAtOrBefore( GetLastVBlank(), mHzToRefreshCycle( GetRefresh() ), ulNanos ), true );
 	}
 
 	bool CVBlankTimer::WasCompositing() const
@@ -264,6 +274,7 @@ namespace gamescope
 				return;
 
 
+			m_ulLastWokenVBlank = m_TimerFDSchedule.ulTargetVBlank;
 			m_PendingVBlank = VBlankTime
 			{
 				.schedule = m_TimerFDSchedule,

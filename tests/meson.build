@@ -31,3 +31,21 @@ test_framegen_deadline = executable(
 	cpp_args: gamescope_cpp_args,
 )
 test('framegen_deadline', test_framegen_deadline)
+
+test_swapchain_policy = executable(
+	'test_swapchain_policy',
+	['test_swapchain_policy.cpp'],
+	include_directories: [srcdir],
+	dependencies: [catch2_dep, vulkan_dep.partial_dependency(compile_args: true, includes: true)],
+	cpp_args: gamescope_cpp_args,
+)
+test('swapchain_policy', test_swapchain_policy)
+
+test_vblank_grid = executable(
+	'test_vblank_grid',
+	['test_vblank_grid.cpp'],
+	include_directories: [srcdir],
+	dependencies: [catch2_dep],
+	cpp_args: gamescope_cpp_args,
+)
+test('vblank_grid', test_vblank_grid)

@@ -59,6 +59,11 @@ inline constexpr uint32_t k_uCadencePredictorMinSamples = 4u;
 inline constexpr uint64_t k_ulCadenceArrivalGuardMinNs = 250'000u;
 inline constexpr uint64_t k_uCadenceArrivalGuardDivisor = 32u;
 
+[[nodiscard]] constexpr uint64_t cadence_arrival_guard_ns( uint64_t vblankIntervalNs )
+{
+	return std::max( k_ulCadenceArrivalGuardMinNs, vblankIntervalNs / k_uCadenceArrivalGuardDivisor );
+}
+
 struct CadencePredictorState
 {
 	uint64_t intervalNs = 0;
@@ -152,10 +157,8 @@ struct FixedCadenceAdmission
 		|| vblankIntervalNs == 0u )
 		return { true, false, false, 0u, 0u, 0u };
 
-	const uint64_t arrivalGuard = std::max( k_ulCadenceArrivalGuardMinNs,
-		vblankIntervalNs / k_uCadenceArrivalGuardDivisor );
 	const uint64_t safetyMargin = saturating_add_ns(
-		state.lateErrorNs, arrivalGuard );
+		state.lateErrorNs, cadence_arrival_guard_ns( vblankIntervalNs ) );
 	const uint64_t predictedReady = saturating_add_ns(
 		currentSourceReadyNs, predictedInterval );
 	const uint64_t protectedReady = saturating_add_ns(
@@ -177,6 +180,136 @@ struct FixedCadenceAdmission
 		.safetyMarginNs = safetyMargin,
 		.deadlineHeadroomNs = headroom,
 	};
+}
+
+// The nearest-opportunity rule shared by every queued slot: a slot is due at
+// the opportunity within half a vblank after its target, and missed once the
+// opportunity being serviced is more than half a vblank past it. Half a vblank
+// absorbs clock re-estimation between planning and arbitration without ever
+// moving a slot by a whole opportunity.
+[[nodiscard]] constexpr bool slot_due_at( uint64_t targetNs, uint64_t opportunityNs,
+	uint64_t vblankIntervalNs )
+{
+	return targetNs <= saturating_add_ns( opportunityNs, vblankIntervalNs / 2u );
+}
+
+[[nodiscard]] constexpr bool slot_missed_opportunity( uint64_t targetNs,
+	uint64_t opportunityNs, uint64_t vblankIntervalNs )
+{
+	return saturating_add_ns( targetNs, vblankIntervalNs / 2u ) < opportunityNs;
+}
+
+// Nested fixed-grid slot vs. the vblank opportunity a compositor iteration
+// services (raw vblank domain, no present bias). Due iff the opportunity is the
+// slot's own grid index or later (T/2 absorbs lattice re-estimation between plan
+// and arbitration) AND the slot was submitted before the compositor woke for it.
+// A slot submitted after that wake had no budget there: it is not due (never a
+// miss) and becomes due at the next opportunity. framegen_causal_submit never
+// plans such a slot (fixed_grid_slot_submittable), so a due, not-ready slot is
+// always capacity evidence.
+[[nodiscard]] constexpr bool fixed_grid_slot_due( uint64_t slotVBlankNs, uint64_t submitNs,
+	uint64_t opportunityVBlankNs, uint64_t opportunityWakeNs, uint64_t vblankIntervalNs )
+{
+	return slot_due_at( slotVBlankNs, opportunityVBlankNs, vblankIntervalNs )
+		&& submitNs < opportunityWakeNs;
+}
+
+// Planner side of the same rule. (a) outside the due window of the opportunity
+// the compositor last processed; (b) the slot's estimated wake is more than
+// guardNs away. guardNs covers a wake that fired but is not processed yet,
+// the timer's re-estimation since arming, and plan-to-submit CPU time
+// (command recording included).
+[[nodiscard]] constexpr bool fixed_grid_slot_submittable( uint64_t slotVBlankNs,
+	uint64_t slotWakeNs, uint64_t wokenVBlankNs, uint64_t nowNs,
+	uint64_t vblankIntervalNs, uint64_t guardNs )
+{
+	return slotVBlankNs > saturating_add_ns( wokenVBlankNs, vblankIntervalNs / 2u )
+		&& slotWakeNs > saturating_add_ns( nowNs, guardNs );
+}
+
+// Bidir queue ordering. The pending queue is sorted by display target, and real
+// targets, which follow record time, increase with frame id.
+
+// First display target at or after candidateNs that stays behind a queued
+// target afterNs (0: nothing queued ahead).
+[[nodiscard]] constexpr uint64_t bidir_target_after( uint64_t candidateNs, uint64_t afterNs,
+	uint64_t vblankIntervalNs )
+{
+	return afterNs == 0u ? candidateNs
+		: std::max( candidateNs, saturating_add_ns( afterNs, vblankIntervalNs ) );
+}
+
+// Rounds a duration up to whole vblanks (unchanged for a zero interval).
+[[nodiscard]] constexpr uint64_t round_up_to_vblanks( uint64_t durationNs,
+	uint64_t vblankIntervalNs )
+{
+	if ( vblankIntervalNs == 0u )
+		return durationNs;
+	const uint64_t vblanks = durationNs / vblankIntervalNs
+		+ ( durationNs % vblankIntervalNs != 0u );
+	return vblanks > UINT64_MAX / vblankIntervalNs
+		? UINT64_MAX : vblanks * vblankIntervalNs;
+}
+
+// The queue front lies further behind the opportunity than the queue could ever
+// catch up (horizonVblanks opportunities). Only a suspended or stalled
+// presentation gets there: the queued timeline is a discontinuity, not a
+// backlog (0: nothing queued).
+[[nodiscard]] constexpr bool bidir_timeline_stale( uint64_t frontTargetNs,
+	uint64_t opportunityNs, uint64_t horizonVblanks, uint64_t vblankIntervalNs )
+{
+	const uint64_t horizonNs = vblankIntervalNs != 0u
+		&& horizonVblanks > UINT64_MAX / vblankIntervalNs
+		? UINT64_MAX : horizonVblanks * vblankIntervalNs;
+	return frontTargetNs != 0u
+		&& saturating_add_ns( frontTargetNs, horizonNs ) < opportunityNs;
+}
+
+enum class BidirFrontAction_t : uint8_t
+{
+	Present,	// show the front at this opportunity
+	Wait,		// keep it: not due, or this opportunity already showed a front
+	Discard,	// an interpolation that can no longer be shown on time
+	TooSlow,	// a due interpolation whose GPU work missed its wake (capacity evidence)
+};
+
+struct BidirFrontInputs_t
+{
+	uint64_t targetNs = 0;
+	uint64_t opportunityNs = 0;
+	uint64_t lastFrontOpportunityNs = 0;	// 0: no front shown yet
+	uint64_t vblankIntervalNs = 0;
+	bool real = false;
+	bool completed = false;		// ignored for reals: their composite is complete
+	// The queue is at the output-ring ceiling: a dense timeline, or reals at the
+	// most the plan keeps queued.
+	bool forceDrain = false;
+	// Decided before the compositor woke for this opportunity (a paint between
+	// vblanks): unfinished work still had budget left, so it is no capacity
+	// evidence.
+	bool beforeWake = false;
+};
+
+// What the bidir presenter does with its queue front at one display
+// opportunity. One queue entry is shown per opportunity; a real is never
+// discarded here and catches up one opportunity at a time, while an
+// interpolation never slides to a later opportunity.
+[[nodiscard]] constexpr BidirFrontAction_t bidir_front_action( const BidirFrontInputs_t &in )
+{
+	const uint64_t T = in.vblankIntervalNs;
+	if ( in.lastFrontOpportunityNs != 0u
+		&& in.opportunityNs <= saturating_add_ns( in.lastFrontOpportunityNs, T / 2u ) )
+		return BidirFrontAction_t::Wait;
+	const bool due = slot_due_at( in.targetNs, in.opportunityNs, T );
+	if ( in.real )
+		return due || in.forceDrain ? BidirFrontAction_t::Present : BidirFrontAction_t::Wait;
+	if ( slot_missed_opportunity( in.targetNs, in.opportunityNs, T ) || ( !due && in.forceDrain ) )
+		return BidirFrontAction_t::Discard;
+	if ( !due )
+		return BidirFrontAction_t::Wait;
+	if ( in.completed )
+		return BidirFrontAction_t::Present;
+	return in.beforeWake ? BidirFrontAction_t::Discard : BidirFrontAction_t::TooSlow;
 }
 
 // Preconditions: currentPresentNs >= previousPresentNs and vblankIntervalNs is

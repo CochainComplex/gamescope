@@ -1,6 +1,9 @@
 // For the nested case, reads input from the SDL window and send to wayland
 
 #include <X11/Xlib.h>
+#include <atomic>
+#include <cerrno>
+#include <cstdlib>
 #include <thread>
 #include <mutex>
 #include <string>
@@ -19,6 +22,8 @@
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
 #include "Utils/Defer.h"
+#include "Utils/FaultInjection.h"
+#include "Utils/SwapchainPolicy.h"
 #include "refresh_rate.h"
 
 #include "sdlscancodetable.hpp"
@@ -31,6 +36,10 @@ static bool g_bWindowFocused = true;
 
 static int g_nOutputWidthPts = 0;
 static int g_nOutputHeightPts = 0;
+
+static constexpr uint64_t k_ulPresentationDeferralLogNs = 500'000'000;
+// Event-loop retry interval: a pending visibility change, or an error back-off.
+static constexpr int k_nSDLRetryMs = 100;
 
 extern bool g_bForceHDR10OutputDebug;
 extern bool steamMode;
@@ -54,6 +63,8 @@ namespace gamescope
 		GAMESCOPE_SDL_EVENT_VISIBLE,
 		GAMESCOPE_SDL_EVENT_GRAB,
 		GAMESCOPE_SDL_EVENT_CURSOR,
+		// No handler: only wakes the event loop for shutdown.
+		GAMESCOPE_SDL_EVENT_WAKE,
 
 		GAMESCOPE_SDL_EVENT_COUNT,
 	};
@@ -130,6 +141,9 @@ namespace gamescope
 		SDL_Window *m_pWindow = nullptr;
 		VkSurfaceKHR m_pVkSurface = VK_NULL_HANDLE;
 		BackendConnectorHDRInfo m_HDRInfo{};
+		// Compositor thread only.
+		uint64_t m_ulPresentationDeferredSince = 0;
+		bool m_bPresentationDeferralLogged = false;
 	};
 
 	class CSDLBackend : public CBaseBackend
@@ -188,17 +202,27 @@ namespace gamescope
 	protected:
 		virtual void OnBackendBlobDestroyed( BackendBlob *pBlob ) override;
 	private:
-		void SDLThreadFunc();
+		friend class CSDLConnector;
+		void UpdateWindowVisibility();
+		void SDLThreadFunc( std::stop_token stopToken );
+		void SDLEventLoop( std::stop_token stopToken );
 
 		uint32_t GetUserEventIndex( SDLCustomEvents eEvent ) const;
 		void PushUserEvent( SDLCustomEvents eEvent );
 
 		bool m_bShown = false;
+		bool m_bVisibilityPending = false;
+		// Only the SDL thread writes this: true requires ShowWindow to have
+		// returned, and false is published before any HideWindow call.
+		std::atomic<bool> m_bWindowMapped = { false };
+		// A present holds this through WSI submission; visibility changes only
+		// try the lock so neither thread waits for the other to finish.
+		std::mutex m_PresentationMutex;
+		std::atomic<bool> m_bFirstFrameReady = { false };
 		CSDLConnector m_Connector; // Window.
 		uint32_t m_uUserEventIdBase = 0u;
 		std::vector<const char *> m_pszInstanceExtensions;
 
-		std::thread m_SDLThread;
 		std::atomic<SDLInitState> m_eSDLInit = { SDLInitState::SDLInit_Waiting };
 
 		std::atomic<bool> m_bApplicationGrabbed = { false };
@@ -209,6 +233,10 @@ namespace gamescope
 		SDL_Surface *m_pIconSurface = nullptr;
 		SDL_Surface *m_pCursorSurface = nullptr;
 		SDL_Cursor *m_pCursor = nullptr;
+
+		// Start in Init() after backend publication. Destroy first so the
+		// worker stops and joins before the connector and event state die.
+		std::jthread m_SDLThread;
 	};
 
 	//////////////////
@@ -344,8 +372,52 @@ namespace gamescope
 
 	int CSDLConnector::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
 	{
-		// Base-layer mode (#02, mandatory on a swapchain backend): the consume runs
-		// the late overlay composite against the live layer stack paint_all just
+		// paint_all clears g_bFirstFrame before Present, even if this attempt
+		// is deferred. Publish that on the compositor thread and requeue the
+		// show request before the mapping gate, so Steam's first paint can map.
+		if ( steamMode && !g_bFirstFrame && !m_pBackend->m_bFirstFrameReady.load( std::memory_order_relaxed ) )
+		{
+			m_pBackend->m_bFirstFrameReady.store( true, std::memory_order_release );
+			m_pBackend->PushUserEvent( GAMESCOPE_SDL_EVENT_VISIBLE );
+		}
+
+		// Unmapped or without a presentable surface, the frame ends (Failed: the
+		// request is retired, not retried) and the window's map, expose or size
+		// publish wakes the next paint. Before anything is consumed, so the
+		// framegen present tag is simply replaced by the next paint's, as after
+		// a deferral.
+		std::unique_lock presentationLock{ m_pBackend->m_PresentationMutex, std::try_to_lock };
+		if ( !m_pBackend->m_bWindowMapped.load( std::memory_order_acquire ) )
+		{
+			// Every start waits for the first map; only a wait that outlasts
+			// that is worth a log line.
+			const uint64_t ulNow = get_time_in_nanos();
+			if ( !m_ulPresentationDeferredSince )
+				m_ulPresentationDeferredSince = ulNow;
+			else if ( !m_bPresentationDeferralLogged && ulNow - m_ulPresentationDeferredSince >= k_ulPresentationDeferralLogNs )
+			{
+				sdl_log.infof( "window not mapped; presentation deferred" );
+				m_bPresentationDeferralLogged = true;
+			}
+			return SwapchainImagePresentErrno( SwapchainImage_t::NotPresentable );
+		}
+		// Contention with a visibility change is brief: retry (Deferred).
+		if ( !presentationLock.owns_lock() )
+			return -EAGAIN;
+		if ( m_bPresentationDeferralLogged )
+			sdl_log.infof( "window mapped; presentation resumed" );
+		m_ulPresentationDeferredSince = 0;
+		m_bPresentationDeferralLogged = false;
+
+		// No image of the output size: real and generated frames alike, before
+		// anything is consumed. rendervulkan has arranged the retry, the wake (or
+		// shutdown). A remake here resets framegen, so a generated frame from
+		// before it is never shown.
+		if ( const SwapchainImage_t eImage = vulkan_prepare_swapchain_image(); eImage != SwapchainImage_t::Ready )
+			return SwapchainImagePresentErrno( eImage );
+
+		// Base-layer mode (mandatory on a swapchain backend): the consume runs the
+		// late overlay composite against the live layer stack paint_all just
 		// assembled and returns an output-sized, fully colour-managed image.
 		// Mirrors CDRMBackend::Present / CWaylandConnector::Present, except that
 		// this backend cannot flip it — it composites it into the acquired
@@ -356,8 +428,9 @@ namespace gamescope
 			if ( FramegenDebugShouldLog( s_uGeneratedPresentDebugLogCounter ) )
 				sdl_log.infof( "framegen: SDL presenting generated frame" );
 
-			if ( !vulkan_present_framegen_frame_to_window( pGeneratedFrame, pFrameInfo ) )
-				return -EINVAL;
+			// Same errno mapping as the real-frame path below.
+			if ( int nRet = vulkan_present_framegen_frame_to_window( pGeneratedFrame, pFrameInfo ) )
+				return nRet;
 
 			GetVBlankTimer().UpdateWasCompositing( true );
 			GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
@@ -377,11 +450,16 @@ namespace gamescope
 		// PresentationFeedback is hooked up inside vulkan_present_to_window():
 		// this backend's completion signal is VK_KHR_present_wait, published from
 		// the present-wait thread.
-		vulkan_present_to_window();
+		const bool bPresented = vulkan_present_to_window();
 
 		// Wait for the composite result on our side *after* we
 		// commit the buffer to the compositor to avoid a bubble.
 		vulkan_wait( *oCompositeResult, true );
+
+		// No image reached the swapchain; rendervulkan has arranged a retry
+		// (or shutdown), so keep the requests this frame was meant to service.
+		if ( !bPresented )
+			return -EAGAIN;
 
 		GetVBlankTimer().UpdateWasCompositing( true );
 		GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
@@ -424,12 +502,14 @@ namespace gamescope
 
 	CSDLBackend::CSDLBackend()
 		: m_Connector{ this }
-		, m_SDLThread{ [this](){ this->SDLThreadFunc(); } }
 	{
 	}
 
 	bool CSDLBackend::Init()
 	{
+		// IBackend::Set has published this backend. Thread start makes that
+		// publication visible before the worker can call GetBackend().
+		m_SDLThread = std::jthread{ [this]( std::stop_token stopToken ){ this->SDLThreadFunc( stopToken ); } };
 		m_eSDLInit.wait( SDLInitState::SDLInit_Waiting );
 
 		return m_eSDLInit == SDLInitState::SDLInit_Success;
@@ -579,6 +659,41 @@ namespace gamescope
 		m_bApplicationVisible = bVisible;
 		PushUserEvent( GAMESCOPE_SDL_EVENT_VISIBLE );
 	}
+	void CSDLBackend::UpdateWindowVisibility()
+	{
+		// Steam mode stays visible after its first paint attempt. The SDL
+		// thread reads the published readiness, never g_bFirstFrame itself.
+		bool bVisible = m_bApplicationVisible || ( steamMode && m_bFirstFrameReady );
+		if ( !bVisible )
+			m_bWindowMapped.store( false, std::memory_order_release );
+
+		std::unique_lock presentationLock{ m_PresentationMutex, std::try_to_lock };
+		m_bVisibilityPending = !presentationLock.owns_lock();
+		if ( m_bVisibilityPending )
+			return;
+
+		if ( m_bShown != bVisible )
+		{
+			if ( bVisible )
+			{
+				// SDL 2.30 Wayland_ShowWindow waits for the initial configure
+				// on both xdg-shell and libdecor before returning.
+				SDL_ShowWindow( m_Connector.GetSDLWindow() );
+			}
+			else
+			{
+				// Admission is closed and any admitted present has finished;
+				// HideWindow cannot unmap underneath a WSI submission.
+				SDL_HideWindow( m_Connector.GetSDLWindow() );
+			}
+			m_bShown = bVisible;
+		}
+		bool bPresentationResumed = bVisible && !m_bWindowMapped.exchange( true, std::memory_order_release );
+		// A woken compositor must be able to acquire presentation admission.
+		presentationLock.unlock();
+		if ( bPresentationResumed )
+			force_repaint();
+	}
 	void CSDLBackend::SetTitle( std::shared_ptr<std::string> szTitle )
 	{
 		m_pApplicationTitle = szTitle;
@@ -603,7 +718,7 @@ namespace gamescope
 		// Do nothing.
 	}
 
-	void CSDLBackend::SDLThreadFunc()
+	void CSDLBackend::SDLThreadFunc( std::stop_token stopToken )
 	{
 		pthread_setname_np( pthread_self(), "gamescope-sdl" );
 
@@ -681,17 +796,113 @@ namespace gamescope
 		m_eSDLInit = SDLInitState::SDLInit_Success;
 		m_eSDLInit.notify_all();
 
+		// Startup may fail before the Wayland server starts. Keep this gate
+		// cancellable so backend destruction can still join the SDL worker.
+		while ( !wlserver.bWaylandServerRunning && !stopToken.stop_requested() )
+			SDL_Delay( 1 );
+
+		// Replay visibility after initialization even without a new SetVisible.
+		PushUserEvent( GAMESCOPE_SDL_EVENT_VISIBLE );
+
+		SDLEventLoop( stopToken );
+		m_bWindowMapped.store( false, std::memory_order_release );
+		// Without its event loop the nested session has no input or output.
+		if ( !stopToken.stop_requested() )
+			ShutdownGamescope();
+	}
+
+	void CSDLBackend::SDLEventLoop( std::stop_token stopToken )
+	{
 		static uint32_t fake_timestamp = 0;
 
-		wlserver.bWaylandServerRunning.wait( false );
-
-		SDL_Event event;
-		while( SDL_WaitEvent( &event ) )
+		const char *pszWaitInject = std::getenv( "GAMESCOPE_DEBUG_SDL_WAIT_INJECT" );
+		std::optional<FaultInjection_t> oWaitInjection;
+		bool bInjectPumped = false;
+		if ( pszWaitInject )
 		{
+			oWaitInjection = ParseFaultInjection( pszWaitInject, "error" );
+			if ( !oWaitInjection )
+			{
+				oWaitInjection = ParseFaultInjection( pszWaitInject, "error-pumped" );
+				bInjectPumped = oWaitInjection.has_value();
+			}
+			if ( oWaitInjection )
+				sdl_log.warnf( "SDL event loop: fault injection active (%s%s)", pszWaitInject, bInjectPumped ? "; pump without dispatch" : "" );
+			else
+				sdl_log.errorf( "SDL event loop: invalid fault injection (%s); ignoring", pszWaitInject );
+		}
+		// Shutdown wakes the blocking wait below; SDL_PushEvent is thread-safe.
+		std::stop_callback stopWake( stopToken, [this]{ PushUserEvent( GAMESCOPE_SDL_EVENT_WAKE ); } );
+		SDL_Event event;
+		std::string sLastWaitError;
+		uint64_t ulLastWaitErrorLog = 0;
+		while ( !stopToken.stop_requested() )
+		{
+			// A hide deferred by an in-flight present is retried while pumping
+			// events; only then does the wait time out to bound quiet retries.
+			if ( m_bVisibilityPending )
+				UpdateWindowVisibility();
+
+			SDL_ClearError();
+			const bool bTimedWait = m_bVisibilityPending;
+			int nWaitResult;
+			if ( oWaitInjection && oWaitInjection->Consume() )
+			{
+				// Pumping keeps the display connection serviced while queued
+				// events stay undispatched until the injection is exhausted.
+				if ( bInjectPumped )
+					SDL_PumpEvents();
+				SDL_SetError( "injected" );
+				if ( oWaitInjection->Exhausted() )
+					sdl_log.infof( "SDL event loop: fault injection exhausted" );
+				nWaitResult = 0;
+			}
+			else if ( bTimedWait )
+				nWaitResult = SDL_WaitEventTimeout( &event, k_nSDLRetryMs );
+			else
+				nWaitResult = SDL_WaitEvent( &event );
+			if ( !nWaitResult )
+			{
+				// Zero is a timeout only with one pending; otherwise an error,
+				// which may not have set a message. Only this wait's error counts.
+				const char *pszError = SDL_GetError();
+				if ( pszError[0] || !bTimedWait )
+				{
+					if ( !pszError[0] )
+						pszError = "unknown";
+					// The back-off below bounds this to ten lines a second;
+					// a repeated error is logged at most once a second.
+					const uint64_t ulNow = get_time_in_nanos();
+					if ( sLastWaitError != pszError || ulNow - ulLastWaitErrorLog >= 1'000'000'000ul )
+					{
+						sdl_log.errorf( "SDL_WaitEventTimeout failed: %s", pszError );
+						sLastWaitError = pszError;
+						ulLastWaitErrorLog = ulNow;
+					}
+					if ( SDL_WasInit( SDL_INIT_EVENTS ) == 0 )
+					{
+						sdl_log.errorf( "SDL event loop: event subsystem gone, exiting" );
+						break;
+					}
+					if ( stopToken.stop_requested() )
+						break;
+					// Persistent errors can return immediately. Back off, which
+					// delays shutdown by at most one retry interval.
+					SDL_Delay( k_nSDLRetryMs );
+				}
+				continue;
+			}
+			if ( stopToken.stop_requested() )
+				break;
 			fake_timestamp++;
 
 			switch( event.type )
 			{
+				case SDL_QUIT:
+					// The outer display went away or the last window was closed.
+					sdl_log.infof( "SDL_QUIT received; shutting down" );
+					return;
+
 				case SDL_CLIPBOARDUPDATE:
 				{
 					char *pClipBoard = SDL_GetClipboardText();
@@ -855,6 +1066,12 @@ namespace gamescope
 				{
 					switch( event.window.event )
 					{
+						case SDL_WINDOWEVENT_HIDDEN:
+							// A queued hide from an earlier show/hide cycle must
+							// not revoke admission after a subsequent ShowWindow.
+							if ( !m_bShown )
+								m_bWindowMapped.store( false, std::memory_order_release );
+							break;
 						case SDL_WINDOWEVENT_CLOSE:
 							raise( SIGTERM );
 							break;
@@ -871,6 +1088,9 @@ namespace gamescope
 #endif
 							g_nOutputWidth = width;
 							g_nOutputHeight = height;
+							// Publish, then wake: a paint that found the surface
+							// unable to back the old size ended its frame.
+							force_repaint();
 
 						[[fallthrough]];
 						case SDL_WINDOWEVENT_MOVED:
@@ -905,28 +1125,7 @@ namespace gamescope
 				{
 					if ( event.type == GetUserEventIndex( GAMESCOPE_SDL_EVENT_VISIBLE ) )
 					{
-						bool bVisible = m_bApplicationVisible;
-
-						// If we are Steam Mode in nested, show the window
-						// whenever we have had a first frame to match
-						// what we do in embedded with Steam for testing
-						// held commits, etc.
-						if ( steamMode )
-							bVisible |= !g_bFirstFrame;
-
-						if ( m_bShown != bVisible )
-						{
-							m_bShown = bVisible;
-
-							if ( m_bShown )
-							{
-								SDL_ShowWindow( m_Connector.GetSDLWindow() );
-							}
-							else
-							{
-								SDL_HideWindow( m_Connector.GetSDLWindow() );
-							}
-						}
+						UpdateWindowVisibility();
 					}
 					else if ( event.type == GetUserEventIndex( GAMESCOPE_SDL_EVENT_TITLE ) )
 					{

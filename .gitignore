@@ -8,3 +8,4 @@
 /native-run.log
 /build/
 /build-*/
+__pycache__/

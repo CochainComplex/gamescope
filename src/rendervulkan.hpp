@@ -164,7 +164,7 @@ public:
 	};
 
 	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );
-	bool BInitFromSwapchain( VkImage image, uint32_t width, uint32_t height, VkFormat format );
+	bool BInitFromSwapchain( VkImage image, uint32_t width, uint32_t height, VkFormat format, VkResult *pResult = nullptr );
 
 	uint32_t IncRef();
 	uint32_t DecRef();
@@ -478,11 +478,15 @@ void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentT
 void vulkan_framegen_drain_present_feedback();
 bool vulkan_framegen_has_pending_generated_frame();
 // True when the pending queue front may be presented at this opportunity.
-// Non-bidir (causal/default and the classic fallback): any pending frame is due
-// — its queue front already represents the next opportunity. Bidir: due only
-// when the front's own slot logic says so (its target flip is at or before the
-// next vblank, or the queue is forcing a drain). A non-grid VRR mid-interval
-// front is instead due once its wake deadline has arrived.
+// Non-bidir (causal/default and the classic fallback): a front without a nested
+// grid slot is due — it already represents the next opportunity — and a nested
+// slot is due at its own opportunity. Bidir: due when bidir_front_action says
+// so (its target is within half a vblank of the next vblank, no front was shown
+// at that vblank yet, or the queue is forcing a drain). A non-grid VRR
+// mid-interval front is instead due once its wake deadline has arrived.
+// Before answering, fronts that can never be shown on time are retired
+// (counted as discards; a suspended bidir timeline is abandoned). That is
+// idempotent at a fixed opportunity, so repeated calls agree.
 bool vulkan_framegen_generated_frame_due();
 // True when a generated frame is pending AND its GPU work has completed, so it
 // can be presented this vblank without stalling scanout. Non-consuming.
@@ -494,19 +498,19 @@ bool vulkan_framegen_generated_frame_ready();
 size_t vulkan_framegen_pending_queue_debug( double *pflFrontTargetDeltaMs );
 // Consumes the front generated frame. pPresentFrameInfo is the live frame the
 // present path just assembled (paint_all's current layer stack): in base-layer
-// mode (#02) the generated pre-upscale base is substituted into it and pushed
+// mode the generated pre-upscale base is substituted into it and pushed
 // through the real composite pipeline — FSR/NIS, LUTs, and every CURRENT
 // overlay layer, cursor at its latest position — and the scanout-ready result
 // is returned. In legacy (output-space) mode it is unused and the generated
 // output image is returned directly, as before.
 gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const struct FrameInfo_t *pPresentFrameInfo );
 // True when pending generated frames came from the base-layer path
-// (GAMESCOPE_FRAMEGEN_BASE=1, #02): the late composite renders the current
+// (GAMESCOPE_FRAMEGEN_BASE=1): the late composite renders the current
 // overlay stack onto every generated frame, so a pure overlay update rides the
 // generated present itself and steamcompmgr must not defer it against the
 // generated-frame budget.
 bool vulkan_framegen_base_layer_active();
-// Bidirectional interpolation (B3, GAMESCOPE_FRAMEGEN_BIDIR=1 + motion mode):
+// Bidirectional interpolation (GAMESCOPE_FRAMEGEN_BIDIR=1 + motion mode):
 // generated frames interpolate BETWEEN the two real frames instead of
 // extrapolating past the newest one, and the real frame itself rides the
 // pending queue behind its interpolations — its presentation is delayed by up
@@ -522,17 +526,22 @@ bool vulkan_framegen_bidir_active();
 // timeline back to live (dropping stale pending entries) when a composite
 // bypasses the queue (framegen dormant, prime frame, scene change).
 gamescope::Rc<CVulkanTexture> vulkan_framegen_bidir_flip_texture( gamescope::Rc<CVulkanTexture> pComposite );
+// Bidir active and nothing queued: the next same-base composite is flipped live.
+bool vulkan_framegen_bidir_queue_drained();
+// What the bidir paint since the last call reported (PaintReport_t), then reset;
+// steamcompmgr takes it after every paint_all.
+namespace gamescope::framegen { struct PaintReport_t; }
+gamescope::framegen::PaintReport_t vulkan_framegen_bidir_take_paint_report();
 void vulkan_framegen_discard_generated_frame( const char *reason );
 void vulkan_framegen_invalidate_history( const char *reason );
 void vulkan_framegen_reset( const char *reason );
-// Releases every framegen-owned GPU resource and joins the profile writer.
+// Stops and joins the swapchain waiter before backend teardown. Idempotent,
+// including on backends that never start it.
+void vulkan_present_wait_shutdown();
+// Releases every framegen-owned GPU resource and joins the present waiter and
+// profile writer.
 // Must run before the backend is destroyed: framegen textures own backend FBs.
 void vulkan_framegen_shutdown();
-// Default display-clock pacing (#06, dedicated queue): reactive fill hook for
-// the present decision. Call on a vblank that is going to a hardware repeat
-// while framegen is active; plans one generated frame for the next vblank with
-// its phase measured against the display clock.
-void vulkan_framegen_jit_tick();
 // Cheap compositor-thread counter hook used by the repeat arbiter. Aggregation
 // and reporting remain in vulkan_framegen_drain_present_feedback().
 void vulkan_framegen_metrics_note_repeat();
@@ -543,7 +552,7 @@ void vulkan_framegen_metrics_note_real_wait();
 // inside the early generated commit's blocking commit-to-flip window. Native
 // KMS only; conservative — any missing/untrained input returns false.
 bool vulkan_framegen_real_arrival_blocks_early_commit();
-// VRR hybrid (#01, GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 + dedicated queue): keep
+// VRR hybrid (GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 + dedicated queue): keep
 // adaptive sync active while framegen runs — real frames flip immediately,
 // the generated frame flips mid-interval on a timer. "Requested" (env + queue)
 // gates steamcompmgr's allowVRR decision, which is what lets VRR become active
@@ -566,18 +575,37 @@ void vulkan_framegen_benchmark();
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 
-void vulkan_present_to_window( void );
+bool vulkan_present_to_window( void );
 // Vulkan-swapchain backends: composite an already-finished, output-sized framegen
 // frame into the acquired swapchain image (one one-layer pass plus the framegen
 // HUD) and present it. The swapchain analogue of CDRMBackend::Present's direct
 // flip of the generated texture — swapchain images have no TRANSFER_DST, so this
 // is a composite rather than a blit, which also keeps the colour pipeline intact.
-bool vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFrame, const struct FrameInfo_t *pPresentFrameInfo );
+// Returns the backend's Present errno: 0 presented; without an image, that of
+// vulkan_prepare_swapchain_image's result (SwapchainImagePresentErrno); -EAGAIN
+// not presented (Deferred); -EINVAL the composite failed (Failed, as on the
+// real-frame path).
+int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFrame, const struct FrameInfo_t *pPresentFrameInfo );
 
 void vulkan_garbage_collect( void );
-bool vulkan_remake_swapchain( void );
 bool vulkan_remake_output_images( void );
-bool acquire_next_image( void );
+namespace gamescope { enum class SwapchainImage_t : uint8_t; }
+// Ready iff an image is acquired this iteration. Otherwise one of these is
+// already in place, so callers never loop or request shutdown:
+//  - Transient: a retry and force_repaint, within the recovery budget;
+//  - NotPresentable, the surface cannot back the output size yet (unmapped,
+//    minimised, a resize SDL has not published): the map, an SDL expose or size
+//    publish, or the compositor's size check wakes a paint; this never ends the
+//    session;
+//  - NotPresentable, terminal: shutdown requested.
+gamescope::SwapchainImage_t vulkan_acquire_swapchain_image( bool bRemakeBeforeAcquire );
+// Vulkan-swapchain backends: Ready iff an image of the current composite size
+// (currentOutputWidth/Height) is held, from a swapchain carrying no HDR
+// metadata the content no longer asks for; idempotent while one is. Otherwise a
+// wake is arranged as above (a size published during this iteration counts as
+// Transient, without spending the recovery budget); the backend's Present
+// returns SwapchainImagePresentErrno of the result.
+gamescope::SwapchainImage_t vulkan_prepare_swapchain_image();
 
 bool vulkan_primary_dev_id(dev_t *id);
 bool vulkan_supports_modifiers(void);
@@ -684,6 +712,8 @@ struct VulkanOutput_t
 	std::vector< VkPresentModeKHR > presentModes;
 
 
+	// The HDR metadata set on swapChain; a new swapchain has none. Vulkan cannot
+	// unset it, only recreate the swapchain.
 	std::shared_ptr<gamescope::BackendBlob> swapchainHDRMetadata;
 	VkSwapchainKHR swapChain;
 	VkFence acquireFence;
@@ -711,10 +741,10 @@ struct VulkanOutput_t
 	// this pool (never the outputImages ring). Sized to 2*multiplier so the
 	// (multiplier-1) in-flight generated frames plus any still being scanned
 	// out never collide. Allocated lazily by framegen_ensure_resources.
-	// Base-layer mode (#02): holds base-sized, NON-flippable generated frames
+	// Base-layer mode: holds base-sized, NON-flippable generated frames
 	// instead — inputs to the late overlay composite, never scanout buffers.
 	std::vector<gamescope::OwningRc<CVulkanTexture>> framegenOutputImages;
-	// Base-layer mode (#02): output-sized flippable targets the late overlay
+	// Base-layer mode: output-sized flippable targets the late overlay
 	// composite renders into (generated base + current overlays -> scanout).
 	// Only one is ever consumed per present; 3 covers scanout + in-flight +
 	// margin. Allocated lazily by framegen_ensure_present_pool.
@@ -920,6 +950,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(DestroyBuffer) \
 	VK_FUNC(DestroyDescriptorPool) \
 	VK_FUNC(DestroyDescriptorSetLayout) \
+	VK_FUNC(DestroyFence) \
 	VK_FUNC(DestroyImage) \
 	VK_FUNC(DestroyImageView) \
 	VK_FUNC(DestroyPipeline) \
@@ -1364,8 +1395,8 @@ class CVulkanCmdBuffer
 {
 public:
 	// cmdPool is the pool cmdBuffer was allocated from; it must be freed back to
-	// that same pool. VK_NULL_HANDLE keeps the historical default (commandPool()).
-	CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily, VkCommandPool cmdPool = VK_NULL_HANDLE);
+	// that same explicitly supplied pool, including for general-queue buffers.
+	CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily, VkCommandPool cmdPool);
 	~CVulkanCmdBuffer();
 	CVulkanCmdBuffer(const CVulkanCmdBuffer& other) = delete;
 	CVulkanCmdBuffer(CVulkanCmdBuffer&& other) = delete;

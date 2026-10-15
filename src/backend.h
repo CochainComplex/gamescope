@@ -160,6 +160,8 @@ namespace gamescope
         Real,
         Generated,
         DelayedReal,
+        // The previously shown image flipped again: no new content.
+        Hold,
     };
 
     // Correlates one compositor-selected presentation with backend feedback.

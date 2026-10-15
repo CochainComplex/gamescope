@@ -4,6 +4,15 @@
 
 namespace gamescope
 {
+    // The simple CLI/X11 limit persists across paints and connector changes.
+    // A combined refresh override replaces it only when it also controls FPS.
+    constexpr int32_t ResolveFPSLimit( int32_t nSimpleLimit, int32_t nCombinedOverride,
+                                      bool bChangeFPS )
+    {
+        return nCombinedOverride > 0 && bChangeFPS
+            ? nCombinedOverride : ( nSimpleLimit > 0 ? nSimpleLimit : 0 );
+    }
+
     constexpr int32_t ConvertHztomHz( int32_t nRefreshHz )
     {
         return nRefreshHz * 1'000;

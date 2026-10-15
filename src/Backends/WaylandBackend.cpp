@@ -1860,7 +1860,15 @@ namespace gamescope
             pPlane->UpdateVRRRefreshRate();
         }
 
-        GetVBlankTimer().MarkVBlank( ulTime, true );
+        // Only a vsync'd presentation time is a vblank. Without the flag (a
+        // headless, virtual or remote host output) it is when the host
+        // finished, off the refresh grid: re-phasing to it can schedule a
+        // second wake within one interval, and the frame limiter counts
+        // wakes. A host without a refresh cycle (VRR) has no grid to keep.
+        if ( ( uFlags & WP_PRESENTATION_FEEDBACK_KIND_VSYNC ) || !uRefreshCycle )
+            GetVBlankTimer().MarkVBlank( ulTime, true );
+        else
+            GetVBlankTimer().MarkPresentation( ulTime );
         const uint64_t ulSequence = ( uint64_t( uSeqHi ) << 32ul ) | uSeqLo;
         vulkan_framegen_publish_present_feedback( pFeedbackCtx->tag, ulTime, ulSequence,
             true, pPlane->m_pBackend->PresentationTimestampsAreMonotonic() );

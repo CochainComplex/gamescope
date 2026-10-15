@@ -19,6 +19,11 @@ namespace gamescope
         {
             m_DeferredUnlinks.emplace_front( sPath );
         }
+
+        void UnlinkAll()
+        {
+            m_DeferredUnlinks.clear();
+        }
     private:
         class CDeferUnlink
         {
@@ -39,6 +44,11 @@ namespace gamescope
         std::list<CDeferUnlink> m_DeferredUnlinks;
     };
     static CDeferUnlinks s_DeferredUnlinks;
+
+    void UnlinkDeferredTempFiles()
+    {
+        s_DeferredUnlinks.UnlinkAll();
+    }
 
     int MakeTempFile( char ( &pszOutPath )[ PATH_MAX ], const char *pszTemplate, bool bDeferUnlink )
     {
