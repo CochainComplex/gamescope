@@ -13,6 +13,13 @@ namespace gamescope::framegen
 // R32_UINT values; the renderer copies them only after the submission retires.
 inline constexpr uint32_t k_uAdaptationStatsCount = 96u;
 inline constexpr uint32_t k_uAdaptationMaxTotal = 4u * 1024u * 1024u;
+// Moving-texel counters of the quality meter; the layout is documented in
+// cs_framegen_motion_stats.comp.
+inline constexpr uint32_t k_uAdaptationStatMoving = 15u;
+inline constexpr uint32_t k_uAdaptationStatMovingKilled = 91u;
+inline constexpr uint32_t k_uAdaptationStatMovingBad = 92u;
+inline constexpr uint32_t k_uAdaptationStatMovingKilledMatch = 93u;
+inline constexpr uint32_t k_uAdaptationStatMovingResidual = 94u;
 
 // Same-batch field trust and next-batch CPU adaptation thresholds. Keep these
 // together so resource sizing, push constants, and readback policy cannot drift
@@ -35,6 +42,63 @@ inline constexpr float k_flAdaptationToleranceFallPerFrame = 0.250f;
 inline constexpr float k_flAdaptationNoiseToAgreement = 6.0f;
 inline constexpr float k_flAdaptationAgreementOffsetMax = 0.15f;
 
+// Motion-field quality over moving texels, summed over stats-probe samples.
+// A static background predicts itself whatever the field says, so only moving
+// texels judge the field. A window reports ratios of sums, so every moving
+// texel weighs the same whatever sample it came from. Each ratio is 0 when its
+// denominator is empty; samples == 0 means nothing was measured.
+struct MotionQualityCounts
+{
+	uint64_t samples = 0;
+	uint64_t moving = 0;
+	// Final field confidence below the survive threshold.
+	uint64_t movingKilled = 0;
+	// The killed texels the matcher had already left unconfident; the rest
+	// were killed by the later consistency check or refinement.
+	uint64_t movingKilledMatch = 0;
+	// Survived, yet still mispredicted the real frame.
+	uint64_t movingBad = 0;
+	// Warped-luma residual over moving texels, x1024.
+	uint64_t movingResidualQ10 = 0;
+
+	MotionQualityCounts &operator+=( const MotionQualityCounts &other )
+	{
+		samples += other.samples;
+		moving += other.moving;
+		movingKilled += other.movingKilled;
+		movingKilledMatch += other.movingKilledMatch;
+		movingBad += other.movingBad;
+		movingResidualQ10 += other.movingResidualQ10;
+		return *this;
+	}
+
+	[[nodiscard]] double residual() const
+	{
+		return moving != 0 ? static_cast<double>( movingResidualQ10 ) / 1024.0
+			/ static_cast<double>( moving ) : 0.0;
+	}
+	// Of the moving texels that survived.
+	[[nodiscard]] double badFraction() const
+	{
+		const uint64_t survived = moving - std::min( movingKilled, moving );
+		return survived != 0 ? static_cast<double>( movingBad )
+			/ static_cast<double>( survived ) : 0.0;
+	}
+	[[nodiscard]] double killedFraction() const { return fraction( movingKilled ); }
+	[[nodiscard]] double killedMatchFraction() const { return fraction( movingKilledMatch ); }
+	[[nodiscard]] double killedFbFraction() const
+	{
+		return fraction( movingKilled - std::min( movingKilledMatch, movingKilled ) );
+	}
+
+private:
+	[[nodiscard]] double fraction( uint64_t count ) const
+	{
+		return moving != 0 ? static_cast<double>( count )
+			/ static_cast<double>( moving ) : 0.0;
+	}
+};
+
 struct AdaptationMeasurement
 {
 	float residual;
@@ -47,6 +111,8 @@ struct AdaptationMeasurement
 	uint32_t sceneCut;
 	uint32_t changedSections;
 	uint32_t sceneHistogramDistanceQ10;
+	// One quality-meter sample (samples == 1).
+	MotionQualityCounts quality;
 };
 
 struct AdaptationState
@@ -101,6 +167,19 @@ struct AdaptationState
 		}
 	}
 
+	// Each moving counter is clamped to its parent set, so a window's parts
+	// always add up.
+	const uint32_t moving = std::min( stats[ k_uAdaptationStatMoving ], total );
+	const uint32_t movingKilled = std::min( stats[ k_uAdaptationStatMovingKilled ], moving );
+	const MotionQualityCounts quality = {
+		.samples = 1u,
+		.moving = moving,
+		.movingKilled = movingKilled,
+		.movingKilledMatch = std::min( stats[ k_uAdaptationStatMovingKilledMatch ], movingKilled ),
+		.movingBad = std::min( stats[ k_uAdaptationStatMovingBad ], moving - movingKilled ),
+		.movingResidualQ10 = stats[ k_uAdaptationStatMovingResidual ],
+	};
+
 	return AdaptationMeasurement{
 		.residual = residual,
 		.badFraction = badFraction,
@@ -111,6 +190,7 @@ struct AdaptationState
 		.sceneCut = stats[ 88 ],
 		.changedSections = stats[ 89 ],
 		.sceneHistogramDistanceQ10 = stats[ 90 ],
+		.quality = quality,
 	};
 }
 

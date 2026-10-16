@@ -15,6 +15,11 @@ unless `--logdir` is given. The private runtime directory is always a short
 `sun_path` limit; its path is saved as `runtime-dir.txt` in the scenario log
 directory, and the runtime directory is removed after the scenario.
 
+The last two sections cover the end-to-end showcase compare
+(`scripts/framegen-showcase.sh`), which judges a candidate build against a
+baseline on real content, and the offline split of prediction error into
+matching and continuation (`scripts/framegen-hindsight-eval.py`).
+
 Requirements:
 
 - `--prefix` or `GAMESCOPE_LOCAL_PREFIX` points to your local dependency
@@ -402,6 +407,33 @@ to the actual flip) are metrics only; no gate reads them. Each has `_p50`,
 full scale only says the value is somewhere beyond it. An empty distribution
 prints 0.000.
 
+`ring_ovf` counts the bidir queue fronts that the output-ring ceiling forced
+out ahead of their planned slot in the window. Each one is an overflow that
+the bidir ring bound (`D_ring`) learns from; it stays 0 outside bidir.
+
+The `q_*` fields come from the quality meter. It only measures and never
+changes a generated frame. It runs for every motion pipeline when
+`GAMESCOPE_FRAMEGEN_METRICS=1` or `--framegen-debug` is set; on `learned` and
+above with adaptation on, the adaptation probe supplies the same counters.
+Each real frame grades the field that was estimated for it by warping the
+previous frame's block luma along the final field and comparing it with the
+real frame. Only moving field texels count (|mv| of at least 0.25 field
+texels); a static background predicts itself whatever the field says. Values
+are ratios of sums over the window, so every moving texel weighs the same:
+
+- `q_resid`: mean normalized luma residual of the warp against the real frame.
+- `q_bad_mv`: share of the moving texels that survived the checks whose
+  residual still exceeds the mispredict threshold (bad vectors that were kept).
+- `q_killed_mv`: share of moving texels whose final confidence fell below the
+  survive threshold.
+- `q_killed_match`: the part of `q_killed_mv` the matcher had already left
+  unconfident.
+- `q_killed_fb`: the rest of `q_killed_mv`, cut by the forward-backward
+  consistency check. On `learned` and above it also includes confidence the
+  refiner cut.
+- `q_samples`: the number of frames measured. With 0 (meter off, or no fresh
+  field in the window) every `q_*` ratio prints 0.
+
 These are five-second window counters. `real`, `gen`, and `dreal` count
 presented fresh content, while `rep` counts repeated scanout. A window with
 zero `real`, `gen`, and `dreal` inside the injected timeout therefore provides
@@ -507,3 +539,199 @@ regression confined to them shows only in the per-window rows. `H`
 (`BIDIR_SETTLE_SECONDS`) must cover production's envelope seed window
 (`k_ulBidirWindowNs`). H is longer than the one second after a transition that
 the spacing invariant allows, so the gate does not judge that second strictly.
+
+## End-to-end showcase and baseline compare
+
+`scripts/framegen-showcase.sh` runs a fixed table of ten framegen
+configurations (framegen off, predictive, bidir, each pipeline) against one
+client, with the HUD and `GAMESCOPE_FRAMEGEN_METRICS=1` on, and judges a
+candidate against a saved baseline. It is the per-change gate: a change passes
+when no factor regresses on any combination it touches, and an output change
+stays opt-in until such a compare shows a win on its factor with no regression
+on any other.
+
+```text
+framegen-showcase.sh [--list] [--baseline FILE] [--compare FILE] [--logs DIR] [RUN...]
+  --list            print the run table and settings, then exit
+  --baseline FILE   also save this session's results.json as FILE
+  --compare FILE    judge this session against FILE: exit 0 pass, 1 regression, 2 not comparable
+  --logs DIR        run nothing; summarise (and compare) the run*-r*.log already in DIR
+  RUN...            table indices to run (default: all)
+```
+
+Setup and usage errors exit 2. The summary and the compare run in
+`scripts/framegen-showcase-report.py` (`python3`, standard library only).
+`GAMESCOPE_LOCAL_PREFIX` is passed to `scripts/env-gamescope-local.sh` as for
+the smoke harness.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REPS` | 3 | Whole repetitions, run rep-major (every selected run once, then again), so thermal and background drift spread over all runs. |
+| `SECONDS_PER_RUN` | 45 | Run length; gamescope gets 5 s more. Must be at least 5 × (`WARMUP_WINDOWS` + 2). |
+| `WARMUP_WINDOWS` | 1 | Leading 5 s metrics windows treated as client startup. Raise it for a game with a loading screen. |
+| `BACKEND` | `wayland` | Gamescope backend; `drm` from a text VT for the native verdict. |
+| `W`, `H`, `HZ` | 2560, 1440, 120 | Output size and refresh rate. |
+| `RENDER_DEV` | empty | The client's `MESA_VK_DEVICE_SELECT` (`vid:did[!]`). Empty: the client's default device. |
+| `PRESENT_DEV` | empty | Gamescope's `--prefer-vk-device`. Empty: gamescope's default device. |
+| `CLIENT` | GravityMark | Shell command run inside gamescope through `sh -c`. The default runs `GravityMark.x64` from `GM_DIR` with `ASTEROIDS` asteroids at `W`x`H`. |
+| `GM_DIR` | `$HOME/GravityMark/bin` | GravityMark's `bin` directory for the default client. |
+| `CLIENT_PROC` | `GravityMark.x64` without `CLIENT`, else empty | The client's kernel process name (its first 15 characters), used by the render device check. |
+| `GAMESCOPE_BIN` | `build/src/gamescope` | Binary under test. Its build directory is passed as `GAMESCOPE_BUILD_DIR`, so the WSI layer and the reaper come from the same build. |
+| `OUT` | `$XDG_RUNTIME_DIR/framegen-showcase/<date-time>` | Session directory: `run<i>-r<rep>.log` and `results.json`. |
+| `DEBUG` | 0 | `1` adds `--framegen-debug` to framegen runs. Diagnosis only; refused together with `--baseline` or `--compare`. |
+| `EXTRA_ENV` | empty | Extra gamescope environment for every run. |
+
+Each log starts with `framegen-showcase: key=value` lines: `run`, `index`,
+`rep`, `kind`, `flags`, `run_env`, `backend`, `size`, `hz`, `render`,
+`present`, `client`, `warmup`, `extra_env`, `debug`, `seconds` and `bin`.
+The driver appends `render_gpu=` (`seen`, `not_seen` or `unverified`) once the
+first metrics window appears, and `exit=` with the `timeout` status at the end.
+The render check looks for the client process (`CLIENT_PROC`) in the run's own
+process tree. It uses DRM fdinfo engine time on `RENDER_DEV` when the device's
+driver reports it, and the driver's process list (`nvidia-smi`, by pid) when it
+does not. Cleanup signals only processes from the run's own process tree.
+
+Aggregation:
+
+- Only windows with `w` greater than `warmup` count. The `TOTAL` line is never
+  used: it includes client startup.
+- Frame counts are summed over the steady windows. `real/s` and `shown/s` divide
+  by 5 s per window. `fill` is fresh / (fresh + repeated) over the summed
+  frames, the same definition the compositor uses per window.
+- `jit_ms` is the pooled population standard deviation of the flip interval,
+  from each window's `flip_ms_avg` and `flip_ms_sd`, weighted by its presented
+  frames.
+- `lat_p50` is the median over windows of `src_flip_ms_p50` (live reals,
+  from source-ready to flip), or of `dreal_flip_ms_p50` (delayed reals, from the
+  record, marked `d`) when a run shows more delayed than live reals. One start
+  point is chosen per run; windows without samples (0) are skipped.
+- `dl_hit` and `bias_ms` are medians over windows that generated or delayed a
+  frame; framegen off shows `-`. `reprime`, `ring_ovf` and `q_samples` are
+  summed. Each `q_*` is the median over windows with `q_samples` > 0.
+- The run's value is the median over its reps that produced a steady window.
+
+A rep is complete when `exit=124` (the run lasted its full length) and it has a
+steady window. A missing field is shown as `-` (table) or `n/a` (compare) and is
+never gated: older binaries do not print `q_*` or `ring_ovf`.
+
+Compare gates, per run present in both sessions:
+
+| Factor | Regression when the candidate |
+|---|---|
+| `fill` | falls by more than 0.01 |
+| `flip_ms_sd` (pooled) | rises by more than 0.5 ms |
+| `lat_p50` | rises by more than 1 ms |
+| each `q_*` | exceeds the baseline by more than 5% of it (a zero baseline flags any increase) |
+| completeness | has an incomplete rep where the baseline run had none |
+
+`real_s`, `shown_s`, `dl_hit`, `bias_ms`, `reprime`, `ring_ovf` and `q_samples`
+are reported, not gated. Exit 0 is a pass, 1 a regression. Exit 2 means the
+sessions are not comparable: a context key differs (`backend`, `size`, `hz`,
+`render`, `present`, `client`, `seconds`, `warmup`, `debug`), either side is a
+DEBUG session, a client was not seen on its render device, or a run's flags,
+run environment or latency start point differ. The treatment (`bin`, gamescope
+`version`, `EXTRA_ENV`) is printed for both sides and never compared: it is
+what is under test, so an opt-in knob can be judged with one binary. One
+session holds one treatment; summarising logs of mixed binaries is refused.
+
+Examples (`--compare` needs the baseline's context, so repeat its variables):
+
+```bash
+# Baseline from one build, then a candidate from another.
+GAMESCOPE_BIN=../build-base/src/gamescope scripts/framegen-showcase.sh --baseline base.json
+GAMESCOPE_BIN=build/src/gamescope scripts/framegen-showcase.sh --compare base.json
+
+# Opt-in A/B on one binary: the knob is the treatment.
+scripts/framegen-showcase.sh --baseline a.json 3 6
+EXTRA_ENV=GAMESCOPE_FRAMEGEN_ADAPT=0 scripts/framegen-showcase.sh --compare a.json 3 6
+
+# Hybrid: render on the dGPU, composite, generate and present on the iGPU.
+RENDER_DEV='<dgpu vid:did>!' PRESENT_DEV='<igpu vid:did>' scripts/framegen-showcase.sh --baseline hybrid.json
+
+# Single GPU, at 60 Hz.
+RENDER_DEV='<gpu vid:did>!' PRESENT_DEV='<gpu vid:did>' HZ=60 scripts/framegen-showcase.sh --baseline single60.json
+
+# A game with a loading screen instead of GravityMark.
+CLIENT='exec /path/to/game' CLIENT_PROC=game.exe WARMUP_WINDOWS=6 SECONDS_PER_RUN=90 \
+	scripts/framegen-showcase.sh 1 3 6
+
+# Native verdict from a text VT.
+BACKEND=drm scripts/framegen-showcase.sh --compare native-base.json
+
+# Re-judge saved logs without running anything.
+scripts/framegen-showcase.sh --logs "$XDG_RUNTIME_DIR/framegen-showcase/<session>" --compare base.json
+```
+
+A full A/B covers two contents, two topologies and two refresh rates, one
+compare per combination:
+
+```bash
+for content in gm game; do
+	for topo in hybrid single; do
+		for hz in 60 120; do
+			# set CLIENT/CLIENT_PROC for $content and RENDER_DEV/PRESENT_DEV for $topo
+			HZ=$hz OUT=ab/$content-$topo-$hz scripts/framegen-showcase.sh \
+				--compare base/$content-$topo-$hz.json
+		done
+	done
+done
+```
+
+The full table takes about 10 runs × 3 reps × 57 s, roughly 30 minutes per
+combination; select runs by index for a focused check.
+
+Limits:
+
+- Nested backends carry the parent compositor's frame and jitter. Nested
+  results never decide jitter; the final verdict is a native DRM run.
+- DEBUG numbers are never comparable: per-frame logging perturbs pacing.
+- Latency percentiles are the upper edges of 1 ms buckets, so the +1 ms gate
+  tolerates a one-bucket shift and a sub-millisecond regression is invisible.
+- The `off` run checks pacing and latency parity only, not idle CPU or timer
+  wake-ups.
+- A baseline binary loads this checkout's Lua scripts (`scripts/`), not its own.
+- There is no HDR content gate: the default content is SDR. Run an HDR client
+  through `CLIENT` to cover it.
+- The NVIDIA render check matches the client by pid, not by GPU; with two GPUs
+  of the same `vid:did`, either counts. The check runs once, at the first
+  metrics window.
+- `CLIENT_PROC` is the 15-character kernel process name, not the full name.
+- `timeout` reports 124 for a run that lasted its full length even when
+  gamescope then crashed during shutdown; shutdown is the smoke suite's job.
+
+## Offline prediction-error split (S1/S2)
+
+`scripts/framegen-hindsight-eval.py` splits the predictive path's error on a
+recorded capture into the part a better matcher could remove and the part only
+a better predictor could. Capture in motion mode with
+`GAMESCOPE_FRAMEGEN_RECORD=<dir>`, then run (numpy required):
+
+```bash
+python3 scripts/framegen-hindsight-eval.py --data <dir>
+```
+
+It reuses the trainer's GSFD parser and bilinear sampler
+(`scripts/framegen-net-train.py`) and streams the capture, holding two samples
+at a time. Unreadable samples are skipped with a message and break the chain of
+consecutive frames. For each pair of consecutive real frames N and N+1, over the
+texels moving in either field (at least 0.25 field texels per frame):
+
+- `hold`: the error of showing frame N again.
+- `cont`: constant-motion continuation, frame N warped along its own field (what
+  the predictive path does).
+- `cont*`: the same with the best scale per pair; `cadence-aware gain` is what
+  scaling the motion by frame timing could win.
+- `oracle`: frame N warped along the true next field. This is S1, the matching
+  error.
+- S2 = `cont` − `oracle`, the continuation error, and its share of `cont`.
+
+The rejection block looks at the texels moving in the judged field only (the
+field generation uses, so its moving set is narrower than the split's): of the
+moving texels the field rejects (confidence below 0.5), how often warping would
+have beaten holding, the mean gain, the p95 loss, how often warping wins on the
+kept texels, and the shares of confidence below 0.1 and between 0.1 and 0.5.
+
+Scope: field-resolution luma and absolute error, not a colour-domain perceptual
+score, the same limit as `framegen-net-eval.py`. A continuation teacher is
+worth building only when S2 is at least 30% of the predictive error on two
+contents.

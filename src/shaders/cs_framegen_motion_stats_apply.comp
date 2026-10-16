@@ -5,7 +5,7 @@
 
 #include "descriptor_set_constants.h"
 
-// Apply half of the B4 quality feedback: fold the batch-global field trust
+// Apply half of the quality feedback: fold the batch-global field trust
 // into the motion field's confidence channel, at field resolution, BEFORE the
 // warps run. Trust = 1 - smoothstep over the fraction of texels that passed
 // every consistency check yet still mispredicted the real frame (measured by

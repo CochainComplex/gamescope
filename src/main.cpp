@@ -1153,9 +1153,9 @@ int main(int argc, char **argv)
 
 	// Frame-generation GPU microbenchmark: with a Vulkan device and the framegen
 	// pipelines available, time the generation dispatches in isolation and exit
-	// before the compositor spins up. Run with e.g.:
+	// before the compositor spins up. Run with:
 	//   GAMESCOPE_FRAMEGEN_BENCHMARK=1 gamescope --backend headless -- true
-	if ( getenv( "GAMESCOPE_FRAMEGEN_BENCHMARK" ) )
+	if ( framegen_bool_setting( "GAMESCOPE_FRAMEGEN_BENCHMARK", false ) )
 	{
 		vulkan_framegen_benchmark();
 		gamescope_exit( 0 );

@@ -47,6 +47,21 @@ parse_color_probe_sweep_setting( const char *value )
 	return value != nullptr && *value != '\0' ? value : nullptr;
 }
 
+// On/off switches accept exactly 1/0, true/false, yes/no and on/off. Anything
+// else, including an empty value, is rejected so the caller keeps its default.
+[[nodiscard]] inline std::optional<bool> parse_bool_setting( const char *value )
+{
+	if ( value == nullptr )
+		return std::nullopt;
+
+	const std::string_view setting{ value };
+	if ( setting == "1" || setting == "true" || setting == "yes" || setting == "on" )
+		return true;
+	if ( setting == "0" || setting == "false" || setting == "no" || setting == "off" )
+		return false;
+	return std::nullopt;
+}
+
 // Parse the complete string and reject non-finite values explicitly. Keeping
 // range policy at the call site makes clamp-vs-fallback behavior reviewable for
 // each setting while sharing one strict lexical contract.

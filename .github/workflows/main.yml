@@ -29,7 +29,8 @@ jobs:
           framegen_shell='scripts/env-gamescope-local.sh scripts/test-framegen.sh
             scripts/framegen-launch-common.sh scripts/watch-framegen.sh
             scripts/run-framegen-native.sh scripts/framegen-doctor.sh
-            scripts/gamescope-hybrid.sh tests/gamescope_hybrid_test.sh'
+            scripts/gamescope-hybrid.sh tests/gamescope_hybrid_test.sh
+            scripts/framegen-showcase.sh'
           # bash -n parses only its first operand; check each file.
           for script in $framegen_shell; do bash -n "$script"; done
           shellcheck -x $framegen_shell
@@ -37,7 +38,8 @@ jobs:
           PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
             python3 -m py_compile scripts/framegen-net-train.py \
               scripts/framegen-net-eval.py scripts/framegen-color-eval.py \
-              scripts/framegen-nested-smoke.py
+              scripts/framegen-nested-smoke.py scripts/framegen-showcase-report.py \
+              scripts/framegen-hindsight-eval.py
           c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
             tests/test_framegen.cpp src/framegen/atomic_file.cpp \
             -o /tmp/gamescope-framegen-contracts
@@ -50,7 +52,7 @@ jobs:
             scripts/watch-framegen.sh scripts/run-framegen-native.sh \
             scripts/framegen-doctor.sh scripts/gamescope-hybrid.sh scripts/README.md \
             scripts/framegen-\*.py tests/gamescope_hybrid_test.sh tests/fixtures \
-            scripts/framegen-launch-common.sh src/framegen \
+            scripts/framegen-launch-common.sh scripts/framegen-showcase.sh src/framegen \
             tests/test_framegen.cpp; then
             echo 'Machine-specific home path found in a published framegen file.' >&2
             exit 1

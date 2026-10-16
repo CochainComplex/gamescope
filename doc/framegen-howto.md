@@ -21,6 +21,8 @@ GAMESCOPE_FRAMEGEN_HUD=2 gamescope --expose-wayland --backend wayland --prefer-v
 - When testing `learned` or later, use `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` with a per-game `GAMESCOPE_FRAMEGEN_NET_PROFILE`.
 - On an iGPU-class present GPU (e.g. an 890M) set `GAMESCOPE_FRAMEGEN_NET_EVERY=2` (train every 2nd frame): pacing stays equal and it played best in our real-game test; `1` on a desktop card.
 - Tune with `GAMESCOPE_FRAMEGEN_HUD=2`: `rates` shows source/generated fps, `ladder` shows effective pipeline/recovery, and `pace` shows hit-rate/jitter sparklines. Add `GAMESCOPE_FRAMEGEN_METRICS=1` for a log summary; its latency fields are `src_flip_ms_*` for live real frames and `dreal_flip_ms_*` for bidir's delayed real frames (see [framegen-testing.md](framegen-testing.md)).
+  - `ring_ovf` counts the bidir queue fronts the output-ring ceiling forced out ahead of their slot in each metrics window; each is an overflow the bidir ring bound learns from.
+  - The `q_*` fields come from a measurement-only quality meter that runs for every motion pipeline when `GAMESCOPE_FRAMEGEN_METRICS=1` or `--framegen-debug` is set. Over moving texels: `q_resid` is the residual of the warp against the real frame, `q_bad_mv` the share of surviving texels whose vectors still mispredict it, and `q_killed_mv` the share whose confidence was cut, split into `q_killed_match` (the matcher) and `q_killed_fb` (the forward-backward check; on `learned` and above also confidence the refiner cut). `q_samples` is the number of frames measured; with 0, every `q_*` prints 0.
 - `GAMESCOPE_FRAMEGEN_BIDIR=1` (bidirectional interpolation) is experimental and opt-in. It shows each real frame later than live presentation would, so use it only where the added latency is acceptable, such as video-like content or benchmarks.
   - T is one refresh interval. Each real frame is planned for the first refresh at or after its record time plus the target delay D = min(round_up(E) + T, D_ring), where round_up() rounds up to whole refresh intervals.
   - For a source no faster than the display, once settled every real frame is shown at most D + T after gamescope records it, and consecutive real frames are shown within ±T of their record spacing.
@@ -383,8 +385,9 @@ the default. Legend:
 | `resets_chain` | display-chain learner resets caused by backend, connector, refresh interval, VRR, or timestamp-provenance changes |
 | `resets (ring N)` | pacing/history re-primes (scene cuts, hitches); `ring` counts emergency queue flushes — nonzero means overload |
 | `steps / profile` | net training steps this session / whether a per-game profile was loaded |
-| `GAMESCOPE_FRAMEGEN_RECOVER=0` | Disable the degradation ladder's automatic recovery, so a rung that was stepped down is held until the history is invalidated. Default on. |
-| `GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS=<float>` | **Experiment/diagnostic (native DRM only):** replace the learned minimum-viable generated-frame commit lead after its normal warm-up; unset keeps automatic scheduling. |
+
+The environment switches that change behaviour are listed in
+[section 9](#9-environment-switches).
 
 ---
 
@@ -456,8 +459,9 @@ earlier. Not validated:
 - compositor overlays;
 - a source faster than the display outside the unit tests.
 
-VRR does not apply: requesting both keeps VRR hybrid and ignores bidirectional
-mode.
+VRR does not apply: on a dedicated framegen queue, requesting both keeps VRR
+hybrid and ignores bidirectional mode; on a shared queue VRR hybrid is ignored
+(logged) and bidirectional mode runs.
 ```
 --experimental-framegen --framegen-mode motion --framegen-multiplier 2
 ```
@@ -499,8 +503,10 @@ GAMESCOPE_FRAMEGEN_BASE=1 gamescope --prefer-vk-device "$PRESENT_DEV" …
 Generates on the game layer *before* gamescope composites its own overlays and
 cursor on top, so those stay crisp instead of smearing. It cannot help with a
 game's own HUD or menus: those are drawn by the game into the frame gamescope
-receives, so they are generated along with everything else. (Can't be combined
-with bidirectional.)
+receives, so they are generated along with everything else. With
+`GAMESCOPE_FRAMEGEN_BIDIR=1`, scenes that take base-layer generation use causal
+generation and the other scenes use bidirectional interpolation; the terminal
+logs which one applies whenever a scene changes it.
 
 ### e) VRR / FreeSync / G-Sync monitors
 ```bash
@@ -509,9 +515,10 @@ GAMESCOPE_FRAMEGEN_VRR_HYBRID=1 gamescope --prefer-vk-device "$PRESENT_DEV" --ad
 Keeps your monitor's adaptive-sync (FreeSync/G-Sync) working *with* frame
 generation. **Only does something on a real VRR monitor that's actually in VRR
 mode** — on an ordinary monitor (and most laptop screens) it quietly does
-nothing and falls back to normal. This uses the causal timeline and cannot be
-combined with bidirectional interpolation; requesting both keeps VRR hybrid and
-ignores bidirectional mode.
+nothing and falls back to normal. It needs a dedicated framegen queue; on a
+shared queue it is ignored and the terminal says so. This uses the causal
+timeline and cannot be combined with bidirectional interpolation; requesting
+both keeps VRR hybrid and ignores bidirectional mode.
 
 ### f) AI refiner (most experimental)
 ```bash
@@ -576,8 +583,9 @@ can keep up (see limits).
   20 fps game (20 Hz).
 - **VRR mode** needs a real VRR (FreeSync/G-Sync) monitor actively in VRR; it
   does nothing on ordinary screens or typical laptop panels.
-- **Base-layer** and **bidirectional** can't be used at the same time. Neither can
-  bidirectional and VRR — pick one of those modes.
+- **Base-layer** and **bidirectional** share scenes: a scene that takes
+  base-layer generation runs causal, the others run bidirectional.
+  Bidirectional and VRR hybrid can't be used at the same time — pick one.
 - **AI refiner** needs `--framegen-mode motion` and `--framegen-pipeline learned`
   or above; bidirectional is optional (it works in the zero-latency forward
   path too).
@@ -615,9 +623,16 @@ Add `--framegen-debug` and watch the terminal:
   ML path is on. Causal mode instead logs `learned forward-field refinement`.
 - `content scene cut detected` → motion mode deliberately presented a real
   endpoint instead of predicting across unrelated content.
-- `… ignored (requires …)` → you enabled a mode without its requirement (e.g.
-  `GAMESCOPE_FRAMEGEN_BIDIR=1` without `--framegen-mode motion`, or combined
-  with a mode that owns its own timeline like base-layer or VRR).
+- `… ignored (requires …)` → you enabled a mode without its requirement:
+  `GAMESCOPE_FRAMEGEN_BIDIR=1` needs `--framegen-mode motion` and is excluded by
+  VRR hybrid. With base-layer generation it runs per scene instead (see below).
+- `--experimental-framegen ignored` → the backend (headless, OpenVR) does not
+  present generated frames, so frame generation stays off.
+- `ignoring invalid GAMESCOPE_FRAMEGEN_…` → the value is not one the variable
+  accepts (see [section 9](#9-environment-switches)); its default is used.
+- `bidir on/off for this scene` → `GAMESCOPE_FRAMEGEN_BIDIR=1` and
+  `GAMESCOPE_FRAMEGEN_BASE=1` together: printed whenever a scene switches
+  between base-layer generation (causal) and output-space generation (bidir).
 
 | Problem | Likely cause / fix |
 |---------|--------------------|
@@ -630,9 +645,62 @@ Add `--framegen-debug` and watch the terminal:
 
 ---
 
-*For the full list of flags and environment toggles (including developer
-options), see [`framegen-proposals/README.md`](framegen-proposals/README.md).
-For how it works under the hood, see
+## 9. Environment switches
+
+On/off switches accept `1`/`0`, `true`/`false`, `yes`/`no` and `on`/`off`.
+Any other value, including an empty one, keeps the default and logs
+`framegen: ignoring invalid …` once.
+
+**On/off switches**
+
+| Variable | Values (default) | Effect |
+|---|---|---|
+| `GAMESCOPE_FRAMEGEN_METRICS` | on/off (off) | Logs one `framegen-metrics:` summary line per 5 s window. Also works with framegen off, as a baseline. |
+| `GAMESCOPE_FRAMEGEN_BIDIR` | on/off (off) | Bidirectional interpolation ([5c](#c-bidirectional--the-smoothest-motion)). Needs motion mode on a backend that owns its output images (DRM, nested Wayland); excluded by VRR hybrid; with `_BASE`, decided per scene. |
+| `GAMESCOPE_FRAMEGEN_BASE` | on/off (off; always on with SDL) | Base-layer generation with late overlay composite ([5d](#d-base-layer--keeps-compositor-overlays-and-the-cursor-crisp)). |
+| `GAMESCOPE_FRAMEGEN_VRR_HYBRID` | on/off (off) | Keeps adaptive sync with frame generation ([5e](#e-vrr--freesync--g-sync-monitors)). Needs a dedicated framegen queue. |
+| `GAMESCOPE_FRAMEGEN_CURSOR` | on/off (on) | Keeps the cursor out of generated history and draws the current cursor on every generated frame. |
+| `GAMESCOPE_FRAMEGEN_RECOVER` | on/off (on) | Lets the degradation ladder step back up after sustained headroom. Off holds a stepped-down rung until the history is invalidated. |
+| `GAMESCOPE_FRAMEGEN_FB` | on/off (on; `checked` and above) | Forward-backward consistency check of the motion field. |
+| `GAMESCOPE_FRAMEGEN_AGREE` | on/off (on; `checked` and above) | Full-resolution agreement check of warped content. |
+| `GAMESCOPE_FRAMEGEN_ADAPT` | on/off (on; `learned` and above) | Self-supervised adaptation: each real frame grades the field that predicted it. |
+| `GAMESCOPE_FRAMEGEN_RESERVOIR` | on/off (on; `guided`) | Three-real-frame disocclusion reservoir. |
+| `GAMESCOPE_FRAMEGEN_SHADING` | on/off (on; `guided` with the net) | Shading-persistence color-trend head. |
+| `GAMESCOPE_FRAMEGEN_NET_ONLINE` | on/off (off) | Trains the learned refiner while you play ([5f](#f-ai-refiner-most-experimental)). |
+| `GAMESCOPE_FRAMEGEN_CLASSIC` | on/off (off; validation only) | Selects the classic batch scheduling path instead of deadline scheduling on a dedicated queue. |
+| `GAMESCOPE_FRAMEGEN_SINGLE_QUEUE` | on/off (off) | Does not request a dedicated framegen queue; generation shares the composite queue. |
+| `GAMESCOPE_FRAMEGEN_BENCHMARK` | on/off (off) | Runs the generation microbenchmark and exits. |
+| `GAMESCOPE_FRAMEGEN_JIT` | no effect | Any value only logs a notice. Deadline scheduling is the default; `GAMESCOPE_FRAMEGEN_CLASSIC=1` selects the classic path. |
+
+**Values**
+
+| Variable | Values (default) | Effect |
+|---|---|---|
+| `GAMESCOPE_FRAMEGEN_HUD` | 0–2 (0) | On-screen HUD detail ([legend](#the-on-screen-hud-and-what-its-terms-mean)). |
+| `GAMESCOPE_FRAMEGEN_HUD_SCALE` | 1–6 (automatic) | HUD scale. |
+| `GAMESCOPE_FRAMEGEN_HUD_CORNER` | `tl`/`tr`/`bl`/`br`/`bc` (`bc`) | HUD position. |
+| `GAMESCOPE_FRAMEGEN_DEBUG_EVERY` | ≥1 (60) | With `--framegen-debug`, log every Nth repeated debug line. |
+| `GAMESCOPE_FRAMEGEN_FB_TOL` | 0.05–8 (0.75) | Forward-backward round-trip tolerance in motion-field texels. Setting it stops automatic calibration. |
+| `GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION` | 0–1 (0) | Experimental bidir one-sided occlusion authority ([5c](#c-bidirectional--the-smoothest-motion)). |
+| `GAMESCOPE_FRAMEGEN_BIDIR_TRACE` | 0–1 (0; `guided` only) | Experimental bidir endpoint trace ([5c](#c-bidirectional--the-smoothest-motion)). |
+| `GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS` | >0 (unset: automatic) | **Experiment, native DRM only:** replaces the learned generated-frame commit lead after its normal warm-up. |
+| `GAMESCOPE_FRAMEGEN_NET` | path | Offline weights for the learned refiner. |
+| `GAMESCOPE_FRAMEGEN_NET_LR` | (0, 0.1] (3e-4) | In-situ learning rate. |
+| `GAMESCOPE_FRAMEGEN_NET_EVERY` | ≥1 (1) | Train on every Nth real frame. |
+| `GAMESCOPE_FRAMEGEN_NET_PROFILE` | path | Per-game profile the in-situ net loads and saves. |
+| `GAMESCOPE_FRAMEGEN_RECORD` | directory | Writes field-resolution training samples. |
+| `GAMESCOPE_FRAMEGEN_RECORD_MAX` | ≥1 (1000) | Maximum training samples. |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR` | directory | Full-colour held-out validation capture (motion + bidir, dedicated queue, base-layer off). |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR_MAX` | ≥1 (8) | Maximum validation samples. |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR_SKIP` | ≥0 (0) | Real frames skipped before capturing. |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR_SPAN` | 2–16 (2) | Real frames between the A and C endpoints. |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR_OFFSET` | 1 to SPAN−1 (1) | Position of the held-out B frame. |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR_PHASE_TOLERANCE` | 0–1 (1) | Accepted deviation of the B frame's measured phase from OFFSET/SPAN. |
+| `GAMESCOPE_FRAMEGEN_RECORD_COLOR_SWEEP` | `occlusion`/`trace` (`occlusion`) | Which experimental strength the 0/0.5/1 sweep varies. |
+
+---
+
+*For how it works under the hood, see
 [`framegen-architecture.md`](framegen-architecture.md). Maintainers should also
 read [`framegen-maintenance.md`](framegen-maintenance.md) before changing the
 shader, queue, cache, learning, or presentation contracts. To smoke-test a build

@@ -386,9 +386,11 @@ namespace gamescope
 
         // Whether this backend actually presents compositor-generated frames.
         // Only backends that consume generated frames on their present path
-        // (DRM, nested Wayland) should return true; others must not, so frame
-        // generation never runs — and never imposes its forced-composite /
+        // (DRM, nested Wayland, SDL) should return true; others must not, so
+        // frame generation never runs — and never imposes its forced-composite /
         // no-VRR tax — where the generated frames would just be discarded.
+        // Headless and OpenVR keep false; the renderer logs once that
+        // --experimental-framegen is ignored.
         virtual bool SupportsFramegen() const { return false; }
 
         // Whether this backend owns the KMS commit/flip timing used to schedule

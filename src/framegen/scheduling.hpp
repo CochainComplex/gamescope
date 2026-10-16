@@ -312,6 +312,26 @@ struct BidirFrontInputs_t
 	return in.beforeWake ? BidirFrontAction_t::Discard : BidirFrontAction_t::TooSlow;
 }
 
+// A front the ring ceiling forced out of the queue ahead of its slot: a real
+// shown early, or an interpolation discarded before it was due
+// (bidir_front_action). Every other front leaves on or after its slot.
+[[nodiscard]] constexpr bool bidir_front_forced( uint64_t targetNs, uint64_t opportunityNs,
+	uint64_t vblankIntervalNs )
+{
+	return !slot_due_at( targetNs, opportunityNs, vblankIntervalNs );
+}
+
+// A delayed real shown at the opportunity it was planned for. Its flip measures
+// only the display chain, so it is present-bias evidence; a real the queue
+// shows early (the ring ceiling) or late (catching up) is off its slot by
+// design.
+[[nodiscard]] constexpr bool bidir_real_on_slot( uint64_t targetNs, uint64_t opportunityNs,
+	uint64_t vblankIntervalNs )
+{
+	return slot_due_at( targetNs, opportunityNs, vblankIntervalNs )
+		&& !slot_missed_opportunity( targetNs, opportunityNs, vblankIntervalNs );
+}
+
 // Preconditions: currentPresentNs >= previousPresentNs and vblankIntervalNs is
 // non-zero. The renderer satisfies both with a monotonic clock and a validated
 // output refresh interval.

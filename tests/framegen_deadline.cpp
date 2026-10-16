@@ -1223,8 +1223,16 @@ namespace
 //
 // Source time and record time are separate: a real's latency is the hold from
 // its source-ready time to its commit, and it is recorded at the first wake
-// after that (recordNs).
+// after that (recordNs). Source times can be latched to the vblank grid, as a
+// compositor-paced source's are.
+//
+// The display chain flips every present displayOffsetNs after its opportunity.
+// The loop learns that offset as the renderer does: a delayed real shown at its
+// own opportunity (bidir_real_on_slot) feeds update_present_bias with its tag,
+// the raw target plus the bias learned so far (display_target_ns). Nothing the
+// planner or the presenter decides reads it.
 constexpr uint64_t k_ulLoopVblankNs = 16'666'667u;
+constexpr uint64_t k_ulLoop120HzNs = 8'333'333u;
 constexpr uint64_t k_ulLoopWakeLeadNs = 3'000'000u;
 constexpr uint64_t k_ulLoopStartNs = 1'000'000'000u;
 constexpr uint64_t k_ulLoopSecondNs = 1'000'000'000u;
@@ -1247,6 +1255,9 @@ struct BidirLoopInjection_t
 	uint64_t failedImageRealId = 0;	// this queued real's present image cannot be made (0: none)
 	size_t ringImages = 8u;
 	uint32_t multiplier = 2u;
+	uint64_t vblankNs = k_ulLoopVblankNs;
+	uint64_t sourceQuantumNs = 0;	// source-ready times lie on this grid (0: as the cadence gives them)
+	uint64_t displayOffsetNs = 0;	// every flip lands this long after its opportunity
 };
 
 struct BidirLoopReal_t
@@ -1259,6 +1270,8 @@ struct BidirLoopReal_t
 	uint64_t pushNs = 0;		// target - its own slot: displaced behind an older real
 	uint64_t pastIdealNs = 0;	// target - its display time on the translation
 	bool kept = false;			// queued by a plan that kept the translation
+
+	bool operator==( const BidirLoopReal_t & ) const = default;
 };
 
 struct BidirLoopEvent_t
@@ -1266,6 +1279,8 @@ struct BidirLoopEvent_t
 	uint64_t atNs = 0;
 	BidirReestablish_t kind = BidirReestablish_t::Kept;
 	uint64_t delayNs = 0;
+
+	bool operator==( const BidirLoopEvent_t & ) const = default;
 };
 
 struct BidirLoopResult_t
@@ -1276,6 +1291,11 @@ struct BidirLoopResult_t
 	std::vector<uint64_t> holeNs;			// serviced opportunities that showed nothing new
 	std::vector<uint64_t> lateSlotNs;		// a kept plan's interpolation slot planned after its wake
 	size_t capacity = 0;
+	uint64_t vblankNs = 0;
+	std::vector<uint64_t> forcedNs;			// fronts the ring ceiling forced out ahead of their slot
+	std::vector<uint64_t> planDropNs;		// plans that dropped reals, once per real
+	PresentBiasState_t presentBias;			// learned from the delayed reals' flips
+	uint64_t worstBiasErrorNs = 0;			// the most the learned bias left the display offset after its first sample
 	size_t recorded = 0;
 	size_t generated = 0;
 	size_t doublePresents = 0;			// after the first establishment's opportunity
@@ -1336,11 +1356,16 @@ struct BidirLoopEntry_t
 
 BidirLoopResult_t run_bidir_loop( const std::vector<uint64_t> &intervalsNs, const BidirLoopInjection_t &inject = {} )
 {
-	constexpr uint64_t T = k_ulLoopVblankNs;
-	BidirLoopResult_t r = { .capacity = bidir_pending_hard_capacity( inject.ringImages, inject.multiplier ) };
+	const uint64_t T = inject.vblankNs;
+	BidirLoopResult_t r = { .capacity = bidir_pending_hard_capacity( inject.ringImages, inject.multiplier ), .vblankNs = T };
 	std::vector<uint64_t> source = { k_ulLoopStartNs + T - 5'000'000u };
 	for ( const uint64_t intervalNs : intervalsNs )
 		source.push_back( source.back() + intervalNs );
+	if ( inject.sourceQuantumNs != 0u )
+	{
+		for ( uint64_t &sourceNs : source )
+			sourceNs = source.front() + round_up_to_vblanks( sourceNs - source.front(), inject.sourceQuantumNs );
+	}
 	std::vector<uint64_t> ready( source.size() );
 	for ( size_t id = 0; id < source.size(); id++ )
 	{
@@ -1402,6 +1427,15 @@ BidirLoopResult_t run_bidir_loop( const std::vector<uint64_t> &intervalsNs, cons
 		r.shown.push_back( reals[ id ] );
 		r.shown.back().flipNs = opportunityNs;
 	};
+	const auto learn_bias = [&]( uint64_t targetNs, uint64_t opportunityNs ) {
+		if ( !bidir_real_on_slot( targetNs, opportunityNs, T ) )
+			return;
+		const DisplayChainTimingState_t timing = { .presentBias = r.presentBias };
+		r.presentBias = update_present_bias( r.presentBias, display_target_ns( targetNs, timing ),
+			opportunityNs + inject.displayOffsetNs, cadence_arrival_guard_ns( T ), T, false ).state;
+		r.worstBiasErrorNs = std::max( r.worstBiasErrorNs,
+			signed_ns_magnitude( r.presentBias.emaNs - static_cast<int64_t>( inject.displayOffsetNs ) ) );
+	};
 	const auto present = [&]( uint64_t opportunityNs ) {
 		const BidirPresenterView_t view = view_at( opportunityNs );
 		if ( !queue.empty() && bidir_timeline_stale( queue.front().targetNs, opportunityNs, view.capacity, T ) )
@@ -1421,6 +1455,12 @@ BidirLoopResult_t run_bidir_loop( const std::vector<uint64_t> &intervalsNs, cons
 				true, queue.size(), view ) );
 			if ( action == BidirFrontAction_t::Wait )
 				return;
+			if ( bidir_front_forced( front.targetNs, opportunityNs, T ) )
+			{
+				state.ringBound = observe_bidir_ring_overflow( state.ringBound, opportunityNs,
+					state.epoch.valid ? state.epoch.delayNs : 0u );
+				r.forcedNs.push_back( opportunityNs );
+			}
 			queue.pop_front();
 			if ( action != BidirFrontAction_t::Present )
 				continue;
@@ -1431,7 +1471,10 @@ BidirLoopResult_t run_bidir_loop( const std::vector<uint64_t> &intervalsNs, cons
 			}
 			lastFrontNs = opportunityNs;
 			if ( front.real )
+			{
 				show_real( front.id, opportunityNs );
+				learn_bias( front.targetNs, opportunityNs );
+			}
 			else
 			{
 				show( opportunityNs );
@@ -1662,7 +1705,7 @@ size_t reals_beyond_bound( const BidirLoopResult_t &r, uint64_t fromNs, uint64_t
 {
 	return static_cast<size_t>( std::ranges::count_if( r.shown, [&]( const BidirLoopReal_t &real ) {
 		return real.delayNs != 0u && real.recordNs >= fromNs
-			&& real.flipNs - real.recordNs > real.delayNs + k_ulLoopVblankNs + slackNs + ( withPush ? real.pushNs : 0u );
+			&& real.flipNs - real.recordNs > real.delayNs + r.vblankNs + slackNs + ( withPush ? real.pushNs : 0u );
 	} ) );
 }
 
@@ -1683,7 +1726,7 @@ namespace
 // multiplier can fill.
 size_t fillable_holes_from( const BidirLoopResult_t &r, uint64_t fromNs, uint32_t multiplier = 2u )
 {
-	constexpr uint64_t T = k_ulLoopVblankNs;
+	const uint64_t T = r.vblankNs;
 	size_t holes = 0;
 	const uint64_t endNs = r.shown.empty() ? 0u : r.shown.back().flipNs - 300'000'000u;
 	for ( size_t i = 1u; i < r.shown.size(); i++ )
@@ -1703,7 +1746,7 @@ size_t fillable_holes_from( const BidirLoopResult_t &r, uint64_t fromNs, uint32_
 // A pair across a dropped real is no pair.
 size_t spacing_errors( const BidirLoopResult_t &r, uint64_t fromNs )
 {
-	constexpr int64_t T = k_ulLoopVblankNs;
+	const int64_t T = static_cast<int64_t>( r.vblankNs );
 	size_t errors = 0;
 	const uint64_t endNs = r.shown.empty() ? 0u : r.shown.back().flipNs - 300'000'000u;
 	for ( size_t i = 1u; i < r.shown.size(); i++ )
@@ -1856,8 +1899,11 @@ TEST_CASE( "a bidir pre-record hold step is no delay transition", "[framegen][de
 	// (a frame limiter, a slower submission). Record time follows it, so a step
 	// of it makes one long or one short pair, never a D transition: steps of
 	// 0..3T in 2 ms steps on every cadence, and of 0..100 ms at 30 and 42 fps,
-	// up and down, keep the one D. A source no faster than the display drops no
-	// real; a faster one only what the display cannot show in time. A second
+	// up and down, keep the one D. A source faster than the display at times
+	// holds D at the ring's predicted bound, which a step may move once: an
+	// overflow shortens it, or a hold with room lengthens it a vblank. A source
+	// no faster than the display drops no real; a
+	// faster one only what the display cannot show in time. A second
 	// after the step every slot is planned in time and every opportunity filled.
 	constexpr uint64_t T = k_ulLoopVblankNs;
 	constexpr uint64_t at = k_ulLoopInjectAtNs;
@@ -1878,7 +1924,8 @@ TEST_CASE( "a bidir pre-record hold step is no delay transition", "[framegen][de
 				const BidirLoopResult_t r = run_bidir_loop( sweep.cadence.intervals, { .latency =
 					[=]( size_t, uint64_t sourceNs ) { return ( sourceNs >= at ) == up ? stepNs : 0u; } } );
 				check_loop( r );
-				CHECK( r.events.size() == 1u );
+				CHECK( r.count( BidirReestablish_t::Established ) == 1u );
+				CHECK( r.delay_changes() <= ( sweep.cadence.everyIntervalAtLeastAVblank ? 0u : 1u ) );
 				CHECK( r.dropped() == r.planDropped );
 				if ( sweep.cadence.everyIntervalAtLeastAVblank )
 					CHECK( r.dropped() == 0u );
@@ -1977,8 +2024,10 @@ TEST_CASE( "a lone high or low bidir latency never moves the delay", "[framegen]
 TEST_CASE( "a noisy bimodal bidir latency keeps one delay", "[framegen][deadline]" )
 {
 	// A pre-record hold alternating between 10-25 ms and 45-65 ms every
-	// 0.1-0.9 s, on every cadence at the default ring: one D, established once,
-	// no real dropped. At x4 on a ring of 12 no real is dropped either. A 10-25 /
+	// 0.1-0.9 s, on every cadence at the default ring: established once, moved
+	// at most once (the ring overflowing at a switch of the hold shortens it, or
+	// a quiet hold with room lengthens it a vblank), and no real dropped. At x4
+	// on a ring of 12 no real is dropped either. A 10-25 /
 	// 30-40 ms hold at 30 fps also fills every pair with a slot to fill.
 	for ( const LoopCadence_t &cadence : loop_cadences( 25u * k_ulLoopSecondNs ) )
 	{
@@ -1990,7 +2039,7 @@ TEST_CASE( "a noisy bimodal bidir latency keeps one delay", "[framegen][deadline
 		CHECK( r.dropped() == 0u );
 		CHECK( r.backlogDropNs.empty() );
 		CHECK( r.count( BidirReestablish_t::Established ) == 1u );
-		CHECK( r.delay_changes() == 0u );
+		CHECK( r.delay_changes() <= 1u );
 		const BidirLoopResult_t x4 = run_bidir_loop( cadence.intervals, { .latency = latencyOf, .ringImages = 12u, .multiplier = 4u } );
 		check_loop( x4 );
 		CHECK( x4.dropped() == 0u );
@@ -2336,12 +2385,13 @@ TEST_CASE( "a steady bidir regime yields one delay however it is reached", "[fra
 TEST_CASE( "a slow bidir cadence turning fast keeps its reals and their spacing", "[framegen][deadline]" )
 {
 	// A loading-screen cadence of 60-240 ms, then 16.7-33.3 ms. D never
-	// lengthens. It shortens at once where the ring bound falls below it, and
-	// after the release hold where the envelope falls further; the queued reals
+	// lengthens. It shortens at once where the ring overflows below a lower
+	// predicted bound, and after the release hold where the envelope falls; the
+	// queued reals
 	// move with it, and a second after the switch consecutive reals are shown at
 	// their source spacing within a vblank. No real is dropped, except at the
 	// display's own rate (16.7 ms), where the excess left over from the long D
-	// cannot drain and one backlog drop takes at most two reals.
+	// cannot drain and one backlog drop takes the reals of that excess.
 	constexpr uint64_t T = k_ulLoopVblankNs;
 	for ( const uint64_t slowNs : { 60'000'000ull, 100'000'000ull, 150'000'000ull, 240'000'000ull } )
 	{
@@ -2365,7 +2415,7 @@ TEST_CASE( "a slow bidir cadence turning fast keeps its reals and their spacing"
 			else
 			{
 				CHECK( r.backlogDropNs.size() <= 1u );
-				CHECK( r.dropped() <= 2u );
+				CHECK( r.dropped() <= 3u );
 			}
 			CHECK( spacing_errors( r, switched->flipNs + k_ulLoopSecondNs ) == 0u );
 		}
@@ -2444,6 +2494,159 @@ TEST_CASE( "a bidir source faster than the display is shown within its bound", "
 		CHECK( r.dropped() == r.planDropped );
 		CHECK( r.backlogDropNs.empty() );
 		CHECK( reals_beyond_bound( r, r.firstEstablishNs, ( k_uBidirEnvelopeSamples - 1u ) * T + k_ulLoopWakeLeadNs, false ) == 0u );
+	}
+}
+
+namespace
+{
+
+// A cadence repeating pattern, with a burst of four reals one vblank apart
+// every everyNs.
+std::vector<uint64_t> isolated_bursts( const std::vector<uint64_t> &pattern, uint64_t vblankNs,
+	uint64_t everyNs, uint64_t durationNs )
+{
+	std::vector<uint64_t> intervals;
+	uint64_t nextBurstNs = everyNs;
+	for ( uint64_t totalNs = 0; totalNs < durationNs; totalNs += intervals.back() )
+	{
+		if ( totalNs >= nextBurstNs )
+		{
+			intervals.insert( intervals.end(), { vblankNs, vblankNs, vblankNs } );
+			totalNs += 3u * vblankNs;
+			nextBurstNs += everyNs;
+		}
+		intervals.push_back( pattern[ intervals.size() % pattern.size() ] );
+	}
+	return intervals;
+}
+
+// GravityMark's source cadence at 120 Hz in whole vblanks (8.3, 16.7, 25 and
+// 33 ms; p50 16.7 ms), recorded nested past its loading screen: regimes of 60,
+// 48, 80 and 36 fps that change every few seconds.
+constexpr std::string_view k_szRecordedVblankCadence =
+	"5132111221111114312232681411111111111111111111111111111111111180311222222222222222222221312222222222"
+	"2222222212222222222322222222222222222222222221321312312321321313213222222222222222222222322223323233"
+	"2323333332222322222222222222223223223222322232222322322322232222122221222121212112111112111211212212"
+	"2222222223223223223223223232222223222223222223222322333324233332323323332332323232232222223223323233"
+	"2332323232322323323323332332323232323232323322322232222222222221222222222222222222122122121221212121"
+	"2121212121212121221222122222223222222222222222322222222222222223222222122122122122212223122222222213"
+	"1222222222232223223322323232322233233233323223222323333232323323333233233333233323332332323232232322"
+	"3223232232232322323223233332333232233232322232222222222222222222122212222343343343434343433434334334"
+	"3433433433433434334322222222222312221222212222122222222232332323232323323232232222322222322222322332"
+	"3323333233323323323323323232332323233233233323333332333332333233233233323332333323323323323323233233"
+	"2332323323232323232323232232323223232232232322322323223223232232232232232232322322322322322322323223"
+	"2232232232322322322322322322323223223223223223232232232232232322322322323223223232232232232322322322"
+	"3223232232232232322322322323223223223232232232232322323223232232322323223223232232322322322323223232"
+	"2322323223232232232322322323223232232322323223223232232232322323223232232232322322323223223232232232"
+	"3223223232232322322323223223232232322322323223232232232322322323223232232232322322323223232232232322"
+	"3223232232232322323223223232232232322323223223232232232322323223223232232322333332333333333323333333"
+	"332423333333332333333333323333333332333333332333333333233333333233333333233";
+
+std::vector<uint64_t> recorded_cadence( uint64_t vblankNs )
+{
+	std::vector<uint64_t> intervals;
+	for ( const char vblanks : k_szRecordedVblankCadence )
+		intervals.push_back( static_cast<uint64_t>( vblanks - '0' ) * vblankNs );
+	return intervals;
+}
+
+} // namespace
+
+TEST_CASE( "isolated bidir bursts on a quantised source never re-prime", "[framegen][deadline]" )
+{
+	// Four reals one vblank apart, further apart than a window and a hold, on a
+	// source latched to the vblank grid at 60 and 120 Hz, x2 and x4: a burst is
+	// one piece of evidence, which costs at most an early-shown real and never
+	// moves D or loses a real.
+	for ( const uint64_t T : { k_ulLoopVblankNs, k_ulLoop120HzNs } )
+	{
+		for ( const std::vector<uint64_t> &pattern : { std::vector<uint64_t>{ 2u * T }, std::vector<uint64_t>{ 3u * T },
+			std::vector<uint64_t>{ 2u * T, 2u * T, 2u * T, 4u * T } } )
+		{
+			for ( const uint32_t multiplier : { 2u, 4u } )
+			{
+				CAPTURE( T, pattern.size(), pattern.front(), multiplier );
+				const BidirLoopResult_t r = run_bidir_loop(
+					isolated_bursts( pattern, T, k_ulBidirWindowNs + k_ulBidirReleaseHoldNs + 500'000'000u, 30u * k_ulLoopSecondNs ),
+					{ .ringImages = multiplier == 4u ? 12u : 8u, .multiplier = multiplier, .vblankNs = T, .sourceQuantumNs = T } );
+				check_loop( r );
+				CHECK( r.dropped() == 0u );
+				CHECK( r.events.size() == 1u );
+			}
+		}
+	}
+}
+
+TEST_CASE( "a recorded 120 Hz cadence never flaps the bidir delay", "[framegen][deadline]" )
+{
+	// GravityMark's recorded cadence, twice over, with source times latched to
+	// the vblank grid and a 0-4 ms hold before each record, at 120 and 60 Hz: D
+	// is established once, changes at most once per 10 s, where a bound that
+	// moved on the prediction alone changed it every few seconds, and no real is
+	// dropped.
+	for ( const uint64_t T : { k_ulLoop120HzNs, k_ulLoopVblankNs } )
+	{
+		std::vector<uint64_t> intervals = recorded_cadence( T );
+		const std::vector<uint64_t> once = intervals;
+		intervals.insert( intervals.end(), once.begin(), once.end() );
+		uint64_t durationNs = 0;
+		for ( const uint64_t intervalNs : intervals )
+			durationNs += intervalNs;
+		for ( const uint64_t holdNs : { uint64_t{ 0u }, uint64_t{ 4'000'000u } } )
+		{
+			CAPTURE( T, holdNs );
+			auto rng = std::make_shared<LoopRng_t>();
+			const BidirLoopResult_t r = run_bidir_loop( intervals, {
+				.latency = [=]( size_t, uint64_t ) { return rng->uniform( 0u, holdNs ); },
+				.vblankNs = T, .sourceQuantumNs = T } );
+			check_loop( r );
+			CHECK( r.dropped() == 0u );
+			CHECK( r.count( BidirReestablish_t::Established ) == 1u );
+			CHECK( r.delay_changes() * 10u * k_ulLoopSecondNs <= durationNs );
+		}
+	}
+}
+
+TEST_CASE( "bidir learns the display offset from its delayed reals alone", "[framegen][deadline]" )
+{
+	// A display chain that flips every present 0, a third of a vblank or a
+	// whole vblank after its opportunity (native, a host compositor's frame):
+	// the bias the delayed reals teach is exactly that offset from its first
+	// sample on, through stalls, lost presents, opportunity jumps and presents
+	// only at composites, whose late and early reals never move it. The planner
+	// and the presenter never read it: every decision is the same for every
+	// offset.
+	constexpr uint64_t at = k_ulLoopInjectAtNs;
+	const std::array<BidirLoopInjection_t, 6> injections = {
+		BidirLoopInjection_t{},
+		BidirLoopInjection_t{ .stallAtNs = at + 5'000'000u, .stallForNs = 84'000'000u, .compositesPerVblank = 2u },
+		BidirLoopInjection_t{ .lostPresent = []( uint64_t opportunityNs ) { return opportunityNs % 7u == 0u; } },
+		BidirLoopInjection_t{ .jumpAtNs = at, .jumpNs = k_ulLoopVblankNs },
+		BidirLoopInjection_t{ .latency = constant_latency( 20'000'000u ), .presentsOnlyAtComposites = true },
+		BidirLoopInjection_t{ .vblankNs = k_ulLoop120HzNs, .sourceQuantumNs = k_ulLoop120HzNs },
+	};
+	for ( const LoopCadence_t &cadence : loop_cadences( 12u * k_ulLoopSecondNs ) )
+	{
+		for ( size_t i = 0u; i < injections.size(); i++ )
+		{
+			CAPTURE( cadence.name, i );
+			BidirLoopInjection_t inject = injections[ i ];
+			const BidirLoopResult_t reference = run_bidir_loop( cadence.intervals, inject );
+			CHECK( reference.presentBias.emaNs == 0 );
+			for ( const uint64_t offsetNs : { inject.vblankNs / 3u, inject.vblankNs } )
+			{
+				CAPTURE( offsetNs );
+				inject.displayOffsetNs = offsetNs;
+				const BidirLoopResult_t r = run_bidir_loop( cadence.intervals, inject );
+				REQUIRE( r.presentBias.samples != 0u );
+				CHECK( r.presentBias.emaNs == static_cast<int64_t>( offsetNs ) );
+				CHECK( r.worstBiasErrorNs == 0u );
+				CHECK( r.shown == reference.shown );
+				CHECK( r.events == reference.events );
+				CHECK( r.holeNs == reference.holeNs );
+				CHECK( r.dropped() == reference.dropped() );
+			}
+		}
 	}
 }
 
@@ -2588,7 +2791,7 @@ TEST_CASE( "the bidir window keeps a window of samples, and at least k", "[frame
 	CHECK( dense.sinceNs == 1u );
 }
 
-TEST_CASE( "the bidir ring bound holds the reals the ring can hold", "[framegen][deadline]" )
+TEST_CASE( "the bidir ring bound predicts what the ring holds and moves on overflows", "[framegen][deadline]" )
 {
 	constexpr uint64_t T = 100u;
 	constexpr uint64_t H = k_ulBidirReleaseHoldNs;
@@ -2597,9 +2800,8 @@ TEST_CASE( "the bidir ring bound holds the reals the ring can hold", "[framegen]
 	STATIC_REQUIRE( bidir_ring_reals( 6u ) == 3u );
 	STATIC_REQUIRE( bidir_ring_delay( 3u, 1'000u, T ) == 0u );
 	STATIC_REQUIRE( bidir_ring_delay( 6u, 1'000u, 0u ) == 0u );
-	// One real per vblank until a span is measured; whole vblanks, rounded down.
-	STATIC_REQUIRE( bidir_ring_delay( 6u, 0u, T ) == 3u * T );
-	STATIC_REQUIRE( bidir_ring_delay( 10u, 0u, T ) == 7u * T );
+	// No prediction until k spans are measured; whole vblanks, rounded down.
+	STATIC_REQUIRE( bidir_ring_delay( 6u, 0u, T ) == 0u );
 	STATIC_REQUIRE( bidir_ring_delay( 6u, 3u * T + 99u, T ) == 3u * T );
 	STATIC_REQUIRE( bidir_ring_delay( 6u, 9u * T, T ) == 9u * T );
 
@@ -2618,20 +2820,96 @@ TEST_CASE( "the bidir ring bound holds the reals the ring can hold", "[framegen]
 	CHECK( spacings.span( k_nBidirSpacings ) != 0u );
 	CHECK( spacings.span( k_nBidirSpacings + 1u ) == 0u );
 
-	// The bound in force falls at once and rises only after the measured bound
-	// stayed above it for the hold; a dip restarts the hold.
-	constexpr BidirRingBound_t bound = { .delayNs = 5u * T };
-	STATIC_REQUIRE( hold_bidir_ring_bound( bound, 3u * T, 10u ).delayNs == 3u * T );
-	STATIC_REQUIRE( hold_bidir_ring_bound( bound, 5u * T, 10u ).aboveSinceNs == 0u );
-	constexpr BidirRingBound_t above = hold_bidir_ring_bound( bound, 9u * T, 10u );
-	STATIC_REQUIRE( above.delayNs == 5u * T );
-	STATIC_REQUIRE( above.aboveSinceNs == 10u );
-	STATIC_REQUIRE( hold_bidir_ring_bound( above, 8u * T, 9u + H ).delayNs == 5u * T );
-	STATIC_REQUIRE( hold_bidir_ring_bound( above, 8u * T, 10u + H ).delayNs == 8u * T );
-	STATIC_REQUIRE( hold_bidir_ring_bound( above, 8u * T, 10u + H ).aboveSinceNs == 0u );
-	constexpr BidirRingBound_t dipped = hold_bidir_ring_bound( above, 5u * T, 20u );
-	STATIC_REQUIRE( dipped.aboveSinceNs == 0u );
-	STATIC_REQUIRE( hold_bidir_ring_bound( hold_bidir_ring_bound( dipped, 9u * T, 30u ), 9u * T, 10u + H ).delayNs == 5u * T );
+	// A front leaves forced only ahead of its due window.
+	STATIC_REQUIRE( bidir_front_forced( 1'000u + T, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_front_forced( 1'000u + T / 2u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_front_forced( 1'000u - T, 1'000u, T ) );
+
+	constexpr uint64_t W = k_ulBidirWindowNs;
+	constexpr uint64_t D = 7u * T;
+	constexpr size_t C = 6u;
+	// Until the first translation the predicted bound sets it.
+	STATIC_REQUIRE( update_bidir_ring_bound( {}, 0u, 0u, 5u * T, C, 10u, T ).delayNs == 5u * T );
+
+	// The overflows within D of the newest one are that overflow; none counts
+	// without a translation. The newest k are kept.
+	BidirRingBound_t bound;
+	CHECK( observe_bidir_ring_overflow( bound, 1'000u, 0u ).overflowNs.back() == 0u );
+	bound = observe_bidir_ring_overflow( bound, 1'000u, D );
+	bound = observe_bidir_ring_overflow( bound, 1'000u + D - 1u, D );
+	bound = observe_bidir_ring_overflow( bound, 1'000u + D, D );
+	CHECK( bound.overflowNs == std::array<uint64_t, k_uBidirEnvelopeSamples>{ 0u, 1'000u, 1'000u + D } );
+	CHECK( bound.quietSinceNs == 1'000u + D );
+	CHECK( bound.delayNs == 0u );
+
+	// A prediction alone never moves an established bound.
+	CHECK( update_bidir_ring_bound( {}, D, D, 3u * T, C, 1'000u, T ).delayNs == 0u );
+	// An overflow within a window lowers it at once to a prediction below the D
+	// in force (the translation's, else the envelope's), and is spent; not to a
+	// prediction at or above it, nor after the window.
+	const BidirRingBound_t one = observe_bidir_ring_overflow( {}, 1'000u, D );
+	const BidirRingBound_t predicted = update_bidir_ring_bound( one, D, 9u * T, 4u * T, C, 1'001u, T );
+	CHECK( predicted.delayNs == 4u * T );
+	CHECK( predicted.overflowNs == std::array<uint64_t, k_uBidirEnvelopeSamples>{} );
+	CHECK( predicted.quietSinceNs == 1'001u );
+	CHECK( update_bidir_ring_bound( one, D, 9u * T, D, C, 1'001u, T ).delayNs == 0u );
+	CHECK( update_bidir_ring_bound( one, D, 9u * T, 4u * T, C, 1'000u + W, T ).delayNs == 0u );
+
+	// Fewer than k overflows never lower it a vblank, nor do k spread over more
+	// than a window.
+	CHECK( update_bidir_ring_bound( bound, D, D, D, C, 1'000u + 2u * D, T ).delayNs == 0u );
+	BidirRingBound_t spread;
+	for ( const uint64_t atNs : { uint64_t{ 1'000u }, 1'000u + W / 2u, 1'001u + W } )
+		spread = observe_bidir_ring_overflow( spread, atNs, D );
+	CHECK( update_bidir_ring_bound( spread, D, D, D, C, 1'001u + W, T ).delayNs == 0u );
+
+	// k within a window lower it a vblank below the D in force at once, and are
+	// spent.
+	bound = observe_bidir_ring_overflow( bound, 1'000u + 2u * D, D );
+	const BidirRingBound_t fallen = update_bidir_ring_bound( bound, D, 9u * T, D, C, 1'000u + 3u * D, T );
+	CHECK( fallen.delayNs == D - T );
+	CHECK( fallen.overflowNs == std::array<uint64_t, k_uBidirEnvelopeSamples>{} );
+	CHECK( fallen.quietSinceNs == 1'000u + 3u * D );
+	CHECK( update_bidir_ring_bound( fallen, D - T, 9u * T, D, C, 1'000u + 3u * D + 1u, T ).delayNs == D - T );
+	CHECK( update_bidir_ring_bound( bound, T, D, D, C, 1'000u + 3u * D, T ).delayNs == 0u );
+
+	// A hold without an overflow in which every plan left two entries free
+	// raises it a vblank; reaching the envelope's D it bounds nothing. A deeper
+	// queue blocks the rise until the next overflow, and an overflow restarts
+	// the hold: a hold with room after it raises the bound again.
+	const uint64_t quietNs = fallen.quietSinceNs;
+	CHECK( update_bidir_ring_bound( fallen, D - T, 9u * T, D, C, quietNs + H - 1u, T ).delayNs == D - T );
+	const BidirRingBound_t risen = update_bidir_ring_bound( fallen, D - T, 9u * T, D, C, quietNs + H, T );
+	CHECK( risen.delayNs == D );
+	CHECK( risen.quietSinceNs == quietNs + H );
+	CHECK( update_bidir_ring_bound( fallen, D - T, D, D, C, quietNs + H, T ).delayNs == 0u );
+	BidirRingBound_t deep = fallen;
+	deep.deepestQueue = C - 1u;
+	CHECK( update_bidir_ring_bound( deep, D - T, 9u * T, D, C, quietNs + 10u * H, T ).delayNs == D - T );
+	const BidirRingBound_t interrupted = observe_bidir_ring_overflow( deep, quietNs + H / 2u, D - T );
+	CHECK( interrupted.deepestQueue == 0u );
+	CHECK( update_bidir_ring_bound( interrupted, D - T, 9u * T, D, C, quietNs + H, T ).delayNs == D - T );
+	CHECK( update_bidir_ring_bound( interrupted, D - T, 9u * T, D, C, quietNs + H / 2u + H, T ).delayNs == D );
+}
+
+TEST_CASE( "present tags carry the display time and bidir learns only from reals on their slot", "[framegen][deadline]" )
+{
+	constexpr uint64_t T = 100u;
+	// The bias applies at the tag only, and 0 stays no target.
+	constexpr DisplayChainTimingState_t timing = { .presentBias = { .emaNs = -30, .samples = 9u } };
+	STATIC_REQUIRE( display_target_ns( 1'000u, timing ) == 970u );
+	STATIC_REQUIRE( display_target_ns( 1'000u, {} ) == 1'000u );
+	STATIC_REQUIRE( display_target_ns( 0u, timing ) == 0u );
+	STATIC_REQUIRE( display_target_ns( 10u, timing ) == 0u );
+	STATIC_REQUIRE( display_target_ns( 1'000u, { .presentBias = { .emaNs = 30 } } ) == 1'030u );
+	// A real is on its slot within half a vblank of it, either way.
+	STATIC_REQUIRE( bidir_real_on_slot( 1'000u, 1'000u, T ) );
+	STATIC_REQUIRE( bidir_real_on_slot( 1'050u, 1'000u, T ) );
+	STATIC_REQUIRE( bidir_real_on_slot( 950u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_real_on_slot( 1'051u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_real_on_slot( 949u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_real_on_slot( 900u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_real_on_slot( 1'100u, 1'000u, T ) );
 }
 
 TEST_CASE( "the bidir delay derives from the envelope", "[framegen][deadline]" )
@@ -2863,7 +3141,7 @@ TEST_CASE( "the bidir plan step establishes, re-establishes and admits by one ru
 	CHECK( first.reestablish == BidirReestablish_t::Established );
 	CHECK( first.state.pairLatency.valueNs == 200u );
 	CHECK( first.state.epoch.delayNs == 3u * T );
-	CHECK( first.state.ringBound.delayNs == 3u * T );
+	CHECK( first.state.ringBound.delayNs == 0u );	// no span measured yet: nothing bounds D
 	CHECK( first.state.epoch.endpoint_display_time( opp - 100u ) == opp + 200u );
 	CHECK( first.state.grid.D0 == opp );
 	CHECK( first.state.grid.W0 == opp - 30u );
@@ -2983,33 +3261,43 @@ TEST_CASE( "the bidir plan step moves D at once to protect and after a hold to r
 		CHECK_FALSE( step.previous.queue );
 		CHECK( step.current.idealNs == opp - 350u + 5u * T );
 		CHECK( step.current.targetNs == opp + 4u * T );
-		// The ring bound in force caps it: a bound of 4T lengthens to 4T only.
+		// The ring bound in force caps it: a bound of 4T, moved just now,
+		// lengthens to 4T only.
 		BidirTimelineState_t capped = rising;
-		capped.ringBound = { .delayNs = 4u * T };
+		capped.ringBound = { .delayNs = 4u * T, .quietSinceNs = opp };
 		CHECK( plan_bidir_step( capped, in ).state.epoch.delayNs == 4u * T );
 	}
 
-	// A held D beyond the ring bound shortens at once to it: the ring of a
-	// smaller capacity holds 3T. A larger ring raises the bound back only after
-	// it measured above it for the hold.
+	// A held D beyond the predicted bound stands until the ring overflows; an
+	// overflow within a window then shortens it at once to the prediction (3T:
+	// spans of 350 hold three reals). After a hold without an overflow, in
+	// which every plan left room, the bound rises a vblank, and a vblank per
+	// hold after that.
 	{
-		const BidirTimelineState_t held = established_state( 500u, 700u );
-		const BidirPlanStep_t shortened = plan_bidir_step( held,
-			step_inputs( empty, step_real( 2u, opp - 400u ), step_real( 3u, opp - 350u ), opp, 6u ) );
+		BidirTimelineState_t held = established_state( 500u, 0u );
+		for ( uint64_t i = 1u; i <= 3u; i++ )
+			held.window.push( { .atNs = opp - 400u + i, .sourceSpanNs = 350u, .recordSpanNs = 350u } );
+		const BidirPlanInputs_t in = step_inputs( empty, step_real( 2u, opp - 400u ), step_real( 3u, opp - 350u ), opp, 6u );
+		const BidirPlanStep_t kept = plan_bidir_step( held, in );
+		REQUIRE( kept.planned );
+		CHECK( kept.reestablish == BidirReestablish_t::Kept );
+		CHECK( kept.state.epoch.delayNs == 5u * T );
+
+		held.ringBound = observe_bidir_ring_overflow( held.ringBound, opp - 10u, 5u * T );
+		const BidirPlanStep_t shortened = plan_bidir_step( held, in );
 		REQUIRE( shortened.planned );
 		CHECK( shortened.reestablish == BidirReestablish_t::Shortened );
 		CHECK( shortened.state.epoch.delayNs == 3u * T );
 		CHECK( shortened.state.pairLatency.valueNs == 350u );
 
 		BidirTimelineState_t state = shortened.state;
-		uint64_t atNs = opp;
 		for ( uint32_t i = 1u; i <= 3u; i++ )
 		{
-			atNs = opp + i * H / 2u;
+			const uint64_t atNs = opp + i * H / 2u;
 			const BidirPlanStep_t step = plan_bidir_step( state,
 				step_inputs( empty, step_real( 2u + i, atNs - 400u ), step_real( 3u + i, atNs - 350u ), atNs, 10u ) );
 			REQUIRE( step.planned );
-			CHECK( step.state.epoch.delayNs == ( i < 3u ? 3u * T : 5u * T ) );
+			CHECK( step.state.epoch.delayNs == ( i < 2u ? 3u * T : 4u * T ) );
 			state = step.state;
 		}
 	}

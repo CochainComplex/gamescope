@@ -330,6 +330,16 @@ static void test_numeric_settings_contract()
 	CHECK( !parse_uint32_setting( "12suffix", false ).has_value() );
 	CHECK( parse_uint32_setting( "12", false ).value_or( 0u ) == 12u );
 
+	CHECK( !parse_bool_setting( nullptr ).has_value() );
+	CHECK( !parse_bool_setting( "" ).has_value() );
+	for ( const char *pszOn : { "1", "true", "yes", "on" } )
+		CHECK( parse_bool_setting( pszOn ) == true );
+	for ( const char *pszOff : { "0", "false", "no", "off" } )
+		CHECK( parse_bool_setting( pszOff ) == false );
+	for ( const char *pszInvalid : { "2", "01", "-1", "+1", " 1", "1 ", "TRUE", "True", "On",
+		"y", "n", "truex", "enable", "0x1" } )
+		CHECK( !parse_bool_setting( pszInvalid ).has_value() );
+
 	static_assert( static_cast<uint32_t>( FramegenColorProbeSweep::Occlusion ) == 0u );
 	static_assert( static_cast<uint32_t>( FramegenColorProbeSweep::EndpointTrace ) == 1u );
 	CHECK( !parse_color_probe_sweep_setting( nullptr ).has_value() );
@@ -459,6 +469,81 @@ static void test_adaptation_policy()
 	const auto incompleteHistogram = decode_adaptation_stats( stats );
 	CHECK( incompleteHistogram.has_value() );
 	CHECK( incompleteHistogram->fbP75 == -1.0f );
+}
+
+static void test_quality_meter()
+{
+	using namespace gamescope::framegen;
+
+	// Decode: the moving counters become one sample; the established
+	// adaptation fields ignore them.
+	std::array<uint32_t, k_uAdaptationStatsCount> stats = {};
+	stats[ 0 ] = 100u;
+	stats[ 1 ] = 10u * 1024u;
+	stats[ 2 ] = 20u;
+	stats[ 3 ] = 20u;
+	stats[ k_uAdaptationStatMoving ] = 40u;
+	stats[ k_uAdaptationStatMovingKilled ] = 10u;
+	stats[ k_uAdaptationStatMovingBad ] = 6u;
+	stats[ k_uAdaptationStatMovingKilledMatch ] = 7u;
+	stats[ k_uAdaptationStatMovingResidual ] = 2048u;
+	const auto measurement = decode_adaptation_stats( stats );
+	CHECK( measurement.has_value() );
+	CHECK_NEAR( measurement->residual, 0.10f, 1e-7f );
+	CHECK_NEAR( measurement->badFraction, 0.25f, 1e-7f );
+	CHECK_NEAR( measurement->killedFraction, 0.20f, 1e-7f );
+	const MotionQualityCounts &q = measurement->quality;
+	CHECK( q.samples == 1u );
+	CHECK( q.moving == 40u );
+	CHECK_NEAR( q.residual(), 0.05, 1e-12 );
+	CHECK_NEAR( q.badFraction(), 0.20, 1e-12 );
+	CHECK_NEAR( q.killedFraction(), 0.25, 1e-12 );
+	CHECK_NEAR( q.killedMatchFraction(), 0.175, 1e-12 );
+	CHECK_NEAR( q.killedFbFraction(), 0.075, 1e-12 );
+
+	// The matcher's kills are a subset of all kills, so the two parts always
+	// add up to the killed fraction.
+	stats[ k_uAdaptationStatMovingKilledMatch ] = 15u;
+	const auto overMatched = decode_adaptation_stats( stats );
+	CHECK( overMatched.has_value() );
+	CHECK( overMatched->quality.movingKilledMatch == 10u );
+	CHECK( overMatched->quality.killedFbFraction() == 0.0 );
+	CHECK_NEAR( overMatched->quality.killedMatchFraction() + overMatched->quality.killedFbFraction(),
+		overMatched->quality.killedFraction(), 1e-12 );
+
+	// Counters past their parent set are clamped, never wrapped.
+	stats[ k_uAdaptationStatMoving ] = 200u;
+	stats[ k_uAdaptationStatMovingKilled ] = 150u;
+	stats[ k_uAdaptationStatMovingBad ] = 50u;
+	const auto clamped = decode_adaptation_stats( stats );
+	CHECK( clamped.has_value() );
+	CHECK( clamped->quality.moving == 100u );
+	CHECK( clamped->quality.movingKilled == 100u );
+	CHECK( clamped->quality.movingBad == 0u );
+	CHECK( clamped->quality.badFraction() == 0.0 );
+	CHECK_NEAR( clamped->quality.killedMatchFraction() + clamped->quality.killedFbFraction(),
+		clamped->quality.killedFraction(), 1e-12 );
+
+	// A window is a ratio of sums, and an empty one reports zeros.
+	MotionQualityCounts window;
+	CHECK( window.samples == 0u );
+	CHECK( window.residual() == 0.0 && window.badFraction() == 0.0
+		&& window.killedFraction() == 0.0 && window.killedMatchFraction() == 0.0
+		&& window.killedFbFraction() == 0.0 );
+	MotionQualityCounts a;
+	a.samples = 1u;
+	a.moving = 10u;
+	a.movingResidualQ10 = 1024u;
+	MotionQualityCounts b;
+	b.samples = 1u;
+	b.moving = 30u;
+	b.movingKilled = 30u;
+	b.movingResidualQ10 = 614u;
+	window += a;
+	window += b;
+	CHECK( window.samples == 2u );
+	CHECK_NEAR( window.residual(), 1638.0 / 1024.0 / 40.0, 1e-12 );
+	CHECK_NEAR( window.killedFraction(), 0.75, 1e-12 );
 }
 
 static void test_temporal_policy()
@@ -1091,6 +1176,7 @@ int main()
 	test_atomic_output_file();
 	test_numeric_settings_contract();
 	test_adaptation_policy();
+	test_quality_meter();
 	test_temporal_policy();
 	test_scheduling_policy();
 	test_provisional_nested_slot_keep();

@@ -464,6 +464,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 bool vulkan_framegen_is_enabled();
+// Reads a GAMESCOPE_FRAMEGEN_* on/off switch; an invalid value keeps bDefault
+// and is logged once per name.
+bool framegen_bool_setting( const char *pszName, bool bDefault );
 // Presentation-tag lifecycle. begin_present runs on the compositor thread just
 // before entering a backend; the selected framegen path may refine the tag, and
 // the backend takes the completed value at its existing commit/feedback point.

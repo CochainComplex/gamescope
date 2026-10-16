@@ -5,7 +5,7 @@
 
 #include "descriptor_set_constants.h"
 
-// Self-supervised quality probe (B4). Every real frame is ground truth for the
+// Self-supervised quality probe. Every real frame is ground truth for the
 // field that was just estimated from it: warp the previous frame's luma along
 // the final checked field and compare against the current frame's luma, per
 // field texel. The residual is a direct measurement of "would this field have
@@ -19,16 +19,26 @@
 //   [4] sum residual over static confident texels (x1024)   [5] their count
 //   [6..13] histogram of the round-trip error the FB check stored in field.a,
 //           8 bins x 0.25 field texels
-//   [14] sum |mv| (x64)       [15] reserved
+//   [14] sum |mv| (x64)       [15] moving texels (|mv| >= u_staticMvMax)
 //   [16..51] previous-frame luma histogram (9 screen sections x 4 bins)
 //   [52..87] current-frame luma histogram  (9 screen sections x 4 bins)
 //   [88] scene-cut verdict    [89] changed sections
-//   [90] global histogram distance (x1024) [91..95] reserved
+//   [90] global histogram distance (x1024)
+//   [91] moving killed texels
+//   [92] moving mispredicting texels (survived, residual didn't)
+//   [93] moving killed texels the matcher had already left unconfident
+//   [94] sum residual over moving texels (x1024)
+//   [95] reserved
+//
+// The moving counters judge the field on moving content only; a static
+// background predicts itself whatever the field says.
 //
 // The apply pass consumes the counters in the SAME batch (field trust + scene
 // verdict); the CPU reads everything back one batch later to auto-calibrate
 // the FB tolerance and agreement window. Run twice per batch: once with
-// u_clearOnly (one workgroup zeroes the image) and once over the field.
+// u_clearOnly (one workgroup zeroes the image) and once over the field. The
+// quality meter runs the same two dispatches after the generated frames and
+// only reads the counters back; it binds every field as a sampler.
 layout(
   local_size_x = 8,
   local_size_y = 8,
@@ -54,11 +64,18 @@ layout(binding = 1, r32ui) uniform uimage2D u_stats;
 layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 // s_samplers[0] = lumaPrev, [1] = lumaCur (finest pyramid level, bilinear),
 // [2] = checked motion field (.rg = mv in field texels, .b = conf, .a = fb err).
+// [3] = the matcher's own field for the same pair, before any consistency
+//       check or refinement (the same texture as [2] when nothing checked it).
 
 const uint STAT_COUNT = 96u;
 const uint HIST_PREV_BASE = 16u;
 const uint HIST_CUR_BASE = 52u;
 const uint HIST_BINS = 4u;
+const uint STAT_MOVING = 15u;
+const uint STAT_MOVING_KILLED = 91u;
+const uint STAT_MOVING_BAD = 92u;
+const uint STAT_MOVING_KILLED_MATCH = 93u;
+const uint STAT_MOVING_RESID = 94u;
 shared uint s_acc[STAT_COUNT];
 
 uint lumaBin(float luma) {
@@ -118,6 +135,19 @@ void main() {
         if (mvMag < u_staticMvMax && conf >= 0.75f) {
             atomicAdd(s_acc[4], uResid);
             atomicAdd(s_acc[5], 1u);
+        }
+        // Moving is the exact complement of the static test above. A
+        // consistency check keeps a killed texel's vector, so it still counts.
+        if (mvMag >= u_staticMvMax) {
+            atomicAdd(s_acc[STAT_MOVING], 1u);
+            atomicAdd(s_acc[STAT_MOVING_RESID], uResid);
+            if (conf < u_minConfSurvive) {
+                atomicAdd(s_acc[STAT_MOVING_KILLED], 1u);
+                if (texelFetch(s_samplers[3], p, 0).b < u_minConfSurvive)
+                    atomicAdd(s_acc[STAT_MOVING_KILLED_MATCH], 1u);
+            } else if (resid > u_badThresh) {
+                atomicAdd(s_acc[STAT_MOVING_BAD], 1u);
+            }
         }
         atomicAdd(s_acc[6u + min(uint(max(fbErr, 0.0f) * 4.0f), 7u)], 1u);
         atomicAdd(s_acc[14], uint(clamp(mvMag, 0.0f, 64.0f) * 64.0f + 0.5f));
