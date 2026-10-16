@@ -652,6 +652,56 @@ TEST_CASE( "discard-only present-bias outliers retain the two-strike guard",
 	STATIC_REQUIRE( second.state.samples == mature.samples );
 }
 
+TEST_CASE( "a present bias that warmed up a vblank off relearns from agreeing outliers",
+	"[framegen][deadline]" )
+{
+	// The nested 60 Hz trap: warm-up flips read 0, the chain's offset is
+	// 17.5 ms, beyond the outlier bound |ema| + T.
+	constexpr uint64_t T = 16'666'667u;
+	constexpr uint64_t guardNs = T / 32u;
+	constexpr int64_t offsetNs = 17'500'000;
+	PresentBiasState_t bias = { .samples = k_uPresentBiasWarmupSamples };
+	uint64_t rawNs = 1'000'000'000u;
+	const auto flip = [&]( int64_t chainOffsetNs, bool hitch = false ) {
+		rawNs += T;
+		bias = update_present_bias( bias, apply_present_bias_ns( rawNs, bias.emaNs ),
+			rawNs + static_cast<uint64_t>( chainOffsetNs ), guardNs, T, hitch ).state;
+	};
+
+	for ( uint32_t i = 1u; i < k_uPresentBiasRelearnSamples; i++ )
+		flip( offsetNs );
+	CHECK( bias.emaNs == 0 );
+	CHECK( bias.outlierRun == k_uPresentBiasRelearnSamples - 1u );
+	flip( offsetNs );
+	CHECK( bias.emaNs == offsetNs );
+	CHECK( bias.outlierRun == 0u );
+	CHECK( bias.samples == k_uPresentBiasWarmupSamples );
+	// From there the EMA tracks the chain as usual.
+	flip( offsetNs + 800'000 );
+	CHECK( bias.emaNs == offsetNs + 100'000 );
+
+	// Outliers that scatter more than half a vblank never move it: a stutter.
+	bias = { .samples = k_uPresentBiasWarmupSamples };
+	for ( uint32_t i = 0u; i < 4u * k_uPresentBiasRelearnSamples; i++ )
+		flip( i % 2u != 0u ? offsetNs : offsetNs + static_cast<int64_t>( T / 2u ) + 1 );
+	CHECK( bias.emaNs == 0 );
+
+	// An accepted sample or a hitch ends a run; the next run starts over.
+	bias = { .samples = k_uPresentBiasWarmupSamples };
+	for ( uint32_t i = 1u; i < k_uPresentBiasRelearnSamples; i++ )
+		flip( offsetNs );
+	flip( 0 );
+	CHECK( bias.outlierRun == 0u );
+	for ( uint32_t i = 1u; i < k_uPresentBiasRelearnSamples; i++ )
+		flip( offsetNs );
+	flip( offsetNs, true );
+	CHECK( bias.outlierRun == 0u );
+	CHECK( bias.emaNs == 0 );
+	for ( uint32_t i = 0u; i < k_uPresentBiasRelearnSamples; i++ )
+		flip( offsetNs );
+	CHECK( bias.emaNs == offsetNs );
+}
+
 TEST_CASE( "deadline hit arithmetic uses the biased target", "[framegen][deadline]" )
 {
 	constexpr uint64_t rawTargetNs = 10'000u;

@@ -19,6 +19,9 @@ namespace gamescope::framegen
 
 inline constexpr uint32_t k_uPresentBiasWarmupSamples = 4u;
 inline constexpr uint32_t k_uPresentBiasOutlierVblankIntervals = 1u;
+// Consecutive mature outliers within half a vblank of each other that move the
+// bias to them (update_present_bias).
+inline constexpr uint32_t k_uPresentBiasRelearnSamples = 8u;
 inline constexpr uint32_t k_uPresentLeadWarmupSamples = 4u;
 inline constexpr uint64_t k_uMinimumViablePresentLeadFloorNs = 500'000u;
 inline constexpr uint64_t k_uMinimumViablePresentLeadRelaxDivisor = 64u;
@@ -310,6 +313,11 @@ struct PresentBiasState_t
 	int64_t emaNs = 0;
 	uint32_t samples = 0;
 	uint32_t consecutiveGuardExceeds = 0;
+	// The current run of consecutive mature outliers and the range of their
+	// residuals. The EMA is frozen during a run, so they compare directly.
+	uint32_t outlierRun = 0;
+	int64_t outlierLowNs = 0;
+	int64_t outlierHighNs = 0;
 };
 
 struct PresentLeadState_t
@@ -442,6 +450,40 @@ struct PresentBiasUpdate_t
 		: biasMagnitudeNs + intervalMarginNs;
 }
 
+// Outliers that keep agreeing are the display chain's offset, further from the
+// learned bias than the outlier bound admits (a warm-up that read the wrong
+// vblank, say), and would be discarded forever. Once
+// k_uPresentBiasRelearnSamples consecutive ones lie within half a vblank of
+// each other, the bias moves to their midpoint. A sample outside that range
+// starts a new run, so a stutter's scattered lateness never qualifies.
+[[nodiscard]] constexpr PresentBiasState_t note_present_bias_outlier(
+	PresentBiasState_t state, int64_t residualNs, uint64_t vblankIntervalNs )
+{
+	const int64_t lowNs = std::min( state.outlierLowNs, residualNs );
+	const int64_t highNs = std::max( state.outlierHighNs, residualNs );
+	// highNs >= lowNs, so the unsigned difference is exact.
+	const uint64_t spreadNs = static_cast<uint64_t>( highNs ) - static_cast<uint64_t>( lowNs );
+	if ( state.outlierRun == 0u || spreadNs > vblankIntervalNs / 2u )
+	{
+		state.outlierRun = 1u;
+		state.outlierLowNs = residualNs;
+		state.outlierHighNs = residualNs;
+	}
+	else
+	{
+		state.outlierRun++;
+		state.outlierLowNs = lowNs;
+		state.outlierHighNs = highNs;
+		if ( state.outlierRun >= k_uPresentBiasRelearnSamples )
+		{
+			state.emaNs = saturating_add_signed_ns( state.emaNs,
+				lowNs + static_cast<int64_t>( spreadNs / 2u ) );
+			state.outlierRun = 0u;
+		}
+	}
+	return state;
+}
+
 // Treat the target error as the residual of the bias already applied to this
 // provisional anchor. Adding 1/8 of that residual is algebraically the same as
 // a 1/8 EMA of (actual flip - raw grid target), while allowing the anchor to
@@ -471,13 +513,17 @@ struct PresentBiasUpdate_t
 		result.state.consecutiveGuardExceeds = 0u;
 	}
 
-	const bool discardEmaSample = mature
-		&& ( hitchEpisode
-			|| ( vblankIntervalNs != 0u
-				&& signed_ns_magnitude( result.residualNs )
-					>= present_bias_outlier_bound_ns(
-						state, vblankIntervalNs ) ) );
-	if ( !discardEmaSample )
+	const bool outlier = mature && !hitchEpisode && vblankIntervalNs != 0u
+		&& signed_ns_magnitude( result.residualNs )
+			>= present_bias_outlier_bound_ns( state, vblankIntervalNs );
+	if ( outlier )
+	{
+		result.state = note_present_bias_outlier(
+			result.state, result.residualNs, vblankIntervalNs );
+		return result;
+	}
+	result.state.outlierRun = 0u;
+	if ( !( mature && hitchEpisode ) )
 	{
 		result.state = update_present_timing_ema_residual(
 			result.state, result.residualNs );
