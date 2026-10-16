@@ -1228,8 +1228,8 @@ namespace
 //
 // The display chain flips every present displayOffsetNs after its opportunity.
 // The loop learns that offset as the renderer does: a delayed real shown at its
-// own opportunity (bidir_real_on_slot) feeds update_present_bias with its tag,
-// the raw target plus the bias learned so far (display_target_ns). Nothing the
+// own opportunity (bidir_real_on_slot) feeds update_present_bias with its raw
+// target plus the bias learned so far (display_target_ns). Nothing the
 // planner or the presenter decides reads it.
 constexpr uint64_t k_ulLoopVblankNs = 16'666'667u;
 constexpr uint64_t k_ulLoop120HzNs = 8'333'333u;
@@ -1292,8 +1292,6 @@ struct BidirLoopResult_t
 	std::vector<uint64_t> lateSlotNs;		// a kept plan's interpolation slot planned after its wake
 	size_t capacity = 0;
 	uint64_t vblankNs = 0;
-	std::vector<uint64_t> forcedNs;			// fronts the ring ceiling forced out ahead of their slot
-	std::vector<uint64_t> planDropNs;		// plans that dropped reals, once per real
 	PresentBiasState_t presentBias;			// learned from the delayed reals' flips
 	uint64_t worstBiasErrorNs = 0;			// the most the learned bias left the display offset after its first sample
 	size_t recorded = 0;
@@ -1456,11 +1454,8 @@ BidirLoopResult_t run_bidir_loop( const std::vector<uint64_t> &intervalsNs, cons
 			if ( action == BidirFrontAction_t::Wait )
 				return;
 			if ( bidir_front_forced( front.targetNs, opportunityNs, T ) )
-			{
 				state.ringBound = observe_bidir_ring_overflow( state.ringBound, opportunityNs,
 					state.epoch.valid ? state.epoch.delayNs : 0u );
-				r.forcedNs.push_back( opportunityNs );
-			}
 			queue.pop_front();
 			if ( action != BidirFrontAction_t::Present )
 				continue;

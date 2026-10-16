@@ -6408,10 +6408,15 @@ static FramegenDispatch_t g_framegenDispatch;
 static constexpr float k_flFramegenSuppressLo = 0.08f;
 static constexpr float k_flFramegenSuppressHi = 0.40f;
 
-// Present tokens of the delayed reals whose flips may teach the present bias.
-// More on-slot delayed reals in flight than this lose the oldest sample, never
-// use a wrong one.
-using FramegenBidirBiasTokens_t = std::array<uint64_t, 4>;
+// The delayed reals whose flips may teach the present bias: present token and
+// raw target. More on-slot delayed reals in flight than this lose the oldest
+// sample, never use a wrong one.
+struct FramegenBidirBiasSample_t
+{
+	uint64_t ulPresentToken = 0;
+	uint64_t ulRawTargetNs = 0;
+};
+using FramegenBidirBiasTokens_t = std::array<FramegenBidirBiasSample_t, 4>;
 
 struct FramegenPresentState_t
 {
@@ -6938,21 +6943,25 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback );
 
 // The present bias under bidir: the flip of a delayed real shown on its own
-// slot, against its tag (raw target plus the bias learned so far). Generated
+// slot, against its raw target plus the bias learned by now. Several flips are
+// in flight, so the bias their tags carried is stale; the residual against the
+// current bias keeps this the 1/8 EMA of (flip - raw target). Generated
 // and held flips are what the bias is judged by, and a real shown early or late
 // is off its slot by design, so neither teaches it. The first correlated flip
 // after a hitch is discard-only evidence, as for live reals.
 static void framegen_apply_bidir_flip_feedback( const DisplayFeedback_t &feedback )
 {
 	const FramegenBidirBiasTokens_t &tokens = g_framegenPresentState.onSlotRealTokens;
-	if ( !feedback.bPresented || !feedback.bTimestampValid
-		|| std::ranges::find( tokens, feedback.tag.ulPresentToken ) == tokens.end() )
+	const auto sample = std::ranges::find( tokens, feedback.tag.ulPresentToken,
+		&FramegenBidirBiasSample_t::ulPresentToken );
+	if ( !feedback.bPresented || !feedback.bTimestampValid || sample == tokens.end() )
 		return;
 
 	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
 	g_framegenPresentState.displayTiming.presentBias = gamescope::framegen::update_present_bias(
 		g_framegenPresentState.displayTiming.presentBias,
-		feedback.tag.ulTargetFlipNs, feedback.ulActualFlipNs,
+		gamescope::framegen::display_target_ns( sample->ulRawTargetNs, g_framegenPresentState.displayTiming ),
+		feedback.ulActualFlipNs,
 		gamescope::framegen::cadence_arrival_guard_ns( ulVblankIntervalNs ),
 		ulVblankIntervalNs, g_framegenPresentState.bPresentBiasHitchEpisode ).state;
 	g_framegenPresentState.bPresentBiasHitchEpisode = false;
@@ -7672,6 +7681,17 @@ struct FramegenImagePoolPressure_t
 	uint64_t ulBackendExternalRefs = 0;
 };
 
+// The first backend-fb ref belongs to the first public texture ref. Any excess
+// is an external owner such as a pending KMS commit or unreleased nested-Wayland
+// attach.
+static uint32_t framegen_backend_external_refs( CVulkanTexture &image )
+{
+	const uint32_t uTextureRefs = image.GetRefCount();
+	const gamescope::IBackendFb *pBackendFb = image.GetBackendFb();
+	const uint32_t uBackendRefs = pBackendFb != nullptr ? pBackendFb->GetRefCount() : 0;
+	return uBackendRefs - std::min( uBackendRefs, uTextureRefs != 0 ? 1u : 0u );
+}
+
 static FramegenImagePoolPressure_t framegen_image_pool_pressure(
 	const std::vector<gamescope::OwningRc<CVulkanTexture>> &images )
 {
@@ -7682,13 +7702,7 @@ static FramegenImagePoolPressure_t framegen_image_pool_pressure(
 			continue;
 
 		const uint32_t uTextureRefs = pImage->GetRefCount();
-		const gamescope::IBackendFb *pBackendFb = pImage->GetBackendFb();
-		const uint32_t uBackendRefs = pBackendFb != nullptr ? pBackendFb->GetRefCount() : 0;
-		// The first backend-fb ref belongs to the first public texture ref. Any
-		// excess is an external owner such as a pending KMS commit or unreleased
-		// nested-Wayland attach.
-		const uint32_t uBackendExternalRefs = uBackendRefs
-			- std::min( uBackendRefs, uTextureRefs != 0 ? 1u : 0u );
+		const uint32_t uBackendExternalRefs = framegen_backend_external_refs( *pImage );
 		pressure.nTextureBusy += uTextureRefs != 0;
 		pressure.nBackendBusy += uBackendExternalRefs != 0;
 		pressure.ulTextureRefs += uTextureRefs;
@@ -7697,7 +7711,7 @@ static FramegenImagePoolPressure_t framegen_image_pool_pressure(
 	return pressure;
 }
 
-static void framegen_log_output_ring_pressure()
+static void framegen_log_output_ring_pressure( const char *pszAction )
 {
 	size_t nHistoryRefs = 0;
 	size_t nReadPinRefs = 0;
@@ -7705,26 +7719,52 @@ static void framegen_log_output_ring_pressure()
 	const FramegenImagePoolPressure_t pressure = framegen_image_pool_pressure(
 		g_output.outputImages );
 
+	// One token per ring image: P pending real, c/p current/previous history,
+	// r generation read pin, b<n> external backend refs, t<n> texture refs.
+	std::string sOwners;
 	for ( const auto &pOwnedImage : g_output.outputImages )
 	{
 		CVulkanTexture *pImage = pOwnedImage.get();
 		if ( pImage == nullptr )
 			continue;
 
-		nHistoryRefs += g_framegenHistory.previousReal.get() == pImage;
-		nHistoryRefs += g_framegenHistory.currentReal.get() == pImage;
-		nReadPinRefs += g_framegenHistory.genReadA.get() == pImage;
-		nReadPinRefs += g_framegenHistory.genReadB.get() == pImage;
-		nReadPinRefs += g_framegenHistory.genReadReference.get() == pImage;
+		size_t nPending = 0;
 		for ( const FramegenHistory_t::PendingGenerated_t &entry : g_framegenHistory.pending )
-			nPendingRealRefs += entry.bReal && entry.tex.get() == pImage;
+			nPending += entry.bReal && entry.tex.get() == pImage;
+		const bool bCurrent = g_framegenHistory.currentReal.get() == pImage;
+		const bool bPrevious = g_framegenHistory.previousReal.get() == pImage;
+		const size_t nRead = size_t( g_framegenHistory.genReadA.get() == pImage )
+			+ size_t( g_framegenHistory.genReadB.get() == pImage )
+			+ size_t( g_framegenHistory.genReadReference.get() == pImage );
+		const uint32_t uBackendExternalRefs = framegen_backend_external_refs( *pImage );
+
+		nHistoryRefs += size_t( bCurrent ) + size_t( bPrevious );
+		nReadPinRefs += nRead;
+		nPendingRealRefs += nPending;
+
+		sOwners += sOwners.empty() ? "" : ",";
+		sOwners += nPending != 0 ? "P" : "";
+		sOwners += bCurrent ? "c" : "";
+		sOwners += bPrevious ? "p" : "";
+		sOwners += nRead != 0 ? "r" : "";
+		if ( uBackendExternalRefs != 0 )
+			sOwners += "b" + std::to_string( uBackendExternalRefs );
+		sOwners += "t" + std::to_string( pImage->GetRefCount() );
 	}
 
+	// How far the queue front is past its display target (negative: early).
+	const uint64_t ulFrontTargetNs = g_framegenHistory.pending.empty()
+		? 0 : g_framegenHistory.pending.front().ulTargetFlipNs;
+	const double flFrontLateMs = ulFrontTargetNs != 0
+		? double( int64_t( get_time_in_nanos() - ulFrontTargetNs ) ) / 1.0e6
+		: std::numeric_limits<double>::quiet_NaN();
+
 	vk_log.infof( "framegen: real output-ring pressure pool=%zu texture-busy=%zu refs=%" PRIu64
-		" backend-busy=%zu external-refs=%" PRIu64 " history-refs=%zu read-pins=%zu pending-real-refs=%zu pending=%zu; skipping live-buffer composite",
+		" backend-busy=%zu external-refs=%" PRIu64 " history-refs=%zu read-pins=%zu pending-real-refs=%zu pending=%zu"
+		" front_late_ms=%.1f owners=[%s]; %s",
 		g_output.outputImages.size(), pressure.nTextureBusy, pressure.ulTextureRefs,
 		pressure.nBackendBusy, pressure.ulBackendExternalRefs, nHistoryRefs, nReadPinRefs,
-		nPendingRealRefs, g_framegenHistory.pending.size() );
+		nPendingRealRefs, g_framegenHistory.pending.size(), flFrontLateMs, sOwners.c_str(), pszAction );
 }
 static bool g_bLoggedFramegenConfig = false;
 static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = 250'000'000ull;
@@ -8877,7 +8917,7 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_present_front( gamescope::Rc
 	{
 		FramegenBidirBiasTokens_t &tokens = g_framegenPresentState.onSlotRealTokens;
 		std::shift_left( tokens.begin(), tokens.end(), 1 );
-		tokens.back() = g_framegenPresentState.pendingTag.ulPresentToken;
+		tokens.back() = { g_framegenPresentState.pendingTag.ulPresentToken, front.ulTargetFlipNs };
 	}
 	framegen_bidir_note_ring_overflow( front.ulTargetFlipNs, ulOpportunityNs, ulVblankIntervalNs );
 	static uint64_t s_uPresentedDebugLogCounter = 0;
@@ -15072,6 +15112,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				// Exceptional recovery is atomic for bidir: flush its entire
 				// timeline and invalidate; the next composite flips live.
 				// Non-bidir keeps the same history-release behavior.
+				static uint64_t s_uOutputRingFlushDebugLogCounter = 0;
+				if ( FramegenDebugShouldLog( s_uOutputRingFlushDebugLogCounter ) )
+					framegen_log_output_ring_pressure( "flushing history" );
 				vulkan_framegen_invalidate_history( "real_output_ring_pressure" );
 				nAvailable = framegen_find_available_output_image( g_output.nOutImage );
 			}
@@ -15079,7 +15122,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			{
 				static uint64_t s_uOutputRingPressureDebugLogCounter = 0;
 				if ( FramegenDebugShouldLog( s_uOutputRingPressureDebugLogCounter ) )
-					framegen_log_output_ring_pressure();
+					framegen_log_output_ring_pressure( "skipping live-buffer composite" );
 				return std::nullopt;
 			}
 			g_output.nOutImage = *nAvailable;

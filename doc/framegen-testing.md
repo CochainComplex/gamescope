@@ -627,10 +627,13 @@ Compare gates, per run present in both sessions:
 `real_s`, `shown_s`, `dl_hit`, `bias_ms`, `reprime`, `ring_ovf` and `q_samples`
 are reported, not gated. Exit 0 is a pass, 1 a regression. Exit 2 means the
 sessions are not comparable: a context key differs (`backend`, `size`, `hz`,
-`render`, `present`, `client`, `seconds`, `warmup`, `debug`), either side is a
-DEBUG session, a client was not seen on its render device, or a run's flags,
-run environment or latency start point differ. The treatment (`bin`, gamescope
-`version`, `EXTRA_ENV`) is printed for both sides and never compared: it is
+`render`, `present`, `client`, `seconds`, `warmup`, `debug`, and `host_display`
+when both sides recorded it, since a nested run paces against its host's
+refresh), either side is a DEBUG session, a client was not seen on its render
+device, the sessions have no run in common, a run's flags, run environment or
+latency start point differ, or the candidate lacks a gated field the baseline
+measured (a regression found elsewhere still exits 1). The treatment (`bin`,
+gamescope `version`, `EXTRA_ENV`) is printed for both sides and never compared: it is
 what is under test, so an opt-in knob can be judged with one binary. One
 session holds one treatment; summarising logs of mixed binaries is refused.
 
@@ -641,9 +644,10 @@ Examples (`--compare` needs the baseline's context, so repeat its variables):
 GAMESCOPE_BIN=../build-base/src/gamescope scripts/framegen-showcase.sh --baseline base.json
 GAMESCOPE_BIN=build/src/gamescope scripts/framegen-showcase.sh --compare base.json
 
-# Opt-in A/B on one binary: the knob is the treatment.
-scripts/framegen-showcase.sh --baseline a.json 3 6
-EXTRA_ENV=GAMESCOPE_FRAMEGEN_ADAPT=0 scripts/framegen-showcase.sh --compare a.json 3 6
+# Opt-in A/B on one binary: the knob is the treatment (adaptation needs the
+# learned pipeline, run 8).
+scripts/framegen-showcase.sh --baseline a.json 8
+EXTRA_ENV=GAMESCOPE_FRAMEGEN_ADAPT=0 scripts/framegen-showcase.sh --compare a.json 8
 
 # Hybrid: render on the dGPU, composite, generate and present on the iGPU.
 RENDER_DEV='<dgpu vid:did>!' PRESENT_DEV='<igpu vid:did>' scripts/framegen-showcase.sh --baseline hybrid.json
@@ -677,7 +681,7 @@ for content in gm game; do
 done
 ```
 
-The full table takes about 10 runs × 3 reps × 57 s, roughly 30 minutes per
+The full table takes about 9 runs × 3 reps × 57 s, roughly 26 minutes per
 combination; select runs by index for a focused check.
 
 Limits:

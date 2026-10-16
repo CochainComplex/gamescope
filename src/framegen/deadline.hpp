@@ -920,7 +920,10 @@ struct BidirSpacings_t
 // vblank more of delay queues at most one more entry, and the ceiling forces a
 // front out only at a full queue. It bounds nothing again once it reaches the
 // envelope's D. A prediction alone never moves an established bound, so a
-// cadence the prediction misjudges cannot make D flap.
+// cadence the prediction misjudges cannot make D flap. A queue that came
+// within an entry of the ceiling blocks the rise until the next overflow or
+// move: a vblank more would fill it. That latch never holds a harmful bound,
+// since a D the ring cannot hold overflows, which releases it.
 struct BidirRingBound_t
 {
 	uint64_t delayNs = 0;	// 0: none, D follows the envelope

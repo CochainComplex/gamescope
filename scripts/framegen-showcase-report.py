@@ -32,6 +32,8 @@ WINDOW_SECONDS = 5.0
 
 # Must match between baseline and candidate.
 CONTEXT = ("backend", "size", "hz", "render", "present", "client", "seconds", "warmup", "debug")
+# Must match when both sides recorded it (older logs lack it).
+OPTIONAL_CONTEXT = ("host_display",)
 # What is under test: printed for both sides, never compared.
 TREATMENT = ("bin", "version", "extra_env")
 # Identify a run; must match between the reps of a session and across sessions.
@@ -146,8 +148,8 @@ def summarize(paths):
         refuse("no run logs to summarise")
     logs = [read_log(p) for p in paths]
 
-    for key in (*CONTEXT, "bin", "extra_env"):
-        values = sorted({log["header"][key] for log in logs})
+    for key in (*CONTEXT, *OPTIONAL_CONTEXT, "bin", "extra_env"):
+        values = sorted({log["header"].get(key, "") for log in logs})
         if len(values) > 1:
             refuse(f"logs disagree on {key}: {values}")
     versions = sorted({log["version"] for log in logs if log["version"]})
@@ -187,7 +189,7 @@ def summarize(paths):
         })
 
     header = logs[0]["header"]
-    return {"context": {k: header[k] for k in CONTEXT},
+    return {"context": {k: header[k] for k in (*CONTEXT, *OPTIONAL_CONTEXT) if k in header},
             "treatment": {"bin": header["bin"], "version": versions[0] if versions else "", "extra_env": header["extra_env"]},
             "runs": runs}
 
@@ -244,8 +246,10 @@ def judge(gate, base, cand):
 
 def compare(base, cand):
     problems = []
-    for key in CONTEXT:
+    for key in (*CONTEXT, *OPTIONAL_CONTEXT):
         b, c = base["context"].get(key), cand["context"].get(key)
+        if key in OPTIONAL_CONTEXT and (b is None or c is None):
+            continue
         if b != c:
             problems.append(f"context {key} differs: baseline {b!r}, candidate {c!r}")
     for side, res in (("baseline", base), ("candidate", cand)):
@@ -261,6 +265,8 @@ def compare(base, cand):
     base_runs = {r["index"]: r for r in base["runs"]}
     cand_runs = {r["index"]: r for r in cand["runs"]}
     common = sorted(base_runs.keys() & cand_runs.keys())
+    if not common:
+        problems.append("no run in common")
     for index in common:
         b, c = base_runs[index], cand_runs[index]
         for key in RUN_KEYS:
@@ -275,6 +281,7 @@ def compare(base, cand):
 
     gates = {g.field: g for g in GATES}
     regressions = 0
+    missing = []
     for index in common:
         b, c = base_runs[index], cand_runs[index]
         print(f"run {index} {c['name']} (latency of {c['lat_of'] or b['lat_of'] or '-'} reals)")
@@ -285,7 +292,11 @@ def compare(base, cand):
                     regressions += 1
         for field in (*REPORTED[:2], *(g.field for g in GATES), *REPORTED[2:]):
             bv, cv = b["median"].get(field), c["median"].get(field)
-            if bv is None or cv is None:
+            if bv is not None and cv is None and field in gates:
+                # The baseline measured it: an absent candidate value is no evidence.
+                status = "MISSING"
+                missing.append(f"run {index} {field}")
+            elif bv is None or cv is None:
                 status = "n/a"
             elif field not in gates:
                 status = "reported"
@@ -302,6 +313,9 @@ def compare(base, cand):
     if regressions:
         print(f"FAIL: {regressions} regression(s)")
         return 1
+    if missing:
+        print(f"NOT COMPARABLE: the candidate lacks {', '.join(missing)}")
+        return 2
     print("PASS")
     return 0
 

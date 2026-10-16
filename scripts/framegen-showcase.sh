@@ -51,6 +51,27 @@ DUR=${SECONDS_PER_RUN:-45}
 WARMUP=${WARMUP_WINDOWS:-1}
 BACKEND=${BACKEND:-wayland}
 W=${W:-2560} H=${H:-1440} HZ=${HZ:-120}
+# A nested session paces against its host compositor (present lead, latch
+# phase), so it records the host's active modes as context.
+host_display()
+{
+	[[ $BACKEND == drm ]] && { echo native; return; }
+	local modes
+	modes=$(xrandr --current 2>/dev/null | awk '
+		/ connected/ { out = $1; next }
+		out && /\*/ { for (i = 2; i <= NF; i++) if ($i ~ /\*/) { sub(/[*+]+$/, "", $i); printf "%s%s %s@%s", sep, out, $1, $i; sep = " " } out = "" }')
+	echo "${modes:-unknown}"
+}
+HOST_DISPLAY=$(host_display)
+# A locked host session stops presenting nested windows, so every metric
+# would read 0.
+host_locked()
+{
+	[[ $BACKEND == drm ]] && return 1
+	local session
+	session=$(loginctl show-user "$(id -un)" -p Display --value 2>/dev/null)
+	[[ -n "$session" && "$(loginctl show-session "$session" -p LockedHint --value 2>/dev/null)" == yes ]]
+}
 RENDER_DEV=${RENDER_DEV:-}
 PRESENT_DEV=${PRESENT_DEV:-}
 ASTEROIDS=${ASTEROIDS:-500000}
@@ -81,7 +102,6 @@ RUNS=(
 	"best quality|interpolation, checked pipeline|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline checked|GAMESCOPE_FRAMEGEN_BIDIR=1"
 	"learned x2 + net|predictive, online-trained refiner|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline learned|GAMESCOPE_FRAMEGEN_NET_ONLINE=1 GAMESCOPE_FRAMEGEN_NET_EVERY=2"
 	"guided x2|predictive, guided pipeline|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline guided|"
-	"checked, adapt off|predictive, adaptation disabled|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline checked|GAMESCOPE_FRAMEGEN_ADAPT=0"
 )
 
 die() { echo "framegen-showcase: $*" >&2; exit 2; }
@@ -131,11 +151,15 @@ render_gpu_check()
 		echo unverified
 		return
 	fi
-	# The proprietary nvidia driver has no DRM fdinfo usage statistics.
+	# The proprietary nvidia driver has no DRM fdinfo usage statistics; its
+	# process list names each process's device by PCI address (8-digit domain).
 	if [[ "$driver" == nvidia ]]; then
 		if ! command -v nvidia-smi >/dev/null; then
 			echo unverified
-		elif nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d " " | grep -qx "$pid"; then
+		elif nvidia-smi --query-compute-apps=pid,gpu_bus_id --format=csv,noheader 2>/dev/null \
+			| awk -F', *' -v pid="$pid" -v devs=" ${addrs[*]} " '
+				$1 == pid && index(devs, " " substr(tolower($2), length($2) - 11) " ") { found = 1 }
+				END { exit !found }'; then
 			echo seen
 		else
 			echo not_seen
@@ -161,10 +185,10 @@ run_one()
 		[run]="$name" [index]="$index" [rep]="$rep" [kind]="$kind" [flags]="$flags" [run_env]="$run_env"
 		[backend]="$BACKEND" [size]="${W}x${H}" [hz]="$HZ" [render]="$RENDER_DEV" [present]="$PRESENT_DEV"
 		[client]="$CLIENT" [warmup]="$WARMUP" [extra_env]="$EXTRA_ENV" [debug]="$DEBUG" [seconds]="$DUR"
-		[bin]="$GAMESCOPE_BIN"
+		[bin]="$GAMESCOPE_BIN" [host_display]="$HOST_DISPLAY"
 	)
 	: >"$log"
-	for key in run index rep kind flags run_env backend size hz render present client warmup extra_env debug seconds bin; do
+	for key in run index rep kind flags run_env backend size hz render present client warmup extra_env debug seconds bin host_display; do
 		printf 'framegen-showcase: %s=%s\n' "$key" "${header[$key]}" >>"$log"
 	done
 
@@ -273,6 +297,7 @@ else
 	logs=()
 	for ((rep = 1; rep <= REPS; rep++)); do
 		for i in "${SELECT[@]}"; do
+			host_locked && die "the host session is locked: its nested windows are not presented"
 			logs+=("$OUT/run$i-r$rep.log")
 			run_one "$i" "$rep" "$OUT/run$i-r$rep.log"
 		done
