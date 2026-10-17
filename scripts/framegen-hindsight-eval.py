@@ -9,10 +9,12 @@ pair of consecutive samples, real frame N+1 is predicted from real frame N:
   hold    L_N(p)                     the frame is held
   cont    L_N(p - F_N(p))            constant-motion continuation (predictive path)
   cont*   L_N(p - a F_N(p))          best scale a per pair (cadence-aware continuation)
-  oracle  L_N(p - F_N+1(p))          the true next field: what matching alone leaves
+  oracle  L_N(p - F_N+1(p))          the next pair's estimated field: what it leaves
 
-S1, the matching error, is the oracle error. S2, the continuation error, is
-cont - oracle: what no better matcher can remove, only a better predictor.
+S1 is the oracle error: the residual left by the next pair's own estimated
+field, an upper bound on what better matching could remove (it also holds
+disocclusion, shading change and resampling error). S2, the continuation gap,
+is cont - oracle: what no better matcher can remove, only a better predictor.
 
 The rejection block asks, inside the moving texels the checked field rejects
 (confidence below 0.5), whether warping would have beaten holding.
