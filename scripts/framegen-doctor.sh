@@ -348,7 +348,7 @@ if (( PRESENT >= 0 )); then
 		printf '      export PRESENT_DEV=%s:%s\n' "${G_VENDOR[PRESENT]}" "${G_DEVICE[PRESENT]}"
 	else
 		RENDER=$PRESENT
-		warn "single-GPU only: works, but generation competes with the game (see README's one-GPU exception)"
+		warn "single-GPU only: works, but generation competes with the game (see README Quick start, step 2, One GPU)"
 		printf '      export RENDER_DEV=%s:%s!\n' "${G_VENDOR[RENDER]}" "${G_DEVICE[RENDER]}"
 		printf '      export PRESENT_DEV=%s:%s\n' "${G_VENDOR[PRESENT]}" "${G_DEVICE[PRESENT]}"
 	fi

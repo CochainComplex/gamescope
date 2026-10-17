@@ -1,7 +1,8 @@
 # Proposal 06 — JIT Phase: Display-Clock Pacing for Generated Frames
 
-Status: **prototype implemented** (opt-in via `GAMESCOPE_FRAMEGEN_JIT=1`, requires the
-dedicated framegen queue)
+Status: **shipped as the default** on the dedicated framegen queue (deadline scheduling).
+`GAMESCOPE_FRAMEGEN_JIT` is now a no-op that only logs a notice; `GAMESCOPE_FRAMEGEN_CLASSIC=1`
+selects the old batch path. The opt-in gate described below is historical.
 Scope: temporal placement of generated frames on fixed-refresh outputs
 Owner-area files: `src/rendervulkan.cpp`, `src/rendervulkan.hpp`, `src/steamcompmgr.cpp`
 
