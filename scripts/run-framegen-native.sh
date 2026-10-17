@@ -16,6 +16,10 @@ Arguments:
   WxH         output size                    (default: 2560x1440)
   refresh     display refresh                (default: 120)
 
+Run ./scripts/framegen-doctor.sh first: it prints the exact RENDER_DEV and
+PRESENT_DEV lines to copy for this machine. (./scripts/test-framegen.sh gpus
+lists the GPUs and their vendor:device IDs.)
+
 The client renders on RENDER_DEV. Gamescope composites, generates, and scans
 out on PRESENT_DEV, which must drive the selected display. Pass a client after
 `--`; otherwise vkmark is used. APP remains available for compatibility, but

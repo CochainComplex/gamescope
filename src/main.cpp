@@ -272,7 +272,7 @@ const char usage[] =
 	"  --force-composition, --force-composite\n"
 	"                                 disable direct scan-out\n"
 	"  --debug-dual-gpu-route         log compositor GPU, buffer import, frame path, and FSR/NIS routing diagnostics\n"
-	"  --experimental-framegen        enable experimental x2 compositor-side frame generation (forces the composite path,\n"
+	"  --experimental-framegen        enable experimental compositor-side frame generation (forces the composite path,\n"
 	"                                 disables adaptive sync and tearing while active)\n"
 	"  --framegen-multiplier 2        generated-frame multiplier (2, 3 or 4); actual count adapts to the frame gap\n"
 	"  --framegen-mode MODE           generated-frame algorithm: 'extrapolate' (default, low latency),\n"
