@@ -137,6 +137,19 @@ def bilinear(img, cy, cx):
 # Features (channel-for-channel the shader's phase A)
 # --------------------------------------------------------------------------
 
+def evidence_gate(warped, luma_dst, luma_src):
+    """The confidence-raise gate of cs_framegen_motion_net.comp: the refined
+    vector must predict the pair (normalized residual fades out over
+    0.03..0.10) and explain it better than holding (zero motion): the raise
+    scales with the share of the zero-motion residual it removes, floored at
+    the 0.03 'explained' level, so on static content no vector earns one."""
+    def resid(a, b):
+        return np.abs(a - b) / np.maximum(1.0, np.maximum(np.abs(a), np.abs(b)))
+    rr, r0 = resid(warped, luma_dst), resid(luma_src, luma_dst)
+    t = np.clip((rr - 0.03) / 0.07, 0.0, 1.0)
+    return (1.0 - t * t * (3.0 - 2.0 * t)) * np.clip((r0 - rr) / np.maximum(r0, 0.03), 0.0, 1.0)
+
+
 def features(X, Y, luma_src, luma_dst, y0, x0, size, mode=0.0):
     """12-channel feature crop of `size` starting at (y0, x0)."""
     ys, xs = slice(y0, y0 + size), slice(x0, x0 + size)
@@ -255,10 +268,7 @@ def batch_loss(params, views, size, train=True):
     # correction may recover confidence only when its FINAL vector predicts
     # this frame pair. The gate is intentionally stop-gradient; it is a safety
     # verdict, while FLOW_AUX below supplies the rejected flow's learning path.
-    refined_resid = np.abs(warped - ld) / np.maximum(
-        1.0, np.maximum(np.abs(warped), np.abs(ld)))
-    t = np.clip((refined_resid - 0.03) / 0.07, 0.0, 1.0)
-    gate = 1.0 - t * t * (3.0 - 2.0 * t)
+    gate = evidence_gate(warped, ld, ls_pt)
     dc_raw = o[:, 2]
     dc_chain = np.where(dc_raw < 0.0, 1.0, gate)
     dc = dc_raw * dc_chain

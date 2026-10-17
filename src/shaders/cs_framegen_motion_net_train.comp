@@ -4,6 +4,7 @@
 #extension GL_EXT_scalar_block_layout : require
 
 #include "descriptor_set_constants.h"
+#include "framegen_evidence.h"
 
 // In-situ learning, gradient half (Stage C2): one workgroup = one randomly
 // placed training tile. Recompute the refiner's forward pass on the tile at
@@ -237,11 +238,11 @@ void main() {
         float ld = texelFetch(s_samplers[1], q, 0).r;
         float lsp = texelFetch(s_samplers[0], q, 0).r;
         vec3 wg = bilinearGrad(vec2(q) + 0.5f - Fh, sz);
-        // Same corrected-field evidence gate as inference. Treat the gate as
+        // Same corrected-field evidence gate as inference (framegen_evidence.h;
+        // lsp is the source luma at q, i.e. holding). Treat the gate as
         // stop-gradient: it is a safety verdict, not a shortcut through which
         // the confidence loss should reshape flow.
-        float refinedResid = abs(wg.x - ld) / max(1.0f, max(abs(wg.x), abs(ld)));
-        float gate = 1.0f - smoothstep(0.03f, 0.10f, refinedResid);
+        float gate = framegenEvidenceGate(framegenLumaResid(wg.x, ld), framegenLumaResid(lsp, ld));
         // Bidir ML is a veto, never an authority: it may route an unreliable
         // checked vector toward the phase-correct crossfade, but cannot raise
         // confidence. Define the zero hinge from the negative side so a neutral

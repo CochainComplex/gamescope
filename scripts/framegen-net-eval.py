@@ -131,10 +131,7 @@ def refine(params, X, Y, luma_src, luma_dst):
     o = o[0]
     dF = 2.0 * np.tanh(o[0:2]).transpose(1, 2, 0)                      # (H,W,2)
     Fh = X[..., 0:2].astype(np.float32) + dF
-    warped = warp(luma_src, Fh)
-    rr = np.abs(warped - luma_dst) / np.maximum(1.0, np.maximum(np.abs(warped), np.abs(luma_dst)))
-    t = np.clip((rr - 0.03) / 0.07, 0.0, 1.0)
-    gate = 1.0 - t * t * (3.0 - 2.0 * t)                              # complement smoothstep
+    gate = T.evidence_gate(warp(luma_src, Fh), luma_dst, luma_src)
     dc_raw = o[2]
     dc = dc_raw * np.where(dc_raw < 0.0, 1.0, gate)
     ch = np.clip(X[..., 2].astype(np.float32) + dc, 0.0, 1.0)

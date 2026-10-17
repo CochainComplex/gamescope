@@ -4,6 +4,7 @@
 #extension GL_EXT_scalar_block_layout : require
 
 #include "descriptor_set_constants.h"
+#include "framegen_evidence.h"
 
 // Learned field refinement (Stage C): a tiny convolutional net, fused into a
 // single dispatch, that refines one checked motion field at field resolution
@@ -152,7 +153,7 @@ void main() {
         float lw = texture(s_samplers[0], uv - X.xy * invSz).r;
         // Magnitude-normalized residual — scale-free in SDR and HDR alike
         // (the exact form the B4 probe grades with).
-        float resid = abs(ld - lw) / max(1.0f, max(abs(ld), abs(lw)));
+        float resid = framegenLumaResid(ld, lw);
         uint b = i * 3u;
         s_feat4[b + 0u] = vec4(X.x * 0.125f, X.y * 0.125f, X.z, min(X.w * 0.5f, 1.0f));
         s_feat4[b + 1u] = vec4(Y.x * 0.125f, Y.y * 0.125f, Y.z, min(Y.w * 0.5f, 1.0f));
@@ -295,17 +296,19 @@ void main() {
     // perfectly could never recover its confidence. One field-resolution
     // luma fetch per real frame closes that dead end while preserving the
     // safety invariant: lowering confidence is always allowed, raising it is
-    // allowed only after the final vector demonstrably predicts this pair.
+    // allowed only after the final vector demonstrably predicts this pair,
+    // and only as far as it explains the pair better than holding (zero
+    // motion); see framegen_evidence.h, shared with the online trainer.
     vec2 refinedUv = (vec2(op) + 0.5f - (X0.xy + dF)) * invSz;
     float ld = texelFetch(s_samplers[1], op, 0).r;
     float lw = texture(s_samplers[0], refinedUv).r;
-    float resid = abs(ld - lw) / max(1.0f, max(abs(ld), abs(lw)));
+    float lz = texelFetch(s_samplers[0], op, 0).r;
     float confidenceHead = (!isnan(o2) && !isinf(o2)) ? o2 : 0.0f;
     float dc = 0.0f;
     if (confidenceHead < 0.0f)
         dc = confidenceHead;
     else if (u_confidenceRaiseScale > 0.0f)
-        dc = confidenceHead * (1.0f - smoothstep(0.03f, 0.10f, resid));
+        dc = confidenceHead * framegenEvidenceGate(framegenLumaResid(ld, lw), framegenLumaResid(ld, lz));
     imageStore(u_refined, op, vec4(X0.xy + dF, clamp(X0.z + dc, 0.0f, 1.0f), X0.w));
     // max(tanh, 0) makes every legacy/neutral zero head bit-exact off. Online
     // training can raise focus only where a color trend survived across three
