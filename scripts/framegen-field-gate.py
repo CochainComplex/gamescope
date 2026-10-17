@@ -373,7 +373,8 @@ def main():
     ap.add_argument("--captures", type=Path, default=Path.home() / ".cache/gamescope-framegen-captures")
     ap.add_argument("--stride", type=int, default=6)
     ap.add_argument("--arms", default="checked/8,checked/4")
-    ap.add_argument("--net", type=Path, help="GSFR weights for learned arms")
+    ap.add_argument("--net", type=Path, help="GSFR weights or GSFP profile for learned arms")
+    ap.add_argument("--net-key", type=NE.parse_key, help="profile set key, when it holds several")
     ap.add_argument("--domain", choices=("coded", "linear"), default="coded",
                     help="matching domain; coded is production for 8/10-bit content")
     args = ap.parse_args()
@@ -383,7 +384,7 @@ def main():
         ap.error("NAME... and --size are required without --parity")
     w, h = (int(v) for v in args.size.split("x"))
     arms = args.arms.split(",")
-    net = NE.load_blob(args.net) if args.net else None
+    net = NE.load_blob(args.net, args.net_key) if args.net else None
     rng = np.random.default_rng(1)
     print(f"{args.size} {args.domain}: paired change vs {arms[0]} [95% CI] | sta (drag) | lost edges (smear) | false edges (tearing)")
     for name in args.names:

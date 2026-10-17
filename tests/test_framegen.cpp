@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +27,9 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <span>
+#include <vector>
+#include <optional>
 
 using gamescope::framegen::EffectiveConfig;
 using gamescope::framegen::effective_config;
@@ -227,6 +231,130 @@ static void test_net_profile_contract()
 	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetVersion + 1u, weights ) );
 	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetShadingVersion,
 		std::span<float>( weights.data(), weights.size() - 1u ) ) );
+}
+
+static void test_net_profile_sets()
+{
+	using namespace gamescope::framegen;
+
+	// Every producer path gets its own key; output-space keys ignore the
+	// colourspace argument, base-layer keys keep the output transfer.
+	std::vector<uint32_t> keys;
+	for ( uint32_t tf = 0u; tf < 3u; tf++ )
+	{
+		keys.push_back( net_input_key( false, 0u, tf ) );
+		CHECK( net_input_key( false, 3u, tf ) == net_input_key( false, 0u, tf ) );
+		for ( uint32_t cs = 0u; cs < 5u; cs++ )
+			keys.push_back( net_input_key( true, cs, tf ) );
+	}
+	std::vector<uint32_t> sorted = keys;
+	std::sort( sorted.begin(), sorted.end() );
+	CHECK( std::adjacent_find( sorted.begin(), sorted.end() ) == sorted.end() );
+	char szName[ 48 ];
+	net_input_key_name( net_input_key( false, 0u, 1u ), szName, sizeof( szName ) );
+	CHECK( std::string_view( szName ) == "output tf=pq" );
+	net_input_key_name( net_input_key( true, 2u, 0u ), szName, sizeof( szName ) );
+	CHECK( std::string_view( szName ) == "base cs=scrgb tf=gamma22" );
+	net_input_key_name( net_input_key( false, 0u, 2u ), szName, sizeof( szName ) );
+	CHECK( std::string_view( szName ) == "output tf=none" );
+
+	const auto weightsFor = []( uint32_t seed )
+	{
+		std::vector<float> weights( k_uFramegenNetFloats );
+		for ( size_t i = 0; i < weights.size(); i++ )
+			weights[ i ] = static_cast<float>( seed ) * 0.5f - static_cast<float>( i ) * 1e-3f;
+		weights[ 7 ] = -0.0f;
+		return weights;
+	};
+	const auto setsOf = [&]( uint32_t count )
+	{
+		std::vector<NetProfileSet> sets;
+		for ( uint32_t i = 0u; i < count; i++ )
+			sets.push_back( { keys[ i ], weightsFor( i + 1u ) } );
+		return sets;
+	};
+	const auto sameBits = []( const std::vector<NetProfileSet> &a, const std::vector<NetProfileSet> &b )
+	{
+		if ( a.size() != b.size() )
+			return false;
+		for ( size_t i = 0; i < a.size(); i++ )
+		{
+			if ( a[ i ].key != b[ i ].key || a[ i ].weights.size() != b[ i ].weights.size() )
+				return false;
+			for ( size_t j = 0; j < a[ i ].weights.size(); j++ )
+			{
+				if ( std::bit_cast<uint32_t>( a[ i ].weights[ j ] ) != std::bit_cast<uint32_t>( b[ i ].weights[ j ] ) )
+					return false;
+			}
+		}
+		return true;
+	};
+
+	for ( const uint32_t count : { 1u, 2u, 8u } )
+	{
+		const std::vector<NetProfileSet> sets = setsOf( count );
+		const std::optional<std::vector<uint8_t>> bytes = encode_net_profile( sets );
+		CHECK( bytes.has_value() );
+		CHECK( bytes->size() == 12u + count * ( 4u + k_uFramegenNetBlobBytes ) );
+		const std::optional<std::vector<NetProfileSet>> decoded = decode_net_profile( *bytes );
+		CHECK( decoded.has_value() && sameBits( *decoded, sets ) );
+	}
+
+	// Encoder refuses anything the decoder would reject.
+	CHECK( !encode_net_profile( std::vector<NetProfileSet>{} ) );
+	CHECK( !encode_net_profile( setsOf( 9u ) ) );
+	std::vector<NetProfileSet> bad = setsOf( 2u );
+	bad[ 1 ].key = bad[ 0 ].key;
+	CHECK( !encode_net_profile( bad ) );
+	bad = setsOf( 1u );
+	bad[ 0 ].weights[ 3 ] = std::numeric_limits<float>::quiet_NaN();
+	CHECK( !encode_net_profile( bad ) );
+	bad = setsOf( 1u );
+	bad[ 0 ].weights.pop_back();
+	CHECK( !encode_net_profile( bad ) );
+
+	// Decoder: only a well-formed current profile. No legacy path.
+	const std::vector<uint8_t> good = *encode_net_profile( setsOf( 2u ) );
+	const auto setWord = []( std::vector<uint8_t> bytes, size_t offset, uint32_t word )
+	{
+		for ( uint32_t b = 0u; b < 4u; b++ )
+			bytes[ offset + b ] = uint8_t( word >> ( 8u * b ) );
+		return bytes;
+	};
+	const size_t firstBlob = 16u; // container header + first key
+	const size_t secondKey = 12u + 4u + k_uFramegenNetBlobBytes;
+	CHECK( !decode_net_profile( std::vector<uint8_t>{} ) );
+	CHECK( !decode_net_profile( setWord( good, 0u, k_uFramegenNetMagic ) ) );
+	CHECK( !decode_net_profile( setWord( good, 4u, k_uFramegenNetProfileVersion + 1u ) ) );
+	CHECK( !decode_net_profile( setWord( good, 8u, 0u ) ) );
+	CHECK( !decode_net_profile( setWord( good, 8u, 9u ) ) );
+	CHECK( !decode_net_profile( setWord( good, 8u, 3u ) ) );
+	CHECK( !decode_net_profile( setWord( good, secondKey, keys[ 0 ] ) ) );
+	CHECK( !decode_net_profile( setWord( good, firstBlob + 4u, k_uFramegenNetVersion - 1u ) ) );
+	CHECK( !decode_net_profile( setWord( good, firstBlob + 12u, 13u ) ) );
+	CHECK( !decode_net_profile( setWord( good, firstBlob + 48u + 8u,
+		std::bit_cast<uint32_t>( std::numeric_limits<float>::infinity() ) ) ) );
+	CHECK( !decode_net_profile( std::span<const uint8_t>( good.data(), good.size() - 1u ) ) );
+	std::vector<uint8_t> trailing = good;
+	trailing.push_back( 0u );
+	CHECK( !decode_net_profile( trailing ) );
+	// A bare GSFR blob (the trainer's format, or an old profile) is not a profile.
+	const std::vector<uint8_t> bareBlob( good.begin() + firstBlob, good.begin() + firstBlob + k_uFramegenNetBlobBytes );
+	CHECK( !decode_net_profile( bareBlob ) );
+
+	// Prior order: own set, then the explicit blob, then neutral (or nothing).
+	const std::vector<NetProfileSet> sets = setsOf( 2u );
+	const std::vector<float> blob = weightsFor( 40u );
+	const std::vector<float> neutral = weightsFor( 50u );
+	CHECK( net_profile_prior( keys[ 1 ], sets, blob, neutral ).data() == sets[ 1 ].weights.data() );
+	CHECK( net_profile_prior( keys[ 5 ], sets, blob, neutral ).data() == blob.data() );
+	CHECK( net_profile_prior( keys[ 5 ], sets, {}, neutral ).data() == neutral.data() );
+	CHECK( net_profile_prior( keys[ 5 ], sets, {}, {} ).empty() );
+
+	// Save gate: a retired set or new training, never "weights are live".
+	CHECK( !net_profile_needs_save( 4u, 4u, 100u, 100u ) );
+	CHECK( net_profile_needs_save( 5u, 4u, 100u, 100u ) );
+	CHECK( net_profile_needs_save( 4u, 4u, 101u, 100u ) );
 }
 
 static std::string read_test_file( const std::string &path )
@@ -1187,6 +1315,7 @@ int main()
 	test_learned_net_layout();
 	test_names();
 	test_net_profile_contract();
+	test_net_profile_sets();
 	test_atomic_output_file();
 	test_numeric_settings_contract();
 	test_adaptation_policy();

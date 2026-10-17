@@ -849,11 +849,31 @@ serves a slow EMA of the fast weights (the served function moves calmly — same
 calmer-than-the-signal rule as the B4 EMAs); and the fast weights relax toward the prior every
 step (~1-minute memory horizon), so the model can only stay away from its safe starting point by
 continually re-earning the distance on fresh frames — a model that works *temporarily* for the
-scene, structurally. The prior is, in order: a `GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>` file if it
-exists (which also gets the served weights written back every 1024 steps — persistent per-game
-learning), the `_NET` blob, or a synthesized neutral init (He hidden layers, zero head). Validated
-served weights are also retained across in-process resize/format resets and warm-start the recreated
-GPU state, so a swapchain transition does not restart adaptation from the startup prior. Observed
+scene, structurally. Persistence is keyed by the input encoding the net samples
+(`net_input_key` in `framegen/net_profile.hpp`): history type (composited output or base layer) ×
+base colourspace × the composite's effective output transfer (Gamma22, PQ, or none when colour
+management is off). The key is the producer path, not a claim about what the values mean, because
+the luma pass reads raw stored values: a gamma 8888 swapchain that gamescope labels `LINEAR` still
+holds code values. All pipelines share a key's set. The prior for the active key is, in order:
+- the profile's set for that key (`GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>`, which with `NET_ONLINE`
+  also gets the served weights written back every 1024 steps and at reset/exit);
+- the `_NET` blob;
+- a synthesized neutral init (He hidden layers, zero head), with `NET_ONLINE` only;
+- otherwise the refiner is off for that encoding.
+
+The profile is a GSFP v1 container (per set: a u32 key plus a current GSFR blob, at most 8 sets).
+Anything else is ignored and replaced on the first save; there is no migration. A key change, such
+as HDR on demand, a colour-management toggle or a base colourspace change:
+1. publishes a completed readback;
+2. commits the outgoing set;
+3. drops unfinished readbacks;
+4. invalidates history;
+5. re-seeds the GPU weights, decay prior and optimizer state from the incoming set on the next net
+   batch, where the one-batch-in-flight gate makes the upload staging idle.
+
+Validated served weights are also retained across in-process resize/format resets and warm-start
+the recreated GPU state, so a swapchain transition does not restart adaptation from the startup
+prior. Observed
 live: from a neutral prior on vkmark, the confidence head recovers ~10 points of killed field
 within seconds; warm-started from an offline blob it holds the blob's precision while tracking
 (see `doc/framegen-proposals/README.md` for the measured A/B).

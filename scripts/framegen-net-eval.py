@@ -55,15 +55,21 @@ _spec.loader.exec_module(T)
 # Weights blob (reverse of the trainer's export())
 # --------------------------------------------------------------------------
 
-def load_blob(path):
-    raw = Path(path).read_bytes()
-    magic, version, nlayers = struct.unpack_from("<3I", raw, 0)
+MAGIC_PROFILE = 0x50465347   # 'GSFP': a gamescope per-game profile
+PROFILE_VERSION = 1
+PROFILE_MAX_SETS = 8
+
+
+def _parse_gsfr(raw, off, path, strict):
+    """One GSFR blob at raw[off:]: (params, end offset). strict = profile set."""
+    magic, version, nlayers = struct.unpack_from("<3I", raw, off)
     if magic != T.MAGIC_BLOB:
         sys.exit(f"{path}: not a GSFR weights blob")
     if nlayers != len(T.LAYERS):
         sys.exit(f"{path}: layer count {nlayers} != expected {len(T.LAYERS)}")
-    # The trainer writes the whole shape table first, then all weight/bias data.
-    off = 12
+    if strict and version != T.BLOB_VERSION:
+        sys.exit(f"{path}: profile set has GSFR v{version}, want v{T.BLOB_VERSION}")
+    off += 12
     shapes = []
     for i, (exp_ci, exp_co) in enumerate(T.LAYERS, 1):
         ci, co, ksize = struct.unpack_from("<3I", raw, off)
@@ -74,16 +80,58 @@ def load_blob(path):
     params = {}
     for i, (ci, co, ksize) in enumerate(shapes, 1):
         n = co * ksize * ksize * ci
+        if off + (n + co) * 4 > len(raw):
+            sys.exit(f"{path}: truncated")
         w = np.frombuffer(raw, "<f4", count=n, offset=off).reshape(co, ksize, ksize, ci)
         off += n * 4
         params[f"W{i}"] = np.ascontiguousarray(w.transpose(0, 3, 1, 2))  # -> (co,ci,ky,kx)
         params[f"b{i}"] = np.array(
             np.frombuffer(raw, "<f4", count=co, offset=off), np.float32)
         off += co * 4
-    if version != T.BLOB_VERSION:
+    if not all(np.isfinite(v).all() for v in params.values()):
+        sys.exit(f"{path}: non-finite weights")
+    if not strict and version != T.BLOB_VERSION:
         print(f"note: blob version {version} != trainer {T.BLOB_VERSION}; "
               f"shapes match, evaluating anyway", file=sys.stderr)
-    return params
+    return params, off
+
+
+def load_blob(path, key=None):
+    """A bare GSFR blob (the trainer's export), or one set of a GSFP profile.
+
+    A profile keeps one set per input-encoding key; with several sets, `key`
+    must name one (see gamescope::framegen::net_input_key)."""
+    raw = Path(path).read_bytes()
+    if len(raw) < 12:
+        sys.exit(f"{path}: too short")
+    magic, version, count = struct.unpack_from("<3I", raw, 0)
+    if magic != MAGIC_PROFILE:
+        params, end = _parse_gsfr(raw, 0, path, strict=False)
+        if end != len(raw):
+            sys.exit(f"{path}: {len(raw) - end} trailing bytes")
+        if key is not None:
+            sys.exit(f"{path}: a bare GSFR blob has no keys")
+        return params
+    if version != PROFILE_VERSION or not 1 <= count <= PROFILE_MAX_SETS:
+        sys.exit(f"{path}: unsupported GSFP v{version} with {count} sets")
+    sets, off = {}, 12
+    for _ in range(count):
+        (k,) = struct.unpack_from("<I", raw, off)
+        if k in sets:
+            sys.exit(f"{path}: duplicate key 0x{k:03x}")
+        sets[k], off = _parse_gsfr(raw, off + 4, path, strict=True)
+    if off != len(raw):
+        sys.exit(f"{path}: {len(raw) - off} trailing bytes")
+    if key is None and len(sets) == 1:
+        return next(iter(sets.values()))
+    if key not in sets:
+        have = ", ".join(f"0x{k:03x}" for k in sets)
+        sys.exit(f"{path}: pick a set with --net-key ({have})")
+    return sets[key]
+
+
+def parse_key(text):
+    return int(text, 0)
 
 
 # --------------------------------------------------------------------------
@@ -230,11 +278,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True, help="capture dir (GAMESCOPE_FRAMEGEN_RECORD)")
-    ap.add_argument("--net", help="GSFR weights blob to also evaluate (refined field)")
+    ap.add_argument("--net", help="GSFR weights blob or GSFP profile to also evaluate (refined field)")
+    ap.add_argument("--net-key", type=parse_key, help="profile set key (e.g. 0xf0), when it holds several")
     args = ap.parse_args()
 
     samples = T.load_dataset(args.data)
-    params = load_blob(args.net) if args.net else None
+    params = load_blob(args.net, args.net_key) if args.net else None
     res = evaluate(samples, params)
 
     print("\nfield-resolution photometric quality "

@@ -912,7 +912,10 @@ plain crossfade.
   `net:off` when it is not.
 - `GAMESCOPE_FRAMEGEN_NET_PROFILE=$HOME/fg-<gamename>.bin` is the file where the
   net keeps what it learned. Gamescope loads it at the start if it exists, so
-  the net does not begin from scratch every session. With
+  the net does not begin from scratch every session. It keeps separate sets
+  for SDR, HDR and other output encodings, so switching HDR on or off never
+  mixes them. Profiles from builds before 2026-10-17 are not compatible: they
+  are replaced by a fresh profile, and learning starts over. With
   `GAMESCOPE_FRAMEGEN_HUD=2` the HUD also shows whether a profile was loaded.
 - `GAMESCOPE_FRAMEGEN_NET_EVERY=2` trains every second real frame. Rule: if your
   **present GPU is a laptop's integrated GPU**, set it (pacing stays equal and

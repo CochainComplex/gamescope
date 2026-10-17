@@ -6823,7 +6823,7 @@ static void framegen_metrics_log( const char *pszLabel,
 		delayedFlip.p50(), delayedFlip.percentile( 90u ), delayedFlip.p95(),
 		FramegenMetricsSourceLatencyDistribution_t::k_flFullScaleMs,
 		window.bidirDelayNsMax / 1.0e6, window.ringOverflows,
-		// Motion-field quality over moving texels; all 0 with q_samples=0
+		// Motion-field quality over texels whose content changed; all 0 with q_samples=0
 		// (meter off, or no fresh field in the window).
 		window.quality.residual(), window.quality.badFraction(),
 		window.quality.killedFraction(), window.quality.killedMatchFraction(),
@@ -8464,6 +8464,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	const bool bCut = reason != nullptr
 		&& ( strcmp( reason, "base_colorspace_change" ) == 0
 			|| strcmp( reason, "output_eotf_change" ) == 0
+			|| strcmp( reason, "net_input_key_change" ) == 0
 			|| strcmp( reason, "layer_count_change" ) == 0 );
 	framegen_metrics_note_reset( bCut ? FramegenResetReason_t::Cut
 		: bHitch ? FramegenResetReason_t::Hitch
@@ -10077,13 +10078,14 @@ static std::atomic<bool> g_bFramegenNetWriteInFlight = { false };
 // and race libc/static teardown.
 static std::thread g_framegenNetWriteThread;
 
-static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &weights, bool bLogMissing )
+// The offline trainer's bare GSFR blob (GAMESCOPE_FRAMEGEN_NET). It is not a
+// profile: an explicit prior for every encoding the profile has no set for.
+static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &weights )
 {
 	FILE *pFile = fopen( pszPath, "rb" );
 	if ( pFile == nullptr )
 	{
-		if ( bLogMissing )
-			vk_log.errorf( "framegen: net weights '%s' unreadable", pszPath );
+		vk_log.errorf( "framegen: net weights '%s' unreadable", pszPath );
 		return false;
 	}
 
@@ -10101,7 +10103,12 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 	}
 	fclose( pFile );
 
-	if ( !bOk )
+	if ( !bOk && metadata[ 0 ] == gamescope::framegen::k_uFramegenNetProfileMagic )
+	{
+		weights.clear();
+		vk_log.errorf( "framegen: net weights '%s' are a per-game profile; pass it as GAMESCOPE_FRAMEGEN_NET_PROFILE (without NET_ONLINE it is served read-only)", pszPath );
+	}
+	else if ( !bOk )
 	{
 		weights.clear();
 		vk_log.errorf( "framegen: net weights '%s' malformed (want 3 finite fp32 conv layers 12->16->16->4, k=3)", pszPath );
@@ -10114,48 +10121,121 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 	return bOk;
 }
 
-// The refiner's starting weights, first match wins: a saved per-game profile,
-// the GAMESCOPE_FRAMEGEN_NET blob, or (online mode only) a synthesized
-// neutral init — He-random hidden layers, zero head, i.e. exactly Stage B
-// until learning moves it. Empty = refiner disabled.
-static const std::vector<float> &framegen_net_weights()
+// Per-game learning is keyed by the encoding of the history the net samples
+// (gamescope::framegen::net_input_key): a learned set is never served, decayed
+// toward or saved under another encoding. Render thread only; the checkpoint
+// writer receives encoded bytes, never this store.
+struct FramegenNetStore_t
 {
-	static const std::vector<float> s_weights = []() -> std::vector<float>
+	std::vector<gamescope::framegen::NetProfileSet> sets; // loaded from the profile, then committed
+	std::vector<uint32_t> profileKeys; // keys that came from the file (HUD provenance)
+	std::vector<float> blob;           // GAMESCOPE_FRAMEGEN_NET, if given
+	// He-random hidden layers, zero head: exactly Stage B until learning moves it.
+	std::vector<float> neutral;
+	uint64_t ulRevision = 0; // bumps whenever a committed set changes
+};
+
+static FramegenNetStore_t &framegen_net_store()
+{
+	static FramegenNetStore_t s_store = []()
 	{
-		std::vector<float> weights;
-		if ( framegen_net_profile_path() != nullptr && framegen_net_parse_blob( framegen_net_profile_path(), weights, false ) )
+		FramegenNetStore_t store;
+		if ( const char *pszProfile = framegen_net_profile_path() )
 		{
-			g_bFramegenNetProfileLoaded = true;
-			vk_log.infof( "framegen: net prior loaded from profile '%s'", framegen_net_profile_path() );
-			return weights;
-		}
-		if ( framegen_net_weights_path() != nullptr )
-		{
-			if ( framegen_net_parse_blob( framegen_net_weights_path(), weights, true ) )
+			// A missing file is a new profile. Anything but a current GSFP is
+			// incompatible: it is ignored, and the first save replaces it.
+			if ( FILE *pFile = fopen( pszProfile, "rb" ) )
 			{
-				vk_log.infof( "framegen: net weights loaded from '%s' (%u floats)", framegen_net_weights_path(), k_uFramegenNetFloats );
-				return weights;
+				// One byte past the largest valid profile rejects an oversized
+				// file without reading it all.
+				std::vector<uint8_t> bytes( gamescope::framegen::k_uFramegenNetProfileMaxBytes + 1u );
+				bytes.resize( fread( bytes.data(), 1u, bytes.size(), pFile ) );
+				fclose( pFile );
+				if ( std::optional<std::vector<gamescope::framegen::NetProfileSet>> sets =
+					gamescope::framegen::decode_net_profile( bytes ) )
+					store.sets = std::move( *sets );
+				else
+					vk_log.infof( "framegen: net profile '%s' is not a current GSFP v%u profile (older format or damaged); starting a new profile there",
+						pszProfile, gamescope::framegen::k_uFramegenNetProfileVersion );
 			}
-			// Malformed blob (already logged loudly). Online mode still gets
-			// its neutral prior below; without online learning there is
-			// nothing safe to serve, so the refiner stays disabled.
+			for ( const gamescope::framegen::NetProfileSet &set : store.sets )
+			{
+				char szName[ 48 ];
+				gamescope::framegen::net_input_key_name( set.key, szName, sizeof( szName ) );
+				vk_log.infof( "framegen: net profile '%s' holds a set for '%s'", pszProfile, szName );
+				store.profileKeys.push_back( set.key );
+			}
 		}
-		if ( framegen_net_online_enabled() )
-		{
-			weights.assign( k_uFramegenNetFloats, 0.0f );
-			std::mt19937 rng( 7u );
-			std::normal_distribution<float> dist1( 0.0f, std::sqrt( 2.0f / 108.0f ) );
-			std::normal_distribution<float> dist2( 0.0f, std::sqrt( 2.0f / 144.0f ) );
-			for ( uint32_t i = 0; i < k_uFramegenNetLayer1Weights; i++ )
-				weights[ i ] = dist1( rng );
-			for ( uint32_t i = k_uFramegenNetLayer2Offset;
-				i < k_uFramegenNetLayer2Offset + k_uFramegenNetLayer2Weights; i++ )
-				weights[ i ] = dist2( rng );
-			vk_log.infof( "framegen: net starting from a neutral prior (no blob/profile); online learning will shape it" );
-		}
-		return weights;
+		if ( framegen_net_weights_path() != nullptr
+			&& framegen_net_parse_blob( framegen_net_weights_path(), store.blob ) )
+			vk_log.infof( "framegen: net weights loaded from '%s' (%u floats)", framegen_net_weights_path(), k_uFramegenNetFloats );
+
+		store.neutral.assign( k_uFramegenNetFloats, 0.0f );
+		std::mt19937 rng( 7u );
+		std::normal_distribution<float> dist1( 0.0f, std::sqrt( 2.0f / 108.0f ) );
+		std::normal_distribution<float> dist2( 0.0f, std::sqrt( 2.0f / 144.0f ) );
+		for ( uint32_t i = 0; i < k_uFramegenNetLayer1Weights; i++ )
+			store.neutral[ i ] = dist1( rng );
+		for ( uint32_t i = k_uFramegenNetLayer2Offset;
+			i < k_uFramegenNetLayer2Offset + k_uFramegenNetLayer2Weights; i++ )
+			store.neutral[ i ] = dist2( rng );
+		return store;
 	}();
-	return s_weights;
+	return s_store;
+}
+
+// The active input key and its activation prior: the weights a fresh upload
+// carries, the decay target, and what a state re-init re-seeds from. An empty
+// prior means no weights exist for this encoding, so the refiner stays off,
+// as it always has without weights and without online learning.
+static uint32_t g_uFramegenNetActiveKey = 0;
+static bool g_bFramegenNetKeyActive = false;
+static std::vector<float> g_framegenNetActivePrior;
+// A key switch left netWeightsUpload holding the outgoing set.
+static bool g_bFramegenNetStagingStale = false;
+static std::atomic<uint64_t> g_ulFramegenNetSavedRevision = { 0 };
+
+static bool framegen_net_configured()
+{
+	const FramegenNetStore_t &store = framegen_net_store();
+	return framegen_net_online_enabled() || !store.sets.empty() || !store.blob.empty();
+}
+
+// Before any real frame chose a key (the in-binary benchmark) a fresh upload
+// carries the neutral init, which only times the passes.
+static const std::vector<float> &framegen_net_activation_weights()
+{
+	if ( g_bFramegenNetKeyActive && !g_framegenNetActivePrior.empty() )
+		return g_framegenNetActivePrior;
+	return framegen_net_store().neutral;
+}
+
+// Commit one key's weights. Capped like the file format; realistic games use
+// one to three encodings.
+static void framegen_net_store_put( uint32_t uKey, const std::vector<float> &weights )
+{
+	FramegenNetStore_t &store = framegen_net_store();
+	for ( gamescope::framegen::NetProfileSet &set : store.sets )
+	{
+		if ( set.key == uKey )
+		{
+			set.weights = weights;
+			store.ulRevision++;
+			return;
+		}
+	}
+	if ( store.sets.size() >= gamescope::framegen::k_uFramegenNetProfileMaxSets )
+	{
+		static bool s_bLoggedFull = false;
+		if ( !s_bLoggedFull )
+		{
+			vk_log.errorf( "framegen: net profile already holds %zu input encodings; not persisting another", store.sets.size() );
+			s_bLoggedFull = true;
+		}
+		return;
+	}
+	store.sets.push_back( { uKey, weights } );
+	store.ulRevision++;
 }
 
 static bool framegen_net_requested( GamescopeFramegenPipeline ePipeline )
@@ -10174,7 +10254,7 @@ static bool framegen_net_requested( GamescopeFramegenPipeline ePipeline )
 	}
 
 	return ePipeline >= GamescopeFramegenPipeline::Learned
-		&& !framegen_net_weights().empty();
+		&& ( g_bFramegenNetKeyActive ? !g_framegenNetActivePrior.empty() : framegen_net_configured() );
 }
 
 // Dataset capture: GAMESCOPE_FRAMEGEN_RECORD=<dir> dumps the raw field-res
@@ -10208,6 +10288,84 @@ static uint32_t framegen_record_max()
 }
 
 static uint32_t g_uFramegenRecordCount = 0;
+
+// Make uKey's set the served one. A switch first publishes a completed
+// outgoing snapshot and retires the outgoing set into the store, then drops
+// any unfinished readback: it holds the outgoing weights and must never be
+// published under the new key (at most one batch of learning is lost). The
+// GPU weights, decay prior and optimizer state re-seed on the next net batch;
+// work already submitted finishes on the old weights. Activation is a warm
+// restart, as after a GPU-state recreate: the set's latest weights become its
+// prior.
+static void framegen_net_activate_key( uint32_t uKey )
+{
+	FramegenNetStore_t &store = framegen_net_store();
+	char szName[ 48 ];
+	gamescope::framegen::net_input_key_name( uKey, szName, sizeof( szName ) );
+	if ( g_bFramegenNetKeyActive )
+	{
+		framegen_net_profile_consume();
+		if ( g_framegenNetLiveWeights.size() == k_uFramegenNetFloats )
+			framegen_net_store_put( g_uFramegenNetActiveKey, g_framegenNetLiveWeights );
+		g_framegenNetLiveWeights.clear();
+		g_framegenHistory.ulNetProfileSeqNo = 0;
+		g_framegenHistory.ulNetProfileConsumedSeqNo = 0;
+		// GSFD samples carry no key, so a capture directory must never mix
+		// encodings: saturating the counter ends capture for the process.
+		if ( framegen_record_dir() != nullptr && g_uFramegenRecordCount > 0
+			&& g_uFramegenRecordCount < framegen_record_max() )
+		{
+			vk_log.infof( "framegen: dataset capture stopped after %u samples: the input encoding changed to '%s'",
+				g_uFramegenRecordCount, szName );
+			g_uFramegenRecordCount = framegen_record_max();
+		}
+	}
+
+	const std::span<const float> prior = gamescope::framegen::net_profile_prior( uKey,
+		store.sets, store.blob,
+		framegen_net_online_enabled() ? std::span<const float>( store.neutral ) : std::span<const float>() );
+	g_framegenNetActivePrior.assign( prior.begin(), prior.end() );
+	const bool bFromProfile = !prior.empty()
+		&& std::ranges::find( store.profileKeys, uKey ) != store.profileKeys.end();
+	const char *pszSource = bFromProfile ? "profile set" : "set learned earlier in this session";
+	if ( prior.empty() )
+		pszSource = "no weights for this encoding; learned refinement off";
+	else if ( prior.data() == store.neutral.data() )
+		pszSource = "neutral prior; online learning will shape it";
+	else if ( prior.data() == store.blob.data() )
+		pszSource = "GAMESCOPE_FRAMEGEN_NET blob";
+
+	g_uFramegenNetActiveKey = uKey;
+	g_bFramegenNetKeyActive = true;
+	g_bFramegenNetProfileLoaded = bFromProfile;
+	g_bFramegenNetStagingStale = true;
+	g_framegenMotion.bNetWeightsUploaded = false;
+	g_framegenMotion.bNetStatePending = true;
+	vk_log.infof( "framegen: net set '%s' active: %s", szName, pszSource );
+}
+
+// One u32 compare per real frame unless the encoding changed. The output
+// transfer is the composite's effective one (vulkan_composite): EOTF_Count is
+// an identity output after input degamma, not pass-through SDR.
+static void framegen_net_note_input_key( const struct FrameInfo_t *pFrameInfo, bool bBaseLayer )
+{
+	if ( g_eFramegenPipeline < GamescopeFramegenPipeline::Learned || !framegen_net_configured() )
+		return;
+	const uint32_t uOutputTf = pFrameInfo->applyOutputColorMgmt
+		? (uint32_t)pFrameInfo->outputEncodingEOTF : (uint32_t)EOTF_Count;
+	const uint32_t uKey = gamescope::framegen::net_input_key( bBaseLayer,
+		bBaseLayer ? (uint32_t)pFrameInfo->layers[ 0 ].colorspace : 0u, uOutputTf );
+	if ( g_bFramegenNetKeyActive && uKey == g_uFramegenNetActiveKey )
+		return;
+	const bool bSwitch = g_bFramegenNetKeyActive;
+	framegen_net_activate_key( uKey );
+	// History across an encoding change pairs two encodings. The EOTF and base
+	// colourspace checks already cut for most switches; this also covers colour
+	// management toggles and an EOTF flip under base-layer history. A second
+	// invalidation of already-dropped history is a no-op.
+	if ( bSwitch )
+		vulkan_framegen_invalidate_history( "net_input_key_change" );
+}
 
 // The field the warps and the adaptation probe consume: the net's refined copy
 // when the refiner ran this batch, the checked Stage-B field otherwise.
@@ -11252,6 +11410,18 @@ static bool framegen_record_quality_meter( CVulkanCmdBuffer *pCmdBuffer, uint32_
 // keeps forward prediction at one inference dispatch per real frame instead of
 // paying for an unused reverse result. The one-time staging->GPU weight copy
 // rides the first batch after (re)allocation.
+// Fill the host-coherent upload staging with one full weight set; the next
+// framegen_record_net copies it to the served and prior textures.
+static void framegen_net_stage_weights( const std::vector<float> &weights )
+{
+	for ( uint32_t y = 0; y < k_uFramegenNetTexH; y++ )
+	{
+		const uint32_t uRowFloats = std::min( k_uFramegenNetTexW, k_uFramegenNetFloats - y * k_uFramegenNetTexW );
+		memcpy( g_framegenMotion.netWeightsUpload->mappedData() + (size_t)y * g_framegenMotion.netWeightsUpload->rowPitch(),
+			weights.data() + (size_t)y * k_uFramegenNetTexW, uRowFloats * sizeof( float ) );
+	}
+}
+
 static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH, bool bRefineReverse )
 {
 	if ( g_framegenMotion.mvFieldNet == nullptr || g_framegenMotion.netWeightsGpu == nullptr
@@ -11261,6 +11431,15 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 
 	if ( !g_framegenMotion.bNetWeightsUploaded )
 	{
+		// A key switch leaves the staging holding the outgoing set. Refill it
+		// here rather than at the switch: every batch path admits a new batch
+		// only after the previous one completed (one batch in flight), so no
+		// earlier copy can still be reading the staging.
+		if ( g_bFramegenNetStagingStale )
+		{
+			framegen_net_stage_weights( framegen_net_activation_weights() );
+			g_bFramegenNetStagingStale = false;
+		}
 		pCmdBuffer->copyImage( g_framegenMotion.netWeightsUpload, g_framegenMotion.netWeightsGpu );
 		if ( g_framegenMotion.netWeightsPrior != nullptr )
 			pCmdBuffer->copyImage( g_framegenMotion.netWeightsUpload, g_framegenMotion.netWeightsPrior );
@@ -11458,7 +11637,8 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 // close before publishing with rename.
 // Runs on an owned worker for periodic checkpoints — file I/O on the render
 // thread is a frametime spike — and synchronously for the exit/reset flush.
-static void framegen_net_profile_write_file( std::vector<float> weights, uint64_t ulProgress, bool bFromWorker )
+static void framegen_net_profile_write_file( std::vector<uint8_t> bytes, uint64_t ulProgress,
+	uint64_t ulRevision, size_t uSets, bool bFromWorker )
 {
 	const char *pszPath = framegen_net_profile_path();
 	static std::atomic<bool> s_bLoggedFail = { false };
@@ -11467,14 +11647,6 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 		if ( !s_bLoggedFail.exchange( true ) )
 			vk_log.errorf( "framegen: net profile %s '%s' failed (%s); keeping the previous file", pszWhat, pszPath, strerror( error ) );
 	};
-	if ( !gamescope::framegen::validate_and_migrate_net_profile_weights(
-		k_uFramegenNetVersion, weights ) )
-	{
-		fail( "validation for", EINVAL );
-		if ( bFromWorker )
-			g_bFramegenNetWriteInFlight = false;
-		return;
-	}
 
 	gamescope::framegen::AtomicOutputFile output( pszPath );
 	if ( !output.is_open() )
@@ -11484,9 +11656,7 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 			g_bFramegenNetWriteInFlight = false;
 		return;
 	}
-	constexpr auto metadata = gamescope::framegen::net_profile_metadata();
-	bool bOk = output.write( metadata.data(), metadata.size() * sizeof( uint32_t ) )
-		&& output.write( weights.data(), weights.size() * sizeof( float ) );
+	bool bOk = output.write( bytes.data(), bytes.size() );
 	if ( bOk )
 		bOk = output.commit();
 	if ( !bOk )
@@ -11496,12 +11666,32 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 	else
 	{
 		g_ulFramegenNetSavedProgress = ulProgress;
+		g_ulFramegenNetSavedRevision = ulRevision;
 		static std::atomic<bool> s_bLoggedFirstSave = { false };
 		if ( !s_bLoggedFirstSave.exchange( true ) || g_bFramegenDebug )
-			vk_log.infof( "framegen: net profile saved to '%s' (%" PRIu64 " trained steps)", pszPath, ulProgress );
+			vk_log.infof( "framegen: net profile saved to '%s' (%" PRIu64 " trained steps, %zu input encoding%s)",
+				pszPath, ulProgress, uSets, uSets == 1u ? "" : "s" );
 	}
 	if ( bFromWorker )
 		g_bFramegenNetWriteInFlight = false;
+}
+
+// One atomic file holds every set. Render thread only: the active set is
+// refreshed from the latest healthy served weights and all sets are encoded
+// here, so the writer thread never touches the store. The encoder validates
+// every weight (finite, full length) before anything is written.
+static bool framegen_net_profile_snapshot( std::vector<uint8_t> &bytes, uint64_t &ulRevision, size_t &uSets )
+{
+	if ( g_bFramegenNetKeyActive && g_framegenNetLiveWeights.size() == k_uFramegenNetFloats )
+		framegen_net_store_put( g_uFramegenNetActiveKey, g_framegenNetLiveWeights );
+	const FramegenNetStore_t &store = framegen_net_store();
+	std::optional<std::vector<uint8_t>> encoded = gamescope::framegen::encode_net_profile( store.sets );
+	if ( !encoded )
+		return false;
+	bytes = std::move( *encoded );
+	ulRevision = store.ulRevision;
+	uSets = store.sets.size();
+	return true;
 }
 
 // The checkpoint writer's only lifetime proof. It logs through the file-scope
@@ -11525,11 +11715,19 @@ static void framegen_net_profile_flush()
 	// proof. Joining guarantees an older checkpoint cannot rename over the newer
 	// synchronous flush below.
 	framegen_net_profile_join_writer();
-	if ( framegen_net_profile_path() == nullptr || g_framegenNetLiveWeights.size() != k_uFramegenNetFloats )
+	// Only online learning writes the profile, and nothing was learned before
+	// a key was ever served. The gate is the store, not the live weights: a
+	// set switched away from must still persist at exit.
+	if ( framegen_net_profile_path() == nullptr || !framegen_net_online_enabled() || !g_bFramegenNetKeyActive )
 		return;
-	if ( g_ulFramegenNetLiveProgress == g_ulFramegenNetSavedProgress.load() )
+	if ( !gamescope::framegen::net_profile_needs_save( framegen_net_store().ulRevision, g_ulFramegenNetSavedRevision.load(),
+		g_ulFramegenNetLiveProgress, g_ulFramegenNetSavedProgress.load() ) )
 		return;
-	framegen_net_profile_write_file( g_framegenNetLiveWeights, g_ulFramegenNetLiveProgress, false );
+	std::vector<uint8_t> bytes;
+	uint64_t ulRevision = 0;
+	size_t uSets = 0;
+	if ( framegen_net_profile_snapshot( bytes, ulRevision, uSets ) )
+		framegen_net_profile_write_file( std::move( bytes ), g_ulFramegenNetLiveProgress, ulRevision, uSets, false );
 }
 
 // Weights readback, CPU half: same completion gate as every other readback.
@@ -11587,8 +11785,14 @@ static void framegen_net_profile_consume()
 		// guarantees this join cannot wait on active I/O in the normal cadence.
 		if ( g_framegenNetWriteThread.joinable() )
 			g_framegenNetWriteThread.join();
-		g_framegenNetWriteThread = std::thread( framegen_net_profile_write_file,
-			g_framegenNetLiveWeights, g_ulFramegenNetLiveProgress, true );
+		std::vector<uint8_t> bytes;
+		uint64_t ulRevision = 0;
+		size_t uSets = 0;
+		if ( framegen_net_profile_snapshot( bytes, ulRevision, uSets ) )
+			g_framegenNetWriteThread = std::thread( framegen_net_profile_write_file,
+				std::move( bytes ), g_ulFramegenNetLiveProgress, ulRevision, uSets, true );
+		else
+			g_bFramegenNetWriteInFlight = false;
 	}
 }
 
@@ -11724,18 +11928,14 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 					// weights that passed the CPU finite check. Falling back to the
 					// immutable startup prior is only needed before the first healthy
 					// online readback (or when online learning is disabled).
+					// Live weights always belong to the active input key.
 					const bool bWarmStart = framegen_net_online_enabled()
 						&& g_framegenNetLiveWeights.size() == k_uFramegenNetFloats;
-					const std::vector<float> &weights = bWarmStart
-						? g_framegenNetLiveWeights : framegen_net_weights();
 					if ( bWarmStart && g_bFramegenDebug )
 						vk_log.infof( "framegen: net warm-starting recreated GPU state from the latest healthy served weights (%" PRIu64 " trained steps)", g_ulFramegenNetLiveProgress );
-					for ( uint32_t y = 0; y < k_uFramegenNetTexH; y++ )
-					{
-						const uint32_t uRowFloats = std::min( k_uFramegenNetTexW, (uint32_t)weights.size() - y * k_uFramegenNetTexW );
-						memcpy( g_framegenMotion.netWeightsUpload->mappedData() + (size_t)y * g_framegenMotion.netWeightsUpload->rowPitch(),
-							weights.data() + (size_t)y * k_uFramegenNetTexW, uRowFloats * sizeof( float ) );
-					}
+					framegen_net_stage_weights( bWarmStart
+						? g_framegenNetLiveWeights : framegen_net_activation_weights() );
+					g_bFramegenNetStagingStale = false;
 				}
 				g_framegenMotion.bNetWeightsUploaded = false;
 
@@ -14387,14 +14587,18 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	}
 	g_framegenHistory.pLastBaseTexture = pBaseTexture;
 	g_framegenHistory.ulLastBaseCommitID = ulBaseCommitID;
-	if ( framegen_record_color_probe_real( pRealFrame, pFrameInfo, ulCompositeSeqNo ) )
-		return;
 
 	// Base-layer dispatcher: decide per recorded frame whether the base-layer path
 	// applies. History then tracks the pre-upscale game buffer instead of the
 	// composited output; the dims/mode-keyed reset inside ensure_resources
 	// mediates any live switch between the two, so they never mix in a scene.
 	const bool bBaseLayer = framegen_base_layer_usable( pFrameInfo );
+	// Settle the net's input key before anything below can record, train or
+	// generate from this frame (the colour probe included).
+	framegen_net_note_input_key( pFrameInfo, bBaseLayer );
+	if ( framegen_record_color_probe_real( pRealFrame, pFrameInfo, ulCompositeSeqNo ) )
+		return;
+
 	// Bidir and base-layer generation are exclusive per scene. The first
 	// decision is always reported; later changes only under framegen debug and
 	// rate-limited, since layer 0 can flip between the two paths every frame.

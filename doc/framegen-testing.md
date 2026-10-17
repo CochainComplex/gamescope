@@ -974,6 +974,12 @@ follow one protocol:
 4. A second round repeats the comparison with the order re-randomized.
 5. The assignment is revealed only afterwards.
 
+When an arm uses in-game learning, start every such arm, blind or real-game,
+from its own copy of the same `GAMESCOPE_FRAMEGEN_NET_PROFILE` file, for example
+`cp fg-game.bin fg-game-armA.bin`. The profile keeps training across runs, so a
+shared file gives later arms a better starting point. One file holds the sets
+for every input encoding, so one copy per arm is enough.
+
 ### The blind verdict outranks the metrics
 
 The showcase columns and the offline gates narrow the candidates; the viewer's
@@ -1559,8 +1565,10 @@ The frozen learned profile is not shipped with the repository. It is a
 own, run GravityMark with `GAMESCOPE_FRAMEGEN_NET_ONLINE=1` and
 `GAMESCOPE_FRAMEGEN_NET_PROFILE=<path>` for several minutes (see
 [the AI refiner section of the user guide](framegen-howto.md#f-ai-refiner-in-game-learning)), then use that file as
-`FRAMEGEN_BEST_PROFILE`. To run the preset without a net instead, delete the
-`GAMESCOPE_FRAMEGEN_NET=...` line from the command. The preset is a
+`FRAMEGEN_BEST_PROFILE`. The command serves it read-only through
+`GAMESCOPE_FRAMEGEN_NET_PROFILE` (without `NET_ONLINE` nothing is trained or
+saved). To run the preset without a net instead, delete the
+`GAMESCOPE_FRAMEGEN_NET_PROFILE=...` line from the command. The preset is a
 benchmark-only configuration and is not validated on every topology.
 
 `build-perf` below is just a second meson build directory used for
@@ -1578,12 +1586,12 @@ export FRAMEGEN_BEST_PROFILE="$HOME/.cache/gamescope-fg-gravitymark-best-<id>.bi
 test -r "$FRAMEGEN_BEST_PROFILE" # must succeed; see the note above if the file does not exist
 unset GAMESCOPE_FRAMEGEN_VRR_HYBRID GAMESCOPE_FRAMEGEN_BASE \
   GAMESCOPE_FRAMEGEN_NET_ONLINE \
-  GAMESCOPE_FRAMEGEN_NET_PROFILE GAMESCOPE_FRAMEGEN_RECORD_COLOR \
+  GAMESCOPE_FRAMEGEN_NET GAMESCOPE_FRAMEGEN_RECORD_COLOR \
   GAMESCOPE_FRAMEGEN_BIDIR_TRACE
 
 GAMESCOPE_BUILD_DIR=build-perf \
 GAMESCOPE_FRAMEGEN_BIDIR=1 \
-GAMESCOPE_FRAMEGEN_NET="$FRAMEGEN_BEST_PROFILE" \
+GAMESCOPE_FRAMEGEN_NET_PROFILE="$FRAMEGEN_BEST_PROFILE" \
 GAMESCOPE_FRAMEGEN_BIDIR_OCCLUSION=0 \
 GAMESCOPE_FRAMEGEN_DEBUG_EVERY=60 \
 ./scripts/env-gamescope-local.sh \
@@ -1614,7 +1622,7 @@ cp -a "$FRAMEGEN_BEST_PROFILE" "$FRAMEGEN_WORKING_PROFILE"
 chmod u+w "$FRAMEGEN_WORKING_PROFILE"
 ```
 
-Then remove the frozen command's `GAMESCOPE_FRAMEGEN_NET=...` line and export:
+Then remove the frozen command's `GAMESCOPE_FRAMEGEN_NET_PROFILE=...` line and export:
 
 ```bash
 export GAMESCOPE_FRAMEGEN_NET_ONLINE=1

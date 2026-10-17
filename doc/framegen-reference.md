@@ -277,9 +277,9 @@ Tuning and experimental variables (`FB_TOL`, `DEBUG_EVERY`, `NET_LR`, `BIDIR_OCC
 | `GAMESCOPE_FRAMEGEN_HUD` | 0 to 2 (0) | On-screen HUD detail. See [HUD rows](#hud-rows). |
 | `GAMESCOPE_FRAMEGEN_HUD_SCALE` | 0 to 6 (0) | HUD scale. `0` means automatic: 2 to 4 based on output height (height / 720, clamped). |
 | `GAMESCOPE_FRAMEGEN_HUD_CORNER` | `tl`/`tr`/`bl`/`br`/`bc` (`bc`) | HUD position. |
-| `GAMESCOPE_FRAMEGEN_NET` | path | Offline weights for the learned refiner. |
+| `GAMESCOPE_FRAMEGEN_NET` | path | Offline weights for the learned refiner: a bare GSFR blob from `scripts/framegen-net-train.py`. It is the starting point for every input encoding the profile has no set for. A per-game profile is rejected here; pass it as `NET_PROFILE`. |
 | `GAMESCOPE_FRAMEGEN_NET_EVERY` | >= 1 (1) | Train on every Nth real frame. Use `2` on an iGPU-class present GPU (pacing stays equal; it played best in the real-game test) and `1` on a desktop card. |
-| `GAMESCOPE_FRAMEGEN_NET_PROFILE` | path | Per-game profile the in-situ net loads and saves. Give each game its own file. |
+| `GAMESCOPE_FRAMEGEN_NET_PROFILE` | path | Per-game profile the in-situ net loads and, with `NET_ONLINE`, saves. Without `NET_ONLINE` it is served read-only. Give each game its own file. It holds one weight set per input encoding: the composited output in SDR, in HDR10 (PQ), or with colour management off, or the game's base layer by colourspace. A set is only served and trained under its own encoding, and all pipelines share it. Format GSFP v1; any other file, including profiles from builds before 2026-10-17, is ignored and replaced by a fresh profile on the first save. |
 
 #### Advanced and A/B switches
 
