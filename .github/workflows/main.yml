@@ -30,7 +30,7 @@ jobs:
             scripts/framegen-launch-common.sh scripts/watch-framegen.sh
             scripts/run-framegen-native.sh scripts/framegen-doctor.sh
             scripts/gamescope-hybrid.sh tests/gamescope_hybrid_test.sh
-            scripts/framegen-showcase.sh'
+            scripts/framegen-showcase.sh scripts/framegen-capture.sh'
           # bash -n parses only its first operand; check each file.
           for script in $framegen_shell; do bash -n "$script"; done
           shellcheck -x $framegen_shell
@@ -39,7 +39,8 @@ jobs:
             python3 -m py_compile scripts/framegen-net-train.py \
               scripts/framegen-net-eval.py scripts/framegen-color-eval.py \
               scripts/framegen-nested-smoke.py scripts/framegen-showcase-report.py \
-              scripts/framegen-hindsight-eval.py
+              scripts/framegen-hindsight-eval.py scripts/framegen-headless-host.py \
+              scripts/framegen-field-gate.py scripts/framegen-temporal-gate.py
           c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
             tests/test_framegen.cpp src/framegen/atomic_file.cpp \
             -o /tmp/gamescope-framegen-contracts

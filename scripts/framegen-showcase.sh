@@ -36,6 +36,9 @@
 #                          only, logging perturbs pacing, never compared
 #   EXTRA_ENV              extra gamescope env for every run (the treatment of
 #                          an opt-in A/B on one binary)
+#   HOST_DISPLAY           the host's modes when the caller nests in its own
+#                          host (framegen-headless-host.sh); skips the xrandr
+#                          probe and the locked-session check
 #   GAMESCOPE_LOCAL_PREFIX passed through to scripts/env-gamescope-local.sh only
 #                          when set (its own default applies otherwise); not
 #                          written to the log header
@@ -52,9 +55,12 @@ WARMUP=${WARMUP_WINDOWS:-1}
 BACKEND=${BACKEND:-wayland}
 W=${W:-2560} H=${H:-1440} HZ=${HZ:-120}
 # A nested session paces against its host compositor (present lead, latch
-# phase), so it records the host's active modes as context.
+# phase), so it records the host's active modes as context. A caller that
+# nests in its own host (scripts/framegen-headless-host.sh) names it in
+# HOST_DISPLAY instead.
 host_display()
 {
+	[[ -n "${HOST_DISPLAY:-}" ]] && { echo "$HOST_DISPLAY"; return; }
 	[[ $BACKEND == drm ]] && { echo native; return; }
 	local modes
 	modes=$(xrandr --current 2>/dev/null | awk '
@@ -62,12 +68,14 @@ host_display()
 		out && /\*/ { for (i = 2; i <= NF; i++) if ($i ~ /\*/) { sub(/[*+]+$/, "", $i); printf "%s%s %s@%s", sep, out, $1, $i; sep = " " } out = "" }')
 	echo "${modes:-unknown}"
 }
+# Whether the caller nests us in its own host, before HOST_DISPLAY is filled in.
+NESTED_HOST=${HOST_DISPLAY:+1}
 HOST_DISPLAY=$(host_display)
 # A locked host session stops presenting nested windows, so every metric
 # would read 0.
 host_locked()
 {
-	[[ $BACKEND == drm ]] && return 1
+	[[ $BACKEND == drm || -n "$NESTED_HOST" ]] && return 1
 	local session
 	session=$(loginctl show-user "$(id -un)" -p Display --value 2>/dev/null)
 	[[ -n "$session" && "$(loginctl show-session "$session" -p LockedHint --value 2>/dev/null)" == yes ]]
@@ -102,6 +110,7 @@ RUNS=(
 	"best quality|interpolation, checked pipeline|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline checked|GAMESCOPE_FRAMEGEN_BIDIR=1"
 	"learned x2 + net|predictive, online-trained refiner|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline learned|GAMESCOPE_FRAMEGEN_NET_ONLINE=1 GAMESCOPE_FRAMEGEN_NET_EVERY=2"
 	"guided x2|predictive, guided pipeline|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline guided|"
+	"base layer|predictive on the game layer, overlays live|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline checked|GAMESCOPE_FRAMEGEN_BASE=1"
 )
 
 die() { echo "framegen-showcase: $*" >&2; exit 2; }

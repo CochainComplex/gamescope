@@ -42,7 +42,9 @@ REQUIRED = ("run", "index", "rep", *CONTEXT, "bin", "extra_env", *RUN_KEYS)
 
 QUALITY = ("q_resid", "q_bad_mv", "q_killed_mv", "q_killed_match", "q_killed_fb")
 SUMMED = ("reprime", "ring_ovf", "q_samples")
-REPORTED = ("real_s", "shown_s", "dl_hit", "bias_ms", "reprime", "ring_ovf", "q_samples")
+# The q_* fields are reported, not gated: they measure uncontrolled content as
+# much as the code (identical code spans 0.63-0.97 q_killed_mv between reps).
+REPORTED = ("shown_s", "flip_max", "dl_hit", "bias_ms", "reprime", "ring_ovf", *QUALITY, "q_samples")
 
 
 class Gate(NamedTuple):
@@ -51,14 +53,18 @@ class Gate(NamedTuple):
 
     field: str
     limit: float
-    relative: bool
+    relative: bool = False
 
 
 GATES = (
-    Gate("fill", -0.01, False),
-    Gate("flip_ms_sd", 0.5, False),
-    Gate("lat_p50", 1.0, False),
-    *(Gate(q, 0.05, True) for q in QUALITY),
+    # The game's own frame rate: generation work that slows the game on a
+    # shared GPU hides behind unchanged fill and display pacing.
+    Gate("real_s", -0.10, True),
+    Gate("fill", -0.01),
+    Gate("flip_ms_sd", 0.5),
+    Gate("lat_p50", 1.0),
+    # The tail is what reads as lag (blind A/B, 2026-10-16); release gate: +2 ms.
+    Gate("lat_p95", 2.0),
 )
 
 
@@ -106,6 +112,7 @@ def _median(values):
 
 
 def summarize_rep(windows, key):
+    key95 = key.replace("_p50", "_p95")
     n = len(windows)
     if not n:
         return {"windows": 0}
@@ -130,9 +137,13 @@ def summarize_rep(windows, key):
         mean = sum(n_i * avg for n_i, avg, _ in pooled) / count
         second = sum(n_i * (sd * sd + avg * avg) for n_i, avg, sd in pooled) / count
         out["flip_ms_sd"] = max(second - mean * mean, 0.0) ** 0.5
+    # The longest single flip interval: a stutter the sd averages away.
+    if any("flip_ms_max" in w for w in windows):
+        out["flip_max"] = max(w.get("flip_ms_max", 0.0) for w in windows)
 
     optional = {
         "lat_p50": _median(w[key] for w in windows if w.get(key, 0.0) > 0),
+        "lat_p95": _median(w[key95] for w in windows if w.get(key95, 0.0) > 0),
         # Without generated or delayed frames there are no deadlines and no bias.
         **{f: _median(w[f] for w in windows if f in w and w.get("gen", 0.0) + w.get("dreal", 0.0) > 0)
            for f in ("dl_hit", "bias_ms")},
@@ -206,7 +217,7 @@ def rep_problem(rep):
 
 def format_table(results):
     columns = (("real/s", "real_s", ".1f"), ("shown/s", "shown_s", ".1f"), ("fill", "fill", ".3f"),
-               ("jit_ms", "flip_ms_sd", ".2f"), ("lat_p50", "lat_p50", ".1f"), ("dl_hit", "dl_hit", ".3f"),
+               ("jit_ms", "flip_ms_sd", ".2f"), ("max_ms", "flip_max", ".1f"), ("lat_p50", "lat_p50", ".1f"), ("lat_p95", "lat_p95", ".1f"), ("dl_hit", "dl_hit", ".3f"),
                ("bias_ms", "bias_ms", ".3f"), ("reprime", "reprime", "g"), ("ring_ovf", "ring_ovf", "g"),
                ("q_resid", "q_resid", ".4f"), ("q_bad_mv", "q_bad_mv", ".4f"), ("q_kill_mv", "q_killed_mv", ".4f"))
     lines = ["%-3s %-19s %-5s" % ("run", "name", "reps") + "".join(f" {title:>9}" for title, _, _ in columns)]
@@ -216,7 +227,7 @@ def format_table(results):
         cells = []
         for _, field, spec in columns:
             cell = _fmt(med.get(field), spec)
-            if field == "lat_p50" and field in med and run["lat_of"] == "delayed":
+            if field in ("lat_p50", "lat_p95") and field in med and run["lat_of"] == "delayed":
                 cell += "d"
             cells.append(f" {cell:>9}")
         reps = f"{run['complete_reps']}/{len(run['reps'])}"
@@ -231,16 +242,15 @@ def format_table(results):
                 warnings.append(f"  ! {where}: render device not verified")
     lines += warnings
     lines.append(f"Medians over reps of steady windows (w > warmup={results['context']['warmup']}); counts summed, "
-                 "fill over the summed frames, jitter = pooled flip_ms_sd, lat_p50 in ms "
+                 "fill over the summed frames, jitter = pooled flip_ms_sd, lat_p50/p95 in ms "
                  "(d = delayed reals, from the record).")
     return "\n".join(lines)
 
 
 def judge(gate, base, cand):
-    if gate.relative:
-        # A zero baseline flags any increase.
-        return round(cand - base * (1.0 + gate.limit), 6) > 0
     d = round(cand - base, 6)
+    if gate.relative:
+        d = round(d / base, 6) if base else 0.0
     return d < gate.limit if gate.limit < 0 else d > gate.limit
 
 
@@ -290,7 +300,7 @@ def compare(base, cand):
                 if not rep["complete"]:
                     print(f"  rep {rep['rep']}: REGRESS: {rep_problem(rep)}")
                     regressions += 1
-        for field in (*REPORTED[:2], *(g.field for g in GATES), *REPORTED[2:]):
+        for field in (*(g.field for g in GATES), *REPORTED):
             bv, cv = b["median"].get(field), c["median"].get(field)
             if bv is not None and cv is None and field in gates:
                 # The baseline measured it: an absent candidate value is no evidence.

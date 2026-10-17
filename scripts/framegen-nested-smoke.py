@@ -1405,16 +1405,20 @@ HOST_BUS_CONFIG = """<!DOCTYPE busconfig PUBLIC
 """
 
 
-def host_command(bus_config: Path) -> list[str]:
+HOST_MODE = f"640x480@{REFRESH_HZ}"
+
+
+def host_command(bus_config: Path, mode: str = HOST_MODE) -> list[str]:
     return [
         "dbus-run-session", f"--config-file={bus_config}", "--",
         "gnome-shell", "--headless", "--wayland", "--no-x11",
-        "--virtual-monitor", f"640x480@{REFRESH_HZ}", "--wayland-display", HOST_DISPLAY,
+        "--virtual-monitor", mode, "--wayland-display", HOST_DISPLAY,
     ]
 
 
 def start_host(
-    bus_config: Path, state_dir: Path, runtime_dir: Path, env: dict[str, str], log: BinaryIO
+    bus_config: Path, state_dir: Path, runtime_dir: Path, env: dict[str, str], log: BinaryIO,
+    mode: str = HOST_MODE,
 ) -> subprocess.Popen[bytes]:
     """Start the bidir Wayland host and wait for its display socket.
 
@@ -1439,7 +1443,7 @@ def start_host(
         GSETTINGS_BACKEND="memory", GIO_USE_VFS="local", GVFS_DISABLE_FUSE="1", NO_AT_BRIDGE="1"
     )
     host = subprocess.Popen(
-        host_command(bus_config),
+        host_command(bus_config, mode),
         env=host_env,
         stdout=log,
         stderr=subprocess.STDOUT,
