@@ -686,20 +686,35 @@ TEST_CASE( "a present bias that warmed up a vblank off relearns from agreeing ou
 		flip( i % 2u != 0u ? offsetNs : offsetNs + static_cast<int64_t>( T / 2u ) + 1 );
 	CHECK( bias.emaNs == 0 );
 
-	// An accepted sample or a hitch ends a run; the next run starts over.
+	// An accepted sample or a hitch ends a run. The accepted sample also
+	// confirms the bias: from then on a run must span
+	// k_ulPresentBiasRelearnSpanNs, so a contention episode of consistent
+	// lateness (here 300 ms at two vblanks) never moves it.
 	bias = { .samples = k_uPresentBiasWarmupSamples };
 	for ( uint32_t i = 1u; i < k_uPresentBiasRelearnSamples; i++ )
 		flip( offsetNs );
 	flip( 0 );
 	CHECK( bias.outlierRun == 0u );
+	CHECK( bias.confirmed );
 	for ( uint32_t i = 1u; i < k_uPresentBiasRelearnSamples; i++ )
 		flip( offsetNs );
 	flip( offsetNs, true );
 	CHECK( bias.outlierRun == 0u );
 	CHECK( bias.emaNs == 0 );
-	for ( uint32_t i = 0u; i < k_uPresentBiasRelearnSamples; i++ )
+	for ( uint64_t spanNs = 0u; spanNs < 300'000'000u; spanNs += T )
+		flip( 2 * static_cast<int64_t>( T ) );
+	CHECK( bias.emaNs == 0 );
+	flip( 0 );
+	CHECK( bias.emaNs == 0 );
+	// A chain whose offset really moved relearns once the run spans long enough.
+	uint32_t flips = 0u;
+	while ( bias.emaNs == 0 && flips < 1000u )
+	{
 		flip( offsetNs );
+		flips++;
+	}
 	CHECK( bias.emaNs == offsetNs );
+	CHECK( uint64_t{ flips - 1u } * T >= k_ulPresentBiasRelearnSpanNs );
 }
 
 TEST_CASE( "deadline hit arithmetic uses the biased target", "[framegen][deadline]" )
@@ -2467,6 +2482,33 @@ TEST_CASE( "a slow bidir cadence turning fast keeps its reals and their spacing"
 	}
 }
 
+TEST_CASE( "a fast bidir cadence turning slow lets D follow the envelope again", "[framegen][deadline]" )
+{
+	// A game that drops from a fast cadence to a slow one: the ring bound the
+	// fast cadence needed must not keep D short, which would cost every
+	// interpolation of the slow cadence. Once the source slowed, the bound
+	// rises to what the ring holds and D follows the envelope.
+	for ( const uint64_t T : { k_ulLoopVblankNs, k_ulLoop120HzNs } )
+	for ( const uint64_t fastNs : { 8'400'000ull, 12'000'000ull, 16'700'000ull, 20'000'000ull } )
+	{
+		for ( const uint64_t slowNs : { 50'000'000ull, 66'666'667ull, 100'000'000ull } )
+		{
+			CAPTURE( T, fastNs, slowNs );
+			std::vector<uint64_t> intervals = pattern_cadence( { fastNs }, 8u * k_ulLoopSecondNs );
+			const std::vector<uint64_t> slow = pattern_cadence( { slowNs }, 12u * k_ulLoopSecondNs );
+			intervals.insert( intervals.end(), slow.begin(), slow.end() );
+			const BidirLoopResult_t r = run_bidir_loop( intervals, { .vblankNs = T } );
+			check_loop( r );
+			CHECK( r.dropped() == r.planDropped );
+			CHECK( r.finalDelayNs == bidir_target_delay( r.finalEnvelopeNs, T ) );
+			// The recovery only lengthens D: nothing overflows on the way up.
+			CHECK( std::ranges::none_of( r.events, [&]( const BidirLoopEvent_t &e ) {
+				return e.kind == BidirReestablish_t::Shortened
+					&& e.atNs >= k_ulLoopStartNs + 10u * k_ulLoopSecondNs; } ) );
+		}
+	}
+}
+
 TEST_CASE( "a bursty bidir source never flaps the ring bound", "[framegen][deadline]" )
 {
 	// 20 and 30 fps with three 13 ms frames every 1.2, 1.5 or 2.5 s: a burst is
@@ -2935,6 +2977,20 @@ TEST_CASE( "the bidir ring bound predicts what the ring holds and moves on overf
 	CHECK( interrupted.deepestQueue == 0u );
 	CHECK( update_bidir_ring_bound( interrupted, D - T, 9u * T, D, C, quietNs + H, T ).delayNs == D - T );
 	CHECK( update_bidir_ring_bound( interrupted, D - T, 9u * T, D, C, quietNs + H / 2u + H, T ).delayNs == D );
+
+	// A source k_uBidirRingReleaseFactor times slower than when the bound was
+	// set releases the latch: the rise goes on a vblank per hold.
+	BidirRingBound_t latched = observe_bidir_ring_overflow( {}, 1'000u, D );
+	latched = update_bidir_ring_bound( latched, D, 9u * T, 2u * T, C, 1'001u, T );
+	REQUIRE( latched.delayNs == 2u * T );
+	CHECK( latched.predictedAtSetNs == 2u * T );
+	latched.deepestQueue = C - 1u;
+	const uint64_t heldNs = 1'001u + H;
+	CHECK( update_bidir_ring_bound( latched, 2u * T, 9u * T, 6u * T - 1u, C, heldNs, T ).delayNs == 2u * T );
+	const BidirRingBound_t released = update_bidir_ring_bound( latched, 2u * T, 9u * T, 6u * T, C, heldNs, T );
+	CHECK( released.delayNs == 3u * T );
+	CHECK( released.predictedAtSetNs == 2u * T );
+	CHECK( update_bidir_ring_bound( released, 3u * T, 9u * T, 6u * T, C, heldNs + H, T ).delayNs == 4u * T );
 }
 
 TEST_CASE( "present tags carry the display time and bidir learns only from reals on their slot", "[framegen][deadline]" )

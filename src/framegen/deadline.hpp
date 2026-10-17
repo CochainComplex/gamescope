@@ -20,8 +20,11 @@ namespace gamescope::framegen
 inline constexpr uint32_t k_uPresentBiasWarmupSamples = 4u;
 inline constexpr uint32_t k_uPresentBiasOutlierVblankIntervals = 1u;
 // Consecutive mature outliers within half a vblank of each other that move the
-// bias to them (update_present_bias).
+// bias to them (update_present_bias), while no sample has confirmed it yet.
 inline constexpr uint32_t k_uPresentBiasRelearnSamples = 8u;
+// A confirmed bias moves only for agreeing outliers that span this long: a
+// display chain that changed, not a GPU contention episode.
+inline constexpr uint64_t k_ulPresentBiasRelearnSpanNs = 2'000'000'000u;
 inline constexpr uint32_t k_uPresentLeadWarmupSamples = 4u;
 inline constexpr uint64_t k_uMinimumViablePresentLeadFloorNs = 500'000u;
 inline constexpr uint64_t k_uMinimumViablePresentLeadRelaxDivisor = 64u;
@@ -313,9 +316,13 @@ struct PresentBiasState_t
 	int64_t emaNs = 0;
 	uint32_t samples = 0;
 	uint32_t consecutiveGuardExceeds = 0;
-	// The current run of consecutive mature outliers and the range of their
-	// residuals. The EMA is frozen during a run, so they compare directly.
+	// A mature sample inside the outlier bound has confirmed the bias.
+	bool confirmed = false;
+	// The current run of consecutive mature outliers: its length, its first
+	// target and the range of its residuals. The EMA is frozen during a run,
+	// so they compare directly.
 	uint32_t outlierRun = 0;
+	uint64_t outlierRunStartNs = 0;
 	int64_t outlierLowNs = 0;
 	int64_t outlierHighNs = 0;
 };
@@ -454,10 +461,13 @@ struct PresentBiasUpdate_t
 // learned bias than the outlier bound admits (a warm-up that read the wrong
 // vblank, say), and would be discarded forever. Once
 // k_uPresentBiasRelearnSamples consecutive ones lie within half a vblank of
-// each other, the bias moves to their midpoint. A sample outside that range
-// starts a new run, so a stutter's scattered lateness never qualifies.
+// each other, the bias moves to their midpoint: at once while no sample has
+// confirmed it, else only once the run spans k_ulPresentBiasRelearnSpanNs, so
+// a contention episode's consistent lateness is one piece of evidence, not
+// eight. A sample outside the run's range starts a new run, so a stutter's
+// scattered lateness never qualifies.
 [[nodiscard]] constexpr PresentBiasState_t note_present_bias_outlier(
-	PresentBiasState_t state, int64_t residualNs, uint64_t vblankIntervalNs )
+	PresentBiasState_t state, int64_t residualNs, uint64_t atNs, uint64_t vblankIntervalNs )
 {
 	const int64_t lowNs = std::min( state.outlierLowNs, residualNs );
 	const int64_t highNs = std::max( state.outlierHighNs, residualNs );
@@ -466,6 +476,7 @@ struct PresentBiasUpdate_t
 	if ( state.outlierRun == 0u || spreadNs > vblankIntervalNs / 2u )
 	{
 		state.outlierRun = 1u;
+		state.outlierRunStartNs = atNs;
 		state.outlierLowNs = residualNs;
 		state.outlierHighNs = residualNs;
 	}
@@ -474,7 +485,8 @@ struct PresentBiasUpdate_t
 		state.outlierRun++;
 		state.outlierLowNs = lowNs;
 		state.outlierHighNs = highNs;
-		if ( state.outlierRun >= k_uPresentBiasRelearnSamples )
+		const bool sustained = atNs >= saturating_add_ns( state.outlierRunStartNs, k_ulPresentBiasRelearnSpanNs );
+		if ( state.outlierRun >= k_uPresentBiasRelearnSamples && ( !state.confirmed || sustained ) )
 		{
 			state.emaNs = saturating_add_signed_ns( state.emaNs,
 				lowNs + static_cast<int64_t>( spreadNs / 2u ) );
@@ -519,7 +531,7 @@ struct PresentBiasUpdate_t
 	if ( outlier )
 	{
 		result.state = note_present_bias_outlier(
-			result.state, result.residualNs, vblankIntervalNs );
+			result.state, result.residualNs, provisionalTargetNs, vblankIntervalNs );
 		return result;
 	}
 	result.state.outlierRun = 0u;
@@ -527,6 +539,7 @@ struct PresentBiasUpdate_t
 	{
 		result.state = update_present_timing_ema_residual(
 			result.state, result.residualNs );
+		result.state.confirmed = result.state.confirmed || mature;
 	}
 	return result;
 }
@@ -830,6 +843,10 @@ struct BidirQueueShedPlan_t
 inline constexpr uint32_t k_uBidirEnvelopeSamples = 3u;
 inline constexpr uint64_t k_ulBidirWindowNs = 1'000'000'000u;
 inline constexpr uint64_t k_ulBidirReleaseHoldNs = 2'000'000'000u;
+// A source this many times slower than when the ring bound was set releases
+// its latch. A burst halves the prediction for a while; a game dropping from
+// a menu's cadence to its own changes it several-fold.
+inline constexpr uint64_t k_uBidirRingReleaseFactor = 3u;
 // One sample per plan: the whole window up to 256 plans a second, its newest
 // 256 samples above that.
 inline constexpr size_t k_nBidirWindowSamples = 256u;
@@ -967,15 +984,18 @@ struct BidirSpacings_t
 // front out only at a full queue. It bounds nothing again once it reaches the
 // envelope's D. A prediction alone never moves an established bound, so a
 // cadence the prediction misjudges cannot make D flap. A queue that came
-// within an entry of the ceiling blocks the rise until the next overflow or
-// move: a vblank more would fill it. That latch never holds a harmful bound,
-// since a D the ring cannot hold overflows, which releases it.
+// within an entry of the ceiling blocks that rise until the next overflow or
+// move: a vblank more would fill it. Only a source that slowed down releases
+// it without one: a prediction k_uBidirRingReleaseFactor times its value when
+// the bound was last set (first translation or fall) lets the rise go on, a
+// vblank per hold, until D follows the envelope again.
 struct BidirRingBound_t
 {
 	uint64_t delayNs = 0;	// 0: none, D follows the envelope
 	std::array<uint64_t, k_uBidirEnvelopeSamples> overflowNs = {};	// the newest k overflows, oldest first (0: none)
 	uint64_t quietSinceNs = 0;	// the newest overflow or move of the bound
 	size_t deepestQueue = 0;	// the deepest queue a plan left since then
+	uint64_t predictedAtSetNs = 0;	// the predicted bound when the bound was last set, not raised (0: unknown)
 };
 
 // An overflow at atNs under the translation's delayNs (0: none, which bounds
@@ -1003,21 +1023,26 @@ struct BidirRingBound_t
 	uint64_t vblankIntervalNs )
 {
 	if ( envelopeNs == 0u )
-		return { .delayNs = predictedNs, .quietSinceNs = atNs };
+		return { .delayNs = predictedNs, .quietSinceNs = atNs, .predictedAtSetNs = predictedNs };
 	const auto overflowedSince = [&]( uint64_t overflowNs ) {
 		return overflowNs != 0u && atNs < saturating_add_ns( overflowNs, k_ulBidirWindowNs );
 	};
+	const auto set = [&]( uint64_t delayNs ) -> BidirRingBound_t {
+		return { .delayNs = delayNs, .quietSinceNs = atNs, .predictedAtSetNs = predictedNs };
+	};
 	if ( overflowedSince( bound.overflowNs.back() ) && predictedNs != 0u && predictedNs < inForceNs )
-		return { .delayNs = predictedNs, .quietSinceNs = atNs };
+		return set( predictedNs );
 	if ( overflowedSince( bound.overflowNs.front() ) && inForceNs > vblankIntervalNs )
-		return { .delayNs = inForceNs - vblankIntervalNs, .quietSinceNs = atNs };
-	if ( bound.delayNs != 0u && bound.deepestQueue + 2u <= capacity
-		&& atNs >= saturating_add_ns( bound.quietSinceNs, k_ulBidirReleaseHoldNs ) )
-	{
-		const uint64_t raisedNs = saturating_add_ns( bound.delayNs, vblankIntervalNs );
-		return { .delayNs = raisedNs < envelopeNs ? raisedNs : 0u, .quietSinceNs = atNs };
-	}
-	return bound;
+		return set( inForceNs - vblankIntervalNs );
+	if ( bound.delayNs == 0u || atNs < saturating_add_ns( bound.quietSinceNs, k_ulBidirReleaseHoldNs ) )
+		return bound;
+	const bool slowed = bound.predictedAtSetNs != 0u
+		&& predictedNs / k_uBidirRingReleaseFactor >= bound.predictedAtSetNs;
+	if ( bound.deepestQueue + 2u > capacity && !slowed )
+		return bound;
+	const uint64_t raisedNs = saturating_add_ns( bound.delayNs, vblankIntervalNs );
+	return { .delayNs = raisedNs < envelopeNs ? raisedNs : 0u, .quietSinceNs = atNs,
+		.predictedAtSetNs = bound.predictedAtSetNs };
 }
 
 // E is the window's k-th highest pair latency K, moved by one rule: it rises to
