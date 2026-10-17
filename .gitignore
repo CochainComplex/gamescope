@@ -9,3 +9,12 @@
 /build/
 /build-*/
 __pycache__/
+
+# Local AI tooling state (repowise, OpenWolf, Claude Code, Codex, opencode).
+# May hold API keys, logs and machine-specific paths.
+/.repowise/
+/.repowise-workspace/
+/.repowise-workspace.yaml
+/.mcp.json
+/.vscode/mcp.json
+/.vscode/extensions.json
