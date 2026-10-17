@@ -15,6 +15,41 @@ struct EffectiveConfig
 	GamescopeFramegenPipeline pipeline;
 };
 
+// The motion field's texel size in output pixels. The coarse search always
+// runs at /32 (±128 px at R=4), so a finer field adds pyramid levels below it
+// and never narrows the motion range. Field-texel constants (FB tolerance,
+// static-motion bar) were tuned at the /8 reference and convert by
+// motion_reference_texels to keep their meaning in pixels.
+inline constexpr uint32_t k_uMotionReferenceScale = 8u;
+inline constexpr uint32_t k_uMotionFineScale = 4u;
+inline constexpr uint32_t k_uMotionCoarsestScale = 32u;
+
+// /4 on request below the learned pipelines, whose net is trained on /8
+// fields; else /8. Callers pass the configured pipeline, never the effective
+// one, so a degradation step can never switch the finer, costlier field on.
+[[nodiscard]] constexpr uint32_t motion_field_scale( bool fineRequested,
+	GamescopeFramegenPipeline configured )
+{
+	return fineRequested && configured < GamescopeFramegenPipeline::Learned
+		? k_uMotionFineScale : k_uMotionReferenceScale;
+}
+
+// The 2x pyramid steps from the field's scale down to the coarsest level.
+[[nodiscard]] constexpr uint32_t motion_coarse_levels( uint32_t scale )
+{
+	uint32_t levels = 0;
+	for ( uint32_t s = scale; s != 0u && s < k_uMotionCoarsestScale; s *= 2u )
+		levels++;
+	return levels;
+}
+
+inline constexpr uint32_t k_uMotionMaxCoarseLevels = motion_coarse_levels( k_uMotionFineScale );
+
+[[nodiscard]] constexpr float motion_reference_texels( float atReference, uint32_t scale )
+{
+	return atReference * static_cast<float>( k_uMotionReferenceScale ) / static_cast<float>( scale );
+}
+
 // The compositor output ring also carries zero-copy real-frame history. A
 // higher generated cadence can leave more distinct buffers queued in a nested
 // compositor before its aggregate release events catch up, so reserve two

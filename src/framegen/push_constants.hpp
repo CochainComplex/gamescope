@@ -75,11 +75,12 @@ struct FramegenMotionWarpPush_t
 	float lowResScale;
 	float agreeLo;
 	float agreeHi;
+	float sharpFallback; // 1: scale the displacement by confidence instead of crossfading
 
 	explicit FramegenMotionWarpPush_t( float flStrength, float flLo, float flHi,
-		float flScale, float flAgreeLo, float flAgreeHi )
+		float flScale, float flAgreeLo, float flAgreeHi, bool bSharpFallback )
 		: strength( flStrength ), suppressLo( flLo ), suppressHi( flHi ), lowResScale( flScale )
-		, agreeLo( flAgreeLo ), agreeHi( flAgreeHi )
+		, agreeLo( flAgreeLo ), agreeHi( flAgreeHi ), sharpFallback( bSharpFallback ? 1.0f : 0.0f )
 	{
 	}
 };
@@ -284,7 +285,7 @@ FRAMEGEN_PUSH_SIZE( FramegenMotionMatchPush_t, 16 );
 FRAMEGEN_PUSH_PROPERTIES( FramegenMotionMatchPush_t );
 FRAMEGEN_PUSH_MEMBER( FramegenMotionMatchPush_t, searchRadius, 0 );
 
-FRAMEGEN_PUSH_SIZE( FramegenMotionWarpPush_t, 24 );
+FRAMEGEN_PUSH_SIZE( FramegenMotionWarpPush_t, 28 );
 FRAMEGEN_PUSH_PROPERTIES( FramegenMotionWarpPush_t );
 FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, strength, 0 );
 FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, suppressLo, 4 );
@@ -292,6 +293,7 @@ FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, suppressHi, 8 );
 FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, lowResScale, 12 );
 FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, agreeLo, 16 );
 FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, agreeHi, 20 );
+FRAMEGEN_PUSH_MEMBER( FramegenMotionWarpPush_t, sharpFallback, 24 );
 
 FRAMEGEN_PUSH_SIZE( FramegenMotionAccelPush_t, 52 );
 FRAMEGEN_PUSH_PROPERTIES( FramegenMotionAccelPush_t );

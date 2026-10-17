@@ -94,7 +94,8 @@ void main() {
         float closureError = abs(closure.x) + abs(closure.y);
         float motion = abs(tracedFwd.x) + abs(tracedFwd.y)
             + abs(tracedRev.x) + abs(tracedRev.y);
-        float closureTol = 0.75f + 0.05f * motion;
+        // 0.75 field texels at the /8 reference (6 px), in this field's texels.
+        float closureTol = 6.0f / u_lowResScale + 0.05f * motion;
         float closureTrust = 1.0f
             - smoothstep(closureTol, 2.0f * closureTol, closureError);
         float tracedConfidence = min(clamp(tracedFwd.b, 0.0f, 1.0f),

@@ -3141,6 +3141,18 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 									0, 0, nullptr, 0, nullptr, m_imageBarriers.size(), m_imageBarriers.data());
 }
 
+void CVulkanCmdBuffer::hostReadBarrier()
+{
+	const VkMemoryBarrier barrier =
+	{
+		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+	};
+	m_device->vk.CmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+									0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
 CVulkanDevice g_device;
 
 static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
@@ -6223,19 +6235,20 @@ ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
 
 // Motion-estimation intermediates (low-resolution luma pyramids and the motion
 // field). Allocated lazily by the motion dispatch, released on framegen reset.
-// The matcher runs coarse-to-fine over three pyramid levels: full search only
-// at the smallest, +/-1 seeded refinement below it (framegen_prepare_motion).
+// The matcher runs coarse-to-fine from the field's scale down to /32: full
+// search only at /32, +/-1 seeded refinement below it (framegen_prepare_motion).
 struct FramegenMotionResources_t
 {
 	// Finest (base low-res) level: what the warp's field scale is keyed to.
 	gamescope::OwningRc<CVulkanTexture> lumaPrev;
 	gamescope::OwningRc<CVulkanTexture> lumaCur;
 	gamescope::OwningRc<CVulkanTexture> mvField;
-	// Coarser levels, each a further 2x box downscale: [0] = /2, [1] = /4 of
-	// the base low-res grid, with an intermediate motion field per level.
-	gamescope::OwningRc<CVulkanTexture> lumaPrevCoarse[2];
-	gamescope::OwningRc<CVulkanTexture> lumaCurCoarse[2];
-	gamescope::OwningRc<CVulkanTexture> mvFieldCoarse[2];
+	// Coarser levels, each a further 2x box downscale of the one before ([0] =
+	// /2 of the base grid), down to /32 of the output; an intermediate motion
+	// field per level. motion_coarse_levels() of them are in use.
+	gamescope::OwningRc<CVulkanTexture> lumaPrevCoarse[ gamescope::framegen::k_uMotionMaxCoarseLevels ];
+	gamescope::OwningRc<CVulkanTexture> lumaCurCoarse[ gamescope::framegen::k_uMotionMaxCoarseLevels ];
+	gamescope::OwningRc<CVulkanTexture> mvFieldCoarse[ gamescope::framegen::k_uMotionMaxCoarseLevels ];
 	// Forward-backward consistency (only when enabled): the unchecked forward
 	// field and the reverse (prev-anchored) field the check pass reads; the
 	// checked result lands in mvField. The reverse chain reuses the coarse
@@ -6335,7 +6348,58 @@ struct FramegenMotionResources_t
 	uint32_t lumaFormat = DRM_FORMAT_INVALID;
 };
 static FramegenMotionResources_t g_framegenMotion;
-static constexpr uint32_t k_uFramegenMotionDownscale = 8;
+
+// The motion field's scale for this session (gamescope::framegen::
+// motion_field_scale): fixed at startup from the configured pipeline.
+static uint32_t framegen_motion_scale()
+{
+	static const uint32_t s_uScale = []()
+	{
+		const uint32_t uScale = gamescope::framegen::motion_field_scale(
+			framegen_bool_setting( "GAMESCOPE_FRAMEGEN_FIELD_FINE", false ), g_eFramegenPipeline );
+		if ( uScale != gamescope::framegen::k_uMotionReferenceScale )
+			vk_log.infof( "framegen: fine motion field (1/%u of the output)", uScale );
+		return uScale;
+	}();
+	return s_uScale;
+}
+
+// Predictive warp fallback where the motion evidence is weak: move the real
+// frame only as far as the confidence allows (default) instead of crossfading
+// with the colour extrapolation (GAMESCOPE_FRAMEGEN_SHARP_FALLBACK=0). In blind
+// A/Bs (2026-10-16, Xonotic and GravityMark 1M, dual GPU, 120 Hz) the sharp
+// fallback beat framegen off on both, the crossfade lost to off on Xonotic,
+// and head to head the sharp one was preferred on both. The crossfade stays as
+// an escape hatch until more games, HDR and a second GPU pair confirm it.
+static bool framegen_sharp_fallback()
+{
+	static const bool s_bEnabled = []()
+	{
+		const bool bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_SHARP_FALLBACK", true );
+		if ( !bEnabled )
+			vk_log.infof( "framegen: crossfade low-confidence fallback (GAMESCOPE_FRAMEGEN_SHARP_FALLBACK=0)" );
+		return bEnabled;
+	}();
+	return s_bEnabled;
+}
+
+// Opt-in (GAMESCOPE_FRAMEGEN_BATCH_REPAINT=1, causal mode only): request a
+// composite after each generated batch instead of only waking the compositor,
+// as before 518498f. Measured nested on a GPU-bound client (GravityMark 1M,
+// 2048x1280@120, dual GPU): ~28% more real frames and steadier flips, at the
+// cost of a longer source-to-flip tail (p95 ~25 ms vs ~11 ms). Off by default:
+// it trades the latency tail for real-frame throughput.
+static bool framegen_batch_repaint()
+{
+	static const bool s_bEnabled = []()
+	{
+		const bool bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_BATCH_REPAINT", false );
+		if ( bEnabled )
+			vk_log.infof( "framegen: composite request after each generated batch (GAMESCOPE_FRAMEGEN_BATCH_REPAINT)" );
+		return bEnabled;
+	}();
+	return s_bEnabled;
+}
 
 // Full-colour held-out validation. In capture mode, endpoint frames
 // A/C and one exact intermediate reference B are retained; B is hidden from the
@@ -6549,6 +6613,10 @@ struct FramegenMetricsWindow_t
 	// source interval.
 	FramegenMetricsSourceLatencyDistribution_t realSourceToFlip;
 	FramegenMetricsSourceLatencyDistribution_t delayedRealRecordToFlip;
+	// The live-real latency split at the first paint of its content: waiting
+	// for the compositor to pick it up, then composite + present to the flip.
+	FramegenMetricsSourceLatencyDistribution_t realSourceToRecord;
+	FramegenMetricsSourceLatencyDistribution_t realRecordToFlip;
 	gamescope::framegen::MotionQualityCounts quality;
 };
 
@@ -6722,7 +6790,8 @@ static void framegen_metrics_log( const char *pszLabel,
 		" dreal_flip_ms_p95=%.3f dreal_flip_ms_fs=%.3f bidir_delay_ms=%.3f"
 		" ring_ovf=%" PRIu64
 		" q_resid=%.4f q_bad_mv=%.3f q_killed_mv=%.3f q_killed_match=%.3f"
-		" q_killed_fb=%.3f q_samples=%" PRIu64,
+		" q_killed_fb=%.3f q_samples=%" PRIu64
+		" src_rec_ms_p50=%.3f src_rec_ms_p95=%.3f rec_flip_ms_p50=%.3f rec_flip_ms_p95=%.3f",
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -6758,7 +6827,9 @@ static void framegen_metrics_log( const char *pszLabel,
 		// (meter off, or no fresh field in the window).
 		window.quality.residual(), window.quality.badFraction(),
 		window.quality.killedFraction(), window.quality.killedMatchFraction(),
-		window.quality.killedFbFraction(), window.quality.samples );
+		window.quality.killedFbFraction(), window.quality.samples,
+		window.realSourceToRecord.p50(), window.realSourceToRecord.p95(),
+		window.realRecordToFlip.p50(), window.realRecordToFlip.p95() );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
@@ -6822,6 +6893,14 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 			const uint64_t ulLatencyNs = feedback.ulActualFlipNs - ulFromNs;
 			for ( FramegenMetricsWindow_t *pWindow : { &g_framegenMetrics.current, &g_framegenMetrics.total } )
 				( bDelayed ? pWindow->delayedRealRecordToFlip : pWindow->realSourceToFlip ).add( ulLatencyNs );
+			if ( !bDelayed && pEntry->ulRecordNs >= ulFromNs && feedback.ulActualFlipNs > pEntry->ulRecordNs )
+			{
+				for ( FramegenMetricsWindow_t *pWindow : { &g_framegenMetrics.current, &g_framegenMetrics.total } )
+				{
+					pWindow->realSourceToRecord.add( pEntry->ulRecordNs - ulFromNs );
+					pWindow->realRecordToFlip.add( feedback.ulActualFlipNs - pEntry->ulRecordNs );
+				}
+			}
 		}
 	}
 	if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real )
@@ -10104,8 +10183,17 @@ static bool framegen_net_requested( GamescopeFramegenPipeline ePipeline )
 // samples (default 1000 — mind the disk; ~0.6 MB per 1080p sample).
 static const char *framegen_record_dir()
 {
-	static const char *s_pszDir = gamescope::framegen::non_empty_setting(
-		getenv( "GAMESCOPE_FRAMEGEN_RECORD" ) );
+	static const char *s_pszDir = []() -> const char *
+	{
+		const char *pszDir = gamescope::framegen::non_empty_setting( getenv( "GAMESCOPE_FRAMEGEN_RECORD" ) );
+		// GSFD samples and the trainer that reads them are defined at /8.
+		if ( pszDir != nullptr && framegen_motion_scale() != gamescope::framegen::k_uMotionReferenceScale )
+		{
+			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_RECORD ignored: captures hold /8 fields and the fine motion field is on" );
+			return nullptr;
+		}
+		return pszDir;
+	}();
 	return s_pszDir;
 }
 
@@ -10616,7 +10704,7 @@ static bool framegen_fbcheck_tol_pinned()
 FramegenMotionStatsPush_t::FramegenMotionStatsPush_t( bool bClearOnly )
 	: clearOnly( bClearOnly ? 1u : 0u )
 	, badThresh( gamescope::framegen::k_flAdaptationBadResidual )
-	, staticMvMax( 0.25f )
+	, staticMvMax( gamescope::framegen::motion_reference_texels( 0.25f, framegen_motion_scale() ) )
 	, minConfSurvive( 0.25f )
 {
 }
@@ -10640,10 +10728,12 @@ static float framegen_adapt_agree_hi()
 		g_framegenHistory.adaptation, k_flFramegenAgreeHi );
 }
 
+// In texels of the session's field; the tolerance itself is defined at /8
+// (adaptation only runs on the learned pipelines, which always use /8).
 static float framegen_effective_fbcheck_tol( GamescopeFramegenPipeline ePipeline )
 {
-	return framegen_adapt_enabled( ePipeline )
-		? framegen_adapt_fbcheck_tol() : framegen_fbcheck_tol_base();
+	return gamescope::framegen::motion_reference_texels( framegen_adapt_enabled( ePipeline )
+		? framegen_adapt_fbcheck_tol() : framegen_fbcheck_tol_base(), framegen_motion_scale() );
 }
 
 static float framegen_effective_agree_lo( GamescopeFramegenPipeline ePipeline )
@@ -10689,8 +10779,8 @@ static void framegen_adapt_consume( GamescopeFramegenPipeline ePipeline )
 		if ( FramegenDebugShouldLog( s_uQualityDebugLogCounter ) )
 		{
 			const gamescope::framegen::MotionQualityCounts &q = measurement->quality;
-			vk_log.infof( "framegen: quality moving=%" PRIu64 " resid=%.4f bad=%.1f%% killed=%.1f%% (matcher %.1f%%, after match %.1f%%)",
-				q.moving, q.residual(), q.badFraction() * 100.0,
+			vk_log.infof( "framegen: quality changed=%" PRIu64 " resid=%.4f bad=%.1f%% killed=%.1f%% (matcher %.1f%%, after match %.1f%%)",
+				q.changed, q.residual(), q.badFraction() * 100.0,
 				q.killedFraction() * 100.0, q.killedMatchFraction() * 100.0,
 				q.killedFbFraction() * 100.0 );
 		}
@@ -11138,6 +11228,7 @@ static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t 
 	// Copy after scene finalization so the next-batch debug/CPU consumer sees
 	// the same verdict that this batch's warps consumed.
 	pCmdBuffer->copyImage( g_framegenMotion.statsAccum, g_framegenMotion.statsReadback );
+	pCmdBuffer->hostReadBarrier();
 }
 
 // The quality meter: the same counters, measured on the final field after
@@ -11150,6 +11241,7 @@ static bool framegen_record_quality_meter( CVulkanCmdBuffer *pCmdBuffer, uint32_
 	if ( !framegen_record_stats_accumulate( pCmdBuffer, lowW, lowH ) )
 		return false;
 	pCmdBuffer->copyImage( g_framegenMotion.statsAccum, g_framegenMotion.statsReadback );
+	pCmdBuffer->hostReadBarrier();
 	return true;
 }
 
@@ -11354,6 +11446,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	if ( m.netProfileReadback != nullptr )
 	{
 		pCmdBuffer->copyImage( m.netWeightsGpu, m.netProfileReadback );
+		pCmdBuffer->hostReadBarrier();
 		return true;
 	}
 	return false;
@@ -11525,11 +11618,14 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	g_framegenMotion.uMotionFieldFrameId = 0;
 	g_framegenMotion.uMotionFieldIntervalNs = 0;
 
-	const uint32_t lowW = std::max( 1u, div_roundup( width, k_uFramegenMotionDownscale ) );
-	const uint32_t lowH = std::max( 1u, div_roundup( height, k_uFramegenMotionDownscale ) );
+	const uint32_t uScale = framegen_motion_scale();
+	const uint32_t lowW = std::max( 1u, div_roundup( width, uScale ) );
+	const uint32_t lowH = std::max( 1u, div_roundup( height, uScale ) );
 	const uint32_t uFieldFormat = DRM_FORMAT_ABGR16161616F;
-	const uint32_t uCoarseW[2] = { std::max( 1u, div_roundup( lowW, 2u ) ), std::max( 1u, div_roundup( lowW, 4u ) ) };
-	const uint32_t uCoarseH[2] = { std::max( 1u, div_roundup( lowH, 2u ) ), std::max( 1u, div_roundup( lowH, 4u ) ) };
+	// Level 0 is the base grid; level i > 0 is coarse level i - 1.
+	const uint32_t nCoarse = gamescope::framegen::motion_coarse_levels( uScale );
+	const auto levelW = [&]( uint32_t i ) { return std::max( 1u, div_roundup( lowW, 1u << i ) ); };
+	const auto levelH = [&]( uint32_t i ) { return std::max( 1u, div_roundup( lowH, 1u << i ) ); };
 	// Bidir gathers the previous frame along the reverse field. The learned
 	// refiner also consumes the checked reverse field as evidence even in the
 	// zero-latency forward-prediction path. Both therefore require the reverse
@@ -11550,7 +11646,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	if ( g_framegenMotion.width != lowW || g_framegenMotion.height != lowH
 		|| g_framegenMotion.lumaFormat != dispatch.motionLumaFormat
 		|| g_framegenMotion.lumaPrev == nullptr || g_framegenMotion.lumaCur == nullptr || g_framegenMotion.mvField == nullptr
-		|| g_framegenMotion.mvFieldCoarse[ 1 ] == nullptr
+		|| g_framegenMotion.mvFieldCoarse[ nCoarse - 1 ] == nullptr
 		|| ( bFBCheck && ( g_framegenMotion.mvFieldFwd == nullptr || g_framegenMotion.mvFieldRev == nullptr ) )
 		|| ( bNeedCheckedReverse && g_framegenMotion.mvFieldRevChk == nullptr )
 		|| ( bNeedMotionHistory && g_framegenMotion.mvFieldHistory == nullptr )
@@ -11568,11 +11664,11 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		bool bAllocated = framegen_create_intermediate( &g_framegenMotion.lumaPrev, lowW, lowH, dispatch.motionLumaFormat )
 			&& framegen_create_intermediate( &g_framegenMotion.lumaCur, lowW, lowH, dispatch.motionLumaFormat )
 			&& framegen_create_intermediate( &g_framegenMotion.mvField, lowW, lowH, uFieldFormat );
-		for ( uint32_t i = 0; bAllocated && i < 2; i++ )
+		for ( uint32_t i = 0; bAllocated && i < nCoarse; i++ )
 		{
-			bAllocated = framegen_create_intermediate( &g_framegenMotion.lumaPrevCoarse[ i ], uCoarseW[ i ], uCoarseH[ i ], dispatch.motionLumaFormat )
-				&& framegen_create_intermediate( &g_framegenMotion.lumaCurCoarse[ i ], uCoarseW[ i ], uCoarseH[ i ], dispatch.motionLumaFormat )
-				&& framegen_create_intermediate( &g_framegenMotion.mvFieldCoarse[ i ], uCoarseW[ i ], uCoarseH[ i ], uFieldFormat );
+			bAllocated = framegen_create_intermediate( &g_framegenMotion.lumaPrevCoarse[ i ], levelW( i + 1 ), levelH( i + 1 ), dispatch.motionLumaFormat )
+				&& framegen_create_intermediate( &g_framegenMotion.lumaCurCoarse[ i ], levelW( i + 1 ), levelH( i + 1 ), dispatch.motionLumaFormat )
+				&& framegen_create_intermediate( &g_framegenMotion.mvFieldCoarse[ i ], levelW( i + 1 ), levelH( i + 1 ), uFieldFormat );
 		}
 		if ( bAllocated && bFBCheck )
 		{
@@ -11810,69 +11906,61 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	pCmdBuffer->setSamplerNearest( 1, false );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 
-	// Pass 2: build the coarser pyramid levels, one 2x step per dispatch, both
-	// frames per dispatch (bilinear tap = exact 2x2 box).
-	for ( uint32_t i = 0; i < 2; i++ )
+	// The luma of one frame and the scratch field at a pyramid level (0: base).
+	const auto lumaPrevAt = [&]( uint32_t i ) -> const gamescope::OwningRc<CVulkanTexture> &
+		{ return i == 0 ? g_framegenMotion.lumaPrev : g_framegenMotion.lumaPrevCoarse[ i - 1 ]; };
+	const auto lumaCurAt = [&]( uint32_t i ) -> const gamescope::OwningRc<CVulkanTexture> &
+		{ return i == 0 ? g_framegenMotion.lumaCur : g_framegenMotion.lumaCurCoarse[ i - 1 ]; };
+
+	// Pass 2: build the coarser pyramid levels down to /32, one 2x step per
+	// dispatch, both frames per dispatch (bilinear tap = exact 2x2 box).
+	for ( uint32_t i = 1; i <= nCoarse; i++ )
 	{
 		pCmdBuffer->bindPipeline( g_device.pipeline( dispatch.motionPyramidPair ) );
-		pCmdBuffer->bindTarget( g_framegenMotion.lumaPrevCoarse[ i ] );
-		pCmdBuffer->bindTarget2( g_framegenMotion.lumaCurCoarse[ i ] );
-		framegen_motion_bind_sampler( pCmdBuffer, 0, i == 0 ? g_framegenMotion.lumaPrev : g_framegenMotion.lumaPrevCoarse[ 0 ], false );
-		framegen_motion_bind_sampler( pCmdBuffer, 1, i == 0 ? g_framegenMotion.lumaCur : g_framegenMotion.lumaCurCoarse[ 0 ], false );
-		pCmdBuffer->dispatch( div_roundup( uCoarseW[ i ], pg ), div_roundup( uCoarseH[ i ], pg ) );
+		pCmdBuffer->bindTarget( lumaPrevAt( i ) );
+		pCmdBuffer->bindTarget2( lumaCurAt( i ) );
+		framegen_motion_bind_sampler( pCmdBuffer, 0, lumaPrevAt( i - 1 ), false );
+		framegen_motion_bind_sampler( pCmdBuffer, 1, lumaCurAt( i - 1 ), false );
+		pCmdBuffer->dispatch( div_roundup( levelW( i ), pg ), div_roundup( levelH( i ), pg ) );
 	}
 
-	// Pass 3: full block match at the coarsest level only.
-	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH ) );
-	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldCoarse[ 1 ] );
-	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaPrevCoarse[ 1 ], true );
-	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaCurCoarse[ 1 ], true );
-	pCmdBuffer->pushConstants<FramegenMotionMatchPush_t>( 4 );
-	pCmdBuffer->dispatch( div_roundup( uCoarseW[ 1 ], pg ), div_roundup( uCoarseH[ 1 ], pg ) );
-
-	// Passes 4-5: seeded +/-1 refinement down the pyramid. The finest pass also
-	// runs the sub-texel parabola and the confidence estimate, and writes the
-	// field the warps consume (.rg = mv in base low-res texels, .b = conf) —
-	// or, with the FB check on, the unchecked forward field it filters.
-	for ( uint32_t i = 0; i < 2; i++ )
+	// One direction's coarse-to-fine match: the full block search at /32 only,
+	// then seeded +/-1 refinement down the pyramid. The base level also runs the
+	// sub-texel parabola and the confidence estimate (.rg = mv in base texels,
+	// .b = conf). The coarse fields are scratch, so the reverse chain reuses
+	// them after the forward one; the per-dispatch barriers order the reuse.
+	const auto matchChain = [&]( const auto &srcAt, const auto &dstAt, const gamescope::OwningRc<CVulkanTexture> &finalField )
 	{
-		const bool bFinal = ( i == 1 );
-		pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE ) );
-		pCmdBuffer->bindTarget( bFinal ? ( bFBCheck ? g_framegenMotion.mvFieldFwd : g_framegenMotion.mvField ) : g_framegenMotion.mvFieldCoarse[ 0 ] );
-		framegen_motion_bind_sampler( pCmdBuffer, 0, bFinal ? g_framegenMotion.lumaPrev : g_framegenMotion.lumaPrevCoarse[ 0 ], true );
-		framegen_motion_bind_sampler( pCmdBuffer, 1, bFinal ? g_framegenMotion.lumaCur : g_framegenMotion.lumaCurCoarse[ 0 ], true );
-		framegen_motion_bind_sampler( pCmdBuffer, 2, bFinal ? g_framegenMotion.mvFieldCoarse[ 0 ] : g_framegenMotion.mvFieldCoarse[ 1 ], true );
-		pCmdBuffer->pushConstants<FramegenMotionRefinePush_t>( bFinal );
-		pCmdBuffer->dispatch( div_roundup( bFinal ? lowW : uCoarseW[ 0 ], pg ), div_roundup( bFinal ? lowH : uCoarseH[ 0 ], pg ) );
-	}
+		pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH ) );
+		pCmdBuffer->bindTarget( g_framegenMotion.mvFieldCoarse[ nCoarse - 1 ] );
+		framegen_motion_bind_sampler( pCmdBuffer, 0, srcAt( nCoarse ), true );
+		framegen_motion_bind_sampler( pCmdBuffer, 1, dstAt( nCoarse ), true );
+		pCmdBuffer->pushConstants<FramegenMotionMatchPush_t>( 4 );
+		pCmdBuffer->dispatch( div_roundup( levelW( nCoarse ), pg ), div_roundup( levelH( nCoarse ), pg ) );
+		for ( uint32_t i = nCoarse; i-- > 0; )
+		{
+			const bool bFinal = ( i == 0 );
+			pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE ) );
+			pCmdBuffer->bindTarget( bFinal ? finalField : g_framegenMotion.mvFieldCoarse[ i - 1 ] );
+			framegen_motion_bind_sampler( pCmdBuffer, 0, srcAt( i ), true );
+			framegen_motion_bind_sampler( pCmdBuffer, 1, dstAt( i ), true );
+			framegen_motion_bind_sampler( pCmdBuffer, 2, g_framegenMotion.mvFieldCoarse[ i ], true );
+			pCmdBuffer->pushConstants<FramegenMotionRefinePush_t>( bFinal );
+			pCmdBuffer->dispatch( div_roundup( levelW( i ), pg ), div_roundup( levelH( i ), pg ) );
+		}
+	};
+
+	// Forward flow, anchored at the current frame (cur(p) came from
+	// prev(p - F(p))): the field the warps consume, or with the FB check on the
+	// unchecked forward field it filters.
+	matchChain( lumaPrevAt, lumaCurAt, bFBCheck ? g_framegenMotion.mvFieldFwd : g_framegenMotion.mvField );
 
 	if ( !bFBCheck )
 		return true;
 
-	// Passes 6-8: the same coarse-to-fine match with the two luma bindings
-	// swapped estimates the REVERSE flow, anchored at the previous frame
-	// (prev(q) came from cur(q - R(q))). The forward chain is done with the
-	// coarse fields by now, so the reverse chain reuses them as scratch — the
-	// per-dispatch barriers order the reuse, and the only extra allocations
-	// are the two full-res fields.
-	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH ) );
-	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldCoarse[ 1 ] );
-	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaCurCoarse[ 1 ], true );
-	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaPrevCoarse[ 1 ], true );
-	pCmdBuffer->pushConstants<FramegenMotionMatchPush_t>( 4 );
-	pCmdBuffer->dispatch( div_roundup( uCoarseW[ 1 ], pg ), div_roundup( uCoarseH[ 1 ], pg ) );
-
-	for ( uint32_t i = 0; i < 2; i++ )
-	{
-		const bool bFinal = ( i == 1 );
-		pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE ) );
-		pCmdBuffer->bindTarget( bFinal ? g_framegenMotion.mvFieldRev : g_framegenMotion.mvFieldCoarse[ 0 ] );
-		framegen_motion_bind_sampler( pCmdBuffer, 0, bFinal ? g_framegenMotion.lumaCur : g_framegenMotion.lumaCurCoarse[ 0 ], true );
-		framegen_motion_bind_sampler( pCmdBuffer, 1, bFinal ? g_framegenMotion.lumaPrev : g_framegenMotion.lumaPrevCoarse[ 0 ], true );
-		framegen_motion_bind_sampler( pCmdBuffer, 2, bFinal ? g_framegenMotion.mvFieldCoarse[ 0 ] : g_framegenMotion.mvFieldCoarse[ 1 ], true );
-		pCmdBuffer->pushConstants<FramegenMotionRefinePush_t>( bFinal );
-		pCmdBuffer->dispatch( div_roundup( bFinal ? lowW : uCoarseW[ 0 ], pg ), div_roundup( bFinal ? lowH : uCoarseH[ 0 ], pg ) );
-	}
+	// The same match with the lumas swapped estimates the REVERSE flow,
+	// anchored at the previous frame (prev(q) came from cur(q - R(q))).
+	matchChain( lumaCurAt, lumaPrevAt, g_framegenMotion.mvFieldRev );
 
 	// Pass 9: forward-backward consistency. A correct forward vector round-
 	// trips through the reverse field (R(p - F(p)) ~= -F(p)); lookalike
@@ -11963,7 +12051,7 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 			: gamescope::Rc<CVulkanTexture>( g_framegenMotion.lumaCur ), false );
 		pCmdBuffer->pushConstants<FramegenMotionAccelPush_t>( flStrength,
 			k_flFramegenSuppressLo, k_flFramegenSuppressHi,
-			(float)k_uFramegenMotionDownscale, flAgreeLo, flAgreeHi,
+			(float)framegen_motion_scale(), flAgreeLo, flAgreeHi,
 			1.0f, bHistoryValid, bGuided, bReservoirValid, bShadingValid,
 			flHistoryFlowScale, flAccelTimeFactor );
 	}
@@ -11971,7 +12059,7 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	{
 		pCmdBuffer->pushConstants<FramegenMotionWarpPush_t>( flStrength,
 			k_flFramegenSuppressLo, k_flFramegenSuppressHi,
-			(float)k_uFramegenMotionDownscale, flAgreeLo, flAgreeHi );
+			(float)framegen_motion_scale(), flAgreeLo, flAgreeHi, framegen_sharp_fallback() );
 	}
 	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pg ), div_roundup( pTarget->height(), pg ) );
 }
@@ -12015,7 +12103,7 @@ static void framegen_bidir_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamesc
 	const float flOneSidedStrength = flOneSidedOverride >= 0.0f
 		? std::clamp( flOneSidedOverride, 0.0f, 1.0f )
 		: framegen_bidir_one_sided_strength();
-	pCmdBuffer->pushConstants<FramegenMotionBidirPush_t>( flPhase, (float)k_uFramegenMotionDownscale,
+	pCmdBuffer->pushConstants<FramegenMotionBidirPush_t>( flPhase, (float)framegen_motion_scale(),
 		bAgree ? framegen_effective_agree_lo( ePipeline ) : 1e5f,
 		bAgree ? framegen_effective_agree_hi( ePipeline ) : 1e6f,
 		flOneSidedStrength, flEndpointTraceStrength );
@@ -12383,6 +12471,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		pCmdBuffer->copyImage( g_framegenMotion.lumaCur, g_framegenMotion.recLumaCur );
 		pCmdBuffer->copyImage( g_framegenMotion.mvField, g_framegenMotion.recField );
 		pCmdBuffer->copyImage( g_framegenMotion.mvFieldRevChk, g_framegenMotion.recFieldRev );
+		pCmdBuffer->hostReadBarrier();
 	}
 	// Gate on the effective (post-degradation) pipeline, not just allocation:
 	// once the ladder drops below the net-bearing rung the refiner's inputs
@@ -12517,6 +12606,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		for ( uint32_t i = 0; i < k_uFramegenColorProbeCandidates; i++ )
 			pCmdBuffer->copyImage( slots[ i ].tex, g_framegenColorProbe.generatedReadback[ i ] );
 		pCmdBuffer->copyImage( pColorProbe->reference, g_framegenColorProbe.referenceReadback );
+		pCmdBuffer->hostReadBarrier();
 	}
 	// Causal pacing reuses the existing small timestamp table, but causal one-slot work
 	// is keyed by preparation shape instead of the now-constant output count.
@@ -12638,8 +12728,14 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// connector changes) and participates in the repaint-deferral budget. A
 	// nudge is sufficient here: under VRR every wake arbitrates, and under a
 	// fixed refresh only the vblank timer may present a generated frame.
+	// framegen_batch_repaint() opts back into the composite request.
 	if ( pColorProbe == nullptr && !vulkan_framegen_vrr_hybrid_active() )
-		nudge_steamcompmgr();
+	{
+		if ( framegen_batch_repaint() && !vulkan_framegen_bidir_active() )
+			force_repaint();
+		else
+			nudge_steamcompmgr();
+	}
 	return true;
 }
 

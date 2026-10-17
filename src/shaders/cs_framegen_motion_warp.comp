@@ -6,9 +6,10 @@
 #include "descriptor_set.h"
 
 // Motion-compensated warp. Reprojects the current frame forward along the
-// estimated motion field, blends toward the plain forward-extrapolation result
-// wherever the match is unconfident (so it can never be much worse than the
-// extrapolate mode), and applies the same TAA-style neighborhood rectification.
+// estimated motion field. Where the match is unconfident it either moves the
+// frame only as far as the confidence allows (default), or blends toward the
+// plain forward-extrapolation result with the same TAA-style neighborhood
+// rectification as the extrapolate mode (u_sharpFallback = 0).
 // Writes the output image, so it reuses descriptor_set.h's formatless dst.
 layout(
   local_size_x = 8,
@@ -27,6 +28,10 @@ uniform motion_warp_t {
     // below Lo is trusted fully, above Hi kills the motion term per pixel.
     float u_agreeLo;
     float u_agreeHi;
+    // 1 (default) scales the displacement by the final confidence and samples
+    // once; 0 (GAMESCOPE_FRAMEGEN_SHARP_FALLBACK=0) crossfades the warp with
+    // the extrapolation fallback below.
+    float u_sharpFallback;
 };
 
 // s_samplers[0] = previousReal, [1] = currentReal, [2] = motion field
@@ -77,6 +82,18 @@ void main() {
     float disagree = max(max(dd.r, dd.g), dd.b);
     float nrm = max(1.0f, max(max(abs(predictedMotion.r), abs(predictedMotion.g)), abs(predictedMotion.b)));
     conf *= 1.0f - smoothstep(u_agreeLo, u_agreeHi, disagree / nrm);
+
+    // Sharp fallback: one real-frame sample, moved only as far as the
+    // evidence supports. A crossfade of two differently placed images reads
+    // as blur and double edges; this degrades toward holding the real frame.
+    // The per-pixel agreement in conf matters here too: without it (field
+    // confidence only) a blind A/B found the real game choppier, although
+    // particle swarms fray less.
+    if (u_sharpFallback > 0.5f) {
+        vec3 sharp = texture(s_samplers[1], uv - mvUv * (u_strength * conf)).rgb;
+        imageStore(dst, coord, vec4(sharp, currentSample.a));
+        return;
+    }
 
     // Plain forward extrapolation, used as the low-confidence fallback.
     vec3 delta = currentFrame - previousFrame;

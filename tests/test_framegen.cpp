@@ -70,6 +70,20 @@ static void test_degradation_policy()
 	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 4 ) == 12u );
 	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 5 ) == 12u );
 
+	// The fine field: only on request and below the learned pipelines; the
+	// coarse search stays at /32; pixel-meaning constants keep their pixels.
+	using gamescope::framegen::motion_field_scale;
+	static_assert( motion_field_scale( false, GamescopeFramegenPipeline::Checked ) == 8u );
+	static_assert( motion_field_scale( true, GamescopeFramegenPipeline::Warp ) == 4u );
+	static_assert( motion_field_scale( true, GamescopeFramegenPipeline::Checked ) == 4u );
+	static_assert( motion_field_scale( true, GamescopeFramegenPipeline::Learned ) == 8u );
+	static_assert( motion_field_scale( true, GamescopeFramegenPipeline::Predict ) == 8u );
+	static_assert( gamescope::framegen::motion_coarse_levels( 8u ) == 2u );
+	static_assert( gamescope::framegen::motion_coarse_levels( 4u ) == 3u );
+	static_assert( gamescope::framegen::k_uMotionMaxCoarseLevels == 3u );
+	static_assert( gamescope::framegen::motion_reference_texels( 0.75f, 8u ) == 0.75f );
+	static_assert( gamescope::framegen::motion_reference_texels( 0.75f, 4u ) == 1.5f );
+
 	constexpr std::array modes = {
 		GamescopeFramegenMode::Extrapolate,
 		GamescopeFramegenMode::Blend,
@@ -475,18 +489,18 @@ static void test_quality_meter()
 {
 	using namespace gamescope::framegen;
 
-	// Decode: the moving counters become one sample; the established
+	// Decode: the changed counters become one sample; the established
 	// adaptation fields ignore them.
 	std::array<uint32_t, k_uAdaptationStatsCount> stats = {};
 	stats[ 0 ] = 100u;
 	stats[ 1 ] = 10u * 1024u;
 	stats[ 2 ] = 20u;
 	stats[ 3 ] = 20u;
-	stats[ k_uAdaptationStatMoving ] = 40u;
-	stats[ k_uAdaptationStatMovingKilled ] = 10u;
-	stats[ k_uAdaptationStatMovingBad ] = 6u;
-	stats[ k_uAdaptationStatMovingKilledMatch ] = 7u;
-	stats[ k_uAdaptationStatMovingResidual ] = 2048u;
+	stats[ k_uAdaptationStatChanged ] = 40u;
+	stats[ k_uAdaptationStatChangedKilled ] = 10u;
+	stats[ k_uAdaptationStatChangedBad ] = 6u;
+	stats[ k_uAdaptationStatChangedKilledMatch ] = 7u;
+	stats[ k_uAdaptationStatChangedResidual ] = 2048u;
 	const auto measurement = decode_adaptation_stats( stats );
 	CHECK( measurement.has_value() );
 	CHECK_NEAR( measurement->residual, 0.10f, 1e-7f );
@@ -494,7 +508,7 @@ static void test_quality_meter()
 	CHECK_NEAR( measurement->killedFraction, 0.20f, 1e-7f );
 	const MotionQualityCounts &q = measurement->quality;
 	CHECK( q.samples == 1u );
-	CHECK( q.moving == 40u );
+	CHECK( q.changed == 40u );
 	CHECK_NEAR( q.residual(), 0.05, 1e-12 );
 	CHECK_NEAR( q.badFraction(), 0.20, 1e-12 );
 	CHECK_NEAR( q.killedFraction(), 0.25, 1e-12 );
@@ -503,23 +517,23 @@ static void test_quality_meter()
 
 	// The matcher's kills are a subset of all kills, so the two parts always
 	// add up to the killed fraction.
-	stats[ k_uAdaptationStatMovingKilledMatch ] = 15u;
+	stats[ k_uAdaptationStatChangedKilledMatch ] = 15u;
 	const auto overMatched = decode_adaptation_stats( stats );
 	CHECK( overMatched.has_value() );
-	CHECK( overMatched->quality.movingKilledMatch == 10u );
+	CHECK( overMatched->quality.changedKilledMatch == 10u );
 	CHECK( overMatched->quality.killedFbFraction() == 0.0 );
 	CHECK_NEAR( overMatched->quality.killedMatchFraction() + overMatched->quality.killedFbFraction(),
 		overMatched->quality.killedFraction(), 1e-12 );
 
 	// Counters past their parent set are clamped, never wrapped.
-	stats[ k_uAdaptationStatMoving ] = 200u;
-	stats[ k_uAdaptationStatMovingKilled ] = 150u;
-	stats[ k_uAdaptationStatMovingBad ] = 50u;
+	stats[ k_uAdaptationStatChanged ] = 200u;
+	stats[ k_uAdaptationStatChangedKilled ] = 150u;
+	stats[ k_uAdaptationStatChangedBad ] = 50u;
 	const auto clamped = decode_adaptation_stats( stats );
 	CHECK( clamped.has_value() );
-	CHECK( clamped->quality.moving == 100u );
-	CHECK( clamped->quality.movingKilled == 100u );
-	CHECK( clamped->quality.movingBad == 0u );
+	CHECK( clamped->quality.changed == 100u );
+	CHECK( clamped->quality.changedKilled == 100u );
+	CHECK( clamped->quality.changedBad == 0u );
 	CHECK( clamped->quality.badFraction() == 0.0 );
 	CHECK_NEAR( clamped->quality.killedMatchFraction() + clamped->quality.killedFbFraction(),
 		clamped->quality.killedFraction(), 1e-12 );
@@ -532,13 +546,13 @@ static void test_quality_meter()
 		&& window.killedFbFraction() == 0.0 );
 	MotionQualityCounts a;
 	a.samples = 1u;
-	a.moving = 10u;
-	a.movingResidualQ10 = 1024u;
+	a.changed = 10u;
+	a.changedResidualQ10 = 1024u;
 	MotionQualityCounts b;
 	b.samples = 1u;
-	b.moving = 30u;
-	b.movingKilled = 30u;
-	b.movingResidualQ10 = 614u;
+	b.changed = 30u;
+	b.changedKilled = 30u;
+	b.changedResidualQ10 = 614u;
 	window += a;
 	window += b;
 	CHECK( window.samples == 2u );

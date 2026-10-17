@@ -1291,7 +1291,9 @@ protected:
 	// dispatches: luma pair + 2 pyramid + 2x [match + 2 refines] + 2 FB checks
 	// (forward + bidir reverse) + 5 stats passes (clear + accumulate + finalize +
 	// 2 field applies) + 2 net refinements + 2 net training tiles + up to 2
-	// optimizer steps (init + step on the first online batch) + 3 warps).
+	// optimizer steps (init + step on the first online batch) + 3 warps). The
+	// fine /4 field adds a pyramid step and a refine per direction (+3), but
+	// only below the learned pipelines: at most 19 there.
 	static constexpr uint32_t k_uFramegenMaxDispatchesPerBatch = 25;
 	static constexpr uint32_t k_uFramegenDescriptorSets = 30;
 	static_assert( k_uFramegenDescriptorSets >= k_uFramegenMaxDispatchesPerBatch );
@@ -1444,6 +1446,9 @@ public:
 	void discardImage(CVulkanTexture *image);
 	void markDirty(CVulkanTexture *image);
 	void insertBarrier(bool flush = false);
+	// Makes the transfer writes recorded so far visible to host reads of
+	// mapped memory: a fence or semaphore wait covers device accesses only.
+	void hostReadBarrier();
 
 	VkQueue queue() { return m_queue; }
 	uint32_t queueFamily() { return m_queueFamily; }

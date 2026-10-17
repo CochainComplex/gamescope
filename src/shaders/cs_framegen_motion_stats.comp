@@ -19,19 +19,20 @@
 //   [4] sum residual over static confident texels (x1024)   [5] their count
 //   [6..13] histogram of the round-trip error the FB check stored in field.a,
 //           8 bins x 0.25 field texels
-//   [14] sum |mv| (x64)       [15] moving texels (|mv| >= u_staticMvMax)
+//   [14] sum |mv| (x64)       [15] changed texels (unwarped residual > u_badThresh)
 //   [16..51] previous-frame luma histogram (9 screen sections x 4 bins)
 //   [52..87] current-frame luma histogram  (9 screen sections x 4 bins)
 //   [88] scene-cut verdict    [89] changed sections
 //   [90] global histogram distance (x1024)
-//   [91] moving killed texels
-//   [92] moving mispredicting texels (survived, residual didn't)
-//   [93] moving killed texels the matcher had already left unconfident
-//   [94] sum residual over moving texels (x1024)
+//   [91] changed killed texels
+//   [92] changed mispredicting texels (survived, residual didn't)
+//   [93] changed killed texels the matcher had already left unconfident
+//   [94] sum residual over changed texels (x1024)
 //   [95] reserved
 //
-// The moving counters judge the field on moving content only; a static
-// background predicts itself whatever the field says.
+// The changed counters judge the field where the content changed between the
+// two real frames, whatever the field says: that is what motion has to
+// explain, and a static background predicts itself.
 //
 // The apply pass consumes the counters in the SAME batch (field trust + scene
 // verdict); the CPU reads everything back one batch later to auto-calibrate
@@ -71,18 +72,18 @@ const uint STAT_COUNT = 96u;
 const uint HIST_PREV_BASE = 16u;
 const uint HIST_CUR_BASE = 52u;
 const uint HIST_BINS = 4u;
-const uint STAT_MOVING = 15u;
-const uint STAT_MOVING_KILLED = 91u;
-const uint STAT_MOVING_BAD = 92u;
-const uint STAT_MOVING_KILLED_MATCH = 93u;
-const uint STAT_MOVING_RESID = 94u;
+const uint STAT_CHANGED = 15u;
+const uint STAT_CHANGED_KILLED = 91u;
+const uint STAT_CHANGED_BAD = 92u;
+const uint STAT_CHANGED_KILLED_MATCH = 93u;
+const uint STAT_CHANGED_RESID = 94u;
 shared uint s_acc[STAT_COUNT];
 
 uint lumaBin(float luma) {
-    // Compress linear-light HDR into a stable [0,1) range. These boundaries
-    // correspond to approximately 0.05, 0.18 and 0.54 in linear light, so
-    // the histogram retains useful shadow/midtone/highlight separation in SDR
-    // without clipping scRGB highlights into one unbounded bucket.
+    // Compress the matching luma into a stable [0,1) range: code values for
+    // 8/10-bit outputs (the luma pass samples the UNORM srgbView()), linear
+    // light for float outputs. The boundaries are ~0.05, 0.18 and 0.54 in
+    // that domain, so scRGB highlights never pile into one unbounded bucket.
     float v = max(luma, 0.0f);
     float mapped = v / (1.0f + v);
     if (mapped < 0.05f) return 0u;
@@ -136,17 +137,20 @@ void main() {
             atomicAdd(s_acc[4], uResid);
             atomicAdd(s_acc[5], 1u);
         }
-        // Moving is the exact complement of the static test above. A
-        // consistency check keeps a killed texel's vector, so it still counts.
-        if (mvMag >= u_staticMvMax) {
-            atomicAdd(s_acc[STAT_MOVING], 1u);
-            atomicAdd(s_acc[STAT_MOVING_RESID], uResid);
+        // Changed: holding the previous frame would mispredict this texel,
+        // judged with the same normalization and bar as the warped residual.
+        // Independent of the field, so a zero vector that the sub-texel fit
+        // nudged past the static bar is not counted as motion.
+        float held = abs(lc - lpUnwarped) / max(1.0f, max(abs(lc), abs(lpUnwarped)));
+        if (held > u_badThresh) {
+            atomicAdd(s_acc[STAT_CHANGED], 1u);
+            atomicAdd(s_acc[STAT_CHANGED_RESID], uResid);
             if (conf < u_minConfSurvive) {
-                atomicAdd(s_acc[STAT_MOVING_KILLED], 1u);
+                atomicAdd(s_acc[STAT_CHANGED_KILLED], 1u);
                 if (texelFetch(s_samplers[3], p, 0).b < u_minConfSurvive)
-                    atomicAdd(s_acc[STAT_MOVING_KILLED_MATCH], 1u);
+                    atomicAdd(s_acc[STAT_CHANGED_KILLED_MATCH], 1u);
             } else if (resid > u_badThresh) {
-                atomicAdd(s_acc[STAT_MOVING_BAD], 1u);
+                atomicAdd(s_acc[STAT_CHANGED_BAD], 1u);
             }
         }
         atomicAdd(s_acc[6u + min(uint(max(fbErr, 0.0f) * 4.0f), 7u)], 1u);

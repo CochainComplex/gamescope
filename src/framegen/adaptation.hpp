@@ -13,13 +13,13 @@ namespace gamescope::framegen
 // R32_UINT values; the renderer copies them only after the submission retires.
 inline constexpr uint32_t k_uAdaptationStatsCount = 96u;
 inline constexpr uint32_t k_uAdaptationMaxTotal = 4u * 1024u * 1024u;
-// Moving-texel counters of the quality meter; the layout is documented in
+// Changed-texel counters of the quality meter; the layout is documented in
 // cs_framegen_motion_stats.comp.
-inline constexpr uint32_t k_uAdaptationStatMoving = 15u;
-inline constexpr uint32_t k_uAdaptationStatMovingKilled = 91u;
-inline constexpr uint32_t k_uAdaptationStatMovingBad = 92u;
-inline constexpr uint32_t k_uAdaptationStatMovingKilledMatch = 93u;
-inline constexpr uint32_t k_uAdaptationStatMovingResidual = 94u;
+inline constexpr uint32_t k_uAdaptationStatChanged = 15u;
+inline constexpr uint32_t k_uAdaptationStatChangedKilled = 91u;
+inline constexpr uint32_t k_uAdaptationStatChangedBad = 92u;
+inline constexpr uint32_t k_uAdaptationStatChangedKilledMatch = 93u;
+inline constexpr uint32_t k_uAdaptationStatChangedResidual = 94u;
 
 // Same-batch field trust and next-batch CPU adaptation thresholds. Keep these
 // together so resource sizing, push constants, and readback policy cannot drift
@@ -42,60 +42,61 @@ inline constexpr float k_flAdaptationToleranceFallPerFrame = 0.250f;
 inline constexpr float k_flAdaptationNoiseToAgreement = 6.0f;
 inline constexpr float k_flAdaptationAgreementOffsetMax = 0.15f;
 
-// Motion-field quality over moving texels, summed over stats-probe samples.
-// A static background predicts itself whatever the field says, so only moving
-// texels judge the field. A window reports ratios of sums, so every moving
-// texel weighs the same whatever sample it came from. Each ratio is 0 when its
+// Motion-field quality over changed texels (holding the previous frame would
+// mispredict them, whatever the field says), summed over stats-probe samples.
+// A static background predicts itself, so only changed texels judge the
+// field. A window reports ratios of sums, so every changed texel weighs the
+// same whatever sample it came from. Each ratio is 0 when its
 // denominator is empty; samples == 0 means nothing was measured.
 struct MotionQualityCounts
 {
 	uint64_t samples = 0;
-	uint64_t moving = 0;
+	uint64_t changed = 0;
 	// Final field confidence below the survive threshold.
-	uint64_t movingKilled = 0;
+	uint64_t changedKilled = 0;
 	// The killed texels the matcher had already left unconfident; the rest
 	// were killed by the later consistency check or refinement.
-	uint64_t movingKilledMatch = 0;
+	uint64_t changedKilledMatch = 0;
 	// Survived, yet still mispredicted the real frame.
-	uint64_t movingBad = 0;
-	// Warped-luma residual over moving texels, x1024.
-	uint64_t movingResidualQ10 = 0;
+	uint64_t changedBad = 0;
+	// Warped-luma residual over changed texels, x1024.
+	uint64_t changedResidualQ10 = 0;
 
 	MotionQualityCounts &operator+=( const MotionQualityCounts &other )
 	{
 		samples += other.samples;
-		moving += other.moving;
-		movingKilled += other.movingKilled;
-		movingKilledMatch += other.movingKilledMatch;
-		movingBad += other.movingBad;
-		movingResidualQ10 += other.movingResidualQ10;
+		changed += other.changed;
+		changedKilled += other.changedKilled;
+		changedKilledMatch += other.changedKilledMatch;
+		changedBad += other.changedBad;
+		changedResidualQ10 += other.changedResidualQ10;
 		return *this;
 	}
 
 	[[nodiscard]] double residual() const
 	{
-		return moving != 0 ? static_cast<double>( movingResidualQ10 ) / 1024.0
-			/ static_cast<double>( moving ) : 0.0;
+		return changed != 0 ? static_cast<double>( changedResidualQ10 ) / 1024.0
+			/ static_cast<double>( changed ) : 0.0;
 	}
-	// Of the moving texels that survived.
+	// Of the changed texels that survived.
 	[[nodiscard]] double badFraction() const
 	{
-		const uint64_t survived = moving - std::min( movingKilled, moving );
-		return survived != 0 ? static_cast<double>( movingBad )
+		const uint64_t survived = changed - std::min( changedKilled, changed );
+		return survived != 0 ? static_cast<double>( changedBad )
 			/ static_cast<double>( survived ) : 0.0;
 	}
-	[[nodiscard]] double killedFraction() const { return fraction( movingKilled ); }
-	[[nodiscard]] double killedMatchFraction() const { return fraction( movingKilledMatch ); }
+	[[nodiscard]] double killedFraction() const { return fraction( changedKilled ); }
+	[[nodiscard]] double killedMatchFraction() const { return fraction( changedKilledMatch ); }
 	[[nodiscard]] double killedFbFraction() const
 	{
-		return fraction( movingKilled - std::min( movingKilledMatch, movingKilled ) );
+		return fraction( changedKilled - std::min( changedKilledMatch, changedKilled ) );
 	}
 
 private:
 	[[nodiscard]] double fraction( uint64_t count ) const
 	{
-		return moving != 0 ? static_cast<double>( count )
-			/ static_cast<double>( moving ) : 0.0;
+		return changed != 0 ? static_cast<double>( count )
+			/ static_cast<double>( changed ) : 0.0;
 	}
 };
 
@@ -167,17 +168,17 @@ struct AdaptationState
 		}
 	}
 
-	// Each moving counter is clamped to its parent set, so a window's parts
+	// Each changed counter is clamped to its parent set, so a window's parts
 	// always add up.
-	const uint32_t moving = std::min( stats[ k_uAdaptationStatMoving ], total );
-	const uint32_t movingKilled = std::min( stats[ k_uAdaptationStatMovingKilled ], moving );
+	const uint32_t changed = std::min( stats[ k_uAdaptationStatChanged ], total );
+	const uint32_t changedKilled = std::min( stats[ k_uAdaptationStatChangedKilled ], changed );
 	const MotionQualityCounts quality = {
 		.samples = 1u,
-		.moving = moving,
-		.movingKilled = movingKilled,
-		.movingKilledMatch = std::min( stats[ k_uAdaptationStatMovingKilledMatch ], movingKilled ),
-		.movingBad = std::min( stats[ k_uAdaptationStatMovingBad ], moving - movingKilled ),
-		.movingResidualQ10 = stats[ k_uAdaptationStatMovingResidual ],
+		.changed = changed,
+		.changedKilled = changedKilled,
+		.changedKilledMatch = std::min( stats[ k_uAdaptationStatChangedKilledMatch ], changedKilled ),
+		.changedBad = std::min( stats[ k_uAdaptationStatChangedBad ], changed - changedKilled ),
+		.changedResidualQ10 = stats[ k_uAdaptationStatChangedResidual ],
 	};
 
 	return AdaptationMeasurement{
